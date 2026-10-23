@@ -22,6 +22,17 @@ enum Cmd {
     RefreshGithub,
     Sync,
     FetchDiff { repo: String, number: i64 },
+    ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
+}
+
+/// 状态栏配置状态文本。
+fn config_status(cfg: &Config) -> String {
+    if cfg.is_unconfigured() {
+        return "未配置（点 ⚙ 设置）".into();
+    }
+    let mut parts = vec![format!("GitHub 已配置 {} 个仓库", cfg.repos.len())];
+    parts.push(if cfg.sync_token.is_empty() { "sync 未启用".into() } else { "sync 已配置".into() });
+    parts.join(" · ")
 }
 
 enum Msg {
@@ -75,6 +86,20 @@ fn main() -> anyhow::Result<()> {
         selected: None,
     }));
 
+    // 设置页初值 + 首启引导 + 状态栏配置状态
+    ui.set_s_server(cfg.server_url.clone().into());
+    ui.set_s_sync_token(cfg.sync_token.clone().into());
+    ui.set_s_gh_token(cfg.github_token.clone().unwrap_or_default().into());
+    ui.set_s_repos(cfg.repos.join("\n").into());
+    ui.set_s_poll(cfg.poll_interval_min as i32);
+    ui.set_gh_token_from_env(std::env::var("GITHUB_TOKEN").map(|t| !t.is_empty()).unwrap_or(false));
+    let unconfigured = cfg.is_unconfigured();
+    ui.set_onboarding(unconfigured);
+    if unconfigured {
+        ui.set_settings_open(true); // 首启自动打开设置
+    }
+    ui.set_status_text(config_status(&cfg).into());
+
     // ── 后台工作线程（tokio runtime） ──
     {
         let app = app.clone();
@@ -85,11 +110,12 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 自动同步定时器
+    // 自动同步定时器（每轮重新读当前间隔，设置页改间隔下轮生效）
     {
         let cmd_tx = cmd_tx.clone();
-        let interval = cfg.poll_interval_min.max(1);
+        let app2 = app.clone();
         std::thread::spawn(move || loop {
+            let interval = app2.lock().unwrap().cfg.poll_interval_min.max(1);
             std::thread::sleep(std::time::Duration::from_secs(interval * 60));
             if cmd_tx.send(Cmd::Sync).is_err() {
                 break;
@@ -228,6 +254,48 @@ fn main() -> anyhow::Result<()> {
             if let Some(i) = sel {
                 local_update(&app, i, "priority", p as i64);
             }
+        });
+    }
+    // ── 设置页 ──
+    {
+        let ui2 = ui.as_weak();
+        ui.on_open_settings(move || {
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_settings_open(true);
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        let ui2 = ui.as_weak();
+        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s| {
+            let repos: Vec<String> = repos_text
+                .lines()
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty() && l.contains('/'))
+                .collect();
+            let poll: u64 = poll_s.trim().parse().unwrap_or(5).max(1);
+            let new_cfg = Config {
+                server_url: server.trim().to_string(),
+                sync_token: sync_tok.trim().to_string(),
+                github_token: Some(gh_tok.trim().to_string()).filter(|t| !t.is_empty()),
+                repos,
+                poll_interval_min: poll,
+            };
+            if let Err(e) = new_cfg.save(&PathBuf::from("config.toml")) {
+                send_msg(Msg::Status(format!("配置保存失败: {e}")));
+                return;
+            }
+            {
+                app.lock().unwrap().cfg = new_cfg.clone();
+            }
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_onboarding(new_cfg.is_unconfigured());
+                ui.set_status_text(config_status(&new_cfg).into());
+            }
+            send_msg(Msg::Status("配置已保存并生效".into()));
+            let _ = cmd_tx.send(Cmd::ReloadConfig); // 热生效，不用重启
         });
     }
 
@@ -478,15 +546,18 @@ fn build_diff_files(diff: &str) -> Vec<DiffFile> {
 async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sender<Msg>) {
     let _ = MSG_TX.set(msg_tx.clone());
 
-    let token = Config::github_token();
-    let gh = match github::GitHub::new(token) {
+    let token = {
+        let cfg = app.lock().unwrap().cfg.clone();
+        cfg.token()
+    };
+    let mut gh = match github::GitHub::new(token) {
         Ok(g) => Some(g),
         Err(e) => {
             let _ = msg_tx.send(Msg::Status(format!("GitHub 客户端初始化失败: {e}")));
             None
         }
     };
-    let sync_client = {
+    let mut sync_client = {
         let cfg = app.lock().unwrap().cfg.clone();
         sync::SyncClient::new(&cfg)
     };
@@ -573,6 +644,43 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             let _ = msg_tx.send(Msg::Status(format!("diff 拉取失败: {e}")));
                         }
                     }
+                }
+            }
+            Cmd::ReloadConfig => {
+                // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
+                let cfg = app.lock().unwrap().cfg.clone();
+                match github::GitHub::new(cfg.token()) {
+                    Ok(g) => gh = Some(g),
+                    Err(e) => {
+                        let _ = msg_tx.send(Msg::Status(format!("GitHub 客户端重建失败: {e}")));
+                    }
+                }
+                sync_client = sync::SyncClient::new(&cfg);
+                let _ = msg_tx.send(Msg::Status("配置已重载".into()));
+                // 复用现有流程：直接内联一次刷新 + 同步
+                if let Some(g) = &gh {
+                    let repos = cfg.repos.clone();
+                    let mut total = 0;
+                    for repo in &repos {
+                        match g.fetch_open_prs(repo).await {
+                            Ok(prs) => {
+                                total += prs.len();
+                                let a = app.lock().unwrap();
+                                for p in prs {
+                                    let _ = a.db.upsert_pr(&serde_json::json!({
+                                        "repo": p.repo, "number": p.number, "title": p.title,
+                                        "author": p.author, "url": p.url, "head_sha": p.head_sha,
+                                        "status": "pending", "updated_at": db::now(),
+                                    }));
+                                }
+                            }
+                            Err(e) => {
+                                let _ = msg_tx.send(Msg::Status(format!("拉取 {repo} 失败: {e}")));
+                            }
+                        }
+                    }
+                    reload_rows(&app, &msg_tx);
+                    let _ = msg_tx.send(Msg::Status(format!("GitHub 刷新完成：{total} 个 open PR")));
                 }
             }
         }

@@ -80,6 +80,10 @@ async fn fetch_one(client: &reqwest::Client, url: String, path: PathBuf) -> bool
     if bytes.len() < 64 {
         return false;
     }
+    // 只写真正的 PNG（网络错误页/代理拦截页不落盘，避免坏缓存反复重拉）
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return false;
+    }
     if let Some(parent) = path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
             return false;

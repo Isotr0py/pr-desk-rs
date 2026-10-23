@@ -31,16 +31,21 @@ slint = { version = "1", default-features = false,
 
 ## 配置
 
-首次启动在当前目录生成 `config.toml` 模板：
+首次启动在当前目录生成 `config.toml` 模板；**推荐在应用内 ⚙ 设置页修改**（保存后热生效，无需重启），设置页包含服务器地址、sync_token、GitHub token、仓库列表、轮询间隔。未配置时（repos 为空或全是模板占位）首启自动弹出引导与设置页。
 
 ```toml
 server_url = "http://127.0.0.1:6185"   # AstrBot 地址
 sync_token = ""                        # 插件配置里的 sync_token（留空 = 仅本地浏览，不同步）
+github_token = ""                      # 明文本地存储（自用）；环境变量 GITHUB_TOKEN 优先级更高
 repos = ["owner/repo"]                 # 关注的仓库（拉 open PR）
 poll_interval_min = 5                  # 自动同步间隔（分钟）
 ```
 
-GitHub token 从环境变量 `GITHUB_TOKEN` 读取（不写任何文件）。
+> **token 存储**：`github_token`/`sync_token` 在 config.toml 中为明文（本地自用应用）。
+> 建议不要把包含 token 的 config.toml 提交/分享；（Windows 上无可靠的 0600 等价物，
+> 如需隔离请用环境变量 `GITHUB_TOKEN` —— 它优先于文件且不落地）。
+
+GitHub token 从环境变量 `GITHUB_TOKEN` 优先读取（不写任何文件时唯一来源）。
 
 ## 功能（Phase 1）
 
