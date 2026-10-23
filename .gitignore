@@ -1,1 +1,5 @@
 /target
+
+# 运行时生成
+config.toml
+data/

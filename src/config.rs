@@ -51,6 +51,9 @@ impl Config {
     /// 读取 config.toml；不存在则生成模板并用默认值。
     pub fn load(path: &Path) -> Result<Config> {
         if !path.exists() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).ok();
+            }
             fs::write(path, TEMPLATE).context("写入 config.toml 模板失败")?;
             tracing::info!("已生成配置模板 {:?}，请填写后重启", path);
             return Ok(Config::default());

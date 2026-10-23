@@ -6,7 +6,7 @@ edition = "2024"
 [features]
 default = ["ui"]
 # Slint UI（windows 大 crate 编译吃内存；纯逻辑测试可用 --no-default-features 跳过）
-ui = ["dep:slint"]
+ui = ["dep:slint", "dep:slint-build"]
 
 [dependencies]
 slint = { version = "1", optional = true }
