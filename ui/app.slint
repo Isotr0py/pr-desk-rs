@@ -1,27 +1,14 @@
-// PR Desk — Slint UI（GPLv3）
-import { Button, ListView } from "std-widgets.slint";
+// PR Desk — 主窗口（组装 theme/components/pr_list/drawer/diff_view）
+// 键盘：PrListView 自带 j/k/↑↓/Enter/Esc；外层 FocusScope 只处理 p/1/2/3
+// （事件先到 PrListView，reject 后冒泡到外层）。
+import { Button } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
+import { DetailDrawer } from "drawer.slint";
+import { DiffView, DiffFile, DiffLine } from "diff_view.slint";
 
-export struct PrRow {
-    is_header: bool,
-    key: string,
-    repo: string,
-    number: int,
-    title: string,
-    author: string,
-    score: string,
-    ci: string,       // success / failure / pending / none / ""
-    review: string,   // approved / changes_requested / commented / review_required / ""
-    turn: string,     // me / them / ""
-    priority: int,    // 0 未排 1 高 2 中 3 低
-    pinned: bool,
-    on_board: bool,
-    selected: bool,
-}
-
-export struct DiffLine {
-    text: string,
-    kind: int,  // 0 ctx / 1 add / 2 del / 3 hunk / 4 meta
-}
+// 类型再导出：slint-build 从本文件生成 Rust 绑定
+export { PrListRow, PrGroup, DiffFile, DiffLine }
 
 export component MainWindow inherits Window {
     title: "PR Desk";
@@ -30,170 +17,110 @@ export component MainWindow inherits Window {
     min-width: 800px;
     min-height: 480px;
 
-    in property <[PrRow]> rows: [];
+    in property <[PrListRow]> rows: [];
+    in-out property <[PrGroup]> groups: [];
     in property <string> status_text: "就绪";
-    in property <bool> detail_open: false;
+    // 抽屉
+    in property <bool> d_open: false;
     in property <string> d_title: "";
-    in property <string> d_meta: "";
-    in property <string> d_summary: "";
-    in property <string> d_score: "";
-    in property <string> d_extra: "";
-    in property <[DiffLine]> diff_lines: [];
+    in property <string> d_subtitle: "";
+    in property <string> d_body: "";
+    in property <string> d_convo: "";
+    in property <string> d_checks: "";
+    in property <string> d_files: "";
+    in property <int> d_priority: 0;
+    // diff
+    in property <[DiffFile]> diff_files: [];
+    in property <string> diff_hint: "选择 PR 后在此查看 diff";
 
     callback refresh();
     callback sync_now();
-    callback row_clicked(int);
-    callback key_pressed(string);
+    callback row_activated(int);
+    callback row_pin(int);
+    callback row_reject(int);
+    callback row_board(int);
+    callback drawer_close();
+    callback drawer_requeue();
+    callback drawer_reject();
+    callback drawer_set_priority(int);
+    callback diff_file_toggled(int);
+    callback key_pin();
+    callback key_priority(int);
 
-    // 键盘快捷键：j/k 上下、Enter 详情、Esc 关闭、p 置顶、1/2/3 优先级
     forward-focus: keys;
-    keys := FocusScope {
-        key-pressed(event) => {
-            root.key_pressed(event.text);
-            accept
-        }
-    }
 
     VerticalLayout {
         // 顶栏
         Rectangle {
-            height: 36px;
-            background: #1f232b;
+            height: 38px;
+            background: Theme.card;
             HorizontalLayout {
                 padding: 6px;
                 spacing: 8px;
-                Text { text: "PR Desk"; color: #fff; font-weight: 700; vertical-alignment: center; }
+                Text {
+                    text: "PR Desk";
+                    color: Theme.text;
+                    font-weight: 700;
+                    vertical-alignment: center;
+                }
                 Rectangle { width: 8px; }
                 Button { text: "刷新 GitHub"; clicked => { root.refresh(); } }
                 Button { text: "同步服务器"; clicked => { root.sync_now(); } }
-                Rectangle {}
-                Text { text: root.status_text; color: #9ca3af; vertical-alignment: center; font-size: 12px; }
-            }
-        }
-
-        HorizontalLayout {
-            // 左：分区列表
-            Rectangle {
-                width: 56%;
-                background: #16181d;
-                ListView {
-                    for row[i] in root.rows: Rectangle {
-                        height: row.is_header ? 28px : 30px;
-                        background: row.is_header ? #1f232b
-                            : (row.selected ? #25405e : (touch.has-hover ? #1d2129 : transparent));
-                        touch := TouchArea {
-                            enabled: !row.is_header;
-                            clicked => { root.row_clicked(i); }
-                        }
-                        if row.is_header: Text {
-                            x: 10px;
-                            text: row.title;
-                            color: #9ca3af;
-                            font-weight: 700;
-                            font-size: 12px;
-                            vertical-alignment: center;
-                        }
-                        if !row.is_header: HorizontalLayout {
-                            padding-left: 10px;
-                            padding-right: 8px;
-                            spacing: 6px;
-                            Text {
-                                text: row.priority == 1 ? "!" : (row.priority == 2 ? "!" : (row.priority == 3 ? "!" : ""));
-                                color: row.priority == 1 ? #f87171 : (row.priority == 2 ? #fbbf24 : #6b7280);
-                                font-weight: 800;
-                                vertical-alignment: center;
-                                width: 12px;
-                            }
-                            Text {
-                                text: "#" + row.number;
-                                color: #60a5fa;
-                                vertical-alignment: center;
-                                                width: 52px;
-                            }
-                            Text {
-                                text: row.title;
-                                color: #e5e7eb;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                horizontal-stretch: 1;
-                            }
-                            Text {
-                                text: row.turn == "me" ? "我" : (row.turn == "them" ? "对方" : "");
-                                color: #60a5fa;
-                                font-weight: 700;
-                                vertical-alignment: center;
-                                width: 30px;
-                            }
-                            // Review 状态
-                            Text {
-                                text: row.review == "approved" ? "✓" : (row.review == "changes_requested" ? "✗" : (row.review == "commented" ? "💬" : "○"));
-                                color: row.review == "approved" ? #4ade80 : (row.review == "changes_requested" ? #f87171 : #6b7280);
-                                vertical-alignment: center;
-                                width: 20px;
-                            }
-                            // CI 状态点
-                            Rectangle {
-                                width: 9px; height: 9px; border-radius: 4.5px;
-                                y: (parent.height - 9px) / 2;
-                                background: row.ci == "success" ? #4ade80 : (row.ci == "failure" ? #f87171 : (row.ci == "pending" ? #fbbf24 : #4b5563));
-                            }
-                            Text {
-                                text: row.score;
-                                color: #e5e7eb;
-                                vertical-alignment: center;
-                                width: 34px;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 右：详情面板
-            Rectangle {
-                background: #1f232b;
-                if !root.detail_open: Text {
-                    text: "选择左侧 PR 查看详情\n（j/k 移动，Enter 打开）";
-                    color: #6b7280;
-                    horizontal-alignment: center;
+                Rectangle { horizontal-stretch: 1; }
+                Text {
+                    text: root.status_text;
+                    color: Theme.text-dim;
+                    font-size: 12px;
                     vertical-alignment: center;
                 }
-                if root.detail_open: VerticalLayout {
-                    padding: 12px;
-                    spacing: 8px;
-                    Text { text: root.d_title; color: #fff; font-size: 15px; font-weight: 700; wrap: word-wrap; }
-                    Text { text: root.d_meta; color: #9ca3af; font-size: 12px; wrap: word-wrap; }
-                    Text { text: root.d_score; color: #fbbf24; font-weight: 700; }
-                    Text { text: root.d_extra; color: #9ca3af; font-size: 12px; wrap: word-wrap; }
-                    Text { text: root.d_summary; color: #d1d5db; wrap: word-wrap; }
-                    Text { text: "Diff"; color: #9ca3af; font-weight: 700; }
-                    Rectangle {
-                        vertical-stretch: 1;
-                        background: #16181d;
-                        border-radius: 6px;
-                        ListView {
-                            for line in root.diff_lines: Rectangle {
-                                height: 16px;
-                                background: line.kind == 1 ? #16a34a26
-                                    : (line.kind == 2 ? #dc262626
-                                    : (line.kind == 3 ? #7c3aed26
-                                    : (line.kind == 4 ? #1f232b : transparent)));
-                                Text {
-                                    x: 6px;
-                                    text: line.text;
-                                    font-family: "monospace";
-                                    font-size: 11px;
-                                    font-weight: line.kind == 4 ? 700 : 400;
-                                    color: line.kind == 1 ? #4ade80
-                                        : (line.kind == 2 ? #f87171
-                                        : (line.kind == 3 ? #a78bfa
-                                        : (line.kind == 4 ? #9ca3af : #9ca3af)));
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
+            }
+        }
+
+        Rectangle { height: 1px; background: Theme.border; }
+
+        // 主区：左列表 + 右 diff（抽屉打开时覆盖右侧）
+        keys := FocusScope {
+            key-pressed(event) => {
+                if (event.text == "p") { root.key_pin(); return accept; }
+                if (event.text == "1") { root.key_priority(1); return accept; }
+                if (event.text == "2") { root.key_priority(2); return accept; }
+                if (event.text == "3") { root.key_priority(3); return accept; }
+                reject
+            }
+
+            HorizontalLayout {
+                list := PrListView {
+                    width: 58%;
+                    rows: root.rows;
+                    groups: root.groups;
+                    row_activated(i) => { root.row_activated(i); }
+                    row_pin(i) => { root.row_pin(i); }
+                    row_reject(i) => { root.row_reject(i); }
+                    row_board(i) => { root.row_board(i); }
+                    dismissed => { root.drawer_close(); }
+                }
+                Rectangle { width: 1px; background: Theme.border; }
+                DiffView {
+                    files: root.diff_files;
+                    file_toggled(i) => { root.diff_file_toggled(i); }
                 }
             }
         }
+    }
+
+    // 详情抽屉：窗口顶层直接子元素、位于其它内容之后（不放进 Layout）
+    DetailDrawer {
+        open: root.d_open;
+        title: root.d_title;
+        subtitle: root.d_subtitle;
+        body_html_free_text: root.d_body;
+        convo_text: root.d_convo;
+        checks_text: root.d_checks;
+        files_text: root.d_files;
+        current_priority: root.d_priority;
+        close => { root.drawer_close(); }
+        action_requeue => { root.drawer_requeue(); }
+        action_toggle_reject => { root.drawer_reject(); }
+        action_set_priority(p) => { root.drawer_set_priority(p); }
     }
 }

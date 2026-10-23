@@ -1,0 +1,385 @@
+// PR Desk — 分区 PR 列表组件（GPLv3）
+// 可折叠分组（Pinned/看板/待评审/已评审/不采纳/已合入关闭）+ 密集行 + 键盘导航（j/k/Enter/Esc）。
+// 依赖共享契约：theme.slint 的 global Theme，components.slint 的
+// Avatar / StatusDot / ScoreChip / SizeBadge / PriorityDot / TagChip。
+import { Theme } from "theme.slint";
+import { Avatar, StatusDot, ScoreChip, SizeBadge, PriorityDot, TagChip } from "components.slint";
+
+// 单行 PR 数据（分组头不在此数组里，见 PrGroup）
+export struct PrListRow {
+    key: string,
+    number: int,
+    title: string,
+    priority: int,      // 0 未排 / 1 高 / 2 中 / 3 低
+    author: string,
+    avatar: image,      // Rust 侧传入的头像
+    is_org: bool,       // 作者是组织（显示组织图标占位）
+    turn: string,       // me / them / ""
+    review: string,     // approved / changes_requested / commented / review_required / ""
+    ci: string,         // success / failure / pending / none / ""
+    size: string,       // XS / S / M / L / XL / ""
+    additions: int,
+    deletions: int,
+    score: float,       // 0 表示未评分（不显示 ScoreChip）
+    age: string,        // 创建至今相对时间，如 "3d"
+    updated: string,    // 最近更新相对时间，如 "2h"（优先于 age 显示）
+    pinned: bool,
+    on_board: bool,
+}
+
+// 分组元数据：rows 按组顺序扁平排列，start/count 切片出本组行
+export struct PrGroup {
+    key: string,        // pinned / board / needs-review / reviewed / rejected / closed
+    name: string,       // 显示名（Pinned / 看板 / 待评审 / 已评审 / 不采纳 / 已合入关闭）
+    start: int,         // 在 rows 中的起始下标
+    count: int,         // 本组行数
+    collapsed: bool,
+}
+
+// ── 组头：折叠箭头 + 名称 + 数量 ──
+component GroupHeader inherits Rectangle {
+    in property <PrGroup> group;
+    callback toggled();
+
+    height: 28px;
+    background: head-ta.has-hover ? Theme.card : transparent;
+
+    head-ta := TouchArea {
+        clicked => { root.toggled(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 10px;
+        spacing: 6px;
+        Text {
+            text: root.group.collapsed ? "▸" : "▾";
+            color: Theme.text_dim;
+            font-size: 11px;
+            width: 12px;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.group.name;
+            color: Theme.text_dim;
+            font-weight: 700;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+        Rectangle {
+            width: count-text.preferred-width + 12px;
+            height: 16px;
+            border-radius: 8px;
+            background: Theme.border.with-alpha(0.5);
+            count-text := Text {
+                text: root.group.count;
+                color: Theme.text_dim;
+                font-size: 10px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle { horizontal-stretch: 1; }
+    }
+
+    // 组头下 hairline
+    Rectangle {
+        x: 0;
+        y: parent.height - 1px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.border.with-alpha(0.6);
+    }
+}
+
+// ── hover 快捷操作按钮 ──
+component QuickAction inherits Rectangle {
+    in property <string> glyph;
+    callback activated();
+
+    width: 24px;
+    height: 22px;
+    border-radius: 4px;
+    background: qa-ta.has-hover ? Theme.border.with-alpha(0.8) : transparent;
+
+    qa-ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+    Text {
+        text: root.glyph;
+        color: Theme.text_dim;
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+// ── Turn 标记：me accent 高亮 / them 灰 ──
+component TurnChip inherits Rectangle {
+    in property <string> turn;  // me / them
+
+    property <bool> mine: root.turn == "me";
+
+    height: 18px;
+    width: layout.preferred-width;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: root.mine ? Theme.accent.with-alpha(0.5) : Theme.border;
+    background: root.mine ? Theme.accent.with-alpha(0.18) : Theme.card;
+
+    layout := HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 7px;
+        Text {
+            text: root.mine ? "me" : "them";
+            color: root.mine ? Theme.accent : Theme.text_dim;
+            font-size: 11px;
+            font-weight: root.mine ? 700 : 400;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── 密集行（32px）──
+component PrRowItem inherits Rectangle {
+    in property <PrListRow> pr;
+    in property <bool> selected: false;
+    callback clicked();
+    callback pin();
+    callback board();
+    callback reject();
+
+    height: 32px;
+    background: root.selected ? Theme.accent.with-alpha(0.14)
+        : (row-ta.has-hover ? Theme.card : transparent);
+
+    row-ta := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    // 选中行 accent 左边条
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 3px;
+        height: parent.height;
+        background: Theme.accent;
+        visible: root.selected;
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 8px;
+        spacing: 6px;
+        alignment: center;
+
+        PriorityDot { priority: root.pr.priority; }
+
+        Text {
+            text: "#" + root.pr.number;
+            color: Theme.accent;
+            font-size: 12px;
+            width: 52px;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.pr.title;
+            color: Theme.text;
+            font-size: 13px;
+            overflow: elide;
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+        }
+
+        // 作者：Avatar + 名字 + 组织图标占位
+        HorizontalLayout {
+            spacing: 4px;
+            width: 116px;
+            alignment: center;
+            Avatar {
+                img: root.pr.avatar;
+                login: root.pr.author;
+                size: 18px;
+            }
+            Text {
+                text: root.pr.author;
+                color: Theme.text_dim;
+                font-size: 12px;
+                overflow: elide;
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+            }
+            // 组织图标占位
+            if root.pr.is_org: TagChip { label: "org"; }
+        }
+
+        // Turn 标记（me 高亮 / them 灰）
+        if root.pr.turn != "": TurnChip { turn: root.pr.turn; }
+
+        // Review 状态符号
+        Text {
+            text: root.pr.review == "approved" ? "✓"
+                : (root.pr.review == "changes_requested" ? "✗"
+                : (root.pr.review == "commented" ? "💬" : "○"));
+            color: root.pr.review == "approved" ? Theme.good
+                : (root.pr.review == "changes_requested" ? Theme.bad
+                : (root.pr.review == "commented" ? Theme.text : Theme.text_dim));
+            font-size: 12px;
+            width: 16px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        StatusDot { status: root.pr.ci; }
+
+        if root.pr.size != "": SizeBadge { label: root.pr.size; }
+        if root.pr.score > 0: ScoreChip { score: root.pr.score; }
+
+        // Age / 更新相对时间（dim 小字）
+        Text {
+            text: root.pr.updated != "" ? root.pr.updated : root.pr.age;
+            color: Theme.text_dim;
+            font-size: 11px;
+            width: 36px;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+
+    // hover 快捷操作：pin / 看板 / 不采纳
+    if row-ta.has-hover: Rectangle {
+        x: parent.width - self.width - 6px;
+        width: actions.preferred-width + 8px;
+        height: parent.height;
+        background: root.selected ? Theme.card : Theme.bg;
+        actions := HorizontalLayout {
+            y: (parent.height - self.preferred-height) / 2;
+            spacing: 2px;
+            QuickAction { glyph: "📌"; activated => { root.pin(); } }
+            QuickAction { glyph: "▦"; activated => { root.board(); } }
+            QuickAction { glyph: "✕"; activated => { root.reject(); } }
+        }
+    }
+
+    // 行底 hairline
+    Rectangle {
+        x: 10px;
+        y: parent.height - 1px;
+        width: parent.width - 10px;
+        height: 1px;
+        background: Theme.border.with-alpha(0.4);
+    }
+}
+
+// ── 分区列表 ──
+// rows 为扁平数据行（不含组头），groups 以 start/count 切片；groups 为空时退化为扁平列表。
+// 折叠状态直接写在 groups[i].collapsed（in-out，集成方可用 VecModel 持久化）。
+export component PrListView inherits FocusScope {
+    in property <[PrListRow]> rows: [];
+    in-out property <[PrGroup]> groups: [];
+    out property <int> selected_index: -1;
+
+    callback row_activated(int);    // 点击或 Enter：打开详情（传 rows 下标）
+    callback row_pin(int);
+    callback row_reject(int);
+    callback row_board(int);
+    callback dismissed();           // Esc
+
+    function move_selection(delta: int) {
+        if (root.rows.length == 0) { return; }
+        if (root.selected_index < 0 || root.selected_index >= root.rows.length) {
+            root.selected_index = delta > 0 ? 0 : root.rows.length - 1;
+            return;
+        }
+        root.selected_index = Math.min(root.rows.length - 1, Math.max(0, root.selected_index + delta));
+    }
+
+    // 键盘导航：j/k 或 ↑/↓ 移动，Enter 打开，Esc 取消
+    key-pressed(event) => {
+        if (event.text == "j" || event.text == Key.DownArrow) {
+            root.move_selection(1);
+            return accept;
+        }
+        if (event.text == "k" || event.text == Key.UpArrow) {
+            root.move_selection(-1);
+            return accept;
+        }
+        if (event.text == Key.Return) {
+            if (root.selected_index >= 0 && root.selected_index < root.rows.length) {
+                root.row_activated(root.selected_index);
+            }
+            return accept;
+        }
+        if (event.text == Key.Escape) {
+            root.dismissed();
+            return accept;
+        }
+        reject
+    }
+
+    Rectangle {
+        background: Theme.bg;
+
+        Flickable {
+            content-height: list_col.preferred-height;
+
+            list_col := VerticalLayout {
+                alignment: start;
+
+                // 空态
+                if root.rows.length == 0: Text {
+                    text: "没有 PR";
+                    color: Theme.text_dim;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    height: 48px;
+                    vertical-alignment: center;
+                }
+
+                // 退化模式：未提供分组时扁平渲染
+                if root.rows.length > 0 && root.groups.length == 0: VerticalLayout {
+                    alignment: start;
+                    for r[i] in root.rows: PrRowItem {
+                        pr: r;
+                        selected: i == root.selected_index;
+                        clicked => {
+                            root.selected_index = i;
+                            root.row_activated(i);
+                        }
+                        pin => { root.row_pin(i); }
+                        board => { root.row_board(i); }
+                        reject => { root.row_reject(i); }
+                    }
+                }
+
+                // 分组模式
+                for group[gi] in root.groups: VerticalLayout {
+                    alignment: start;
+
+                    GroupHeader {
+                        group: group;
+                        toggled => { root.groups[gi].collapsed = !root.groups[gi].collapsed; }
+                    }
+
+                    if !group.collapsed: VerticalLayout {
+                        alignment: start;
+                        for ri in group.count: PrRowItem {
+                            private property <int> idx: group.start + ri;
+                            pr: root.rows[self.idx];
+                            selected: self.idx == root.selected_index;
+                            clicked => {
+                                root.selected_index = self.idx;
+                                root.row_activated(self.idx);
+                            }
+                            pin => { root.row_pin(self.idx); }
+                            board => { root.row_board(self.idx); }
+                            reject => { root.row_reject(self.idx); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

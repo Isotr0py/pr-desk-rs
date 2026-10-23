@@ -4,7 +4,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-pub const SCHEMA_VERSION: i32 = 1;
+pub const SCHEMA_VERSION: i32 = 2;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS prs (
@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS diff_cache (
 );
 "#;
 
+// v2：prs 增加 extras 缓存列（recent_commits / extras_detail / extras_updated_at），
+// 与插件 schema 对齐，会话/Checks 标签页的数据来源。
+const MIGRATE_V2: &str = r#"
+ALTER TABLE prs ADD COLUMN recent_commits TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE prs ADD COLUMN extras_detail TEXT;
+ALTER TABLE prs ADD COLUMN extras_updated_at TEXT;
+"#;
+
 pub struct Db {
     pub conn: Connection,
 }
@@ -50,18 +58,30 @@ impl Db {
     pub fn open(path: &std::path::Path) -> Result<Db> {
         let conn = Connection::open(path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        let version: i32 =
-            conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < 1 {
-            conn.execute_batch(SCHEMA_V1)?;
-            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
-        }
-        Ok(Db { conn })
+        Self::migrate(conn)
     }
 
     pub fn open_memory() -> Result<Db> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA_V1)?;
+        Self::migrate(conn)
+    }
+
+    fn migrate(conn: Connection) -> Result<Db> {
+        let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version < 1 {
+            conn.execute_batch(SCHEMA_V1)?;
+        }
+        if version < 2 {
+            // v1 → v2：prs 加 extras 缓存列（幂等：列已存在则跳过）
+            let cols: Vec<String> = {
+                let mut stmt = conn.prepare("PRAGMA table_info(prs)")?;
+                stmt.query_map([], |r| r.get::<_, String>(1))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            if !cols.iter().any(|c| c == "recent_commits") {
+                conn.execute_batch(MIGRATE_V2)?;
+            }
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Db { conn })
     }
@@ -88,15 +108,19 @@ impl Db {
     pub fn upsert_pr(&self, p: &serde_json::Value) -> Result<()> {
         self.conn.execute(
             "INSERT INTO prs(repo, number, title, author, url, head_sha, status, tags, role,
-                on_board, priority, pinned, ci_status, review_decision, turn, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+                on_board, priority, pinned, ci_status, review_decision, turn, updated_at,
+                recent_commits, extras_detail, extras_updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
              ON CONFLICT(repo, number) DO UPDATE SET
                 title=excluded.title, author=excluded.author, url=excluded.url,
                 head_sha=excluded.head_sha, status=excluded.status, tags=excluded.tags,
                 role=excluded.role, on_board=excluded.on_board, priority=excluded.priority,
                 pinned=excluded.pinned, ci_status=excluded.ci_status,
                 review_decision=excluded.review_decision, turn=excluded.turn,
-                updated_at=excluded.updated_at",
+                updated_at=excluded.updated_at,
+                recent_commits=excluded.recent_commits,
+                extras_detail=excluded.extras_detail,
+                extras_updated_at=excluded.extras_updated_at",
             params![
                 p["repo"].as_str().unwrap_or(""),
                 p["number"].as_i64().unwrap_or(0),
@@ -114,6 +138,9 @@ impl Db {
                 p["review_decision"].as_str(),
                 p["turn"].as_str(),
                 p["updated_at"].as_str(),
+                p["recent_commits"].as_str().unwrap_or("[]"),
+                p["extras_detail"].as_str(),
+                p["extras_updated_at"].as_str(),
             ],
         )?;
         Ok(())
@@ -176,10 +203,11 @@ impl Db {
     }
 
     // ── 列表查询 ──
-    /// 列表行：prs + 最近 review 的 score（与插件 list_prs 同语义）。
+    /// 列表行：prs + 最近 review 的 score/体量（与插件 list_prs 同语义）。
     pub fn list_prs(&self) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.conn.prepare(
-            "SELECT p.*, r.score, r.reviewed_at FROM prs p
+            "SELECT p.*, r.score, r.reviewed_at, r.size_label, r.additions, r.deletions
+             FROM prs p
              LEFT JOIN reviews r ON r.rowid = (
                 SELECT r2.rowid FROM reviews r2
                 WHERE r2.repo=p.repo AND r2.number=p.number
@@ -203,7 +231,13 @@ impl Db {
                     "ci_status": row.get::<_, Option<String>>(12)?,
                     "review_decision": row.get::<_, Option<String>>(13)?,
                     "turn": row.get::<_, Option<String>>(14)?,
-                    "score": row.get::<_, Option<f64>>(16)?,
+                    "updated_at": row.get::<_, Option<String>>(15)?,
+                    "recent_commits": row.get::<_, Option<String>>(16)?,
+                    "extras_detail": row.get::<_, Option<String>>(17)?,
+                    "score": row.get::<_, Option<f64>>(19)?,
+                    "size_label": row.get::<_, Option<String>>(21)?,
+                    "additions": row.get::<_, Option<i64>>(22)?,
+                    "deletions": row.get::<_, Option<i64>>(23)?,
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

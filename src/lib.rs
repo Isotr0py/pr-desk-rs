@@ -8,8 +8,8 @@ pub mod github;
 pub mod sync;
 
 /// 行数据 → 分组：（组标题, 该组内数据行的索引列表）。
-/// 分区顺序：Pinned → 看板 → 待评审 → 已评审；行只出现在一个组里；
-/// pinned 独立成组（不再出现在其状态组）。空组不返回。
+/// 分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
+/// 行只出现在一个组里；pinned 独立成组（不再出现在其状态组）。空组不返回。
 pub fn build_sections(rows: &[serde_json::Value]) -> Vec<(String, Vec<usize>)> {
     let mut out: Vec<(String, Vec<usize>)> = Vec::new();
     let mut emit = |title: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
@@ -35,7 +35,17 @@ pub fn build_sections(rows: &[serde_json::Value]) -> Vec<(String, Vec<usize>)> {
     emit("已评审", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
-            && r["status"].as_str() != Some("pending")
+            && matches!(r["status"].as_str(), Some("reviewed") | Some("failed"))
+    });
+    emit("不采纳", &|r| {
+        r["pinned"].as_i64() != Some(1)
+            && r["on_board"].as_i64() != Some(1)
+            && r["status"].as_str() == Some("rejected")
+    });
+    emit("已合入 / 已关闭", &|r| {
+        r["pinned"].as_i64() != Some(1)
+            && r["on_board"].as_i64() != Some(1)
+            && matches!(r["status"].as_str(), Some("merged") | Some("closed"))
     });
     out
 }
