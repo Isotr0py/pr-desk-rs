@@ -1,53 +1,66 @@
-// PR Desk — 主窗口（组装 theme/components/pr_list/drawer/diff_view）
-// 键盘：PrListView 自带 j/k/↑↓/Enter/Esc；外层 FocusScope 只处理 p/1/2/3
-// （事件先到 PrListView，reject 后冒泡到外层）。
+// PR Desk — 主窗口（组装 topbar/pr_list/detail_panel/diff_view + 设置页/首启引导）
+// 键盘：PrListView 管 j/k/↑↓/Enter/Esc（reject 冒泡）；外层 FocusScope 接 p/1/2/3 和 /。
+// Esc 语义（见 dismissed）：详情开着 → 关详情；否则取消选中。
 import { Button, LineEdit, TextEdit, SpinBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { TopBar, StatusBar } from "topbar.slint";
 import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
-import { DetailDrawer } from "drawer.slint";
+import { DetailPanel, ConvoEntry, CheckRun, FileChange } from "detail_panel.slint";
 import { DiffView, DiffFile, DiffLine } from "diff_view.slint";
 
 // 类型再导出：slint-build 从本文件生成 Rust 绑定
-export { PrListRow, PrGroup, DiffFile, DiffLine }
+export { PrListRow, PrGroup, ConvoEntry, CheckRun, FileChange, DiffFile, DiffLine }
 
 export component MainWindow inherits Window {
     title: "PR Desk";
-    preferred-width: 1150px;
-    preferred-height: 720px;
-    min-width: 800px;
+    preferred-width: 1280px;
+    preferred-height: 760px;
+    min-width: 900px;
     min-height: 480px;
 
+    // ── 列表 ──
     in property <[PrListRow]> rows: [];
     in-out property <[PrGroup]> groups: [];
-    in property <string> status_text: "就绪";
-    // 抽屉
+    in-out property <string> filter_text: "";
+    in-out property <int> view_mode: 0;      // 0=列表 1=Diff（TopBar 分段控件，唯一一套视图切换）
+    // ── 状态栏 ──
+    in property <string> sb_sync: "";
+    in property <string> sb_quota: "";
+    in property <int> sb_total: 0;
+    // ── 详情面板 ──
     in property <bool> d_open: false;
     in property <string> d_title: "";
-    in property <string> d_subtitle: "";
+    in property <string> d_author: "";
+    in property <image> d_avatar;
+    in property <string> d_state: "open";
+    in property <string> d_ci: "";
+    in property <string> d_opened: "";
+    in property <string> d_updated: "";
     in property <string> d_body: "";
-    in property <string> d_convo: "";
-    in property <string> d_checks: "";
-    in property <string> d_files: "";
     in property <int> d_priority: 0;
-    // diff
+    in property <bool> d_pinned: false;
+    in property <bool> d_on_board: false;
+    in property <[ConvoEntry]> d_convo: [];
+    in property <[CheckRun]> d_checks: [];
+    in property <[FileChange]> d_files: [];
     in property <[DiffFile]> diff_files: [];
-    in property <string> diff_hint: "选择 PR 后在此查看 diff";
 
     callback refresh();
     callback sync_now();
+    callback open_settings();
+    callback filter_changed(string);
     callback row_activated(int);
     callback row_pin(int);
     callback row_reject(int);
     callback row_board(int);
-    callback drawer_close();
-    callback drawer_requeue();
-    callback drawer_reject();
-    callback drawer_set_priority(int);
+    callback panel_close();
+    callback panel_board();
+    callback panel_set_priority(int);
+    callback panel_toggle_pin();
     callback diff_file_toggled(int);
     callback key_pin();
     callback key_priority(int);
     // 设置页
-    callback open_settings();
     callback save_settings(string, string, string, string, string);
     in-out property <bool> settings_open: false;
     in-out property <string> s_server: "";
@@ -58,85 +71,80 @@ export component MainWindow inherits Window {
     in property <bool> onboarding: false;   // 未配置（首启引导）
     in property <bool> gh_token_from_env: false;  // GITHUB_TOKEN 环境变量优先提示
 
-    forward-focus: keys;
+    // 顶栏搜索框内容变化（双向绑定）→ 通知 Rust 重建过滤视图
+    changed filter_text => { root.filter_changed(root.filter_text); }
 
     VerticalLayout {
-        // 顶栏
-        Rectangle {
-            height: 38px;
-            background: Theme.card;
-            HorizontalLayout {
-                padding: 6px;
-                spacing: 8px;
-                Text {
-                    text: "PR Desk";
-                    color: Theme.text;
-                    font-weight: 700;
-                    vertical-alignment: center;
-                }
-                Rectangle { width: 8px; }
-                Button { text: "刷新 GitHub"; clicked => { root.refresh(); } }
-                Button { text: "同步服务器"; clicked => { root.sync_now(); } }
-                Button { text: "⚙ 设置"; clicked => { root.open_settings(); } }
-                Rectangle { horizontal-stretch: 1; }
-                Text {
-                    text: root.status_text;
-                    color: Theme.text-dim;
-                    font-size: 12px;
-                    vertical-alignment: center;
-                }
-            }
+        topbar := TopBar {
+            filter_text <=> root.filter_text;
+            view_mode <=> root.view_mode;
+            refresh => { root.refresh(); }
+            sync => { root.sync_now(); }
+            open_settings => { root.open_settings(); }
         }
 
-        Rectangle { height: 1px; background: Theme.border; }
-
-        // 主区：左列表 + 右 diff（抽屉打开时覆盖右侧）
         keys := FocusScope {
+            vertical-stretch: 1;
             key-pressed(event) => {
                 if (event.text == "p") { root.key_pin(); return accept; }
                 if (event.text == "1") { root.key_priority(1); return accept; }
                 if (event.text == "2") { root.key_priority(2); return accept; }
                 if (event.text == "3") { root.key_priority(3); return accept; }
-                reject
+                if (event.text == "/") { topbar.focus_search(); return accept; }
+                reject  // j/k/Enter/Esc 冒泡给 PrListView 内部处理
             }
 
-            HorizontalLayout {
+            if root.view_mode == 0: HorizontalLayout {
                 list := PrListView {
-                    width: 58%;
+                    horizontal-stretch: 1;
                     rows: root.rows;
                     groups: root.groups;
                     row_activated(i) => { root.row_activated(i); }
                     row_pin(i) => { root.row_pin(i); }
                     row_reject(i) => { root.row_reject(i); }
                     row_board(i) => { root.row_board(i); }
-                    dismissed => { root.drawer_close(); }
+                    dismissed => {
+                        if (root.d_open) { root.panel_close(); } else { self.selected_index = -1; }
+                    }
                 }
-                Rectangle { width: 1px; background: Theme.border; }
-                DiffView {
-                    files: root.diff_files;
-                    file_toggled(i) => { root.diff_file_toggled(i); }
+                DetailPanel {
+                    visible: root.d_open;
+                    title: root.d_title;
+                    author: root.d_author;
+                    avatar: root.d_avatar;
+                    state: root.d_state;
+                    ci: root.d_ci;
+                    opened: root.d_opened;
+                    updated: root.d_updated;
+                    body: root.d_body;
+                    priority: root.d_priority;
+                    pinned: root.d_pinned;
+                    on_board: root.d_on_board;
+                    convo_entries: root.d_convo;
+                    check_runs: root.d_checks;
+                    files: root.d_files;
+                    diff_files: root.diff_files;
+                    close => { root.panel_close(); }
+                    action_board => { root.panel_board(); }
+                    action_set_priority(p) => { root.panel_set_priority(p); }
+                    action_toggle_pin => { root.panel_toggle_pin(); }
+                    diff_file_toggled(i) => { root.diff_file_toggled(i); }
                 }
             }
+            if root.view_mode == 1: DiffView {
+                files: root.diff_files;
+                file_toggled(i) => { root.diff_file_toggled(i); }
+            }
+        }
+
+        StatusBar {
+            sync_text: root.sb_sync;
+            quota_text: root.sb_quota;
+            total_count: root.sb_total;
         }
     }
 
-    // 详情抽屉：窗口顶层直接子元素、位于其它内容之后（不放进 Layout）
-    DetailDrawer {
-        open: root.d_open;
-        title: root.d_title;
-        subtitle: root.d_subtitle;
-        body_html_free_text: root.d_body;
-        convo_text: root.d_convo;
-        checks_text: root.d_checks;
-        files_text: root.d_files;
-        current_priority: root.d_priority;
-        close => { root.drawer_close(); }
-        action_requeue => { root.drawer_requeue(); }
-        action_toggle_reject => { root.drawer_reject(); }
-        action_set_priority(p) => { root.drawer_set_priority(p); }
-    }
-
-    // 首启引导：未配置时盖住列表区，引导打开设置
+    // 首启引导：未配置时盖住主区，引导打开设置
     if root.onboarding && !root.settings_open: Rectangle {
         width: 100%;
         height: 100%;

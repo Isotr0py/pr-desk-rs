@@ -1,5 +1,9 @@
 //! 行模型装配：serde_json 行 → PrListRow + PrGroup（Slint 生成类型，经 build_sections 分组），
-//! 以及相对时间（age_text/updated_text）与作者组织（author_orgs）的派生函数。
+//! 以及相对时间（age_text/updated_text）、次级活动行（activity_text）、
+//! 作者组织（author_orgs）与过滤（filter_rows/row_matches）的派生函数。
+//!
+//! 集成注意：PrListRow（pr_list.slint）若新增 `activity_text` 字段，
+//! 在 to_row 里加一行 `activity_text: activity_text(r).into()` 即可。
 
 use chrono::{Local, NaiveDateTime};
 use pr_desk_rs::build_sections;
@@ -54,6 +58,64 @@ pub fn age_text(r: &serde_json::Value) -> String {
 #[allow(dead_code)]
 pub fn updated_text(r: &serde_json::Value) -> String {
     age_text(r)
+}
+
+/// 行内评审条数：优先 extras_detail.reviews 数组长度，其次 reviews 数字字段。
+fn review_count(r: &serde_json::Value) -> i64 {
+    if let Some(n) = r["reviews"].as_i64() {
+        return n;
+    }
+    if let Some(detail) = r["extras_detail"].as_str() {
+        if let Ok(d) = serde_json::from_str::<serde_json::Value>(detail) {
+            if let Some(rvs) = d["reviews"].as_array() {
+                return rvs.len() as i64;
+            }
+        }
+    }
+    0
+}
+
+/// 次级活动行（dim 文本）：「3 条评审 · 更新于 27m 前」/「更新于 27m 前」；
+/// 既无评审也无时间戳时返回 ""。
+pub fn activity_text(r: &serde_json::Value) -> String {
+    let updated = rel_time(r["updated_at"].as_str().unwrap_or(""));
+    let reviews = review_count(r);
+    let mut parts = Vec::new();
+    if reviews > 0 {
+        parts.push(format!("{reviews} 条评审"));
+    }
+    if !updated.is_empty() {
+        parts.push(format!("更新于 {updated} 前"));
+    }
+    parts.join(" · ")
+}
+
+/// 大小写不敏感子串匹配：title / number（query 可带 # 前缀）/ author / repo。
+/// query_lower 须已转小写；空 query 恒真。
+pub fn row_matches(r: &serde_json::Value, query_lower: &str) -> bool {
+    let q = query_lower.trim().trim_start_matches('#');
+    if q.is_empty() {
+        return true;
+    }
+    let hit = |s: &str| s.to_lowercase().contains(q);
+    hit(r["title"].as_str().unwrap_or(""))
+        || hit(r["author"].as_str().unwrap_or(""))
+        || hit(r["repo"].as_str().unwrap_or(""))
+        || r["number"]
+            .as_i64()
+            .map(|n| n.to_string())
+            .is_some_and(|n| n.contains(q))
+}
+
+/// 大小写不敏感子串过滤（title/number/author/repo）；空 query 原样返回。
+/// 独立过滤入口（集成方 / 测试用）；main.rs 内部用 row_matches 保留下标映射。
+#[allow(dead_code)]
+pub fn filter_rows(rows: &[serde_json::Value], query: &str) -> Vec<serde_json::Value> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return rows.to_vec();
+    }
+    rows.iter().filter(|r| row_matches(r, &q)).cloned().collect()
 }
 
 /// 作者所属组织列表。GitHub/sync 侧在行数据上提供 `author_orgs` 字段时生效，
@@ -133,6 +195,7 @@ pub fn to_row(r: &serde_json::Value) -> PrListRow {
         score: r["score"].as_f64().unwrap_or(0.0) as f32,
         age: age_text(r).into(),
         updated: age_text(r).into(),
+        activity_text: activity_text(r).into(),
         pinned: r["pinned"].as_i64() == Some(1),
         on_board: r["on_board"].as_i64() == Some(1),
     }
@@ -183,5 +246,63 @@ mod tests {
         assert_eq!(author_orgs(&s), vec!["acme".to_string()]);
         let none = serde_json::json!({});
         assert!(author_orgs(&none).is_empty());
+    }
+
+    #[test]
+    fn activity_text_combines_reviews_and_updated() {
+        // activity_text 基于真实当前时间，测试数据也用 Local::now() 构造
+        let recent = (Local::now().naive_local() - Duration::minutes(27))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let r = serde_json::json!({
+            "updated_at": recent,
+            "extras_detail": serde_json::to_string(&serde_json::json!({
+                "reviews": [{"author": "a"}, {"author": "b"}, {"author": "c"}]
+            })).unwrap(),
+        });
+        assert_eq!(activity_text(&r), "3 条评审 · 更新于 27m 前");
+        // reviews 数字字段形态
+        let r2 = serde_json::json!({"updated_at": recent, "reviews": 2});
+        assert_eq!(activity_text(&r2), "2 条评审 · 更新于 27m 前");
+        // 只有更新时间
+        let r3 = serde_json::json!({"updated_at": recent});
+        assert_eq!(activity_text(&r3), "更新于 27m 前");
+        // 只有评审数
+        let r4 = serde_json::json!({"reviews": 1});
+        assert_eq!(activity_text(&r4), "1 条评审");
+        // 都没有
+        assert_eq!(activity_text(&serde_json::json!({})), "");
+    }
+
+    fn frow(repo: &str, number: i64, title: &str, author: &str) -> serde_json::Value {
+        serde_json::json!({"repo": repo, "number": number, "title": title, "author": author})
+    }
+
+    #[test]
+    fn filter_rows_empty_query_passthrough() {
+        let rows = vec![frow("o/r", 1, "Fix bug", "alice")];
+        assert_eq!(filter_rows(&rows, ""), rows);
+        assert_eq!(filter_rows(&rows, "   "), rows);
+    }
+
+    #[test]
+    fn filter_rows_case_insensitive_substring() {
+        let rows = vec![
+            frow("acme/web", 12, "Fix Login Bug", "Alice"),
+            frow("acme/api", 34, "Add endpoint", "bob"),
+            frow("oss/lib", 56, "Refactor parser", "carol"),
+        ];
+        // title 大小写不敏感
+        assert_eq!(filter_rows(&rows, "login").len(), 1);
+        assert_eq!(filter_rows(&rows, "LOGIN").len(), 1);
+        // author
+        assert_eq!(filter_rows(&rows, "ali")[0]["number"], 12);
+        // repo
+        assert_eq!(filter_rows(&rows, "acme").len(), 2);
+        // number 子串 + 可选 # 前缀
+        assert_eq!(filter_rows(&rows, "34")[0]["title"], "Add endpoint");
+        assert_eq!(filter_rows(&rows, "#56")[0]["author"], "carol");
+        // 无匹配
+        assert!(filter_rows(&rows, "zzz").is_empty());
     }
 }

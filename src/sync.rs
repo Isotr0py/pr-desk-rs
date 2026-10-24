@@ -4,12 +4,45 @@
 //! 拆分为纯 HTTP（pull_body/push_body）与纯 DB（apply_pull/apply_push_result）两层，
 //! 调用方（worker）在两次锁之间不跨 await 持有 DB 锁。
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::{Context, Result};
+use chrono::{Local, NaiveDateTime};
 use rusqlite::params;
 use serde_json::Value;
 
 use crate::config::Config;
 use crate::db::Db;
+
+/// 最近一次同步成功时间的共享状态（worker 写入，UI 状态栏读取）。
+pub type SharedLastSync = Arc<Mutex<Option<NaiveDateTime>>>;
+
+pub fn shared_last_sync() -> SharedLastSync {
+    Arc::new(Mutex::new(None))
+}
+
+/// 同步成功后调用：把当前本地时间记入共享状态。
+pub fn mark_synced(state: &SharedLastSync) {
+    *state.lock().unwrap() = Some(Local::now().naive_local());
+}
+
+/// 「已同步 27m 前」状态栏片段；从未同步过返回 None。
+pub fn last_sync_text(state: &SharedLastSync) -> Option<String> {
+    let ts = *state.lock().unwrap();
+    ts.map(|ts| format!("已同步 {} 前", rel_short(ts)))
+}
+
+/// 相对时间简写："27m" / "2h" / "3d"；未来时间归零为 "0m"。
+fn rel_short(ts: NaiveDateTime) -> String {
+    let mins = (Local::now().naive_local() - ts).num_minutes().max(0);
+    if mins < 60 {
+        format!("{mins}m")
+    } else if mins < 24 * 60 {
+        format!("{}h", mins / 60)
+    } else {
+        format!("{}d", mins / (24 * 60))
+    }
+}
 
 pub struct SyncClient {
     client: reqwest::Client,
@@ -238,5 +271,14 @@ mod tests {
         assert_eq!((p, r, t), (1, 1, 1));
         assert_eq!(db.get_cursor().unwrap().as_deref(), Some("2026-01-01T00:00:00"));
         assert_eq!(db.list_prs().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn last_sync_state() {
+        let state = shared_last_sync();
+        assert_eq!(last_sync_text(&state), None); // 从未同步
+        mark_synced(&state);
+        let text = last_sync_text(&state).unwrap();
+        assert!(text.starts_with("已同步 0m 前"), "got: {text}");
     }
 }

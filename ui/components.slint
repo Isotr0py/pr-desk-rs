@@ -12,6 +12,8 @@ export component Avatar inherits Rectangle {
     width: root.size;
     height: root.size;
     border-radius: root.size / 2;
+    border-width: 1px;
+    border-color: Theme.hairline;  // GitHub 风格细描边
     clip: true;
 
     property <bool> has-img: root.img.width > 0 && root.img.height > 0;
@@ -96,12 +98,12 @@ export component TagChip inherits Rectangle {
     width: layout.preferred-width;
     border-radius: 9px;
     border-width: 1px;
-    border-color: Theme.border;
+    border-color: Theme.hairline;  // 中性描边统一 hairline
     background: Theme.card;
 
     layout := HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 8px;
+        padding-left: 7px;
+        padding-right: 7px;
         Text {
             text: root.label;
             font-size: 11px;
@@ -122,7 +124,7 @@ export component SizeBadge inherits Rectangle {
 
     height: 16px;
     width: layout.preferred-width;
-    border-radius: 3px;
+    border-radius: 4px;
     background: root.tone;
 
     layout := HorizontalLayout {
@@ -151,4 +153,130 @@ export component PriorityDot inherits Text {
     color: root.priority == 1 ? Theme.bad
         : root.priority == 2 ? Theme.mid
         : Theme.accent;
+}
+
+// 图标按钮：26x26，hover 微亮底（100ms 过渡），tooltip 悬停 450ms 后延迟浮现。
+// 注意：tooltip 画在组件自身上方（y 为负），依赖祖先不 clip，且可能被后绘制的同级覆盖。
+export component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <string> tooltip;
+    callback clicked();
+
+    width: 26px;
+    height: 26px;
+    border-radius: 6px;
+    background: touch.has-hover ? Theme.hover : #00000000;
+    animate background { duration: 100ms; }
+
+    property <bool> show-tip: false;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+        changed has-hover => {
+            if (!self.has-hover) { root.show-tip = false; }
+        }
+    }
+
+    Text {
+        text: root.icon;
+        font-size: 13px;
+        color: touch.has-hover ? Theme.text : Theme.text_dim;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        animate color { duration: 100ms; }
+    }
+
+    tip-timer := Timer {
+        interval: 450ms;
+        running: touch.has-hover && root.tooltip != "" && !root.show-tip;
+        triggered => { root.show-tip = true; }
+    }
+
+    if root.show-tip && touch.has-hover: Rectangle {
+        x: (root.width - tip.preferred-width) / 2;
+        y: -30px;
+        width: tip.preferred-width;
+        height: 22px;
+        border-radius: 6px;
+        background: #1c2128;
+        border-width: 1px;
+        border-color: Theme.border;
+        tip := HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            Text {
+                text: root.tooltip;
+                font-size: 11px;
+                color: Theme.text;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// 胶囊分段控件单元：active 时 accent 填充白字，否则透明底 dim 字，hover 微亮
+export component PillTab inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked();
+
+    height: 24px;
+    width: layout.preferred-width;
+    border-radius: 12px;
+    background: root.active ? Theme.accent : touch.has-hover ? Theme.hover : #00000000;
+    animate background { duration: 100ms; }
+
+    layout := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: root.label;
+            font-size: 12px;
+            font-weight: root.active ? 600 : 400;
+            color: root.active ? Theme.sel-text : touch.has-hover ? Theme.text : Theme.text_dim;
+            vertical-alignment: center;
+            animate color { duration: 100ms; }
+        }
+    }
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// 空状态：居中 dim 大图标 + 标题 + 提示（占满父级区域）
+export component EmptyState inherits Rectangle {
+    in property <string> icon;
+    in property <string> title;
+    in property <string> hint;
+
+    background: #00000000;
+
+    VerticalLayout {
+        alignment: center;
+        spacing: 8px;
+        padding: 24px;
+        Text {
+            text: root.icon;
+            font-size: 34px;
+            color: Theme.text-dim.with-alpha(0.55);
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.title;
+            font-size: 14px;
+            font-weight: 600;
+            color: Theme.text;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: root.hint;
+            font-size: 12px;
+            color: Theme.text-dim;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
+    }
 }

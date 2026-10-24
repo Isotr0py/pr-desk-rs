@@ -40,16 +40,27 @@ enum Msg {
     // Slint 模型类型（SharedString/Image 基于 Rc）不能跨线程：
     // 行数据以 serde_json（Send）过界，PrListRow/PrGroup 在 UI 线程装配。
     Rows(Vec<serde_json::Value>),
-    Drawer {
+    // 搜索框过滤词变化（UI 回调 send_msg 进来，apply_msg 里重建行模型）
+    FilterChanged(String),
+    // 只重组状态栏（配额 / 同步时间变化，不改临时消息）
+    StatusBarRefresh,
+    // 详情面板：文本/JSON 字符串过界；ConvoEntry/CheckRun/FileChange 模型在 UI 线程装配
+    Panel {
         title: String,
-        subtitle: String,
+        author: String,
+        state: String,
+        ci: String,
+        opened: String,
+        updated: String,
         body: String,
-        convo: String,
-        checks: String,
-        files: String,
         priority: i32,
+        pinned: bool,
+        on_board: bool,
+        convo_json: String,
+        checks_json: String,
+        files_json: String,
     },
-    CloseDrawer,
+    ClosePanel,
     // 同理：diff 以原始文本过界，DiffFile 模型在 UI 线程的 apply_msg 里构建
     DiffRaw(String),
 }
@@ -58,7 +69,48 @@ struct App {
     cfg: Config,
     db: Db,
     rows: Vec<serde_json::Value>,           // 扁平数据行（selected 直接索引它）
-    selected: Option<usize>,
+    view: Vec<usize>,                       // 过滤后可见行 → rows 下标（UI 下标经它换算）
+    filter: String,                         // 当前过滤词（空 = 全量）
+    selected: Option<usize>,                // rows 下标（已从视图下标换算）
+    status_msg: String,                     // 状态栏临时消息（最近一条 Status）
+    total: usize,                           // 全部行数（状态栏「共 N 个 PR」）
+    rate_limit: Arc<Mutex<Option<u64>>>,    // GitHub X-RateLimit-Remaining 共享状态
+    last_sync: sync::SharedLastSync,        // 最近同步成功时间
+}
+
+/// 状态栏组合逻辑已内联进 update_status_bar（三段：同步/配额/总数）。
+fn update_status_bar(ui: &MainWindow, app: &Arc<Mutex<App>>) {
+    let a = app.lock().unwrap();
+    // 状态栏三段：同步/临时消息 · API 配额 · PR 总数
+    let sync_text = if !a.status_msg.is_empty() {
+        a.status_msg.clone()
+    } else {
+        sync::last_sync_text(&a.last_sync).unwrap_or_default()
+    };
+    let quota = a.rate_limit.lock().unwrap()
+        .map(|n| format!("API 配额 {n}"))
+        .unwrap_or_default();
+    ui.set_sb_sync(sync_text.into());
+    ui.set_sb_quota(quota.into());
+    ui.set_sb_total(a.total as i32);
+}
+
+/// 当前过滤词下可见行的原始下标。
+fn filtered_view(rows: &[serde_json::Value], filter: &str) -> Vec<usize> {
+    let q = filter.trim().to_lowercase();
+    if q.is_empty() {
+        return (0..rows.len()).collect();
+    }
+    rows.iter()
+        .enumerate()
+        .filter(|(_, r)| model::row_matches(r, &q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// UI 传来的可见行下标 → rows 原始下标。
+fn resolve_view(app: &Arc<Mutex<App>>, view_idx: usize) -> Option<usize> {
+    app.lock().unwrap().view.get(view_idx).copied()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -75,7 +127,6 @@ fn main() -> anyhow::Result<()> {
     let db = Db::open(&data_dir.join("pr-desk.db"))?;
 
     let ui = MainWindow::new()?;
-    ui.set_diff_hint("选择 PR 后在此查看 diff".into());
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
 
@@ -83,7 +134,13 @@ fn main() -> anyhow::Result<()> {
         cfg: cfg.clone(),
         db,
         rows: Vec::new(),
+        view: Vec::new(),
+        filter: String::new(),
         selected: None,
+        status_msg: config_status(&cfg),
+        total: 0,
+        rate_limit: Arc::new(Mutex::new(None)),
+        last_sync: sync::shared_last_sync(),
     }));
 
     // 设置页初值 + 首启引导 + 状态栏配置状态
@@ -98,7 +155,7 @@ fn main() -> anyhow::Result<()> {
     if unconfigured {
         ui.set_settings_open(true); // 首启自动打开设置
     }
-    ui.set_status_text(config_status(&cfg).into());
+    ui.set_sb_sync(config_status(&cfg).into());
 
     // ── 后台工作线程（tokio runtime） ──
     {
@@ -126,13 +183,15 @@ fn main() -> anyhow::Result<()> {
     // ── 消息回 UI ──
     {
         let weak = ui.as_weak();
+        let app = app.clone();
         std::thread::spawn(move || loop {
             match msg_rx.recv() {
                 Ok(msg) => {
                     let weak = weak.clone();
+                    let app = app.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
-                            apply_msg(&ui, msg);
+                            apply_msg(&ui, &app, msg);
                         }
                     });
                 }
@@ -155,60 +214,74 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        // 顶栏搜索框过滤词 → 重建行模型（view 下标映射在 resolve_view）
+        ui.on_filter_changed(|q| send_msg(Msg::FilterChanged(q.to_string())));
+    }
+    {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
-        ui.on_row_activated(move |i| open_drawer(&app, &cmd_tx, i as usize));
-    }
-    {
-        let app = app.clone();
-        ui.on_row_pin(move |i| {
-            let v = toggle_of(&app, i as usize, "pinned");
-            local_update(&app, i as usize, "pinned", v);
-        });
-    }
-    {
-        let app = app.clone();
-        ui.on_row_board(move |i| {
-            let v = toggle_of(&app, i as usize, "on_board");
-            local_update(&app, i as usize, "on_board", v);
-        });
-    }
-    {
-        let app = app.clone();
-        ui.on_row_reject(move |i| {
-            let cur = {
-                let a = app.lock().unwrap();
-                a.rows
-                    .get(i as usize)
-                    .and_then(|r| r["status"].as_str().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "pending".into())
-            };
-            let to = if cur == "rejected" { "pending" } else { "rejected" };
-            local_update(&app, i as usize, "status", to);
-        });
-    }
-    ui.on_drawer_close(|| send_msg(Msg::CloseDrawer));
-    {
-        let app = app.clone();
-        ui.on_drawer_reject(move || {
-            // 抽屉的不采纳作用于当前选中行
-            let sel = app.lock().unwrap().selected;
-            if let Some(i) = sel {
-                let cur = {
-                    let a = app.lock().unwrap();
-                    a.rows
-                        .get(i)
-                        .and_then(|r| r["status"].as_str().map(|s| s.to_string()))
-                        .unwrap_or_else(|| "pending".into())
-                };
-                let to = if cur == "rejected" { "pending" } else { "rejected" };
-                local_update(&app, i, "status", to);
+        // UI 传视图下标，先经 view 换算为 rows 原始下标
+        ui.on_row_activated(move |i| {
+            if let Some(idx) = resolve_view(&app, i as usize) {
+                open_drawer(&app, &cmd_tx, idx);
             }
         });
     }
     {
         let app = app.clone();
-        ui.on_drawer_set_priority(move |p| {
+        ui.on_row_pin(move |i| {
+            if let Some(idx) = resolve_view(&app, i as usize) {
+                let v = toggle_of(&app, idx, "pinned");
+                local_update(&app, idx, "pinned", v);
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        ui.on_row_board(move |i| {
+            if let Some(idx) = resolve_view(&app, i as usize) {
+                let v = toggle_of(&app, idx, "on_board");
+                local_update(&app, idx, "on_board", v);
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        ui.on_row_reject(move |i| {
+            let Some(idx) = resolve_view(&app, i as usize) else { return };
+            let cur = {
+                let a = app.lock().unwrap();
+                a.rows
+                    .get(idx)
+                    .and_then(|r| r["status"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "pending".into())
+            };
+            let to = if cur == "rejected" { "pending" } else { "rejected" };
+            local_update(&app, idx, "status", to);
+        });
+    }
+    {
+        // 详情面板：关闭（Esc 语义的第一支在 app.slint 里，这里同时清选中态）
+        let app = app.clone();
+        ui.on_panel_close(move || {
+            app.lock().unwrap().selected = None;
+            send_msg(Msg::ClosePanel);
+        });
+    }
+    {
+        // 面板看板按钮：切换当前选中行的 on_board
+        let app = app.clone();
+        ui.on_panel_board(move || {
+            let sel = app.lock().unwrap().selected;
+            if let Some(i) = sel {
+                let v = toggle_of(&app, i, "on_board");
+                local_update(&app, i, "on_board", v);
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        ui.on_panel_set_priority(move |p| {
             let sel = app.lock().unwrap().selected;
             if let Some(i) = sel {
                 local_update(&app, i, "priority", p as i64);
@@ -216,9 +289,13 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
-        // 抽屉「重新评审」：桌面端无远程重评审通道（phase 2），先提示
-        ui.on_drawer_requeue(|| {
-            send_msg(Msg::Status("桌面端暂不支持远程重新评审（phase 2 接入插件 API）".into()));
+        let app = app.clone();
+        ui.on_panel_toggle_pin(move || {
+            let sel = app.lock().unwrap().selected;
+            if let Some(i) = sel {
+                let v = toggle_of(&app, i, "pinned");
+                local_update(&app, i, "pinned", v);
+            }
         });
     }
     {
@@ -288,11 +365,13 @@ fn main() -> anyhow::Result<()> {
                 return;
             }
             {
-                app.lock().unwrap().cfg = new_cfg.clone();
+                let mut a = app.lock().unwrap();
+                a.cfg = new_cfg.clone();
+                a.status_msg = config_status(&new_cfg);
             }
             if let Some(ui) = ui2.upgrade() {
                 ui.set_onboarding(new_cfg.is_unconfigured());
-                ui.set_status_text(config_status(&new_cfg).into());
+                update_status_bar(&ui, &app);
             }
             send_msg(Msg::Status("配置已保存并生效".into()));
             let _ = cmd_tx.send(Cmd::ReloadConfig); // 热生效，不用重启
@@ -351,20 +430,13 @@ fn reload_rows_global(app: &Arc<Mutex<App>>) {
 // ── 详情抽屉 ──
 
 fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, idx: usize) {
-    let (repo, number, subtitle, priority) = {
+    let (repo, number, priority) = {
         let mut a = app.lock().unwrap();
         a.selected = Some(idx);
         match a.rows.get(idx) {
             Some(r) => (
                 r["repo"].as_str().unwrap_or("").to_string(),
                 r["number"].as_i64().unwrap_or(0),
-                format!(
-                    "{}#{} · {}{}",
-                    r["repo"].as_str().unwrap_or(""),
-                    r["number"].as_i64().unwrap_or(0),
-                    r["author"].as_str().unwrap_or("?"),
-                    if r["role"].as_str() == Some("author") { " · 我提的" } else { "" }
-                ),
                 r["priority"].as_i64().unwrap_or(0) as i32,
             ),
             None => return,
@@ -416,28 +488,49 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, idx: usize) {
         }
     }
 
-    // 会话 / Checks / Files 简易文本（数据模型里有啥用啥）
-    let (convo, checks) = row
+    // 会话 / Checks / Files：JSON 过界（Slint 模型不跨线程），UI 线程装配
+    let (convo_json, checks_json) = row
         .as_ref()
-        .map(|r| drawer_extra_texts(r))
+        .map(|r| drawer_extras_json(r))
         .unwrap_or_default();
-    let files = match &diff_cached {
-        Some(d) => files_text_from_diff(d),
-        None => String::new(),
+    let files_json = match &diff_cached {
+        Some(d) => files_json_from_diff(d),
+        None => "[]".into(),
     };
+    let state = row
+        .as_ref()
+        .and_then(|r| r["status"].as_str().map(|s| s.to_string()))
+        .map(|s| if s == "merged" || s == "closed" { s } else { "open".into() })
+        .unwrap_or_else(|| "open".into());
+    let ci = row
+        .as_ref()
+        .and_then(|r| r["ci_status"].as_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+    let age = row.as_ref().map(|r| model::age_text(r)).unwrap_or_default();
+    let pinned = row.as_ref().map(|r| r["pinned"].as_i64() == Some(1)).unwrap_or(false);
+    let on_board = row.as_ref().map(|r| r["on_board"].as_i64() == Some(1)).unwrap_or(false);
 
-    send_msg(Msg::Drawer {
+    send_msg(Msg::Panel {
         title: row
             .as_ref()
             .and_then(|r| r["title"].as_str().map(|s| s.to_string()))
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("{repo} #{number}")),
-        subtitle,
+        author: row
+            .as_ref()
+            .and_then(|r| r["author"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default(),
+        state,
+        ci,
+        opened: age.clone(),
+        updated: age,
         body,
-        convo,
-        checks,
-        files,
         priority,
+        pinned,
+        on_board,
+        convo_json,
+        checks_json,
+        files_json,
     });
 
     match diff_cached {
@@ -448,42 +541,43 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, idx: usize) {
     }
 }
 
-/// extras_detail / recent_commits → 会话与 Checks 的简易文本。
-fn drawer_extra_texts(r: &serde_json::Value) -> (String, String) {
-    let mut convo = String::new();
-    let mut checks = String::new();
+/// extras_detail / recent_commits → (会话条目 JSON, Checks JSON)。
+/// 条目结构对齐 detail_panel.slint 的 ConvoEntry/CheckRun（kind/author/time/text、name/conclusion）。
+fn drawer_extras_json(r: &serde_json::Value) -> (String, String) {
+    let mut convo: Vec<serde_json::Value> = Vec::new();
+    let mut checks: Vec<serde_json::Value> = Vec::new();
     if let Some(detail_str) = r["extras_detail"].as_str() {
         if let Ok(detail) = serde_json::from_str::<serde_json::Value>(detail_str) {
             if let Some(rvs) = detail["reviews"].as_array() {
                 for rv in rvs {
-                    let state = rv["state"].as_str().unwrap_or("");
-                    let body = rv["body"].as_str().unwrap_or("");
-                    convo.push_str(&format!(
-                        "💬 {}（{}）{}{}\n",
-                        rv["author"].as_str().unwrap_or("?"),
-                        state,
-                        if body.is_empty() { "" } else { "：" },
-                        body
-                    ));
+                    convo.push(serde_json::json!({
+                        "kind": "review",
+                        "author": rv["author"].as_str().unwrap_or(""),
+                        "time": rv["submitted_at"].as_str().unwrap_or(""),
+                        "text": rv["body"].as_str().unwrap_or(""),
+                    }));
                 }
             }
             if let Some(runs) = detail["check_runs"].as_array() {
                 for c in runs {
-                    checks.push_str(&format!(
-                        "{} {}（{}）\n",
-                        c["name"].as_str().unwrap_or("?"),
-                        c["conclusion"].as_str().unwrap_or(""),
-                        c["status"].as_str().unwrap_or("")
-                    ));
+                    checks.push(serde_json::json!({
+                        "name": c["name"].as_str().unwrap_or(""),
+                        "conclusion": if c["status"].as_str() == Some("completed") {
+                            c["conclusion"].as_str().unwrap_or("")
+                        } else {
+                            "pending"
+                        },
+                    }));
                 }
             }
-            // commits 带日期（extras_detail.commits）
             if let Some(cs) = detail["commits"].as_array() {
                 for c in cs {
-                    convo.push_str(&format!(
-                        "📦 {}\n",
-                        c["title"].as_str().unwrap_or("")
-                    ));
+                    convo.push(serde_json::json!({
+                        "kind": "commit",
+                        "author": c["author"].as_str().unwrap_or(""),
+                        "time": c["date"].as_str().unwrap_or(""),
+                        "text": c["title"].as_str().unwrap_or(""),
+                    }));
                 }
             }
         }
@@ -493,23 +587,34 @@ fn drawer_extra_texts(r: &serde_json::Value) -> (String, String) {
         if let Some(rc) = r["recent_commits"].as_str() {
             if let Ok(cs) = serde_json::from_str::<Vec<String>>(rc) {
                 for c in cs {
-                    convo.push_str(&format!("📦 {c}\n"));
+                    convo.push(serde_json::json!({"kind": "commit", "author": "", "time": "", "text": c}));
                 }
             }
         }
     }
-    (convo, checks)
+    // 时间线按时间升序（空时间排最后）
+    convo.sort_by(|a, b| {
+        let ta = a["time"].as_str().unwrap_or("~");
+        let tb = b["time"].as_str().unwrap_or("~");
+        ta.cmp(tb)
+    });
+    (
+        serde_json::to_string(&convo).unwrap_or_else(|_| "[]".into()),
+        serde_json::to_string(&checks).unwrap_or_else(|_| "[]".into()),
+    )
 }
 
-/// 从缓存 diff 文本算 Files 标签页的简易清单（路径 + 增删行数）。
-fn files_text_from_diff(diff: &str) -> String {
-    let mut out = String::new();
-    for (path, text) in diffview::split_files(diff) {
-        let adds = text.lines().filter(|l| l.starts_with('+')).count();
-        let dels = text.lines().filter(|l| l.starts_with('-')).count();
-        out.push_str(&format!("{path}  +{adds} -{dels}\n"));
-    }
-    out
+/// 从缓存 diff 文本算 Files 标签页清单（JSON：[{path, adds, dels}]）。
+fn files_json_from_diff(diff: &str) -> String {
+    let files: Vec<serde_json::Value> = diffview::split_files(diff)
+        .into_iter()
+        .map(|(path, text)| {
+            let adds = text.lines().filter(|l| l.starts_with('+')).count();
+            let dels = text.lines().filter(|l| l.starts_with('-')).count();
+            serde_json::json!({"path": path, "adds": adds, "dels": dels})
+        })
+        .collect();
+    serde_json::to_string(&files).unwrap_or_else(|_| "[]".into())
 }
 
 /// diff 文本 → DiffFile 模型（前 3 个文件展开）。
@@ -557,6 +662,10 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             None
         }
     };
+    // 配额共享句柄交给 App（UI 状态栏读取 X-RateLimit-Remaining）
+    if let Some(g) = &gh {
+        app.lock().unwrap().rate_limit = g.rate_limit_handle();
+    }
     let mut sync_client = {
         let cfg = app.lock().unwrap().cfg.clone();
         sync::SyncClient::new(&cfg)
@@ -619,6 +728,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 .await;
                 match result {
                     Ok(((p, r, t), push)) => {
+                        // 记入「已同步 X 前」共享状态（状态栏组合读取）
+                        let last_sync = app.lock().unwrap().last_sync.clone();
+                        sync::mark_synced(&last_sync);
                         let _ = msg_tx.send(Msg::Status(format!(
                             "同步完成：拉取 {p} PR/{r} 评审/{t} 待办；推送 {} 条（冲突 {}）",
                             push.applied, push.conflicts
@@ -639,6 +751,8 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                                 let _ = a.db.put_diff(&repo, number, &diff);
                             }
                             let _ = msg_tx.send(Msg::DiffRaw(diff));
+                            // diff 响应也带配额头，状态栏重组刷新配额
+                            let _ = msg_tx.send(Msg::StatusBarRefresh);
                         }
                         Err(e) => {
                             let _ = msg_tx.send(Msg::Status(format!("diff 拉取失败: {e}")));
@@ -650,7 +764,11 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
                 let cfg = app.lock().unwrap().cfg.clone();
                 match github::GitHub::new(cfg.token()) {
-                    Ok(g) => gh = Some(g),
+                    Ok(g) => {
+                        // 重建客户端后替换配额共享句柄
+                        app.lock().unwrap().rate_limit = g.rate_limit_handle();
+                        gh = Some(g);
+                    }
                     Err(e) => {
                         let _ = msg_tx.send(Msg::Status(format!("GitHub 客户端重建失败: {e}")));
                     }
@@ -721,37 +839,99 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
 
 // ── UI 消息应用 ──
 
-fn apply_msg(ui: &MainWindow, msg: Msg) {
-    match msg {
-        Msg::Status(s) => ui.set_status_text(s.into()),
-        Msg::Rows(rows_json) => {
-            // 在 UI 线程装配 Slint 模型（SharedString/Image 是 Rc，不跨线程）
-            let (rows, mut groups) = model::build_models(&rows_json);
-            // 折叠状态持久化：按组 key 从旧模型带回
-            let old = ui.get_groups();
-            for g in groups.iter_mut() {
-                for gi in 0..old.row_count() {
-                    let og = old.row_data(gi).unwrap();
-                    if og.key == g.key {
-                        g.collapsed = og.collapsed;
-                        break;
-                    }
-                }
+/// 用当前 filter 过滤 app.rows 并重建 rows/groups 模型（折叠状态按组 key 从旧模型带回）。
+fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
+    // 在 UI 线程装配 Slint 模型（SharedString/Image 是 Rc，不跨线程）
+    let rows_json: Vec<serde_json::Value> = {
+        let a = app.lock().unwrap();
+        a.view.iter().map(|&i| a.rows[i].clone()).collect()
+    };
+    let (rows, mut groups) = model::build_models(&rows_json);
+    let old = ui.get_groups();
+    for g in groups.iter_mut() {
+        for gi in 0..old.row_count() {
+            let og = old.row_data(gi).unwrap();
+            if og.key == g.key {
+                g.collapsed = og.collapsed;
+                break;
             }
-            ui.set_rows(ModelRc::new(VecModel::from(rows)));
-            ui.set_groups(ModelRc::new(VecModel::from(groups)));
         }
-        Msg::Drawer { title, subtitle, body, convo, checks, files, priority } => {
+    }
+    ui.set_rows(ModelRc::new(VecModel::from(rows)));
+    ui.set_groups(ModelRc::new(VecModel::from(groups)));
+}
+
+fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
+    match msg {
+        Msg::Status(s) => {
+            app.lock().unwrap().status_msg = s;
+            update_status_bar(ui, app);
+        }
+        Msg::StatusBarRefresh => update_status_bar(ui, app),
+        Msg::FilterChanged(q) => {
+            {
+                let mut a = app.lock().unwrap();
+                a.filter = q;
+                a.view = filtered_view(&a.rows, &a.filter);
+            }
+            rebuild_rows_ui(ui, app);
+        }
+        Msg::Rows(rows_json) => {
+            {
+                let mut a = app.lock().unwrap();
+                a.total = rows_json.len();
+                a.view = filtered_view(&a.rows, &a.filter);
+            }
+            rebuild_rows_ui(ui, app);
+            update_status_bar(ui, app);
+        }
+        Msg::Panel { title, author, state, ci, opened, updated, body, priority, pinned, on_board, convo_json, checks_json, files_json } => {
             ui.set_d_title(title.into());
-            ui.set_d_subtitle(subtitle.into());
+            ui.set_d_author(author.clone().into());
+            // 头像在 UI 线程从磁盘缓存读（slint::Image 是 Rc，不过线程边界）
+            ui.set_d_avatar(avatars::get_avatar(&author).unwrap_or_default());
+            ui.set_d_state(state.into());
+            ui.set_d_ci(ci.into());
+            ui.set_d_opened(opened.into());
+            ui.set_d_updated(updated.into());
             ui.set_d_body(body.into());
-            ui.set_d_convo(convo.into());
-            ui.set_d_checks(checks.into());
-            ui.set_d_files(files.into());
             ui.set_d_priority(priority);
+            ui.set_d_pinned(pinned);
+            ui.set_d_on_board(on_board);
+            // JSON → Slint 模型（UI 线程装配）
+            let convo: Vec<ConvoEntry> = serde_json::from_str::<Vec<serde_json::Value>>(&convo_json)
+                .unwrap_or_default()
+                .iter()
+                .map(|e| ConvoEntry {
+                    kind: e["kind"].as_str().unwrap_or("").into(),
+                    author: e["author"].as_str().unwrap_or("").into(),
+                    time: model::rel_time(e["time"].as_str().unwrap_or("")).into(),
+                    text: e["text"].as_str().unwrap_or("").into(),
+                })
+                .collect();
+            ui.set_d_convo(ModelRc::new(VecModel::from(convo)));
+            let checks: Vec<CheckRun> = serde_json::from_str::<Vec<serde_json::Value>>(&checks_json)
+                .unwrap_or_default()
+                .iter()
+                .map(|c| CheckRun {
+                    name: c["name"].as_str().unwrap_or("").into(),
+                    conclusion: c["conclusion"].as_str().unwrap_or("").into(),
+                })
+                .collect();
+            ui.set_d_checks(ModelRc::new(VecModel::from(checks)));
+            let files: Vec<FileChange> = serde_json::from_str::<Vec<serde_json::Value>>(&files_json)
+                .unwrap_or_default()
+                .iter()
+                .map(|f| FileChange {
+                    path: f["path"].as_str().unwrap_or("").into(),
+                    adds: f["adds"].as_i64().unwrap_or(0) as i32,
+                    dels: f["dels"].as_i64().unwrap_or(0) as i32,
+                })
+                .collect();
+            ui.set_d_files(ModelRc::new(VecModel::from(files)));
             ui.set_d_open(true);
         }
-        Msg::CloseDrawer => ui.set_d_open(false),
+        Msg::ClosePanel => ui.set_d_open(false),
         Msg::DiffRaw(diff) => {
             // 在 UI 线程构建 Slint 模型（DiffView 依赖整体替换）
             ui.set_diff_files(ModelRc::new(VecModel::from(build_diff_files(&diff))));
