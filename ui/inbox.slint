@@ -1,0 +1,748 @@
+// PR Desk — Inbox 通知列表（GitHub Notifications）
+// 28px 紧凑行：未读蓝点 + repo（dim）+ 标题（未读加粗）+ kind 徽章 + reason（dim）+ 相对时间（dim 右对齐）。
+// 顶部工具栏：全部已读 / 只看未读开关。键盘：j/k/↑↓ 移动，Enter 打开浏览器，Esc 取消选中。
+// 样式全部走 Theme 令牌；空态用 components.slint 的 EmptyState。
+import { Theme } from "theme.slint";
+import { EmptyState, Avatar } from "components.slint";
+import { ScrollView, ListView } from "std-widgets.slint";
+import { ConvoEntry, FileChange } from "detail_panel.slint";
+import { DiffView, DiffFile } from "diff_view.slint";
+
+// 单行通知数据（updated 已是相对时间文本，Rust 侧换算；url 是可直接打开的 HTML URL）
+export struct NotifRow {
+    id: string,         // GitHub thread id（标记已读用）
+    repo: string,       // repository.full_name
+    title: string,
+    kind: string,       // subject.type：PullRequest / Issue / Release / Discussion / CheckSuite…
+    reason: string,     // review_requested / mention / ci_activity…
+    updated: string,    // 相对时间，如 "2h"
+    unread: bool,
+    url: string,        // HTML URL（subject.url 由 Rust 侧转换）
+    added: bool,        // PR 已在本地库（「+ 预评审」→「已加入」反馈）
+}
+
+// ── kind 徽章：surface2 底胶囊（与 TagChip 同风格）──
+component KindBadge inherits Rectangle {
+    in property <string> label;
+
+    height: 16px;
+    width: layout.preferred-width;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.hairline;
+    background: Theme.surface2;
+
+    layout := HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        Text {
+            text: root.label;
+            font-size: Theme.fs_xs;
+            color: Theme.text_dim;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ── 工具栏小按钮：22px 高、描边、hover 微亮 ──
+component ToolButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+
+    height: 22px;
+    width: layout.preferred-width;
+    border-radius: Theme.r_sm;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: ta.has-hover ? Theme.hover : transparent;
+    animate background { duration: 100ms; }
+
+    layout := HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        Text {
+            text: root.label;
+            font-size: Theme.fs_xs;
+            color: Theme.text_dim;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── 开关胶囊：开 = accent 描边 + accent 字，关 = 描边 + dim 字（同 TurnChip 风格）──
+component TogglePill inherits Rectangle {
+    in property <string> label;
+    in property <bool> on: false;
+    callback clicked();
+
+    height: 22px;
+    width: layout.preferred-width;
+    border-radius: 11px;
+    border-width: 1px;
+    border-color: root.on ? Theme.accent.with-alpha(0.5) : Theme.border;
+    background: root.on ? Theme.accent.with-alpha(0.18) : (ta.has-hover ? Theme.hover : transparent);
+    animate background { duration: 100ms; }
+
+    layout := HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 4px;
+        Text {
+            text: root.on ? "✓" : "";
+            width: root.on ? self.preferred-width : 0px;
+            font-size: Theme.fs_xs;
+            color: Theme.accent;
+            vertical-alignment: center;
+        }
+        Text {
+            text: root.label;
+            font-size: Theme.fs_xs;
+            font-weight: root.on ? 600 : 400;
+            color: root.on ? Theme.accent : Theme.text_dim;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── 单行通知（28px）：选中 sel 底 + 左侧 accent 竖条；hover 用 Theme.hover；行底 hairline ──
+component NotifRowItem inherits Rectangle {
+    in property <NotifRow> notif;
+    in property <bool> selected: false;
+    in property <bool> zebra: false;
+    callback clicked();
+    callback add_review();
+
+    property <color> fg: root.selected ? Theme.sel_text : Theme.text;
+    property <color> fg-dim: root.selected ? Theme.sel_text.with-alpha(0.75) : Theme.text_dim;
+
+    height: 28px;
+    background: root.selected ? Theme.sel
+        : (ta.has-hover ? Theme.hover
+        : (root.zebra ? Theme.text.with-alpha(0.03) : transparent));
+    animate background { duration: root.selected ? 150ms : 100ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    // 选中指示条：左侧 2px accent 竖条
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 2px;
+        height: parent.height;
+        background: Theme.accent;
+        visible: root.selected;
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+
+        // 未读蓝点（已读时占位保持对齐）
+        Rectangle {
+            width: 8px;
+            height: 8px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 4px;
+            background: root.notif.unread ? Theme.accent : transparent;
+        }
+
+        Text {
+            text: root.notif.repo;
+            width: 180px;
+            color: root.fg-dim;
+            font-size: Theme.fs_xs;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.notif.title;
+            horizontal-stretch: 1;
+            color: root.fg;
+            font-size: Theme.fs_sm;
+            font-weight: root.notif.unread ? 700 : 400;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+
+        if root.notif.kind != "": KindBadge {
+            label: root.notif.kind;
+            y: (parent.height - self.height) / 2;
+        }
+
+        Text {
+            text: root.notif.reason;
+            color: root.fg-dim;
+            font-size: Theme.fs_xs;
+            vertical-alignment: center;
+        }
+
+        // 已加入本地库的持久反馈（dim 小字，不遮挡时间列）
+        if root.notif.added: Text {
+            text: "已加入";
+            color: root.fg-dim;
+            font-size: Theme.fs_xs;
+            vertical-alignment: center;
+        }
+
+        Text {
+            text: root.notif.updated;
+            width: 40px;
+            color: root.fg-dim;
+            font-size: Theme.fs_xs;
+            horizontal-alignment: right;
+            vertical-alignment: center;
+        }
+    }
+
+    // hover 快捷操作：+ 预评审（仅 PullRequest 且未加入时）。
+    // 常驻元素 + visible 切换，可见性并入按钮自身 hover，防覆盖层抖动（同 PrRowItem）。
+    actions-overlay := Rectangle {
+        x: parent.width - self.width - 4px;
+        y: 3px;
+        width: 76px;
+        height: parent.height - 6px;
+        visible: root.notif.kind == "PullRequest" && !root.notif.added
+            && (ta.has-hover || add-ta.has-hover);
+        border-radius: Theme.r_sm;
+        background: root.selected ? Theme.sel : Theme.card;
+
+        Rectangle {
+            width: parent.width;
+            height: parent.height;
+            border-radius: Theme.r_sm;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: add-ta.has-hover ? Theme.hover : transparent;
+            add-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.add_review(); }
+            }
+            Text {
+                text: "+ 预评审";
+                font-size: Theme.fs_xs;
+                color: root.selected ? root.fg : Theme.text_dim;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    // 行底 hairline
+    Rectangle {
+        x: 10px;
+        y: parent.height - 1px;
+        width: parent.width - 10px;
+        height: 1px;
+        background: Theme.hairline;
+    }
+}
+
+// ── 通知列表 ──
+// needs_token：未配置 GitHub token 时显示提示空态（通知 API 需要鉴权）。
+// 单击 / Enter：选中 + 展开右侧预览（row_activated）；预览已开时再按 Enter：打开浏览器；
+// Esc：预览开着 → 关预览，否则取消选中。
+export component InboxView inherits FocusScope {
+    in property <[NotifRow]> rows: [];
+    in property <bool> needs_token: false;
+    in property <bool> detail_open: false;  // 右侧预览面板是否展开（Enter/Esc 语义依赖它）
+    in-out property <bool> unread_only: false;  // 只看未读（false = 连已读一起拉）
+    in-out property <int> selected_index: -1;
+
+    callback row_activated(int);    // 单击 / Enter：选中 + 展开预览（传 rows 下标）
+    callback row_add_review(int);   // 「+ 预评审」：加入本地库（传 rows 下标）
+    callback open_browser();        // 预览已开时按 Enter：浏览器打开当前详情
+    callback close_detail();        // 预览已开时按 Esc：关预览
+    callback mark_all_read();       // 「全部已读」：PUT /notifications 后刷新
+    callback filter_toggled(bool);  // 「只看未读」开关变化（传新值）
+
+    function move_selection(delta: int) {
+        if (root.rows.length == 0) { return; }
+        if (root.selected_index < 0 || root.selected_index >= root.rows.length) {
+            root.selected_index = delta > 0 ? 0 : root.rows.length - 1;
+            return;
+        }
+        root.selected_index = Math.min(root.rows.length - 1, Math.max(0, root.selected_index + delta));
+    }
+
+    // 键盘导航：j/k 或 ↑/↓ 移动，Enter 展开预览 / 打开浏览器，Esc 关预览 / 取消选中
+    key-pressed(event) => {
+        if (event.text == "j" || event.text == Key.DownArrow) {
+            root.move_selection(1);
+            return accept;
+        }
+        if (event.text == "k" || event.text == Key.UpArrow) {
+            root.move_selection(-1);
+            return accept;
+        }
+        if (event.text == Key.Return) {
+            if (root.detail_open) {
+                root.open_browser();
+            } else if (root.selected_index >= 0 && root.selected_index < root.rows.length) {
+                root.row_activated(root.selected_index);
+            }
+            return accept;
+        }
+        if (event.text == Key.Escape) {
+            if (root.detail_open) {
+                root.close_detail();
+            } else {
+                root.selected_index = -1;
+            }
+            return accept;
+        }
+        reject
+    }
+
+    Rectangle {
+        background: Theme.bg;
+
+        VerticalLayout {
+            alignment: start;
+
+            // ── 工具栏：26px，底部 hairline ──
+            Rectangle {
+                height: 26px;
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 8px;
+
+                    Text {
+                        text: "通知";
+                        font-size: Theme.fs_xs;
+                        font-weight: 600;
+                        color: Theme.text_dim;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    ToolButton {
+                        label: "全部已读";
+                        clicked => { root.mark_all_read(); }
+                    }
+                    TogglePill {
+                        label: "只看未读";
+                        on: root.unread_only;
+                        clicked => {
+                            root.unread_only = !root.unread_only;
+                            root.filter_toggled(root.unread_only);
+                        }
+                    }
+                }
+
+                Rectangle {
+                    x: 0;
+                    y: parent.height - 1px;
+                    width: parent.width;
+                    height: 1px;
+                    background: Theme.hairline;
+                }
+            }
+
+            if root.needs_token: EmptyState {
+                vertical-stretch: 1;
+                icon: "🔑";
+                title: "需要 GitHub token";
+                hint: "通知接口需要鉴权。打开设置（⚙）填入 GitHub token，或配置 GITHUB_TOKEN 环境变量。";
+            }
+
+            if !root.needs_token && root.rows.length == 0: EmptyState {
+                vertical-stretch: 1;
+                icon: "📭";
+                title: "没有通知";
+                hint: "GitHub 通知为空。点顶栏刷新按钮重新拉取。";
+            }
+
+            if !root.needs_token && root.rows.length > 0: Flickable {
+                vertical-stretch: 1;
+                content-height: col.preferred-height;
+
+                // Flickable 子元素需显式铺满视口宽，否则 stretch 列拿不到剩余空间
+                col := VerticalLayout {
+                    width: parent.width;
+                    alignment: start;
+
+                    for r[i] in root.rows: NotifRowItem {
+                        notif: r;
+                        selected: i == root.selected_index;
+                        zebra: mod(i, 2) == 1;
+                        clicked => {
+                            root.selected_index = i;
+                            root.row_activated(i);
+                        }
+                        add_review => { root.row_add_review(i); }
+                    }
+
+                    // 列表末尾呼吸空间
+                    Rectangle { height: 8px; }
+                }
+            }
+        }
+    }
+}
+
+// ── 小号描边按钮（面板操作行用，同 DetailPanel 的 OutlineBtn 风格）──
+component OutlineBtn inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    in property <color> tint: Theme.accent;
+    callback clicked();
+
+    height: 26px;
+    width: layout.preferred-width;
+    border-radius: Theme.r_md;
+    border-width: 1px;
+    border-color: root.active ? root.tint : Theme.border;
+    background: root.active ? root.tint.with-alpha(0.12)
+        : (ta.has-hover ? Theme.hover : transparent);
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    layout := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        Text {
+            text: root.label;
+            font-size: Theme.fs_sm;
+            color: root.active ? root.tint : (ta.has-hover ? Theme.text : Theme.text_dim);
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// ── 通知详情预览面板（右侧检查器，结构参考 DetailPanel，只保留 会话/Files/Diff 三个标签页）──
+// visible=false 时宽度为 0 不占位；打开时从 0 动画展开到 panel_width。
+// Issue 类型没有 Files/Diff：标签页只显示「会话」。
+export component NotifPreview inherits Rectangle {
+    in property <length> panel_width: 420px;
+
+    in property <string> title: "";
+    in property <string> kind: "";        // PullRequest / Issue / …（决定标签页）
+    in property <bool> added: false;      // 已在本地库（按钮变「已加入」）
+    in property <bool> loading: false;    // 详情拉取中
+
+    in property <[ConvoEntry]> convo_entries: [];
+    in property <[FileChange]> files: [];
+    in property <[DiffFile]> diff_files: [];
+
+    callback close();
+    callback open_browser();
+    callback add_review();
+    callback diff_file_toggled(int);
+
+    property <bool> is_pr: root.kind == "PullRequest";
+    property <[string]> tabs: root.is_pr ? ["会话", "Files", "Diff"] : ["会话"];
+    in-out property <int> current_tab: 0;
+
+    width: root.visible ? root.panel_width : 0px;
+    clip: true;
+    background: Theme.card;
+    animate width { duration: 150ms; easing: ease-out-quad; }
+
+    // 左缘 hairline
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 1px;
+        height: 100%;
+        background: Theme.hairline;
+    }
+
+    VerticalLayout {
+        // ── 头部：标题 + 关闭 ×，kind 徽章 + 操作按钮行 ──
+        Rectangle {
+            background: Theme.card;
+
+            VerticalLayout {
+                padding-left: 16px;
+                padding-right: 12px;
+                padding-top: 12px;
+                padding-bottom: 12px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        height: 40px;   // 两行 15px 标题的高度
+                        clip: true;
+                        Text {
+                            width: parent.width;
+                            text: root.title == "" ? "未选择" : root.title;
+                            color: Theme.text;
+                            font-size: Theme.fs_lg;
+                            font-weight: 600;
+                            wrap: word-wrap;
+                        }
+                    }
+                    Rectangle {
+                        width: 24px;
+                        height: 24px;
+                        border-radius: Theme.r_sm;
+                        background: close_ta.has-hover ? Theme.hover : transparent;
+                        animate background { duration: 100ms; }
+                        close_ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.close(); }
+                        }
+                        Text {
+                            text: "×";
+                            width: 100%;
+                            height: 100%;
+                            font-size: Theme.fs_lg;
+                            color: close_ta.has-hover ? Theme.text : Theme.text_dim;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    if root.kind != "": KindBadge {
+                        label: root.kind;
+                        y: (parent.height - self.height) / 2;
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    OutlineBtn {
+                        label: "在浏览器打开";
+                        clicked => { root.open_browser(); }
+                    }
+                    if root.is_pr: OutlineBtn {
+                        label: root.added ? "已加入" : "+ 预评审";
+                        active: root.added;
+                        tint: Theme.good;
+                        clicked => { if (!root.added) { root.add_review(); } }
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 0;
+                y: parent.height - 1px;
+                width: 100%;
+                height: 1px;
+                background: Theme.hairline;
+            }
+        }
+
+        // ── 标签页分段控件（同 DetailPanel 风格）──
+        Rectangle {
+            height: 40px;
+            background: Theme.card;
+
+            Rectangle {
+                x: 12px;
+                y: (parent.height - self.height) / 2;
+                height: 26px;
+                width: tabs_layout.preferred-width;
+                border-radius: Theme.r_md;
+                border-width: 1px;
+                border-color: Theme.hairline;
+                background: Theme.surface2;
+                clip: true;
+
+                tabs_layout := HorizontalLayout {
+                    padding: 2px;
+                    spacing: 2px;
+                    for tab[i] in root.tabs: Rectangle {
+                        property <bool> current: root.current_tab == i;
+                        border-radius: Theme.r_sm;
+                        width: tab_t.preferred-width + 20px;
+                        background: self.current ? Theme.card
+                            : (tab_ta.has-hover ? Theme.hover : transparent);
+                        border-width: self.current ? 1px : 0;
+                        border-color: Theme.border;
+                        animate background { duration: 100ms; }
+
+                        tab_ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.current_tab = i; }
+                        }
+                        tab_t := Text {
+                            text: tab;
+                            width: 100%;
+                            height: 100%;
+                            font-size: Theme.fs_sm;
+                            font-weight: parent.current ? 600 : 400;
+                            color: parent.current ? Theme.text
+                                : (tab_ta.has-hover ? Theme.text : Theme.text_dim);
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                x: 0;
+                y: parent.height - 1px;
+                width: 100%;
+                height: 1px;
+                background: Theme.hairline;
+            }
+        }
+
+        // ── 内容区 ──
+        Rectangle {
+            vertical-stretch: 1;
+            background: Theme.bg;
+            clip: true;
+
+            // 会话：时间线（24px 头像 + 2px 竖线）
+            if root.current_tab == 0: Rectangle {
+                if root.convo_entries.length > 0: ListView {
+                    for e[i] in root.convo_entries: Rectangle {
+                        height: entry_layout.preferred-height + 16px;
+
+                        Rectangle {
+                            x: 16px + 11px;
+                            y: 0;
+                            width: 2px;
+                            height: 100%;
+                            background: Theme.hairline;
+                        }
+
+                        entry_layout := HorizontalLayout {
+                            x: 16px;
+                            y: 8px;
+                            width: parent.width - 32px;
+                            spacing: 10px;
+                            alignment: start;
+
+                            Rectangle {
+                                width: 24px;
+                                Avatar {
+                                    login: e.author;
+                                    size: 24px;
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    Text {
+                                        text: e.author;
+                                        font-size: Theme.fs_sm;
+                                        font-weight: 600;
+                                        color: Theme.text;
+                                        overflow: elide;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        text: e.time;
+                                        font-size: Theme.fs_xs;
+                                        color: Theme.text_faint;
+                                        vertical-alignment: center;
+                                    }
+                                    Rectangle { horizontal-stretch: 1; }
+                                }
+                                Text {
+                                    text: e.text;
+                                    font-size: Theme.fs_md;
+                                    color: Theme.text_dim;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+                if root.convo_entries.length == 0 && !root.loading: EmptyState {
+                    icon: "💬";
+                    title: "暂无会话记录";
+                    hint: "评论活动将显示在这里";
+                }
+            }
+
+            // Files：文件名 + 增删数字（仅 PR 有此标签页）
+            if root.current_tab == 1 && root.is_pr: Rectangle {
+                if root.files.length > 0: ListView {
+                    for f[i] in root.files: Rectangle {
+                        height: 30px;
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 12px;
+                            spacing: 10px;
+                            Text {
+                                text: f.path;
+                                font-family: "Consolas";
+                                font-size: Theme.fs_xs;
+                                color: Theme.text;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: "+" + f.adds;
+                                font-family: "Consolas";
+                                font-size: Theme.fs_xs;
+                                color: Theme.good;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: "-" + f.dels;
+                                font-family: "Consolas";
+                                font-size: Theme.fs_xs;
+                                color: Theme.bad;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle {
+                            x: 16px;
+                            y: parent.height - 1px;
+                            width: parent.width - 16px;
+                            height: 1px;
+                            background: Theme.hairline;
+                        }
+                    }
+                }
+                if root.files.length == 0 && !root.loading: EmptyState {
+                    icon: "📄";
+                    title: "暂无文件变更";
+                    hint: "Diff 文件列表将显示在这里";
+                }
+            }
+
+            // Diff：嵌入真实 DiffView（彩色渲染 + 按文件折叠）
+            if root.current_tab == 2 && root.is_pr: DiffView {
+                files: root.diff_files;
+                file_toggled(i) => { root.diff_file_toggled(i); }
+            }
+
+            // 加载中遮罩提示
+            if root.loading: Rectangle {
+                background: Theme.bg.with-alpha(0.7);
+                Text {
+                    text: "加载中…";
+                    color: Theme.text_dim;
+                    font-size: Theme.fs_md;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+}

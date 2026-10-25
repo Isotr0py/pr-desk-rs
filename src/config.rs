@@ -18,6 +18,8 @@ github_token = ""
 repos = ["owner/repo"]
 # 轮询/自动同步间隔（分钟）
 poll_interval_min = 5
+# 界面主题：light 或 dark
+theme = "light"
 "#;
 
 #[derive(Debug, Clone)]
@@ -27,6 +29,8 @@ pub struct Config {
     pub github_token: Option<String>,
     pub repos: Vec<String>,
     pub poll_interval_min: u64,
+    /// 界面主题："light" | "dark"
+    pub theme: String,
 }
 
 impl Default for Config {
@@ -37,6 +41,7 @@ impl Default for Config {
             github_token: None,
             repos: Vec::new(),
             poll_interval_min: 5,
+            theme: "light".into(),
         }
     }
 }
@@ -61,6 +66,11 @@ impl Config {
     /// 返回是否「未配置」（repos 为空或全是模板占位）。
     pub fn is_unconfigured(&self) -> bool {
         self.repos.is_empty() || self.repos.iter().all(|r| r == "owner/repo")
+    }
+
+    /// 当前是否深色主题。
+    pub fn is_dark(&self) -> bool {
+        self.theme == "dark"
     }
 
     /// GitHub token：环境变量 GITHUB_TOKEN 优先于 config.toml。
@@ -103,6 +113,10 @@ impl Config {
                     .collect();
             } else if let Some(v) = parse_value(line, "poll_interval_min") {
                 cfg.poll_interval_min = v.trim().parse().unwrap_or(5);
+            } else if let Some(v) = parse_value(line, "theme") {
+                // 只认 light/dark，其它值（老配置、手写错误）回退默认
+                let v = unquote(v);
+                cfg.theme = if v == "dark" { "dark".into() } else { "light".into() };
             }
         }
         Ok(cfg)
@@ -114,19 +128,20 @@ impl Config {
             "[{}]",
             self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
         );
-        let kv: [(&str, String); 5] = [
+        let kv: [(&str, String); 6] = [
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
             ("github_token", quote(self.github_token.as_deref().unwrap_or(""))),
             ("repos", repos_toml),
             ("poll_interval_min", self.poll_interval_min.to_string()),
+            ("theme", quote(&self.theme)),
         ];
 
         let mut lines: Vec<String> = match fs::read_to_string(path) {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
             Err(_) => TEMPLATE.lines().map(|l| l.to_string()).collect(),
         };
-        let mut seen = [false; 5];
+        let mut seen = [false; 6];
         for (i, line) in lines.iter_mut().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -186,6 +201,7 @@ mod tests {
             github_token: Some("ghp_x".into()),
             repos: vec!["a/b".into(), "c/d".into()],
             poll_interval_min: 15,
+            theme: "dark".into(),
         };
         cfg.save(&path).unwrap();
 
@@ -197,6 +213,8 @@ mod tests {
         assert_eq!(loaded.github_token.as_deref(), Some("ghp_x"));
         assert_eq!(loaded.repos, vec!["a/b".to_string(), "c/d".to_string()]);
         assert_eq!(loaded.poll_interval_min, 15);
+        assert_eq!(loaded.theme, "dark");
+        assert!(loaded.is_dark());
         assert!(!loaded.is_unconfigured());
         let _ = std::fs::remove_dir_all(&dir);
     }

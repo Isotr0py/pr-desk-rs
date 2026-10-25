@@ -1,9 +1,9 @@
-// PR Desk 基础组件库 — GitHub Dark 风格，纯矢量绘制，无外部资源
+// PR Desk 基础组件库 — 纯矢量绘制，无外部资源；颜色全部取自 Theme 令牌
 import { Theme } from "theme.slint";
 
-// 圆形头像：img 有效时裁剪为圆形图片；否则显示 login 首字母的彩色字母头像。
-// 注：Slint 无字符串索引/子串，首字母用「单字宽裁剪窗 + Consolas 等宽字体」实现，
-// 色相用 login.character-count 做稳定伪哈希（同一 login 颜色固定）。
+// 圆形头像：img 有效时裁剪为圆形图片；否则显示 login 首字母。
+// 无图底色：按 login 长度做稳定伪哈希，从 4 个主题色相中选 1 个，
+// 底色为色相 15% 透明、文字为色相本体，明暗主题下均柔和可读。
 export component Avatar inherits Rectangle {
     in property <string> login;
     in property <image> img;
@@ -13,13 +13,14 @@ export component Avatar inherits Rectangle {
     height: root.size;
     border-radius: root.size / 2;
     border-width: 1px;
-    border-color: Theme.hairline;  // GitHub 风格细描边
+    border-color: Theme.hairline;
     clip: true;
 
     property <bool> has-img: root.img.width > 0 && root.img.height > 0;
-    // GitHub 深色系高饱和底色，白字对比度好
-    property <[color]> palette: [#1f6feb, #8957e5, #bf3989, #cf222e, #9a6700, #1a7f37, #0969da, #8250df];
-    background: root.has-img ? #00000000 : root.palette[mod(root.login.character-count, 8)];
+    property <[color]> palette: [Theme.accent, Theme.purple, Theme.good, Theme.mid];
+    property <color> tone: root.palette[mod(root.login.character-count, 4)];
+
+    background: root.has-img ? #00000000 : root.tone.with-alpha(0.15);
 
     if root.has-img: Image {
         width: 100%;
@@ -29,7 +30,7 @@ export component Avatar inherits Rectangle {
     }
     if !root.has-img: Rectangle {
         property <length> fs: root.size * 0.5;
-        property <length> gw: fs * 0.62;  // Consolas 单字宽 ≈ 0.6em
+        property <length> gw: fs * 0.62;  // 等宽字体单字宽 ≈ 0.6em，裁剪出首字母
         x: (parent.width - gw) / 2;
         width: gw;
         height: parent.height;
@@ -39,8 +40,8 @@ export component Avatar inherits Rectangle {
             text: root.login.to-uppercase();
             font-family: "Consolas";
             font-size: fs;
-            font-weight: 700;
-            color: #ffffff;
+            font-weight: 600;
+            color: root.tone;
             wrap: no-wrap;
             vertical-alignment: center;
         }
@@ -57,7 +58,7 @@ export component StatusDot inherits Rectangle {
     background: root.status == "success" ? Theme.good
         : root.status == "failure" ? Theme.bad
         : root.status == "pending" ? Theme.mid
-        : #6e7681;
+        : Theme.text_dim;
 }
 
 // 评分徽章：>=8 绿 / >=6 黄 / 否则红；oversized 时显示灰底「超大」
@@ -65,7 +66,7 @@ export component ScoreChip inherits Rectangle {
     in property <float> score;
     in property <bool> oversized: false;
 
-    property <color> tone: root.oversized ? #6e7681
+    property <color> tone: root.oversized ? Theme.text_dim
         : root.score >= 8 ? Theme.good
         : root.score >= 6 ? Theme.mid
         : Theme.bad;
@@ -73,17 +74,17 @@ export component ScoreChip inherits Rectangle {
     height: 18px;
     width: layout.preferred-width;
     border-radius: 9px;
-    background: root.tone.with-alpha(0.15);
+    background: root.tone.with-alpha(0.14);
     border-width: 1px;
-    border-color: root.tone.with-alpha(0.45);
+    border-color: root.tone.with-alpha(0.35);
 
     layout := HorizontalLayout {
-        padding-left: 7px;
-        padding-right: 7px;
+        padding-left: 8px;
+        padding-right: 8px;
         Text {
             text: root.oversized ? "超大" : "" + (Math.round(root.score * 10) / 10);
-            font-size: 11px;
-            font-weight: 700;
+            font-size: Theme.fs_xs;
+            font-weight: 500;
             color: root.tone;
             vertical-alignment: center;
         }
@@ -98,22 +99,23 @@ export component TagChip inherits Rectangle {
     width: layout.preferred-width;
     border-radius: 9px;
     border-width: 1px;
-    border-color: Theme.hairline;  // 中性描边统一 hairline
-    background: Theme.card;
+    border-color: Theme.hairline;
+    background: Theme.surface2;
 
     layout := HorizontalLayout {
-        padding-left: 7px;
-        padding-right: 7px;
+        padding-left: 8px;
+        padding-right: 8px;
         Text {
             text: root.label;
-            font-size: 11px;
+            font-size: Theme.fs_xs;
+            font-weight: 500;
             color: Theme.text_dim;
             vertical-alignment: center;
         }
     }
 }
 
-// PR 体积徽章：XS/S 绿、M 蓝、L 黄、XL 红，彩底白字
+// PR 体积徽章：XS/S 绿、M 蓝、L 黄、XL 红，柔和底色 + 同色系文字
 export component SizeBadge inherits Rectangle {
     in property <string> label;
 
@@ -122,19 +124,21 @@ export component SizeBadge inherits Rectangle {
         : root.label == "L" ? Theme.mid
         : Theme.bad;
 
-    height: 16px;
+    height: 18px;
     width: layout.preferred-width;
-    border-radius: 4px;
-    background: root.tone;
+    border-radius: 9px;
+    background: root.tone.with-alpha(0.14);
+    border-width: 1px;
+    border-color: root.tone.with-alpha(0.35);
 
     layout := HorizontalLayout {
-        padding-left: 5px;
-        padding-right: 5px;
+        padding-left: 8px;
+        padding-right: 8px;
         Text {
             text: root.label;
-            font-size: 10px;
-            font-weight: 700;
-            color: #ffffff;
+            font-size: Theme.fs_xs;
+            font-weight: 500;
+            color: root.tone;
             vertical-alignment: center;
         }
     }
@@ -146,7 +150,7 @@ export component PriorityDot inherits Text {
 
     text: root.priority > 0 ? "!" : "";
     width: root.priority > 0 ? 10px : 0px;
-    font-size: 12px;
+    font-size: Theme.fs_sm;
     font-weight: 800;
     horizontal-alignment: center;
     vertical-alignment: center;
@@ -155,16 +159,16 @@ export component PriorityDot inherits Text {
         : Theme.accent;
 }
 
-// 图标按钮：26x26，hover 微亮底（100ms 过渡），tooltip 悬停 450ms 后延迟浮现。
+// 图标按钮：28x28，圆角 6px，hover 用 Theme.hover（100ms 过渡），tooltip 悬停 450ms 后浮现。
 // 注意：tooltip 画在组件自身上方（y 为负），依赖祖先不 clip，且可能被后绘制的同级覆盖。
 export component IconButton inherits Rectangle {
     in property <string> icon;
     in property <string> tooltip;
     callback clicked();
 
-    width: 26px;
-    height: 26px;
-    border-radius: 6px;
+    width: 28px;
+    height: 28px;
+    border-radius: Theme.r_md;
     background: touch.has-hover ? Theme.hover : #00000000;
     animate background { duration: 100ms; }
 
@@ -180,7 +184,7 @@ export component IconButton inherits Rectangle {
 
     Text {
         text: root.icon;
-        font-size: 13px;
+        font-size: Theme.fs_md;
         color: touch.has-hover ? Theme.text : Theme.text_dim;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -198,8 +202,8 @@ export component IconButton inherits Rectangle {
         y: -30px;
         width: tip.preferred-width;
         height: 22px;
-        border-radius: 6px;
-        background: #1c2128;
+        border-radius: Theme.r_sm;
+        background: Theme.card;
         border-width: 1px;
         border-color: Theme.border;
         tip := HorizontalLayout {
@@ -207,7 +211,7 @@ export component IconButton inherits Rectangle {
             padding-right: 8px;
             Text {
                 text: root.tooltip;
-                font-size: 11px;
+                font-size: Theme.fs_xs;
                 color: Theme.text;
                 vertical-alignment: center;
             }
@@ -215,7 +219,7 @@ export component IconButton inherits Rectangle {
     }
 }
 
-// 胶囊分段控件单元：active 时 accent 填充白字，否则透明底 dim 字，hover 微亮
+// 胶囊分段控件单元：active 用 Theme.sel 底 + sel_text 字，否则透明底 dim 字，hover 微亮
 export component PillTab inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
@@ -224,7 +228,7 @@ export component PillTab inherits Rectangle {
     height: 24px;
     width: layout.preferred-width;
     border-radius: 12px;
-    background: root.active ? Theme.accent : touch.has-hover ? Theme.hover : #00000000;
+    background: root.active ? Theme.sel : touch.has-hover ? Theme.hover : #00000000;
     animate background { duration: 100ms; }
 
     layout := HorizontalLayout {
@@ -232,9 +236,9 @@ export component PillTab inherits Rectangle {
         padding-right: 10px;
         Text {
             text: root.label;
-            font-size: 12px;
+            font-size: Theme.fs_sm;
             font-weight: root.active ? 600 : 400;
-            color: root.active ? Theme.sel-text : touch.has-hover ? Theme.text : Theme.text_dim;
+            color: root.active ? Theme.sel_text : touch.has-hover ? Theme.text : Theme.text_dim;
             vertical-alignment: center;
             animate color { duration: 100ms; }
         }
@@ -246,7 +250,7 @@ export component PillTab inherits Rectangle {
     }
 }
 
-// 空状态：居中 dim 大图标 + 标题 + 提示（占满父级区域）
+// 空状态：居中图标字符 + 主文案 + 副提示（占满父级区域）
 export component EmptyState inherits Rectangle {
     in property <string> icon;
     in property <string> title;
@@ -260,21 +264,21 @@ export component EmptyState inherits Rectangle {
         padding: 24px;
         Text {
             text: root.icon;
-            font-size: 34px;
-            color: Theme.text-dim.with-alpha(0.55);
+            font-size: 28px;
+            color: Theme.text_dim;
             horizontal-alignment: center;
         }
         Text {
             text: root.title;
-            font-size: 14px;
-            font-weight: 600;
+            font-size: Theme.fs_md;
+            font-weight: 500;
             color: Theme.text;
             horizontal-alignment: center;
         }
         Text {
             text: root.hint;
-            font-size: 12px;
-            color: Theme.text-dim;
+            font-size: Theme.fs_sm;
+            color: Theme.text_dim;
             horizontal-alignment: center;
             wrap: word-wrap;
         }

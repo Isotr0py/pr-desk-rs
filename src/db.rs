@@ -263,6 +263,16 @@ impl Db {
         Ok(None)
     }
 
+    /// PR 是否已在本地库（Inbox「+ 预评审」的去重判断：避免 upsert 把已有行字段覆盖成空）。
+    pub fn pr_exists(&self, repo: &str, number: i64) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM prs WHERE repo=?1 AND number=?2",
+            params![repo, number],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
     // ── 本地改动（立即生效 + 入队 outbox 待推送） ──
     pub fn local_pr_update(&self, repo: &str, number: i64, field: &str, value: &serde_json::Value) -> Result<()> {
         // 立即应用到本地

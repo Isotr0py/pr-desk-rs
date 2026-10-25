@@ -1,6 +1,6 @@
 // PR Desk — 分区 PR 列表组件（GPLv3）
-// GitHub Dark / PR Desk 风格：表头行 + 28px 紧凑行 + 整行选中 + hover 快捷操作。
-// 依赖共享契约：theme.slint 的 global Theme（含 sel/sel_text/hover/hairline），
+// GitHub 风格精致列表：11px 表头 + 28px 紧凑行 + 左侧 accent 选中指示条。
+// 依赖共享契约：theme.slint 的 global Theme（sel/sel_text/hover/hairline/fs_*/r_*），
 // components.slint 的 Avatar / StatusDot / ScoreChip / SizeBadge / PriorityDot / TagChip。
 import { Theme } from "theme.slint";
 import { Avatar, StatusDot, ScoreChip, SizeBadge, PriorityDot, TagChip } from "components.slint";
@@ -37,43 +37,186 @@ export struct PrGroup {
     collapsed: bool,
 }
 
-// 列宽契约（表头与数据行共用，保持一致）
+// 列宽契约（表头与数据行共用，保持一致）。in-out：表头拖拽手柄可改列宽。
 //   P 12px / # 56px / Title 弹性 / Author 116px / Turn 40px
 //   Review 24px / CI 24px / Size 30px / Age 40px / Updated 40px
 global Cols {
-    out property <length> priority: 12px;
-    out property <length> number: 56px;
-    out property <length> author: 116px;
-    out property <length> turn: 40px;
-    out property <length> review: 24px;
-    out property <length> ci: 24px;
-    out property <length> size: 30px;
-    out property <length> age: 40px;
-    out property <length> updated: 40px;
+    in-out property <length> priority: 12px;
+    in-out property <length> number: 56px;
+    in-out property <length> author: 116px;
+    in-out property <length> turn: 40px;
+    in-out property <length> review: 24px;
+    in-out property <length> ci: 24px;
+    in-out property <length> size: 30px;
+    in-out property <length> age: 40px;
+    in-out property <length> updated: 40px;
     out property <length> row-pad-l: 10px;
     out property <length> row-pad-r: 8px;
 }
 
-// ── 表头行：dim 小字 + 底部 hairline ──
+// 增删行数列宽（表头拖拽手柄可调）
+global DiffCol {
+    in-out property <length> width: 72px;
+}
+
+// ── 表头列宽拖拽手柄：8px 宽热区，拖动列分界线调整该列（弹性标题列吸收余量）──
+// dragged 回调收到的是鼠标在表头坐标系下的绝对 x——用手柄自身 x + 相对位移算出，
+// 与列宽解耦，避免「手柄跟随列宽移动导致相对位移漂移」的反馈回路。
+component ColHandle inherits Rectangle {
+    callback dragged(length);
+
+    // 拖拽期间「左列 + 右列」宽度之和不变，每次事件先暂存再分配
+    //（in-out：回调处理器编译在父组件作用域，跨组件访问需要可见性）
+    in-out property <length> pair-total;
+
+    width: 8px;
+
+    // 常显细分隔线（居中 1px），hover/拖拽时整根手柄显示 accent 色条
+    Rectangle {
+        x: (parent.width - 1px) / 2;
+        width: 1px;
+        height: 12px;
+        y: (parent.height - self.height) / 2;
+        background: ta.has-hover || ta.pressed ? Theme.accent : Theme.text_faint;
+    }
+    background: ta.pressed ? Theme.accent.with-alpha(0.25) : transparent;
+
+    ta := TouchArea {
+        mouse-cursor: col-resize;
+        moved => {
+            if (self.pressed) {
+                root.dragged(root.x + self.mouse-x);
+            }
+        }
+    }
+}
+
+// ── 表头行：11px / 500 / text_dim，底部 hairline；列分界处有拖拽手柄 ──
+// 与 PrRowItem 共用同一套列坐标公式（绝对定位），保证任何宽度下逐像素对齐
 component ListHeader inherits Rectangle {
     height: 26px;
 
-    HorizontalLayout {
-        padding-left: Cols.row-pad-l;
-        padding-right: Cols.row-pad-r;
-        spacing: 6px;
-        alignment: center;
+    // 列 x 坐标：左锚定链式计算，Title 弹性吸收剩余宽度（PrRowItem 里有一套相同的）
+    property <length> x-p: Cols.row-pad-l;
+    property <length> x-num: x-p + Cols.priority + 6px;
+    property <length> x-title: x-num + Cols.number + 6px;
+    property <length> fixed-sum: Cols.priority + Cols.number + Cols.author + Cols.turn + Cols.review + Cols.ci + Cols.size + DiffCol.width + Cols.age + Cols.updated;
+    property <length> title-w: max(60px, root.width - fixed-sum - 6px * 10 - Cols.row-pad-l - Cols.row-pad-r);
+    property <length> x-author: x-title + title-w + 6px;
+    property <length> x-turn: x-author + Cols.author + 6px;
+    property <length> x-rev: x-turn + Cols.turn + 6px;
+    property <length> x-ci: x-rev + Cols.review + 6px;
+    property <length> x-size: x-ci + Cols.ci + 6px;
+    property <length> x-diff: x-size + Cols.size + 6px;
+    property <length> x-age: x-diff + DiffCol.width + 6px;
+    property <length> x-upd: x-age + Cols.age + 6px;
 
-        Text { text: "P"; width: Cols.priority; font-size: 10px; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-        Text { text: "#"; width: Cols.number; font-size: 10px; color: Theme.text_dim; vertical-alignment: center; }
-        Text { text: "Title"; font-size: 10px; color: Theme.text_dim; horizontal-stretch: 1; vertical-alignment: center; }
-        Text { text: "Author"; width: Cols.author; font-size: 10px; color: Theme.text_dim; vertical-alignment: center; }
-        Text { text: "Turn"; width: Cols.turn; font-size: 10px; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-        Text { text: "Rev"; width: Cols.review; font-size: 10px; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-        Text { text: "CI"; width: Cols.ci; font-size: 10px; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-        Text { text: "Size"; width: Cols.size; font-size: 10px; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-        Text { text: "Age"; width: Cols.age; font-size: 10px; color: Theme.text_dim; horizontal-alignment: right; vertical-alignment: center; }
-        Text { text: "Upd"; width: Cols.updated; font-size: 10px; color: Theme.text_dim; horizontal-alignment: right; vertical-alignment: center; }
+    Text { x: root.x-p; width: Cols.priority; height: 100%; text: "P"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-num; width: Cols.number; height: 100%; text: "#"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-title; width: root.title-w; height: 100%; text: "Title"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-author; width: Cols.author; height: 100%; text: "Author"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-turn; width: Cols.turn; height: 100%; text: "Turn"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-rev; width: Cols.review; height: 100%; text: "Rev"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-ci; width: Cols.ci; height: 100%; text: "CI"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-size; width: Cols.size; height: 100%; text: "Size"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-diff; width: DiffCol.width; height: 100%; text: "+/-"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-age; width: Cols.age; height: 100%; text: "Age"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-upd; width: Cols.updated; height: 100%; text: "Upd"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+
+    // 列宽拖拽手柄：拖分界线 = 相邻两列宽度互转（左列 + 右列 = 常量），
+    // 其它列位置/宽度完全不动。手柄中心 = 间隙中心（右列左缘 - 3px）。
+    // Title 是弹性列：与 # 或 Author 互转时由它吸收差值。
+    // P | #
+    ColHandle {
+        x: root.x-num - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = Cols.priority + Cols.number;
+            Cols.priority = min(self.pair-total - 40px, max(8px, hx - 3px - root.x-p));
+            Cols.number = self.pair-total - Cols.priority;
+        }
+    }
+    // # | Title（# 变宽，Title 吸收）
+    ColHandle {
+        x: root.x-title - 7px;
+        height: parent.height;
+        dragged(hx) => { Cols.number = min(120px, max(40px, hx - 3px - root.x-num)); }
+    }
+    // Title | Author（Author 变宽，Title 吸收）
+    ColHandle {
+        x: root.x-author - 7px;
+        height: parent.height;
+        dragged(hx) => { Cols.author = min(400px, max(70px, Cols.author + root.x-author - 3px - hx)); }
+    }
+    // Author | Turn
+    ColHandle {
+        x: root.x-turn - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = Cols.author + Cols.turn;
+            Cols.author = min(self.pair-total - 36px, max(70px, hx - 3px - root.x-author));
+            Cols.turn = self.pair-total - Cols.author;
+        }
+    }
+    // Turn | Rev
+    ColHandle {
+        x: root.x-rev - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = Cols.turn + Cols.review;
+            Cols.turn = min(self.pair-total - 16px, max(36px, hx - 3px - root.x-turn));
+            Cols.review = self.pair-total - Cols.turn;
+        }
+    }
+    // Rev | CI
+    ColHandle {
+        x: root.x-ci - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = Cols.review + Cols.ci;
+            Cols.review = min(self.pair-total - 16px, max(16px, hx - 3px - root.x-rev));
+            Cols.ci = self.pair-total - Cols.review;
+        }
+    }
+    // CI | Size
+    ColHandle {
+        x: root.x-size - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = Cols.ci + Cols.size;
+            Cols.ci = min(self.pair-total - 28px, max(16px, hx - 3px - root.x-ci));
+            Cols.size = self.pair-total - Cols.ci;
+        }
+    }
+    // Size | +/-
+    ColHandle {
+        x: root.x-diff - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = Cols.size + DiffCol.width;
+            Cols.size = min(self.pair-total - 48px, max(28px, hx - 3px - root.x-size));
+            DiffCol.width = self.pair-total - Cols.size;
+        }
+    }
+    // +/- | Age
+    ColHandle {
+        x: root.x-age - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = DiffCol.width + Cols.age;
+            DiffCol.width = min(self.pair-total - 32px, max(48px, hx - 3px - root.x-diff));
+            Cols.age = self.pair-total - DiffCol.width;
+        }
+    }
+    // Age | Upd
+    ColHandle {
+        x: root.x-upd - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = Cols.age + Cols.updated;
+            Cols.age = min(self.pair-total - 32px, max(32px, hx - 3px - root.x-age));
+            Cols.updated = self.pair-total - Cols.age;
+        }
     }
 
     Rectangle {
@@ -85,12 +228,12 @@ component ListHeader inherits Rectangle {
     }
 }
 
-// ── 组头：小字 dim + 数量，hairline 分隔，更轻量 ──
+// ── 组头：小号大写感（11px/600/dim）+ 右侧数量徽章（surface2 胶囊），26px 行高 ──
 component GroupHeader inherits Rectangle {
     in property <PrGroup> group;
     callback toggled();
 
-    height: 24px;
+    height: 26px;
     background: head-ta.has-hover ? Theme.hover : transparent;
 
     animate background { duration: 100ms; }
@@ -103,27 +246,38 @@ component GroupHeader inherits Rectangle {
         padding-left: 8px;
         padding-right: 10px;
         spacing: 6px;
+
         Text {
             text: root.group.collapsed ? "▸" : "▾";
             color: Theme.text_dim;
-            font-size: 10px;
+            font-size: Theme.fs_xs;
             width: 12px;
             vertical-alignment: center;
         }
         Text {
-            text: root.group.name;
+            text: root.group.name.to-uppercase();
             color: Theme.text_dim;
-            font-size: 11px;
+            font-size: Theme.fs_xs;
             font-weight: 600;
             vertical-alignment: center;
         }
-        Text {
-            text: root.group.count;
-            color: Theme.text_dim;
-            font-size: 11px;
-            vertical-alignment: center;
-        }
         Rectangle { horizontal-stretch: 1; }
+        // 数量徽章：surface2 底胶囊
+        Rectangle {
+            width: badge-text.preferred-width + 14px;
+            height: 16px;
+            border-radius: 8px;
+            background: Theme.surface2;
+            badge-text := Text {
+                width: 100%;
+                height: 100%;
+                text: root.group.count;
+                color: Theme.text_dim;
+                font-size: Theme.fs_xs;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
     }
 
     Rectangle {
@@ -138,11 +292,12 @@ component GroupHeader inherits Rectangle {
 // ── hover 快捷操作按钮 ──
 component QuickAction inherits Rectangle {
     in property <string> glyph;
+    out property <bool> hovered: qa-ta.has-hover;   // 暴露给父级：并入行 hover 条件，防覆盖层抖动
     callback activated();
 
-    width: 22px;
-    height: 20px;
-    border-radius: 6px;
+    width: 24px;
+    height: 22px;
+    border-radius: Theme.r_sm;
     background: qa-ta.has-hover ? Theme.border.with-alpha(0.8) : transparent;
 
     qa-ta := TouchArea {
@@ -152,7 +307,7 @@ component QuickAction inherits Rectangle {
     Text {
         text: root.glyph;
         color: Theme.text_dim;
-        font-size: 11px;
+        font-size: Theme.fs_xs;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -177,7 +332,7 @@ component TurnChip inherits Rectangle {
         Text {
             text: root.mine ? "me" : "them";
             color: root.mine ? Theme.accent : Theme.text_dim;
-            font-size: 10px;
+            font-size: Theme.fs_xs;
             font-weight: root.mine ? 700 : 400;
             vertical-alignment: center;
         }
@@ -185,7 +340,7 @@ component TurnChip inherits Rectangle {
 }
 
 // ── 紧凑数据行（28px）──
-// 选中：整行 accent 底 + 白字（PR Desk 风格）；hover：浅底 + 快捷操作浮现。
+// 选中：sel 底 + sel_text 字 + 左侧 2px accent 竖条；hover：Theme.hover。
 component PrRowItem inherits Rectangle {
     in property <PrListRow> pr;
     in property <bool> selected: false;
@@ -198,6 +353,8 @@ component PrRowItem inherits Rectangle {
     // 选中行上所有文字统一用 sel_text（选中态前景色）
     property <color> fg: root.selected ? Theme.sel_text : Theme.text;
     property <color> fg-dim: root.selected ? Theme.sel_text.with-alpha(0.75) : Theme.text_dim;
+    // 高优先级行提升视觉层级
+    property <bool> hot: root.pr.priority == 1;
 
     height: 28px;
     background: root.selected ? Theme.sel
@@ -210,134 +367,248 @@ component PrRowItem inherits Rectangle {
         clicked => { root.clicked(); }
     }
 
-    HorizontalLayout {
-        padding-left: Cols.row-pad-l;
-        padding-right: Cols.row-pad-r;
-        spacing: 6px;
-        alignment: center;
+    // 选中指示条：左侧 2px accent 竖条
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 2px;
+        height: parent.height;
+        background: Theme.accent;
+        visible: root.selected;
+    }
 
+    // 列 x 坐标：左锚定链式计算，Title 弹性吸收剩余宽度（与 ListHeader 相同）
+    property <length> x-p: Cols.row-pad-l;
+    property <length> x-num: x-p + Cols.priority + 6px;
+    property <length> x-title: x-num + Cols.number + 6px;
+    property <length> fixed-sum: Cols.priority + Cols.number + Cols.author + Cols.turn + Cols.review + Cols.ci + Cols.size + DiffCol.width + Cols.age + Cols.updated;
+    property <length> title-w: max(60px, root.width - fixed-sum - 6px * 10 - Cols.row-pad-l - Cols.row-pad-r);
+    property <length> x-author: x-title + title-w + 6px;
+    property <length> x-turn: x-author + Cols.author + 6px;
+    property <length> x-rev: x-turn + Cols.turn + 6px;
+    property <length> x-ci: x-rev + Cols.review + 6px;
+    property <length> x-size: x-ci + Cols.ci + 6px;
+    property <length> x-diff: x-size + Cols.size + 6px;
+    property <length> x-age: x-diff + DiffCol.width + 6px;
+    property <length> x-upd: x-age + Cols.age + 6px;
+
+    // 固定优先级列宽：无优先级时也占位，否则整行后续列左移
+    Rectangle {
+        x: root.x-p;
+        width: Cols.priority;
+        height: parent.height;
         PriorityDot {
             priority: root.pr.priority;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
             color: root.selected ? root.fg : (root.pr.priority == 1 ? Theme.bad
                 : root.pr.priority == 2 ? Theme.mid : Theme.accent);
         }
+    }
+
+    Text {
+        x: root.x-num;
+        width: Cols.number;
+        height: parent.height;
+        text: "#" + root.pr.number;
+        color: root.fg-dim;
+        font-size: Theme.fs_xs;
+        horizontal-alignment: center;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+
+    // 标题区：标题吃剩余空间并 elide；活动文本/评分徽章右端对齐
+    Rectangle {
+        x: root.x-title;
+        width: root.title-w;
+        height: parent.height;
+        clip: true;
+
+        property <length> act-w: act.visible ? act.preferred-width : 0px;
+        property <length> chip-w: chip.visible ? chip.preferred-width + 6px : 0px;
 
         Text {
-            text: "#" + root.pr.number;
-            color: root.fg-dim;
-            font-size: 11px;
-            width: Cols.number;
+            x: 0;
+            width: max(20px, parent.width - parent.act-w - parent.chip-w - (parent.act-w > 0px ? 8px : 0px));
+            height: parent.height;
+            text: root.pr.title;
+            color: root.fg;
+            font-size: Theme.fs_sm;
+            font-weight: root.hot ? 700 : 500;
             overflow: elide;
             vertical-alignment: center;
         }
-
-        // 标题 + dim 最近活动文本（标题右侧拼接）
-        HorizontalLayout {
-            spacing: 8px;
-            horizontal-stretch: 1;
-            alignment: start;
-            Text {
-                text: root.pr.title;
-                color: root.fg;
-                font-size: 12px;
-                overflow: elide;
-                horizontal-stretch: 1;
-                vertical-alignment: center;
-            }
-            if root.pr.activity_text != "": Text {
-                text: root.pr.activity_text;
-                color: root.fg-dim;
-                font-size: 11px;
-                overflow: elide;
-                vertical-alignment: center;
-            }
-        }
-
-        // 作者：Avatar + 名字 + 组织图标占位
-        HorizontalLayout {
-            spacing: 4px;
-            width: Cols.author;
-            alignment: center;
-            Avatar {
-                img: root.pr.avatar;
-                login: root.pr.author;
-                size: 16px;
-            }
-            Text {
-                text: root.pr.author;
-                color: root.fg-dim;
-                font-size: 11px;
-                overflow: elide;
-                horizontal-stretch: 1;
-                vertical-alignment: center;
-            }
-            if root.pr.is_org: TagChip { label: "org"; }
-        }
-
-        HorizontalLayout {
-            width: Cols.turn;
-            alignment: center;
-            if root.pr.turn != "": TurnChip { turn: root.pr.turn; }
-        }
-
-        // Review 状态符号
-        Text {
-            text: root.pr.review == "approved" ? "✓"
-                : (root.pr.review == "changes_requested" ? "✗"
-                : (root.pr.review == "commented" ? "💬" : "○"));
-            color: root.selected ? root.fg
-                : (root.pr.review == "approved" ? Theme.good
-                : (root.pr.review == "changes_requested" ? Theme.bad
-                : (root.pr.review == "commented" ? Theme.text : Theme.text_dim)));
-            font-size: 11px;
-            width: Cols.review;
-            horizontal-alignment: center;
+        act := Text {
+            visible: root.pr.activity_text != "";
+            x: parent.width - parent.act-w - parent.chip-w;
+            width: self.preferred-width;
+            height: parent.height;
+            text: root.pr.activity_text;
+            color: root.fg-dim;
+            font-size: Theme.fs_xs;
             vertical-alignment: center;
         }
-
-        HorizontalLayout {
-            width: Cols.ci;
-            alignment: center;
-            StatusDot { status: root.pr.ci; }
+        // 评分徽章放标题区最右，避免占用列位顶歪后续列
+        chip := ScoreChip {
+            visible: root.pr.score > 0;
+            x: parent.width - parent.chip-w + 6px;
+            y: (parent.height - self.height) / 2;
+            score: root.pr.score;
         }
+    }
 
-        HorizontalLayout {
-            width: Cols.size;
-            alignment: center;
-            if root.pr.size != "": SizeBadge { label: root.pr.size; }
+    // 作者：Avatar + 名字 + 组织图标占位（左对齐，与表头一致）
+    // 纯 Rectangle + 手动居中：HorizontalLayout 设 alignment 后子元素垂直方向不再居中
+    Rectangle {
+        x: root.x-author;
+        width: Cols.author;
+        height: parent.height;
+        clip: true;
+        Avatar {
+            img: root.pr.avatar;
+            login: root.pr.author;
+            size: 16px;
+            x: 0;
+            y: (parent.height - 16px) / 2;
         }
-        if root.pr.score > 0: ScoreChip { score: root.pr.score; }
-
         Text {
-            text: root.pr.age;
+            x: 20px;
+            width: parent.width - 20px - (org-tag.visible ? org-tag.width + 4px : 0px);
+            height: parent.height;
+            text: root.pr.author;
             color: root.fg-dim;
-            font-size: 11px;
-            width: Cols.age;
-            horizontal-alignment: right;
+            font-size: Theme.fs_xs;
+            overflow: elide;
             vertical-alignment: center;
         }
-        Text {
-            text: root.pr.updated != "" ? root.pr.updated : root.pr.age;
-            color: root.fg-dim;
-            font-size: 11px;
-            width: Cols.updated;
-            horizontal-alignment: right;
+        org-tag := TagChip {
+            visible: root.pr.is_org;
+            x: parent.width - self.width;
+            y: (parent.height - self.height) / 2;
+            label: "org";
+        }
+    }
+
+    Rectangle {
+        x: root.x-turn;
+        width: Cols.turn;
+        height: parent.height;
+        if root.pr.turn != "": TurnChip {
+            turn: root.pr.turn;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+    }
+
+    // Review 状态符号
+    Text {
+        x: root.x-rev;
+        width: Cols.review;
+        height: parent.height;
+        text: root.pr.review == "approved" ? "✓"
+            : (root.pr.review == "changes_requested" ? "✗"
+            : (root.pr.review == "commented" ? "💬" : "○"));
+        color: root.selected ? root.fg
+            : (root.pr.review == "approved" ? Theme.good
+            : (root.pr.review == "changes_requested" ? Theme.bad
+            : (root.pr.review == "commented" ? Theme.text : Theme.text_dim)));
+        font-size: Theme.fs_xs;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    Rectangle {
+        x: root.x-ci;
+        width: Cols.ci;
+        height: parent.height;
+        StatusDot {
+            status: root.pr.ci;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+    }
+
+    Rectangle {
+        x: root.x-size;
+        width: Cols.size;
+        height: parent.height;
+        if root.pr.size != "": SizeBadge {
+            label: root.pr.size;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+        }
+    }
+
+    // 增删行数：右对齐，绿加红减
+    Rectangle {
+        x: root.x-diff;
+        width: DiffCol.width;
+        height: parent.height;
+        clip: true;
+        adds := Text {
+            x: (parent.width - self.preferred-width - 6px - dels.preferred-width) / 2;
+            width: self.preferred-width;
+            height: parent.height;
+            text: "+" + root.pr.additions;
+            color: root.selected ? root.fg-dim : Theme.good;
+            font-size: Theme.fs_xs;
+            vertical-alignment: center;
+        }
+        dels := Text {
+            x: adds.x + adds.preferred-width + 6px;
+            width: self.preferred-width;
+            height: parent.height;
+            text: "-" + root.pr.deletions;
+            color: root.selected ? root.fg-dim : Theme.bad;
+            font-size: Theme.fs_xs;
             vertical-alignment: center;
         }
     }
 
-    // hover 快捷操作：pin / 看板 / 不采纳（浮现于行右端）
-    if row-ta.has-hover: Rectangle {
-        x: parent.width - self.width - 6px;
-        width: actions.preferred-width + 8px;
+    Text {
+        x: root.x-age;
+        width: Cols.age;
         height: parent.height;
+        text: root.pr.age;
+        color: root.fg-dim;
+        font-size: Theme.fs_xs;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    Text {
+        x: root.x-upd;
+        width: Cols.updated;
+        height: parent.height;
+        text: root.pr.updated != "" ? root.pr.updated : root.pr.age;
+        color: root.fg-dim;
+        font-size: Theme.fs_xs;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    // hover 快捷操作：置顶 / 加看板 / 不采纳（浮现于行右端）。
+    // 常驻元素 + visible 切换（不用 if 销毁重建）；可见性同时看行 hover 与覆盖层自身 hover，
+    // 否则鼠标移上按钮时遮住 row-ta → has-hover 变 false → 覆盖层消失 → 无限抖动点不中。
+    actions-overlay := Rectangle {
+        x: parent.width - self.width - 4px;
+        y: 3px;
+        width: 88px;
+        height: parent.height - 6px;
+        visible: row-ta.has-hover || actions-ta.has-hover || qa-pin.hovered || qa-board.hovered || qa-reject.hovered;
+        border-radius: Theme.r_sm;
         background: root.selected ? Theme.sel : Theme.card;
-        actions := HorizontalLayout {
+
+        // 整条覆盖层的 TouchArea：保持 hover 存活，也挡住穿透到行上的误点
+        actions-ta := TouchArea { }
+
+        HorizontalLayout {
+            x: 4px;
             y: (parent.height - self.preferred-height) / 2;
-            spacing: 2px;
-            QuickAction { glyph: "📌"; activated => { root.pin(); } }
-            QuickAction { glyph: "▦"; activated => { root.board(); } }
-            QuickAction { glyph: "✕"; activated => { root.reject(); } }
+            spacing: 4px;
+            qa-pin := QuickAction { glyph: "📌"; activated => { root.pin(); } }
+            qa-board := QuickAction { glyph: "＋"; activated => { root.board(); } }
+            qa-reject := QuickAction { glyph: "×"; activated => { root.reject(); } }
         }
     }
 
@@ -410,14 +681,17 @@ export component PrListView inherits FocusScope {
                 vertical-stretch: 1;
                 content-height: list_col.preferred-height;
 
+                // Flickable 子元素默认宽度是内容自然宽度，需显式铺满视口宽，
+                // 否则行内 stretch 列拿不到剩余空间、整体挤在中间
                 list_col := VerticalLayout {
+                    width: parent.width;
                     alignment: start;
 
                     // 空态
                     if root.rows.length == 0: Text {
                         text: "没有 PR";
                         color: Theme.text_dim;
-                        font-size: 13px;
+                        font-size: Theme.fs_md;
                         horizontal-alignment: center;
                         height: 48px;
                         vertical-alignment: center;
@@ -466,6 +740,9 @@ export component PrListView inherits FocusScope {
                             }
                         }
                     }
+
+                    // 列表末尾呼吸空间
+                    Rectangle { height: 8px; }
                 }
             }
         }

@@ -1,15 +1,132 @@
-// PR Desk — 主窗口（组装 topbar/pr_list/detail_panel/diff_view + 设置页/首启引导）
+// PR Desk — 主窗口（组装 topbar/pr_list/detail_panel/diff_view + 设置弹窗/首启引导）
 // 键盘：PrListView 管 j/k/↑↓/Enter/Esc（reject 冒泡）；外层 FocusScope 接 p/1/2/3 和 /。
 // Esc 语义（见 dismissed）：详情开着 → 关详情；否则取消选中。
-import { Button, LineEdit, TextEdit, SpinBox } from "std-widgets.slint";
+import { SpinBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TopBar, StatusBar } from "topbar.slint";
 import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
 import { DetailPanel, ConvoEntry, CheckRun, FileChange } from "detail_panel.slint";
-import { DiffView, DiffFile, DiffLine } from "diff_view.slint";
+import { DiffFile, DiffLine } from "diff_view.slint";
+import { InboxView, NotifRow, NotifPreview } from "inbox.slint";
 
 // 类型再导出：slint-build 从本文件生成 Rust 绑定
-export { PrListRow, PrGroup, ConvoEntry, CheckRun, FileChange, DiffFile, DiffLine }
+export { PrListRow, PrGroup, ConvoEntry, CheckRun, FileChange, DiffFile, DiffLine, NotifRow }
+
+// ── 表单输入框：30px 高、6px 圆角、1px 描边，聚焦时 accent 描边 ──
+component FormField inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder: "";
+    in property <bool> password: false;
+
+    height: 30px;
+    border-radius: Theme.r_md;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    background: Theme.bg;
+    animate border-color { duration: 120ms; }
+
+    input := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        vertical-alignment: center;
+        single-line: true;
+        font-size: Theme.fs_md;
+        color: Theme.text;
+        input-type: root.password ? InputType.password : InputType.text;
+    }
+
+    // 占位提示（空内容时显示，不拦截点击）
+    if root.text == "": Text {
+        x: 10px;
+        width: parent.width - 20px;
+        text: root.placeholder;
+        color: Theme.text_faint;
+        font-size: Theme.fs_md;
+        vertical-alignment: center;
+    }
+}
+
+// ── 多行输入框（仓库列表），样式与 FormField 对齐 ──
+component FormArea inherits Rectangle {
+    in-out property <string> text <=> input.text;
+    in property <string> placeholder: "";
+
+    height: 88px;
+    border-radius: Theme.r_md;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent : Theme.border;
+    background: Theme.bg;
+    clip: true;
+    animate border-color { duration: 120ms; }
+
+    Flickable {
+        x: 10px;
+        y: 7px;
+        width: parent.width - 20px;
+        height: parent.height - 14px;
+        viewport-width: self.width;
+        viewport-height: input.preferred-height;
+        input := TextInput {
+            width: parent.width;
+            wrap: word-wrap;
+            font-size: Theme.fs_md;
+            color: Theme.text;
+        }
+    }
+
+    if root.text == "": Text {
+        x: 10px;
+        y: 7px;
+        width: parent.width - 20px;
+        text: root.placeholder;
+        color: Theme.text_faint;
+        font-size: Theme.fs_md;
+        wrap: word-wrap;
+    }
+}
+
+// ── 表单分组：12px dim 标签在上，控件在下，间距 4px ──
+component Field inherits VerticalLayout {
+    in property <string> label;
+    spacing: 4px;
+    Text {
+        text: root.label;
+        color: Theme.text_dim;
+        font-size: Theme.fs_sm;
+    }
+    @children
+}
+
+// ── 对话框按钮：primary = accent 实心白字，否则描边按钮 ──
+component DialogButton inherits Rectangle {
+    in property <string> text;
+    in property <bool> primary: false;
+    in property <length> button-width: 72px;
+    callback clicked();
+
+    width: root.button-width;
+    height: 30px;
+    border-radius: Theme.r_md;
+    border-width: root.primary ? 0px : 1px;
+    border-color: Theme.border;
+    background: root.primary
+        ? (ta.has-hover ? Theme.accent.darker(1.08) : Theme.accent)
+        : (ta.has-hover ? Theme.hover : transparent);
+    animate background { duration: 120ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Text {
+        text: root.text;
+        color: root.primary ? #ffffff : Theme.text;
+        font-size: Theme.fs_md;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
 
 export component MainWindow inherits Window {
     title: "PR Desk";
@@ -17,12 +134,21 @@ export component MainWindow inherits Window {
     preferred-height: 760px;
     min-width: 900px;
     min-height: 480px;
+    background: Theme.bg;
+
+    // ── 主题（dark_mode 写回 Theme 并通知 Rust 持久化）──
+    in-out property <bool> dark_mode: Theme.dark;
+    callback theme_toggled(bool);
+    changed dark_mode => {
+        Theme.dark = root.dark_mode;
+        root.theme_toggled(root.dark_mode);
+    }
 
     // ── 列表 ──
     in property <[PrListRow]> rows: [];
     in-out property <[PrGroup]> groups: [];
     in-out property <string> filter_text: "";
-    in-out property <int> view_mode: 0;      // 0=列表 1=Diff（TopBar 分段控件，唯一一套视图切换）
+    in-out property <int> view_mode: 0;      // 0=列表 1=Inbox（TopBar 分段控件，唯一一套视图切换）
     // ── 状态栏 ──
     in property <string> sb_sync: "";
     in property <string> sb_quota: "";
@@ -44,6 +170,19 @@ export component MainWindow inherits Window {
     in property <[CheckRun]> d_checks: [];
     in property <[FileChange]> d_files: [];
     in property <[DiffFile]> diff_files: [];
+    // ── Inbox（GitHub 通知）──
+    in property <[NotifRow]> inbox_rows: [];
+    in property <bool> inbox_needs_token: false;
+    in-out property <bool> inbox_unread_only: false;
+    // ── Inbox 预览面板 ──
+    in property <bool> inbox_detail_open: false;
+    in property <string> nd_title: "";
+    in property <string> nd_kind: "";
+    in property <bool> nd_added: false;
+    in property <bool> nd_loading: false;
+    in property <[ConvoEntry]> nd_convo: [];
+    in property <[FileChange]> nd_files: [];
+    in property <[DiffFile]> nd_diff_files: [];
 
     callback refresh();
     callback sync_now();
@@ -58,6 +197,14 @@ export component MainWindow inherits Window {
     callback panel_set_priority(int);
     callback panel_toggle_pin();
     callback diff_file_toggled(int);
+    callback inbox_activated(int);
+    callback inbox_add_review(int);
+    callback inbox_mark_all_read();
+    callback inbox_filter_toggled(bool);
+    callback inbox_open_browser();
+    callback inbox_close_detail();
+    callback inbox_diff_toggled(int);
+    callback fetch_inbox();             // 切到 Inbox 分段时拉取通知
     callback key_pin();
     callback key_priority(int);
     // 设置页
@@ -73,6 +220,8 @@ export component MainWindow inherits Window {
 
     // 顶栏搜索框内容变化（双向绑定）→ 通知 Rust 重建过滤视图
     changed filter_text => { root.filter_changed(root.filter_text); }
+    // 切到 Inbox 分段时拉一次通知
+    changed view_mode => { if (root.view_mode == 1) { root.fetch_inbox(); } }
 
     VerticalLayout {
         topbar := TopBar {
@@ -131,9 +280,34 @@ export component MainWindow inherits Window {
                     diff_file_toggled(i) => { root.diff_file_toggled(i); }
                 }
             }
-            if root.view_mode == 1: DiffView {
-                files: root.diff_files;
-                file_toggled(i) => { root.diff_file_toggled(i); }
+            if root.view_mode == 1: HorizontalLayout {
+                inbox := InboxView {
+                    horizontal-stretch: 1;
+                    rows: root.inbox_rows;
+                    needs_token: root.inbox_needs_token;
+                    detail_open: root.inbox_detail_open;
+                    unread_only <=> root.inbox_unread_only;
+                    row_activated(i) => { root.inbox_activated(i); }
+                    row_add_review(i) => { root.inbox_add_review(i); }
+                    open_browser => { root.inbox_open_browser(); }
+                    close_detail => { root.inbox_close_detail(); }
+                    mark_all_read => { root.inbox_mark_all_read(); }
+                    filter_toggled(v) => { root.inbox_filter_toggled(v); }
+                }
+                NotifPreview {
+                    visible: root.inbox_detail_open;
+                    title: root.nd_title;
+                    kind: root.nd_kind;
+                    added: root.nd_added;
+                    loading: root.nd_loading;
+                    convo_entries: root.nd_convo;
+                    files: root.nd_files;
+                    diff_files: root.nd_diff_files;
+                    close => { root.inbox_close_detail(); }
+                    open_browser => { root.inbox_open_browser(); }
+                    add_review => { root.inbox_add_review(inbox.selected_index); }
+                    diff_file_toggled(i) => { root.inbox_diff_toggled(i); }
+                }
             }
         }
 
@@ -150,104 +324,141 @@ export component MainWindow inherits Window {
         height: 100%;
         background: Theme.bg.with-alpha(0.96);
         TouchArea {}  // 拦截点击
+
+        // 引导卡片：420px 宽、12px 圆角，背后一层偏移半透明矩形模拟柔和投影
         Rectangle {
-            width: 460px;
-            height: 240px;
+            x: (parent.width - 420px) / 2;
+            y: (parent.height - card.height) / 2 + 2px;
+            width: 420px;
+            height: card.height;
+            border-radius: Theme.r_lg;
+            background: #00000033;
+        }
+        card := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 420px;
+            height: welcome-col.preferred-height;
             background: Theme.card;
-            border-radius: 12px;
+            border-radius: Theme.r_lg;
             border-width: 1px;
             border-color: Theme.border;
-            VerticalLayout {
+
+            welcome-col := VerticalLayout {
                 padding: 28px;
-                spacing: 12px;
-                alignment: center;
+                spacing: 14px;
+
                 Text {
                     text: "👋 欢迎使用 PR Desk";
                     color: Theme.text;
-                    font-size: 18px;
+                    font-size: 20px;
                     font-weight: 700;
                     horizontal-alignment: center;
                 }
                 Text {
-                    text: "还没有配置服务器与仓库。\n打开设置，填入服务器地址、token 和要关注的仓库即可开始。";
-                    color: Theme.text-dim;
-                    font-size: 13px;
+                    text: "还没有配置服务器与仓库。\n打开设置，填入服务器地址、令牌和要关注的仓库即可开始。";
+                    color: Theme.text_dim;
+                    font-size: Theme.fs_md;
                     horizontal-alignment: center;
                     wrap: word-wrap;
                 }
-                Button {
-                    text: "打开设置";
-                    clicked => { root.open_settings(); }
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    DialogButton {
+                        text: "打开设置";
+                        primary: true;
+                        button-width: 120px;
+                        clicked => { root.open_settings(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
                 }
             }
         }
     }
 
-    // 设置页（模态，顶层）
+    // 设置弹窗（模态，顶层）：480px 宽，分组表单
     if root.settings_open: Rectangle {
         width: 100%;
         height: 100%;
-        background: #00000088;
+        background: #00000066;
         TouchArea {}  // 拦截点击穿透
-        Rectangle {
-            width: 520px;
-            height: 470px;
+
+        dialog := Rectangle {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            width: 480px;
+            height: form.preferred-height;
             background: Theme.card;
-            border-radius: 12px;
+            border-radius: Theme.r_lg;
             border-width: 1px;
             border-color: Theme.border;
-            VerticalLayout {
+
+            form := VerticalLayout {
                 padding: 20px;
-                spacing: 8px;
+                spacing: 14px;
+
                 Text {
                     text: "设置";
                     color: Theme.text;
                     font-size: 16px;
-                    font-weight: 700;
+                    font-weight: 600;
                 }
-                Text { text: "服务器地址"; color: Theme.text-dim; font-size: 12px; }
-                LineEdit {
-                    text <=> root.s_server;
-                    placeholder-text: "http://127.0.0.1:6185（AstrBot 地址）";
+
+                Field {
+                    label: "服务器地址";
+                    FormField {
+                        placeholder: "http://127.0.0.1:6185（AstrBot 地址）";
+                        text <=> root.s_server;
+                    }
                 }
-                Text { text: "sync_token（插件配置里的同步令牌）"; color: Theme.text-dim; font-size: 12px; }
-                LineEdit {
-                    text <=> root.s_sync_token;
-                    input-type: password;
-                    placeholder-text: "留空 = 同步关闭";
+                Field {
+                    label: "sync_token（插件配置里的同步令牌）";
+                    FormField {
+                        password: true;
+                        placeholder: "留空 = 同步关闭";
+                        text <=> root.s_sync_token;
+                    }
                 }
-                Text {
-                    text: root.gh_token_from_env
+                Field {
+                    label: root.gh_token_from_env
                         ? "GitHub token（已检测到 GITHUB_TOKEN 环境变量，环境变量优先）"
                         : "GitHub token";
-                    color: Theme.text-dim;
-                    font-size: 12px;
+                    FormField {
+                        password: true;
+                        placeholder: root.gh_token_from_env ? "环境变量生效中，此处可留空" : "公开仓库可留空（限速更低）";
+                        text <=> root.s_gh_token;
+                    }
                 }
-                LineEdit {
-                    text <=> root.s_gh_token;
-                    input-type: password;
-                    placeholder-text: root.gh_token_from_env ? "环境变量生效中，此处可留空" : "公开仓库可留空（限速更低）";
+                Field {
+                    label: "仓库列表（每行一个 owner/repo）";
+                    FormArea {
+                        placeholder: "owner/repo";
+                        text <=> root.s_repos;
+                    }
                 }
-                Text { text: "仓库列表（每行一个 owner/repo）"; color: Theme.text-dim; font-size: 12px; }
-                TextEdit {
-                    text <=> root.s_repos;
-                    min-height: 90px;
+                Field {
+                    label: "轮询间隔（分钟）";
+                    HorizontalLayout {
+                        spacing: 8px;
+                        SpinBox {
+                            value <=> root.s_poll;
+                            minimum: 1;
+                            maximum: 120;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
                 }
+
+                // 底部按钮：右对齐，保存为主色实心
                 HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "轮询间隔（分钟）"; color: Theme.text-dim; font-size: 12px; vertical-alignment: center; }
-                    SpinBox { value <=> root.s_poll; minimum: 1; maximum: 120; }
-                    Rectangle { horizontal-stretch: 1; }
-                }
-                HorizontalLayout {
-                    padding-top: 8px;
+                    padding-top: 4px;
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
-                    Button {
+                    DialogButton {
                         text: "取消";
                         clicked => { root.settings_open = false; }
                     }
-                    Button {
+                    DialogButton {
                         text: "保存";
                         primary: true;
                         clicked => {

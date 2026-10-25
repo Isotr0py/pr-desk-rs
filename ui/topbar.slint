@@ -1,34 +1,35 @@
-// PR Desk — 顶栏与状态栏组件（GitHub Dark 风格）
-// TopBar：应用名 + 列表/Diff 分段控件（胶囊滑块动画）+ 搜索框（/ 聚焦、accent 描边）
-//         + 刷新/同步/设置图标按钮（hover 背景 + tooltip）。
-// StatusBar：左侧快捷键提示 · 右侧同步状态 / API 配额 / PR 总数。
-// 依赖共享契约：theme.slint 的 global Theme
-// （现有字段 bg/card/border/text/text_dim/accent + 主题代理新增的 sel/hover/hairline）。
+// PR Desk — 顶栏与状态栏（macOS 风格）
+// TopBar：40px 高，应用名 / macOS 分段控件（滑块 150ms）/ 搜索框 / 图标按钮组（含主题切换）
+// StatusBar：24px 高，左侧快捷键提示 · 右侧同步状态 / 配额 / 总数
+// 依赖共享契约：theme.slint 的 global Theme（颜色 / 字号 fs_* / 圆角 r_* / dark 开关）
 import { Theme } from "theme.slint";
 
-// ── 图标按钮：hover 背景（100ms）+ 悬停 tooltip ──
+// ── 图标按钮：28×28，hover 底色（120ms），悬停 tooltip ──
+// 图标用内嵌 SVG（Image + colorize），不依赖字体字形，避免豆腐块。
 component IconButton inherits Rectangle {
-    in property <string> icon;
+    in property <image> icon;
     in property <string> tooltip: "";
     callback clicked();
 
-    width: 30px;
-    height: 30px;
-    border-radius: 6px;
+    width: 28px;
+    height: 28px;
+    border-radius: Theme.r_md;
     background: ta.has-hover ? Theme.hover : transparent;
-    animate background { duration: 100ms; }
+    animate background { duration: 120ms; }
 
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
     }
 
-    Text {
-        text: root.icon;
-        font-size: 15px;
-        color: ta.has-hover ? Theme.text : Theme.text_dim;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    Image {
+        source: root.icon;
+        width: 16px;
+        height: 16px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        image-fit: contain;
+        colorize: ta.has-hover ? Theme.text : Theme.text_dim;
     }
 
     if root.tooltip != "" && ta.has-hover: Rectangle {
@@ -36,13 +37,13 @@ component IconButton inherits Rectangle {
         y: parent.height + 6px;
         width: tip.preferred-width + 14px;
         height: 22px;
-        border-radius: 6px;
+        border-radius: Theme.r_md;
         background: Theme.card;
         border-width: 1px;
         border-color: Theme.border;
         tip := Text {
             text: root.tooltip;
-            font-size: 11px;
+            font-size: Theme.fs_xs;
             color: Theme.text;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -50,19 +51,19 @@ component IconButton inherits Rectangle {
     }
 }
 
-// ── 搜索框：圆角 + 左侧放大镜 + 右侧「/」键提示 + 聚焦 accent 描边 ──
+// ── 搜索框：26px 高，surface2 底，聚焦时 accent 描边，右侧「/」快捷键提示 ──
 component SearchBox inherits Rectangle {
     in-out property <string> text;
     callback focus_changed(bool);   // FocusScope 焦点变化（供集成方埋点/联动）
     public function focus_search() { fs.focus(); }   // 全局 / 快捷键调用它聚焦
 
-    height: 30px;
+    height: 26px;
     width: 240px;
-    border-radius: 6px;
+    border-radius: Theme.r_md;
     border-width: 1px;
     border-color: fs.has-focus ? Theme.accent : Theme.border;
-    background: Theme.bg;
-    animate border-color { duration: 100ms; }
+    background: Theme.surface2;
+    animate border-color { duration: 120ms; }
 
     fs := FocusScope {
         changed has-focus => { root.focus_changed(self.has-focus); }
@@ -74,14 +75,14 @@ component SearchBox inherits Rectangle {
             reject
         }
 
-        // 放大镜
-        Text {
-            x: 9px;
-            height: parent.height;
-            text: "🔍";
-            font-size: 12px;
-            color: Theme.text_dim;
-            vertical-alignment: center;
+        // 放大镜图标（SVG，避免字体缺字形）
+        Image {
+            source: @image-url("icons/search.svg");
+            x: 10px;
+            y: (parent.height - 12px) / 2;
+            width: 12px;
+            height: 12px;
+            colorize: Theme.text_faint;
         }
 
         input := TextInput {
@@ -90,7 +91,7 @@ component SearchBox inherits Rectangle {
             height: parent.height;
             text <=> root.text;
             color: Theme.text;
-            font-size: 13px;
+            font-size: Theme.fs_md;
             vertical-alignment: center;
             single-line: true;
         }
@@ -101,8 +102,8 @@ component SearchBox inherits Rectangle {
             width: parent.width - 62px;
             height: parent.height;
             text: "搜索 PR…";
-            font-size: 13px;
-            color: Theme.text_dim;
+            font-size: Theme.fs_md;
+            color: Theme.text_faint;
             vertical-alignment: center;
         }
 
@@ -112,13 +113,13 @@ component SearchBox inherits Rectangle {
             y: (parent.height - 18px) / 2;
             width: 20px;
             height: 18px;
-            border-radius: 4px;
+            border-radius: Theme.r_sm;
             border-width: 1px;
             border-color: Theme.border;
             background: Theme.card;
             Text {
                 text: "/";
-                font-size: 11px;
+                font-size: Theme.fs_xs;
                 color: Theme.text_dim;
                 horizontal-alignment: center;
                 vertical-alignment: center;
@@ -128,7 +129,7 @@ component SearchBox inherits Rectangle {
 }
 
 // ── 顶栏 ──
-// view_mode: 0 = 列表，1 = Diff。回调：refresh / sync / open_settings。
+// view_mode: 0 = 列表，1 = Inbox。回调：refresh / sync / open_settings。
 export component TopBar inherits Rectangle {
     in-out property <string> filter_text;
     in-out property <int> view_mode: 0;
@@ -142,48 +143,48 @@ export component TopBar inherits Rectangle {
     // 供全局 / 快捷键调用：聚焦搜索框
     public function focus_search() { search.focus_search(); }
 
-    height: 44px;
+    height: 40px;
     background: Theme.card;
 
-    property <length> seg-w: 76px;
+    property <length> seg-w: 64px;
 
     HorizontalLayout {
         padding-left: 12px;
-        padding-right: 10px;
-        padding-top: 7px;
-        padding-bottom: 7px;
-        spacing: 10px;
+        padding-right: 12px;
+        padding-top: 6px;
+        padding-bottom: 6px;
+        spacing: 8px;
 
         // 左：应用名
         Text {
             text: "PR Desk";
             color: Theme.text;
-            font-size: 15px;
-            font-weight: 700;
+            font-size: Theme.fs_lg;
+            font-weight: 600;
             vertical-alignment: center;
         }
 
         Rectangle { horizontal-stretch: 1; }
 
-        // 中：列表 / Diff 分段控件（胶囊容器 + 滑块高亮，150ms）
+        // 中：列表 / Inbox 分段控件（macOS 风格：surface2 轨道 + card 白块滑块）
         Rectangle {
             width: root.seg-w * 2 + 4px;
-            height: 28px;
-            border-radius: 6px;
+            height: 24px;
+            border-radius: Theme.r_md;
             border-width: 1px;
             border-color: Theme.border;
-            background: Theme.bg;
+            background: Theme.surface2;
 
-            // 滑块高亮
+            // 滑块：card 色白块 + 1px 描边模拟细微阴影
             Rectangle {
                 x: 2px + root.view_mode * root.seg-w;
                 y: 2px;
                 width: root.seg-w;
                 height: parent.height - 4px;
-                border-radius: 4px;
-                background: Theme.sel;
+                border-radius: Theme.r_sm;
+                background: Theme.card;
                 border-width: 1px;
-                border-color: Theme.accent.with-alpha(0.4);
+                border-color: Theme.border;
                 animate x { duration: 150ms; easing: ease-out; }
             }
 
@@ -199,13 +200,13 @@ export component TopBar inherits Rectangle {
                 width: root.seg-w;
                 height: parent.height;
                 text: "列表";
-                font-size: 12px;
+                font-size: Theme.fs_sm;
                 color: root.view_mode == 0 ? Theme.text
                     : seg-list.has-hover ? Theme.text : Theme.text_dim;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
-            seg-diff := TouchArea {
+            seg-inbox := TouchArea {
                 x: root.seg-w;
                 width: root.seg-w;
                 height: parent.height;
@@ -216,10 +217,10 @@ export component TopBar inherits Rectangle {
                 x: root.seg-w;
                 width: root.seg-w;
                 height: parent.height;
-                text: "Diff";
-                font-size: 12px;
+                text: "Inbox";
+                font-size: Theme.fs_sm;
                 color: root.view_mode == 1 ? Theme.text
-                    : seg-diff.has-hover ? Theme.text : Theme.text_dim;
+                    : seg-inbox.has-hover ? Theme.text : Theme.text_dim;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
@@ -227,22 +228,27 @@ export component TopBar inherits Rectangle {
 
         Rectangle { horizontal-stretch: 1; }
 
-        // 右：搜索 + 刷新 / 同步 / 设置
+        // 右：搜索 + 刷新 / 同步 / 主题 / 设置
         search := SearchBox {
             text <=> root.filter_text;
         }
         IconButton {
-            icon: "⟳";
+            icon: @image-url("icons/refresh.svg");
             tooltip: root.refresh_tooltip;
             clicked => { root.refresh(); }
         }
         IconButton {
-            icon: "⇅";
+            icon: @image-url("icons/sync.svg");
             tooltip: root.sync_tooltip;
             clicked => { root.sync(); }
         }
         IconButton {
-            icon: "⚙";
+            icon: @image-url("icons/theme.svg");
+            tooltip: Theme.dark ? "切换到浅色主题" : "切换到深色主题";
+            clicked => { Theme.dark = !Theme.dark; }
+        }
+        IconButton {
+            icon: @image-url("icons/settings.svg");
             tooltip: root.settings_tooltip;
             clicked => { root.open_settings(); }
         }
@@ -262,7 +268,7 @@ export component StatusBar inherits Rectangle {
     in property <string> quota_text;   // 如「API 剩余 4,037」
     in property <int> total_count;     // PR 总数
 
-    height: 26px;
+    height: 24px;
     background: Theme.card;
 
     // 顶部 hairline 分隔
@@ -276,46 +282,50 @@ export component StatusBar inherits Rectangle {
         padding-right: 12px;
         spacing: 0;
 
-        // 左：快捷键提示
+        // 左：快捷键提示（· 分隔）
         Text {
             text: "j/k 移动 · Enter 详情 · p 置顶 · 1/2/3 优先级 · / 搜索 · Esc 返回";
-            font-size: 11px;
-            color: Theme.text_dim;
+            font-size: Theme.fs_xs;
+            color: Theme.text_faint;
             vertical-alignment: center;
         }
 
         Rectangle { horizontal-stretch: 1; }
 
-        // 右：同步状态 · API 配额 · PR 总数
-        Text {
-            text: root.sync_text;
-            font-size: 11px;
-            color: Theme.text_dim;
-            vertical-alignment: center;
-        }
-        Text {
-            text: " · ";
-            font-size: 11px;
-            color: Theme.text_dim;
-            vertical-alignment: center;
-        }
-        Text {
-            text: root.quota_text;
-            font-size: 11px;
-            color: Theme.text_dim;
-            vertical-alignment: center;
-        }
-        Text {
-            text: " · ";
-            font-size: 11px;
-            color: Theme.text_dim;
-            vertical-alignment: center;
-        }
-        Text {
-            text: "共 " + root.total_count + " 个 PR";
-            font-size: 11px;
-            color: Theme.text_dim;
-            vertical-alignment: center;
+        // 右：同步状态 · API 配额 · PR 总数（8px 间距 + 细分隔点）
+        HorizontalLayout {
+            spacing: 8px;
+
+            Text {
+                text: root.sync_text;
+                font-size: Theme.fs_xs;
+                color: Theme.text_dim;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "·";
+                font-size: Theme.fs_xs;
+                color: Theme.text_faint;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.quota_text;
+                font-size: Theme.fs_xs;
+                color: Theme.text_dim;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "·";
+                font-size: Theme.fs_xs;
+                color: Theme.text_faint;
+                vertical-alignment: center;
+            }
+            Text {
+                text: "共 " + root.total_count + " 个 PR";
+                font-size: Theme.fs_xs;
+                color: Theme.text_dim;
+                vertical-alignment: center;
+            }
         }
     }
 }

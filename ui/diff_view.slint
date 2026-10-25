@@ -1,4 +1,4 @@
-// PR Desk — Diff 查看器组件（GitHub Dark 视觉基准，GPLv3）
+// PR Desk — Diff 查看器组件（GitHub 级观感，GPLv3）
 //
 // 设计说明：
 // - 纯 Slint 表达式不支持数组 fold，文件头的增删行数由隐藏的零尺寸计数
@@ -8,6 +8,7 @@
 // - 折叠状态以数据为准（DiffFile.expanded），点击头部只发 file_toggled(i)，
 //   由 Rust 侧翻转后重建模型。
 // - 每个文件最多渲染 max-render-lines 行，超出显示截断提示。
+// - DiffLine 结构没有真实行号字段，行号列暂以「文件内行序号」代替。
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 
@@ -31,18 +32,37 @@ export component DiffView inherits Rectangle {
     // 单文件渲染行数上限
     in property <int> max_render_lines: 2000;
 
-    property <length> header-h: 30px;
-    property <length> line-h: 18px;
-    property <length> trunc-h: 24px;
+    property <length> header-h: 32px;
+    property <length> line-h: 20px;
+    property <length> trunc-h: 26px;
+    // 行号列宽（GitHub 风格 gutter）
+    property <length> gutter-w: 48px;
 
     background: Theme.bg;
     clip: true;
 
-    if root.files.length == 0: Text {
-        text: "无 diff 内容";
-        color: Theme.text-dim;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    // ── 空状态：居中大号图标字符 + 提示文案 ──
+    if root.files.length == 0: VerticalLayout {
+        alignment: center;
+        spacing: 8px;
+        Text {
+            text: "∅";
+            font-size: 40px;
+            color: Theme.text_faint;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "暂无 Diff 内容";
+            font-size: Theme.fs_md;
+            color: Theme.text_dim;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "选择包含变更的文件或提交后在此查看";
+            font-size: Theme.fs_xs;
+            color: Theme.text_faint;
+            horizontal-alignment: center;
+        }
     }
 
     ListView {
@@ -59,7 +79,11 @@ export component DiffView inherits Rectangle {
                 : 0px;
 
             height: root.header-h + body-h;
-            background: transparent;
+            background: Theme.bg;
+            clip: true;
+
+            // 折叠/展开高度过渡
+            animate height { duration: 120ms; easing: ease-in-out; }
 
             // 隐藏计数器：随委托重建重新累加（前提：模型整体替换）
             for line in file.lines: Rectangle {
@@ -76,36 +100,47 @@ export component DiffView inherits Rectangle {
                 }
             }
 
-            // ── 文件头：折叠箭头 + 路径 + 增删统计 ──
+            // ── 文件头：surface2 底 + 上下 hairline，左箭头+文件名，右 +N/-N ──
             header := Rectangle {
                 y: 0px;
                 width: 100%;
-                height: root.header-h - 4px;
-                border-radius: 6px;
-                background: header-touch.has-hover ? #ffffff0d : Theme.card;
-                border-width: 1px;
-                border-color: header-touch.has-hover ? Theme.border : transparent;
+                height: root.header-h;
+                background: Theme.surface2;
+
+                // 上 / 下发丝分隔线
+                Rectangle { y: 0px; width: 100%; height: 1px; background: Theme.hairline; }
+                Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: Theme.hairline; }
+
+                // hover 罩层
+                Rectangle {
+                    width: 100%;
+                    height: 100%;
+                    background: Theme.hover;
+                    opacity: header-touch.has-hover ? 1 : 0;
+                    animate opacity { duration: 120ms; }
+                }
 
                 header-touch := TouchArea {
                     clicked => { root.file_toggled(fi); }
                 }
 
                 HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 10px;
-                    spacing: 6px;
+                    padding-left: 10px;
+                    padding-right: 12px;
+                    spacing: 8px;
+
                     Text {
                         width: 14px;
                         text: file.expanded ? "▾" : "▸";
-                        color: Theme.text-dim;
-                        font-size: 12px;
+                        color: Theme.text_dim;
+                        font-size: Theme.fs_sm;
                         vertical-alignment: center;
                     }
                     Text {
                         text: file.path;
-                        color: Theme.accent;
+                        color: Theme.text;
                         font-family: "Consolas";
-                        font-size: 12px;
+                        font-size: Theme.fs_md;
                         font-weight: 600;
                         overflow: elide;
                         horizontal-stretch: 1;
@@ -115,7 +150,7 @@ export component DiffView inherits Rectangle {
                         text: "+" + adds;
                         color: Theme.good;
                         font-family: "Consolas";
-                        font-size: 11px;
+                        font-size: Theme.fs_xs;
                         font-weight: 700;
                         vertical-alignment: center;
                     }
@@ -123,62 +158,79 @@ export component DiffView inherits Rectangle {
                         text: "−" + dels;
                         color: Theme.bad;
                         font-family: "Consolas";
-                        font-size: 11px;
+                        font-size: Theme.fs_xs;
                         font-weight: 700;
                         vertical-alignment: center;
                     }
                     Text {
-                        text: file.lines.length + " 行";
-                        color: Theme.text-dim;
-                        font-size: 11px;
+                        text: file.expanded ? "收起" : "展开";
+                        color: Theme.text_faint;
+                        font-size: Theme.fs_xs;
                         vertical-alignment: center;
                     }
                 }
             }
 
-            // 文件之间的 hairline 分隔线
-            Rectangle {
-                y: root.header-h - 2px;
-                width: 100%;
-                height: 1px;
-                background: Theme.border;
-            }
-
-            // ── 行区（仅展开时）──
-            if file.expanded: Rectangle {
+            // ── 行区（高度随折叠动画，内容裁剪） ──
+            body := Rectangle {
                 y: root.header-h;
                 width: 100%;
-                height: file-block.body-h;
+                height: parent.height - root.header-h;
                 clip: true;
+                opacity: file.expanded ? 1 : 0;
+                animate opacity { duration: 120ms; }
 
                 for line[li] in file.lines: Rectangle {
                     y: li * root.line-h;
                     width: 100%;
                     height: root.line-h;
                     visible: li < root.max-render-lines;
-                    background: line.kind == "add" ? #3fb95026
-                        : (line.kind == "del" ? #f8514926
-                        : (line.kind == "hunk" ? Theme.card : transparent));
+                    background: line.kind == "add" ? Theme.green_bg
+                        : (line.kind == "del" ? Theme.red_bg
+                        : (line.kind == "hunk" ? Theme.accent.with-alpha(0.08)
+                        : transparent));
+
+                    // 行号列：48px 宽、右对齐、略深底色
+                    Rectangle {
+                        x: 0px;
+                        width: root.gutter-w;
+                        height: 100%;
+                        background: Theme.surface2;
+                        Text {
+                            x: 0px;
+                            width: parent.width - 8px;
+                            height: 100%;
+                            text: line.kind == "hunk" ? "⋯" : "\{li + 1}";
+                            horizontal-alignment: right;
+                            vertical-alignment: center;
+                            color: Theme.text_faint;
+                            font-family: "Consolas";
+                            font-size: Theme.fs_xs;
+                        }
+                        // 行号与代码之间的分隔线
+                        Rectangle {
+                            x: parent.width - 1px;
+                            width: 1px;
+                            height: 100%;
+                            background: Theme.hairline;
+                        }
+                    }
 
                     // read-only TextInput：行内文本可选中复制
                     TextInput {
-                        x: 8px;
-                        width: parent.width - 16px;
+                        x: root.gutter-w + 8px;
+                        width: parent.width - root.gutter-w - 16px;
                         height: parent.height;
                         read-only: true;
                         single-line: true;
                         enabled: true;
                         text: line.text;
                         font-family: "Consolas";
-                        font-size: 12px;
-                        font-weight: (line.kind == "hunk" || line.kind == "meta") ? 700 : 400;
-                        color: line.kind == "hunk" ? Theme.purple
-                            : (line.kind == "meta" ? Theme.text-dim
-                            : (line.kind == "ctx" ? Theme.text-dim
-                            : (line.kind == "add" ? #7ee787
-                            : (line.kind == "del" ? #ffa198
-                            : Theme.text))));
-                        selection-background-color: #58a6ff44;
+                        font-size: Theme.fs_sm;
+                        color: line.kind == "hunk" ? Theme.text_dim
+                            : (line.kind == "meta" ? Theme.text_dim
+                            : Theme.text);
+                        selection-background-color: Theme.accent.with-alpha(0.28);
                         vertical-alignment: center;
                     }
                 }
@@ -188,14 +240,16 @@ export component DiffView inherits Rectangle {
                     y: shown * root.line-h;
                     width: 100%;
                     height: root.trunc-h;
-                    background: Theme.card;
+                    background: Theme.surface2;
+                    Rectangle { y: 0px; width: 100%; height: 1px; background: Theme.hairline; }
                     Text {
-                        x: 8px;
+                        x: root.gutter-w + 8px;
+                        height: 100%;
                         text: "… 已截断：仅显示前 " + root.max-render-lines
                             + " 行（共 " + file.lines.length + " 行）";
-                        color: Theme.mid;
+                        color: Theme.text_dim;
                         font-family: "Consolas";
-                        font-size: 11px;
+                        font-size: Theme.fs_xs;
                         vertical-alignment: center;
                     }
                 }

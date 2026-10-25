@@ -22,6 +22,11 @@ enum Cmd {
     RefreshGithub,
     Sync,
     FetchDiff { repo: String, number: i64 },
+    FetchInbox,                 // 拉取 GitHub 通知（RefreshGithub/Sync 也会顺带触发）
+    MarkNotifRead(String),      // 标记通知线程已读，完成后重新拉取
+    MarkAllNotifsRead,          // PUT /notifications 全部已读，完成后重新拉取
+    AddNotifReview { repo: String, number: i64, title: String, url: String },  // Inbox「+ 预评审」入库
+    FetchNotifDetail { repo: String, number: i64, kind: String },  // Inbox 预览面板：拉会话/Files/Diff
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
 }
 
@@ -63,6 +68,15 @@ enum Msg {
     ClosePanel,
     // 同理：diff 以原始文本过界，DiffFile 模型在 UI 线程的 apply_msg 里构建
     DiffRaw(String),
+    // Inbox 通知行：serde_json 过界，NotifRow 模型在 UI 线程装配
+    InboxRows(Vec<serde_json::Value>),
+    // Inbox 预览面板：JSON 字符串过界，ConvoEntry/FileChange/DiffFile 在 UI 线程装配
+    //（标题/类型在点击时已由 on_inbox_activated 设置，这里只回送内容数据）
+    NotifDetail {
+        convo_json: String,
+        files_json: String,
+        diff: String,
+    },
 }
 
 struct App {
@@ -73,6 +87,9 @@ struct App {
     filter: String,                         // 当前过滤词（空 = 全量）
     selected: Option<usize>,                // rows 下标（已从视图下标换算）
     status_msg: String,                     // 状态栏临时消息（最近一条 Status）
+    inbox: Vec<serde_json::Value>,          // 最近一批通知行（inbox_activated 按下标取 thread id）
+    inbox_all: bool,                        // 通知拉取范围：true = 含已读（&all=true），false = 只看未读
+    inbox_detail: Option<(String, i64, String, String)>,  // 预览面板当前行（repo, number, kind, url）
     total: usize,                           // 全部行数（状态栏「共 N 个 PR」）
     rate_limit: Arc<Mutex<Option<u64>>>,    // GitHub X-RateLimit-Remaining 共享状态
     last_sync: sync::SharedLastSync,        // 最近同步成功时间
@@ -84,8 +101,11 @@ fn update_status_bar(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     // 状态栏三段：同步/临时消息 · API 配额 · PR 总数
     let sync_text = if !a.status_msg.is_empty() {
         a.status_msg.clone()
+    } else if a.cfg.sync_token.is_empty() {
+        // 未配置同步：明确提示本地模式，不留空白
+        "本地模式 · 未配置同步服务器".into()
     } else {
-        sync::last_sync_text(&a.last_sync).unwrap_or_default()
+        sync::last_sync_text(&a.last_sync).unwrap_or_else(|| "等待首次同步…".into())
     };
     let quota = a.rate_limit.lock().unwrap()
         .map(|n| format!("API 配额 {n}"))
@@ -138,6 +158,9 @@ fn main() -> anyhow::Result<()> {
         filter: String::new(),
         selected: None,
         status_msg: config_status(&cfg),
+        inbox: Vec::new(),
+        inbox_all: true,
+        inbox_detail: None,
         total: 0,
         rate_limit: Arc::new(Mutex::new(None)),
         last_sync: sync::shared_last_sync(),
@@ -156,6 +179,22 @@ fn main() -> anyhow::Result<()> {
         ui.set_settings_open(true); // 首启自动打开设置
     }
     ui.set_sb_sync(config_status(&cfg).into());
+    // 通知接口需要鉴权：无 token 时 Inbox 视图显示提示空态
+    ui.set_inbox_needs_token(cfg.token().is_none());
+    // 启动时把配置的主题应用到 UI
+    ui.set_dark_mode(cfg.is_dark());
+
+    // 主题切换：即时持久化到 config.toml
+    {
+        let app = app.clone();
+        ui.on_theme_toggled(move |dark| {
+            let mut a = app.lock().unwrap();
+            a.cfg.theme = if dark { "dark".into() } else { "light".into() };
+            if let Err(e) = a.cfg.save(&PathBuf::from("config.toml")) {
+                tracing::warn!("主题写入 config.toml 失败: {e}");
+            }
+        });
+    }
 
     // ── 后台工作线程（tokio runtime） ──
     {
@@ -211,6 +250,43 @@ fn main() -> anyhow::Result<()> {
         let cmd_tx = cmd_tx.clone();
         ui.on_sync_now(move || {
             let _ = cmd_tx.send(Cmd::Sync);
+        });
+    }
+    {
+        let cmd_tx = cmd_tx.clone();
+        ui.on_fetch_inbox(move || {
+            let _ = cmd_tx.send(Cmd::FetchInbox);
+        });
+    }
+    {
+        let cmd_tx = cmd_tx.clone();
+        ui.on_inbox_mark_all_read(move || {
+            let _ = cmd_tx.send(Cmd::MarkAllNotifsRead);
+        });
+    }
+    {
+        // 「只看未读」开关：状态存 App（worker 拉取时读取），切完立即重拉
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        ui.on_inbox_filter_toggled(move |unread_only| {
+            app.lock().unwrap().inbox_all = !unread_only;
+            let _ = cmd_tx.send(Cmd::FetchInbox);
+        });
+    }
+    {
+        // 「+ 预评审」：按 UI 下标取 repo/number/title 交给 worker 入库
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        ui.on_inbox_add_review(move |i| {
+            let row = app.lock().unwrap().inbox.get(i as usize).cloned();
+            if let Some(n) = row {
+                let repo = n["repo"].as_str().unwrap_or("").to_string();
+                let title = n["title"].as_str().unwrap_or("").to_string();
+                let url = n["url"].as_str().unwrap_or("").to_string();
+                if let Some(number) = notif_url_number(&url) {
+                    let _ = cmd_tx.send(Cmd::AddNotifReview { repo, number, title, url });
+                }
+            }
         });
     }
     {
@@ -315,6 +391,78 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        // Inbox 行点击 / Enter：选中 + 展开右侧预览面板（发 FetchNotifDetail），并标记已读
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        let weak = ui.as_weak();
+        ui.on_inbox_activated(move |i| {
+            let row = app.lock().unwrap().inbox.get(i as usize).cloned();
+            let Some(n) = row else { return };
+            let repo = n["repo"].as_str().unwrap_or("").to_string();
+            let kind = n["kind"].as_str().unwrap_or("").to_string();
+            let title = n["title"].as_str().unwrap_or("").to_string();
+            let url = n["url"].as_str().unwrap_or("").to_string();
+            let Some(number) = notif_url_number(&url) else { return };
+            app.lock().unwrap().inbox_detail = Some((repo.clone(), number, kind.clone(), url));
+            // 立即开面板并进加载态（数据由 worker 回送）
+            let added = kind == "PullRequest" && {
+                let a = app.lock().unwrap();
+                a.db.pr_exists(&repo, number).unwrap_or(false)
+            };
+            if let Some(ui) = weak.upgrade() {
+                ui.set_nd_title(title.into());
+                ui.set_nd_kind(kind.clone().into());
+                ui.set_nd_added(added);
+                ui.set_nd_loading(true);
+                ui.set_inbox_detail_open(true);
+            }
+            let _ = cmd_tx.send(Cmd::FetchNotifDetail { repo, number, kind });
+            if let Some(id) = n["id"].as_str().filter(|s| !s.is_empty()) {
+                let _ = cmd_tx.send(Cmd::MarkNotifRead(id.to_string()));
+            }
+        });
+    }
+    {
+        // 预览面板「在浏览器打开」/ Enter（面板已开时）
+        let app = app.clone();
+        ui.on_inbox_open_browser(move || {
+            let detail = app.lock().unwrap().inbox_detail.clone();
+            if let Some((_, _, _, url)) = detail {
+                if !url.is_empty() {
+                    if let Err(e) = open::that(&url) {
+                        send_msg(Msg::Status(format!("打开浏览器失败: {e}")));
+                    }
+                }
+            }
+        });
+    }
+    {
+        // 预览面板关闭（× 按钮 / Esc）
+        let app = app.clone();
+        let weak = ui.as_weak();
+        ui.on_inbox_close_detail(move || {
+            app.lock().unwrap().inbox_detail = None;
+            if let Some(ui) = weak.upgrade() {
+                ui.set_inbox_detail_open(false);
+            }
+        });
+    }
+    {
+        // 预览面板 Diff 标签页：整体替换模型（同主面板 on_diff_file_toggled 的注释）
+        let weak = ui.as_weak();
+        ui.on_inbox_diff_toggled(move |i| {
+            let Some(ui) = weak.upgrade() else { return };
+            let old = ui.get_nd_diff_files();
+            let mut files: Vec<DiffFile> = (0..old.row_count())
+                .filter_map(|gi| old.row_data(gi))
+                .collect();
+            if let Some(f) = files.get_mut(i as usize) {
+                f.expanded = !f.expanded;
+            }
+            ui.set_nd_diff_files(ModelRc::new(VecModel::from(files)));
+        });
+    }
+    {
         let app = app.clone();
         ui.on_key_pin(move || {
             let sel = app.lock().unwrap().selected;
@@ -359,6 +507,7 @@ fn main() -> anyhow::Result<()> {
                 github_token: Some(gh_tok.trim().to_string()).filter(|t| !t.is_empty()),
                 repos,
                 poll_interval_min: poll,
+                theme: app.lock().unwrap().cfg.theme.clone(), // 主题不在设置页，保留当前值
             };
             if let Err(e) = new_cfg.save(&PathBuf::from("config.toml")) {
                 send_msg(Msg::Status(format!("配置保存失败: {e}")));
@@ -371,6 +520,7 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(ui) = ui2.upgrade() {
                 ui.set_onboarding(new_cfg.is_unconfigured());
+                ui.set_inbox_needs_token(new_cfg.token().is_none());
                 update_status_bar(&ui, &app);
             }
             send_msg(Msg::Status("配置已保存并生效".into()));
@@ -648,6 +798,50 @@ fn build_diff_files(diff: &str) -> Vec<DiffFile> {
 
 // ── 后台 worker ──
 
+/// subject.url（API URL）→ 浏览器可打开的 HTML URL：
+/// `api.github.com/repos/` → `github.com/`，`/pulls/` → `/pull/`（issues 路径不变）。
+fn notif_html_url(api_url: &str) -> String {
+    api_url
+        .replace("api.github.com/repos/", "github.com/")
+        .replace("/pulls/", "/pull/")
+}
+
+/// 从 HTML URL 末段解析 PR/Issue 编号（…/pull/123 → 123）；非数字末段返回 None。
+fn notif_url_number(html_url: &str) -> Option<i64> {
+    html_url.rsplit('/').next()?.parse().ok()
+}
+
+/// 拉取 GitHub 通知并回送 UI（无 token 时静默跳过：通知接口必须鉴权）。
+async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
+    let (has_token, all) = {
+        let a = app.lock().unwrap();
+        (a.cfg.token().is_some(), a.inbox_all)
+    };
+    tracing::info!("fetch_inbox: has_token={} all={}", has_token, all);
+    if !has_token {
+        return;
+    }
+    match gh.fetch_notifications(all).await {
+        Ok(ns) => {
+            tracing::info!("fetch_inbox: got {} notifications", ns.len());
+            let rows: Vec<serde_json::Value> = ns
+                .into_iter()
+                .map(|n| {
+                    serde_json::json!({
+                        "id": n.id, "repo": n.repo, "title": n.title, "kind": n.kind,
+                        "reason": n.reason, "updated_at": n.updated_at, "unread": n.unread,
+                        "url": notif_html_url(&n.url),
+                    })
+                })
+                .collect();
+            let _ = msg_tx.send(Msg::InboxRows(rows));
+        }
+        Err(e) => {
+            let _ = msg_tx.send(Msg::Status(format!("通知拉取失败: {e}")));
+        }
+    }
+}
+
 async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sender<Msg>) {
     let _ = MSG_TX.set(msg_tx.clone());
 
@@ -697,11 +891,17 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                     reload_rows(&app, &msg_tx);
                     let _ = msg_tx.send(Msg::Status(format!("GitHub 刷新完成：{total} 个 open PR")));
+                    // 顺便拉一次通知
+                    fetch_inbox(gh, &app, &msg_tx).await;
                 }
             }
             Cmd::Sync => {
+                // 通知与同步服务器无关，先顺手拉一次
+                if let Some(g) = &gh {
+                    fetch_inbox(g, &app, &msg_tx).await;
+                }
                 if !sync_client.enabled() {
-                    let _ = msg_tx.send(Msg::Status("sync 未启用（sync_token 为空）".into()));
+                    // 本地模式：静默跳过，状态栏由 update_status_bar 显示「本地模式」
                     continue;
                 }
                 // 不跨 await 持有 DB 锁：HTTP 与 DB 应用分步，各自短时加锁
@@ -760,6 +960,102 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                 }
             }
+            Cmd::FetchInbox => {
+                if let Some(gh) = &gh {
+                    fetch_inbox(gh, &app, &msg_tx).await;
+                }
+            }
+            Cmd::MarkNotifRead(thread_id) => {
+                if let Some(gh) = &gh {
+                    match gh.mark_notification_read(&thread_id).await {
+                        Ok(()) => fetch_inbox(gh, &app, &msg_tx).await,
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Status(format!("标记已读失败: {e}")));
+                        }
+                    }
+                    let _ = msg_tx.send(Msg::StatusBarRefresh);
+                }
+            }
+            Cmd::FetchNotifDetail { repo, number, kind } => {
+                if let Some(gh) = &gh {
+                    // 会话对 PR/Issue 都有；Files/Diff 仅 PullRequest
+                    let convo = match gh.fetch_pr_convo(&repo, number).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Status(format!("会话拉取失败: {e}")));
+                            Vec::new()
+                        }
+                    };
+                    let (files, diff) = if kind == "PullRequest" {
+                        let files = match gh.fetch_pr_files(&repo, number).await {
+                            Ok(f) => f,
+                            Err(e) => {
+                                let _ = msg_tx.send(Msg::Status(format!("文件列表拉取失败: {e}")));
+                                Vec::new()
+                            }
+                        };
+                        let diff = match gh.fetch_diff(&repo, number).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                let _ = msg_tx.send(Msg::Status(format!("diff 拉取失败: {e}")));
+                                String::new()
+                            }
+                        };
+                        (files, diff)
+                    } else {
+                        (Vec::new(), String::new())
+                    };
+                    let _ = msg_tx.send(Msg::NotifDetail {
+                        convo_json: serde_json::to_string(&convo).unwrap_or_else(|_| "[]".into()),
+                        files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
+                        diff,
+                    });
+                    let _ = msg_tx.send(Msg::StatusBarRefresh);
+                }
+            }
+            Cmd::MarkAllNotifsRead => {                if let Some(gh) = &gh {
+                    match gh.mark_all_notifications_read().await {
+                        Ok(()) => {
+                            let _ = msg_tx.send(Msg::Status("通知已全部标记已读".into()));
+                            fetch_inbox(gh, &app, &msg_tx).await;
+                        }
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Status(format!("全部已读失败: {e}")));
+                        }
+                    }
+                    let _ = msg_tx.send(Msg::StatusBarRefresh);
+                }
+            }
+            Cmd::AddNotifReview { repo, number, title, url } => {
+                // 已存在则跳过（upsert 会把已有行的 author/head_sha 等覆盖成空）
+                let exists = {
+                    let a = app.lock().unwrap();
+                    a.db.pr_exists(&repo, number).unwrap_or(false)
+                };
+                if exists {
+                    let _ = msg_tx.send(Msg::Status(format!("{repo} #{number} 已在列表中")));
+                } else {
+                    let ok = {
+                        let a = app.lock().unwrap();
+                        a.db.upsert_pr(&serde_json::json!({
+                            "repo": repo, "number": number, "title": title,
+                            "author": "", "url": url, "head_sha": "",
+                            "status": "pending", "updated_at": db::now(),
+                        })).is_ok()
+                    };
+                    let _ = msg_tx.send(Msg::Status(if ok {
+                        format!("已加入预评审：{repo} #{number}")
+                    } else {
+                        format!("加入预评审失败：{repo} #{number}")
+                    }));
+                    if ok {
+                        reload_rows(&app, &msg_tx);
+                    }
+                }
+                // 重发当前通知行：apply_msg 重新计算「已加入」标记
+                let rows = app.lock().unwrap().inbox.clone();
+                let _ = msg_tx.send(Msg::InboxRows(rows));
+            }
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
                 let cfg = app.lock().unwrap().cfg.clone();
@@ -799,6 +1095,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                     reload_rows(&app, &msg_tx);
                     let _ = msg_tx.send(Msg::Status(format!("GitHub 刷新完成：{total} 个 open PR")));
+                    fetch_inbox(g, &app, &msg_tx).await;
                 }
             }
         }
@@ -932,9 +1229,103 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
             ui.set_d_open(true);
         }
         Msg::ClosePanel => ui.set_d_open(false),
+        Msg::InboxRows(rows_json) => {
+            // 存一份原始 JSON（inbox_activated 按下标取 thread id）
+            app.lock().unwrap().inbox = rows_json.clone();
+            // JSON → NotifRow 模型（UI 线程装配）；updated_at 换算成相对时间；
+            // PullRequest 行查库计算「已加入」标记
+            let rows: Vec<NotifRow> = {
+                let a = app.lock().unwrap();
+                rows_json
+                    .iter()
+                    .map(|n| {
+                        let url = n["url"].as_str().unwrap_or("");
+                        let number = notif_url_number(url);
+                        let added = n["kind"].as_str() == Some("PullRequest")
+                            && number.is_some()
+                            && a.db
+                                .pr_exists(n["repo"].as_str().unwrap_or(""), number.unwrap_or(0))
+                                .unwrap_or(false);
+                        NotifRow {
+                            id: n["id"].as_str().unwrap_or("").into(),
+                            repo: n["repo"].as_str().unwrap_or("").into(),
+                            title: n["title"].as_str().unwrap_or("").into(),
+                            kind: n["kind"].as_str().unwrap_or("").into(),
+                            reason: n["reason"].as_str().unwrap_or("").into(),
+                            updated: model::rel_time(n["updated_at"].as_str().unwrap_or("")).into(),
+                            unread: n["unread"].as_bool().unwrap_or(false),
+                            url: url.into(),
+                            added,
+                        }
+                    })
+                    .collect()
+            };
+            tracing::info!("InboxRows: setting {} rows to UI", rows.len());
+            ui.set_inbox_rows(ModelRc::new(VecModel::from(rows)));
+            // 预览面板开着时同步刷新「已加入」状态（+ 预评审后重发 InboxRows 会走到这里）
+            let detail_added = {
+                let a = app.lock().unwrap();
+                a.inbox_detail.as_ref().map(|(repo, number, kind, _)| {
+                    kind == "PullRequest" && a.db.pr_exists(repo, *number).unwrap_or(false)
+                })
+            };
+            if let Some(added) = detail_added {
+                ui.set_nd_added(added);
+            }
+        }
+        Msg::NotifDetail { convo_json, files_json, diff } => {
+            // JSON → Slint 模型（UI 线程装配，同 Msg::Panel 的模式）
+            let convo: Vec<ConvoEntry> = serde_json::from_str::<Vec<serde_json::Value>>(&convo_json)
+                .unwrap_or_default()
+                .iter()
+                .map(|e| ConvoEntry {
+                    kind: "comment".into(),
+                    author: e["author"].as_str().unwrap_or("").into(),
+                    time: model::rel_time(e["time"].as_str().unwrap_or("")).into(),
+                    text: e["text"].as_str().unwrap_or("").into(),
+                })
+                .collect();
+            ui.set_nd_convo(ModelRc::new(VecModel::from(convo)));
+            let files: Vec<FileChange> = serde_json::from_str::<Vec<serde_json::Value>>(&files_json)
+                .unwrap_or_default()
+                .iter()
+                .map(|f| FileChange {
+                    path: f["path"].as_str().unwrap_or("").into(),
+                    adds: f["adds"].as_i64().unwrap_or(0) as i32,
+                    dels: f["dels"].as_i64().unwrap_or(0) as i32,
+                })
+                .collect();
+            ui.set_nd_files(ModelRc::new(VecModel::from(files)));
+            ui.set_nd_diff_files(ModelRc::new(VecModel::from(build_diff_files(&diff))));
+            ui.set_nd_loading(false);
+        }
         Msg::DiffRaw(diff) => {
             // 在 UI 线程构建 Slint 模型（DiffView 依赖整体替换）
             ui.set_diff_files(ModelRc::new(VecModel::from(build_diff_files(&diff))));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notif_html_url_converts_api_url() {
+        assert_eq!(
+            notif_html_url("https://api.github.com/repos/vllm-project/vllm/pulls/123"),
+            "https://github.com/vllm-project/vllm/pull/123"
+        );
+        assert_eq!(
+            notif_html_url("https://api.github.com/repos/o/r/issues/45"),
+            "https://github.com/o/r/issues/45"
+        );
+    }
+
+    #[test]
+    fn notif_url_number_parses_trailing_segment() {
+        assert_eq!(notif_url_number("https://github.com/o/r/pull/123"), Some(123));
+        assert_eq!(notif_url_number("https://github.com/o/r/releases"), None);
+        assert_eq!(notif_url_number(""), None);
     }
 }

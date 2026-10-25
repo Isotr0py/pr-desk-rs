@@ -1,22 +1,49 @@
-// PR Desk 主题 — GitHub Dark 风格（PR Desk 基准）
-// 用法：import { Theme } from "theme.slint";
+// PR Desk 主题令牌中心（浅色 / 深色双主题）
+//
+// 用法：
+//   import { Theme } from "theme.slint";
+//   颜色一律取 Theme.xxx；切换主题由外层设置 Theme.dark = true/false。
+//   字号用 Theme.fs-*，圆角用 Theme.r-*，禁止在组件里写死色值。
 export global Theme {
-    out property <color> bg: #0d1117;
-    out property <color> card: #161b22;
-    out property <color> border: #30363d;
-    out property <color> text: #e6edf3;
-    out property <color> text_dim: #8b949e;
-    out property <color> accent: #58a6ff;
-    out property <color> good: #3fb950;
-    out property <color> mid: #d29922;
-    out property <color> bad: #f85149;
-    out property <color> purple: #bc8cff;
-    // 微交互与层次：选中蓝底 / 选中文字 / hover 微亮 / 一级分隔线
-    out property <color> sel: #1f6feb;
+    // 主题开关：false = 浅色（默认），true = 深色
+    in-out property <bool> dark: false;
+
+    // ── 颜色 ──────────────────────────────────────────────
+    // 窗口底色 / 卡片面板 / 次级底（表头等）
+    out property <color> bg: dark ? #0d1117 : #f6f8fa;
+    out property <color> card: dark ? #161b22 : #ffffff;
+    out property <color> surface2: dark ? #21262d : #eaeef2;
+    // 边框与发丝级分隔线
+    out property <color> border: dark ? #30363d : #d0d7de;
+    out property <color> hairline: dark ? #21262d : #d8dee4;
+    // 文字三级层次：正文 / 次要 / 更弱
+    out property <color> text: dark ? #e6edf3 : #1f2328;
+    out property <color> text_dim: dark ? #8b949e : #59636e;
+    out property <color> text_faint: dark ? #6e7681 : #8c959f;
+    // 强调色与状态色
+    out property <color> accent: dark ? #58a6ff : #0969da;
+    out property <color> good: dark ? #3fb950 : #1a7f37;
+    out property <color> mid: dark ? #d29922 : #9a6700;
+    out property <color> bad: dark ? #f85149 : #d1242f;
+    out property <color> purple: dark ? #bc8cff : #8250df;
+    // 选中 / 悬停
+    out property <color> sel: dark ? #1f6feb : #0969da;
     out property <color> sel_text: #ffffff;
-    out property <color> hover: #ffffff10;
-    out property <color> hairline: #21262d;
-    // 语义底色（成功/失败 15% 透明度，用于行底/徽章底）
-    out property <color> green_bg: #3fb95026;
-    out property <color> red_bg: #f8514926;
+    out property <color> hover: dark ? #ffffff10 : #00000008;
+    // 语义底色（成功 / 失败 / 警告，用于徽章、行底）
+    out property <color> green_bg: dark ? #3fb95026 : #1a7f3726;
+    out property <color> red_bg: dark ? #f8514926 : #d1242f1a;
+    out property <color> yellow_bg: dark ? #d2992226 : #9a670026;
+
+    // ── 字号 ─────────────────────────────────────────────
+    out property <length> fs_xs: 11px;
+    out property <length> fs_sm: 12px;
+    out property <length> fs_md: 13px;
+    out property <length> fs_lg: 15px;
+    out property <length> fs_xl: 18px;
+
+    // ── 圆角 ─────────────────────────────────────────────
+    out property <length> r_sm: 4px;
+    out property <length> r_md: 6px;
+    out property <length> r_lg: 10px;
 }

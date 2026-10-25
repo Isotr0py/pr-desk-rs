@@ -75,19 +75,11 @@ fn review_count(r: &serde_json::Value) -> i64 {
     0
 }
 
-/// 次级活动行（dim 文本）：「3 条评审 · 更新于 27m 前」/「更新于 27m 前」；
-/// 既无评审也无时间戳时返回 ""。
+/// 次级活动行（dim 文本）：「3 条评审」；无评审时返回 ""。
+/// 不含时间——更新时间在 Upd 列已展示，避免重复。
 pub fn activity_text(r: &serde_json::Value) -> String {
-    let updated = rel_time(r["updated_at"].as_str().unwrap_or(""));
     let reviews = review_count(r);
-    let mut parts = Vec::new();
-    if reviews > 0 {
-        parts.push(format!("{reviews} 条评审"));
-    }
-    if !updated.is_empty() {
-        parts.push(format!("更新于 {updated} 前"));
-    }
-    parts.join(" · ")
+    if reviews > 0 { format!("{reviews} 条评审") } else { String::new() }
 }
 
 /// 大小写不敏感子串匹配：title / number（query 可带 # 前缀）/ author / repo。
@@ -249,8 +241,8 @@ mod tests {
     }
 
     #[test]
-    fn activity_text_combines_reviews_and_updated() {
-        // activity_text 基于真实当前时间，测试数据也用 Local::now() 构造
+    fn activity_text_shows_review_count_only() {
+        // 时间不显示（Upd 列已有），只保留评审数
         let recent = (Local::now().naive_local() - Duration::minutes(27))
             .format("%Y-%m-%dT%H:%M:%S")
             .to_string();
@@ -260,16 +252,12 @@ mod tests {
                 "reviews": [{"author": "a"}, {"author": "b"}, {"author": "c"}]
             })).unwrap(),
         });
-        assert_eq!(activity_text(&r), "3 条评审 · 更新于 27m 前");
-        // reviews 数字字段形态
+        assert_eq!(activity_text(&r), "3 条评审");
         let r2 = serde_json::json!({"updated_at": recent, "reviews": 2});
-        assert_eq!(activity_text(&r2), "2 条评审 · 更新于 27m 前");
-        // 只有更新时间
+        assert_eq!(activity_text(&r2), "2 条评审");
+        // 只有时间 → 空
         let r3 = serde_json::json!({"updated_at": recent});
-        assert_eq!(activity_text(&r3), "更新于 27m 前");
-        // 只有评审数
-        let r4 = serde_json::json!({"reviews": 1});
-        assert_eq!(activity_text(&r4), "1 条评审");
+        assert_eq!(activity_text(&r3), "");
         // 都没有
         assert_eq!(activity_text(&serde_json::json!({})), "");
     }
