@@ -4,15 +4,64 @@
 //! 拆分为纯 HTTP（pull_body/push_body）与纯 DB（apply_pull/apply_push_result）两层，
 //! 调用方（worker）在两次锁之间不跨 await 持有 DB 锁。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use chrono::{Local, NaiveDateTime};
+use hmac::{Hmac, Mac};
 use rusqlite::params;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::config::Config;
 use crate::db::Db;
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// 请求路径前缀（不含 host 与 query），签名输入串使用它。
+const API_PATH: &str = "/api/v1/plugins/extensions/astrbot_plugin_github_pr_review";
+
+/// 纯签名函数：HMAC_SHA256(key=token, msg="{ts}\n{nonce}\n{METHOD}\n{path}\n{sha256_hex(body)}")，
+/// 输出小写 hex。参数化 timestamp/nonce 便于测试。
+pub fn sign_request(
+    token: &str,
+    method: &str,
+    path: &str,
+    body: &[u8],
+    timestamp: &str,
+    nonce: &str,
+) -> String {
+    let body_hash = hex::encode(Sha256::digest(body));
+    let msg = format!("{timestamp}\n{nonce}\n{method}\n{path}\n{body_hash}");
+    let mut mac = HmacSha256::new_from_slice(token.as_bytes()).expect("HMAC 接受任意长度 key");
+    mac.update(msg.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// 当前 unix 秒时间戳字符串。
+pub fn current_timestamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .to_string()
+}
+
+/// 随机 nonce：16 位小写 hex。由 nanos 时间戳 + pid + 原子计数器拼 sha256 取前 8 字节，
+/// 计数器保证同一秒（乃至同一纳秒）内多次调用不重复。
+pub fn gen_nonce() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let material = format!("{}:{}:{}", nanos, std::process::id(), seq);
+    let digest = Sha256::digest(material.as_bytes());
+    hex::encode(&digest[..8])
+}
 
 /// 最近一次同步成功时间的共享状态（worker 写入，UI 状态栏读取）。
 pub type SharedLastSync = Arc<Mutex<Option<NaiveDateTime>>>;
@@ -54,10 +103,7 @@ impl SyncClient {
     pub fn new(cfg: &Config) -> Self {
         Self {
             client: reqwest::Client::new(),
-            base: format!(
-                "{}/api/v1/plugins/extensions/astrbot_plugin_github_pr_review",
-                cfg.server_url.trim_end_matches('/')
-            ),
+            base: format!("{}{}", cfg.server_url.trim_end_matches('/'), API_PATH),
             token: cfg.sync_token.clone(),
         }
     }
@@ -66,37 +112,54 @@ impl SyncClient {
         !self.token.is_empty()
     }
 
+    /// 生成三个签名头（timestamp / nonce / signature），token 不出现在请求里。
+    fn sign_headers(&self, method: &str, path: &str, body: &[u8]) -> [(String, String); 3] {
+        let ts = current_timestamp();
+        let nonce = gen_nonce();
+        let sig = sign_request(&self.token, method, path, body, &ts, &nonce);
+        [
+            ("X-Sync-Timestamp".to_string(), ts),
+            ("X-Sync-Nonce".to_string(), nonce),
+            ("X-Sync-Signature".to_string(), sig),
+        ]
+    }
+
     /// GET sync_pull（since 为 None = 全量）。
     pub async fn pull_body(&self, since: Option<String>) -> Result<Value> {
+        let path = format!("{API_PATH}/sync_pull");
         let mut url = format!("{}/sync_pull", self.base);
         if let Some(s) = &since {
             url = format!("{url}?since={s}");
         }
-        let resp = self
-            .client
-            .get(&url)
-            .header("X-Sync-Token", &self.token)
-            .send()
-            .await?;
+        let mut req = self.client.get(&url);
+        for (k, v) in self.sign_headers("GET", &path, b"") {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
         check_status(&resp)?;
         Ok(resp.json().await?)
     }
 
-    /// POST sync_push。
+    /// POST sync_push。先序列化为字节，对这份字节签名后原样发送，
+    /// 保证签名覆盖线上真实字节（不让 reqwest 再序列化一次）。
     pub async fn push_body(&self, prs_updates: Vec<Value>, reviews_new: Vec<Value>) -> Result<Value> {
+        let path = format!("{API_PATH}/sync_push");
         let body = serde_json::json!({
             "prs_updates": prs_updates,
             "todos_updates": [],
             "todos_new": [],
             "reviews_new": reviews_new,
         });
-        let resp = self
+        let body_bytes = serde_json::to_vec(&body)?;
+        let mut req = self
             .client
             .post(format!("{}/sync_push", self.base))
-            .header("X-Sync-Token", &self.token)
-            .json(&body)
-            .send()
-            .await?;
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body_bytes.clone());
+        for (k, v) in self.sign_headers("POST", &path, &body_bytes) {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await?;
         check_status(&resp)?;
         Ok(resp.json().await?)
     }
@@ -212,6 +275,46 @@ mod tests {
         .unwrap();
         db.local_pr_update("o/r", 1, "priority", &serde_json::json!(1))
             .unwrap();
+    }
+
+    #[test]
+    fn sign_request_push_vector() {
+        let sig = sign_request(
+            "test-secret-123",
+            "POST",
+            "/api/v1/plugins/extensions/astrbot_plugin_github_pr_review/sync_push",
+            br#"{"prs_updates":[],"todos_updates":[],"todos_new":[],"reviews_new":[]}"#,
+            "1730000000",
+            "abc123def456",
+        );
+        assert_eq!(
+            sig,
+            "9bd9394f72f951b84b5f15d41cd00e3437a6e4a6fa9a60b7f05c7efd04428528"
+        );
+    }
+
+    #[test]
+    fn sign_request_pull_vector() {
+        let sig = sign_request(
+            "test-secret-123",
+            "GET",
+            "/api/v1/plugins/extensions/astrbot_plugin_github_pr_review/sync_pull",
+            b"",
+            "1730000000",
+            "abc123def456",
+        );
+        assert_eq!(
+            sig,
+            "5beab6cd98aa8199908b9834ee3b3346727495de0bc3afbb45333ea9e1b182f5"
+        );
+    }
+
+    #[test]
+    fn nonce_unique() {
+        let nonces: std::collections::HashSet<String> = (0..1000).map(|_| gen_nonce()).collect();
+        assert_eq!(nonces.len(), 1000);
+        assert!(nonces.iter().all(|n| n.len() == 16
+            && n.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())));
     }
 
     #[test]
