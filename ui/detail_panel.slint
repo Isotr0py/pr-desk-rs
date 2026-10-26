@@ -7,7 +7,7 @@
 // 设计契约：全部颜色/字号/圆角取自 theme.slint 的 Theme 令牌（浅色/深色双主题）。
 import { ScrollView, ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
-import { Avatar } from "components.slint";
+import { Avatar, MarkdownBlocks, MdBlock } from "components.slint";
 import { DiffView, DiffFile } from "diff_view.slint";
 
 // 会话时间线条目：kind = "commit" / "review" / "comment"
@@ -15,7 +15,8 @@ export struct ConvoEntry {
     kind: string,
     author: string,
     time: string,   // 相对时间，如 "2h"
-    text: string,   // 内容摘要
+    text: string,   // 内容摘要（blocks 为空时的回退显示）
+    blocks: [MdBlock],  // Rust 端解析出的 Markdown 块；空数组 → 回退渲染 text
 }
 
 // CI 检查项：conclusion = "success" / "failure" / "pending" / 其他（灰显原文）
@@ -870,11 +871,15 @@ export component DetailPanel inherits Rectangle {
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                 }
-                                Text {
+                                // 正文：有解析块 → Markdown 渲染；否则回退纯文本（换行）
+                                if e.blocks.length == 0: Text {
                                     text: e.text;
                                     font-size: Theme.fs_md;
                                     color: Theme.text_dim;
                                     wrap: word-wrap;
+                                }
+                                if e.blocks.length > 0: MarkdownBlocks {
+                                    blocks: e.blocks;
                                 }
                             }
                         }

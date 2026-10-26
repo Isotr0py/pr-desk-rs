@@ -23,6 +23,7 @@ anyhow = "1"
 open = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
 
 [build-dependencies]
 slint-build = { version = "1", optional = true }

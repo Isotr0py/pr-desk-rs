@@ -250,6 +250,203 @@ export component PillTab inherits Rectangle {
     }
 }
 
+// Markdown 结构化块：Rust 端把评论正文解析成块数组，MarkdownBlocks 逐块渲染。
+// kind 取值："h1".."h6" | "p" | "code" | "bullet" | "num" | "table" | "quote" | "hr"
+export struct MdBlock {
+    kind: string,
+    text: string,      // 段落/代码/列表项/引用 的文字
+    lang: string,      // code 的语言标注
+    depth: int,        // 列表嵌套层级（0 起）
+    cols: int,         // table 列数
+    cells: [string],   // table：先 cols 个表头，再逐行扁平化
+}
+
+// Markdown 块流式渲染：VerticalLayout 逐块排布（块间 8px），宽度铺满父级、高度取内容。
+// 供放进现有 Flickable/ScrollView/ListView 代理内使用，自身不产生纵向滚动。
+export component MarkdownBlocks inherits VerticalLayout {
+    in property <[MdBlock]> blocks;
+
+    spacing: 8px;
+    alignment: start;
+
+    for b in root.blocks: VerticalLayout {
+        alignment: start;
+
+        // h1/h2：15/14px 加粗 + 底部 hairline
+        if b.kind == "h1" || b.kind == "h2": VerticalLayout {
+            spacing: 4px;
+            alignment: start;
+            Text {
+                text: b.text;
+                font-size: b.kind == "h1" ? 15px : 14px;
+                font-weight: 700;
+                color: Theme.text;
+                wrap: word-wrap;
+            }
+            Rectangle {
+                height: 1px;
+                background: Theme.hairline;
+            }
+        }
+
+        // h3-h6：13px 加粗
+        if b.kind == "h3" || b.kind == "h4" || b.kind == "h5" || b.kind == "h6": Text {
+            text: b.text;
+            font-size: 13px;
+            font-weight: 700;
+            color: Theme.text;
+            wrap: word-wrap;
+        }
+
+        // 段落：13px，必须换行（此前裸文本不换行被裁的 bug 由此修复）
+        if b.kind == "p": Text {
+            text: b.text;
+            font-size: 13px;
+            color: Theme.text;
+            wrap: word-wrap;
+        }
+
+        // 代码块：surface2 底 + 圆角 + 内边距，等宽 12px，不换行、横向可滚动
+        if b.kind == "code": Rectangle {
+            border-radius: Theme.r_md;
+            background: Theme.surface2;
+            clip: true;
+            height: code_txt.preferred-height + 16px;
+
+            Flickable {
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
+                height: parent.height - 16px;
+                content-width: max(code_txt.preferred-width, self.width);
+                content-height: code_txt.preferred-height;
+
+                code_txt := Text {
+                    text: b.text;
+                    font-family: "Consolas";
+                    font-size: 12px;
+                    color: Theme.text;
+                }
+            }
+
+            // 语言标注（右上角 dim 小字）
+            if b.lang != "": Text {
+                x: parent.width - self.preferred-width - 10px;
+                y: 5px;
+                text: b.lang;
+                font-size: Theme.fs_xs;
+                color: Theme.text_faint;
+            }
+        }
+
+        // 无序/有序列表项：按 depth 每级缩进 16px；bullet 前缀 "•"，num 编号已含在 text 里
+        if b.kind == "bullet" || b.kind == "num": Rectangle {
+            height: item_row.preferred-height;
+            item_row := HorizontalLayout {
+                padding-left: b.depth * 16px;
+                spacing: 6px;
+                alignment: start;
+                Text {
+                    text: b.kind == "bullet" ? "•" : "";
+                    width: b.kind == "bullet" ? self.preferred-width : 0px;
+                    font-size: 13px;
+                    color: Theme.text_dim;
+                }
+                Text {
+                    text: b.text;
+                    font-size: 13px;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        // 表格：cells 先 cols 个表头再逐行扁平化；等宽单元格 + hairline 分隔，表头 surface2 底加粗
+        if b.kind == "table" && b.cols > 0: Rectangle {
+            property <int> tcols: max(1, b.cols);
+            property <int> trows: b.cells.length / tcols;
+
+            border-radius: Theme.r_md;
+            border-width: 1px;
+            border-color: Theme.hairline;
+            background: Theme.card;
+            clip: true;
+            height: tbl.preferred-height;
+
+            tbl := VerticalLayout {
+                alignment: start;
+                for r in trows: Rectangle {
+                    height: trow.preferred-height;
+                    background: r == 0 ? Theme.surface2 : transparent;
+
+                    trow := HorizontalLayout {
+                        for c in tcols: Rectangle {
+                            horizontal-stretch: 1;
+                            clip: true;
+                            VerticalLayout {
+                                padding: 6px;
+                                Text {
+                                    text: b.cells[r * tcols + c];
+                                    font-size: 12px;
+                                    font-weight: r == 0 ? 600 : 400;
+                                    color: Theme.text;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            // 单元格右缘分隔线（末列不画）
+                            if c < tcols - 1: Rectangle {
+                                x: parent.width - 1px;
+                                y: 0;
+                                width: 1px;
+                                height: 100%;
+                                background: Theme.hairline;
+                            }
+                        }
+                    }
+
+                    // 行间分隔线（末行不画）
+                    if r < trows - 1: Rectangle {
+                        x: 0;
+                        y: parent.height - 1px;
+                        width: 100%;
+                        height: 1px;
+                        background: Theme.hairline;
+                    }
+                }
+            }
+        }
+
+        // 引用：左缘 3px accent 竖条 + 缩进，文字弱化
+        if b.kind == "quote": Rectangle {
+            height: quote_txt.preferred-height;
+            Rectangle {
+                x: 0;
+                y: 0;
+                width: 3px;
+                height: 100%;
+                border-radius: 1.5px;
+                background: Theme.accent;
+            }
+            quote_txt := Text {
+                x: 12px;
+                y: 0;
+                width: parent.width - 12px;
+                text: b.text;
+                font-size: 13px;
+                color: Theme.text_faint;
+                wrap: word-wrap;
+            }
+        }
+
+        // 水平分割线
+        if b.kind == "hr": Rectangle {
+            height: 1px;
+            background: Theme.hairline;
+        }
+    }
+}
+
 // 空状态：居中图标字符 + 主文案 + 副提示（占满父级区域）
 export component EmptyState inherits Rectangle {
     in property <string> icon;

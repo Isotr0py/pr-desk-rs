@@ -3,7 +3,7 @@
 // 顶部工具栏：全部已读 / 只看未读开关。键盘：j/k/↑↓ 移动，Enter 打开浏览器，Esc 取消选中。
 // 样式全部走 Theme 令牌；空态用 components.slint 的 EmptyState。
 import { Theme } from "theme.slint";
-import { EmptyState, Avatar } from "components.slint";
+import { EmptyState, Avatar, MarkdownBlocks } from "components.slint";
 import { ScrollView, ListView } from "std-widgets.slint";
 import { ConvoEntry, FileChange } from "detail_panel.slint";
 import { DiffView, DiffFile } from "diff_view.slint";
@@ -790,11 +790,15 @@ export component NotifPreview inherits Rectangle {
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                 }
-                                Text {
+                                // 正文：有解析块 → Markdown 渲染；否则回退纯文本（换行）
+                                if e.blocks.length == 0: Text {
                                     text: e.text;
                                     font-size: Theme.fs_md;
                                     color: Theme.text_dim;
                                     wrap: word-wrap;
+                                }
+                                if e.blocks.length > 0: MarkdownBlocks {
+                                    blocks: e.blocks;
                                 }
                             }
                         }

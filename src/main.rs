@@ -949,6 +949,24 @@ fn files_json_from_diff(diff: &str) -> String {
     serde_json::to_string(&files).unwrap_or_else(|_| "[]".into())
 }
 
+/// 评论正文 Markdown → MdBlock 模型（会话 tab 按块渲染；text 字段仍保留原文兼容）。
+fn md_blocks(md: &str) -> ModelRc<MdBlock> {
+    let blocks: Vec<MdBlock> = pr_desk_rs::markdown::parse_markdown(md)
+        .into_iter()
+        .map(|b| MdBlock {
+            kind: b.kind.into(),
+            text: b.text.into(),
+            lang: b.lang.into(),
+            depth: b.depth,
+            cols: b.cols,
+            cells: ModelRc::new(VecModel::from(
+                b.cells.into_iter().map(slint::SharedString::from).collect::<Vec<_>>(),
+            )),
+        })
+        .collect();
+    ModelRc::new(VecModel::from(blocks))
+}
+
 /// diff 文本 → DiffFile 模型（前 3 个文件展开）。
 /// 在 UI 线程调用（Slint 模型不跨线程）；DiffView 依赖模型整体替换。
 fn build_diff_files(diff: &str) -> Vec<DiffFile> {
@@ -1495,6 +1513,7 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
                     author: e["author"].as_str().unwrap_or("").into(),
                     time: model::rel_time(e["time"].as_str().unwrap_or("")).into(),
                     text: e["text"].as_str().unwrap_or("").into(),
+                    blocks: md_blocks(e["text"].as_str().unwrap_or("")),
                 })
                 .collect();
             ui.set_d_convo(ModelRc::new(VecModel::from(convo)));
@@ -1603,6 +1622,7 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
                     author: e["author"].as_str().unwrap_or("").into(),
                     time: model::rel_time(e["time"].as_str().unwrap_or("")).into(),
                     text: e["text"].as_str().unwrap_or("").into(),
+                    blocks: md_blocks(e["text"].as_str().unwrap_or("")),
                 })
                 .collect();
             ui.set_nd_convo(ModelRc::new(VecModel::from(convo)));

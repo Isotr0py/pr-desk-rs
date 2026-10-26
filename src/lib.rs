@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod diffview;
 pub mod github;
+pub mod markdown;
 pub mod ocr;
 pub mod reviewer;
 pub mod sync;
