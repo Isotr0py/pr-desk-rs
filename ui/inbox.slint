@@ -21,26 +21,31 @@ export struct NotifRow {
     added: bool,        // PR 已在本地库（「+ 预评审」→「已加入」反馈）
 }
 
-// ── kind 徽章：surface2 底胶囊（与 TagChip 同风格）──
+// ── kind 徽章：固定宽度 + 按类型着色（PullRequest 蓝 / Issue 紫 / 其他黄）──
 component KindBadge inherits Rectangle {
     in property <string> label;
 
-    height: 16px;
-    width: layout.preferred-width;
-    border-radius: 8px;
-    border-width: 1px;
-    border-color: Theme.hairline;
-    background: Theme.surface2;
+    property <color> tone: root.label == "PullRequest" ? Theme.accent
+        : root.label == "Issue" ? Theme.purple
+        : root.label == "Release" ? Theme.good
+        : Theme.mid;
 
-    layout := HorizontalLayout {
-        padding-left: 6px;
-        padding-right: 6px;
-        Text {
-            text: root.label;
-            font-size: Theme.fs_xs;
-            color: Theme.text_dim;
-            vertical-alignment: center;
-        }
+    width: 82px;   // 固定宽度，保证 PullRequest/Issue 等徽章对齐
+    height: 18px;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: root.tone.with-alpha(0.35);
+    background: root.tone.with-alpha(0.14);
+
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.label;
+        font-size: Theme.fs_xs;
+        font-weight: 500;
+        color: root.tone;
+        horizontal-alignment: center;
+        vertical-alignment: center;
     }
 }
 
@@ -71,6 +76,98 @@ component ToolButton inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.clicked(); }
+    }
+}
+
+// ── 表头列宽拖拽手柄：8px 宽热区，拖动列分界线调整该列（Title 弹性吸收）──
+// dragged 回调收到的是鼠标在表头坐标系下的绝对 x——用手柄自身 x + 相对位移算出。
+component InboxColHandle inherits Rectangle {
+    callback dragged(length);
+
+    // 拖拽期间「左列 + 右列」宽度之和不变，每次事件先暂存再分配
+    in-out property <length> pair-total;
+
+    width: 8px;
+
+    // 常显细分隔线（居中 1px），hover/拖拽时整根手柄显示 accent 色条
+    Rectangle {
+        x: (parent.width - 1px) / 2;
+        width: 1px;
+        height: 12px;
+        y: (parent.height - self.height) / 2;
+        background: ta.has-hover || ta.pressed ? Theme.accent : Theme.text_faint;
+    }
+    background: ta.pressed ? Theme.accent.with-alpha(0.25) : transparent;
+
+    ta := TouchArea {
+        mouse-cursor: col-resize;
+        moved => {
+            if (self.pressed) {
+                root.dragged(root.x + self.mouse-x);
+            }
+        }
+    }
+}
+
+// ── 表头行：列标签 + 拖拽手柄，底部 hairline ──
+// 与 NotifRowItem 共用同一套列坐标公式（InboxCols），保证任何宽度下逐像素对齐。
+component InboxHeader inherits Rectangle {
+    height: 26px;
+
+    // 列 x 坐标（与 NotifRowItem 相同）
+    property <length> x-dot: InboxCols.pad-l;
+    property <length> x-repo: x-dot + InboxCols.dot + 8px;
+    property <length> x-title: x-repo + InboxCols.repo + 8px;
+    property <length> x-kind: root.width - InboxCols.pad-r - InboxCols.time - 8px - InboxCols.reason - 8px - InboxCols.kind;
+    property <length> x-reason: x-kind + InboxCols.kind + 8px;
+    property <length> x-time: x-reason + InboxCols.reason + 8px;
+
+    Text { x: root.x-repo; height: 100%; text: "Repo"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
+    Text { x: root.x-title; height: 100%; text: "Title"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
+    Text { x: root.x-kind; width: InboxCols.kind; height: 100%; text: "Type"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-reason; width: InboxCols.reason; height: 100%; text: "Reason"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
+    Text { x: root.x-time; width: InboxCols.time; height: 100%; text: "Time"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: right; vertical-alignment: center; }
+
+    // 列宽拖拽手柄（Title 弹性吸收）
+    // Repo | Title：Repo 变宽，Title 吸收
+    InboxColHandle {
+        x: root.x-title - 7px;
+        height: parent.height;
+        dragged(hx) => { InboxCols.repo = min(400px, max(80px, hx - 3px - root.x-repo)); }
+    }
+    // Title | Kind：Kind 变宽，Title 吸收
+    InboxColHandle {
+        x: root.x-kind - 7px;
+        height: parent.height;
+        dragged(hx) => { InboxCols.kind = min(160px, max(60px, InboxCols.kind + root.x-kind - 3px - hx)); }
+    }
+    // Kind | Reason
+    InboxColHandle {
+        x: root.x-reason - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = InboxCols.kind + InboxCols.reason;
+            InboxCols.kind = min(self.pair-total - 60px, max(60px, hx - 3px - root.x-kind));
+            InboxCols.reason = self.pair-total - InboxCols.kind;
+        }
+    }
+    // Reason | Time
+    InboxColHandle {
+        x: root.x-time - 7px;
+        height: parent.height;
+        dragged(hx) => {
+            self.pair-total = InboxCols.reason + InboxCols.time;
+            InboxCols.reason = min(self.pair-total - 32px, max(60px, hx - 3px - root.x-reason));
+            InboxCols.time = self.pair-total - InboxCols.reason;
+        }
+    }
+
+    Rectangle {
+        x: 0;
+        y: parent.height - 1px;
+        width: parent.width;
+        height: 1px;
+        background: Theme.hairline;
     }
 }
 
@@ -114,7 +211,20 @@ component TogglePill inherits Rectangle {
     }
 }
 
+// Inbox 列宽契约（表头与数据行共用）。in-out：表头拖拽手柄可改列宽。
+//   dot 8px / repo 180px / title 弹性 / kind 82px / reason 110px / time 40px
+global InboxCols {
+    in-out property <length> dot: 8px;
+    in-out property <length> repo: 180px;
+    in-out property <length> kind: 82px;
+    in-out property <length> reason: 110px;
+    in-out property <length> time: 40px;
+    out property <length> pad-l: 10px;
+    out property <length> pad-r: 10px;
+}
+
 // ── 单行通知（28px）：选中 sel 底 + 左侧 accent 竖条；hover 用 Theme.hover；行底 hairline ──
+// 列坐标与 InboxHeader 共用同一套公式（绝对定位），保证任何宽度下逐像素对齐。
 component NotifRowItem inherits Rectangle {
     in property <NotifRow> notif;
     in property <bool> selected: false;
@@ -124,6 +234,14 @@ component NotifRowItem inherits Rectangle {
 
     property <color> fg: root.selected ? Theme.sel_text : Theme.text;
     property <color> fg-dim: root.selected ? Theme.sel_text.with-alpha(0.75) : Theme.text_dim;
+
+    // 列 x 坐标（与 InboxHeader 共用同一套公式）
+    property <length> x-dot: InboxCols.pad-l;
+    property <length> x-repo: x-dot + InboxCols.dot + 8px;
+    property <length> x-title: x-repo + InboxCols.repo + 8px;
+    property <length> x-kind: root.width - InboxCols.pad-r - InboxCols.time - 8px - InboxCols.reason - 8px - InboxCols.kind;
+    property <length> x-reason: x-kind + InboxCols.kind + 8px;
+    property <length> x-time: x-reason + InboxCols.reason + 8px;
 
     height: 28px;
     background: root.selected ? Theme.sel
@@ -146,67 +264,77 @@ component NotifRowItem inherits Rectangle {
         visible: root.selected;
     }
 
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-        spacing: 8px;
+    // 未读蓝点（已读时占位保持对齐）
+    Rectangle {
+        x: root.x-dot;
+        width: InboxCols.dot;
+        height: 8px;
+        y: (parent.height - self.height) / 2;
+        border-radius: 4px;
+        background: root.notif.unread ? Theme.accent : transparent;
+    }
 
-        // 未读蓝点（已读时占位保持对齐）
-        Rectangle {
-            width: 8px;
-            height: 8px;
-            y: (parent.height - self.height) / 2;
-            border-radius: 4px;
-            background: root.notif.unread ? Theme.accent : transparent;
-        }
+    Text {
+        x: root.x-repo;
+        width: InboxCols.repo;
+        height: parent.height;
+        text: root.notif.repo;
+        color: root.fg-dim;
+        font-size: Theme.fs_xs;
+        overflow: elide;
+        vertical-alignment: center;
+    }
 
-        Text {
-            text: root.notif.repo;
-            width: 180px;
-            color: root.fg-dim;
-            font-size: Theme.fs_xs;
-            overflow: elide;
-            vertical-alignment: center;
-        }
+    Text {
+        x: root.x-title;
+        width: root.x-kind - 8px - root.x-title;
+        height: parent.height;
+        text: root.notif.title;
+        color: root.fg;
+        font-size: Theme.fs_sm;
+        font-weight: root.notif.unread ? 700 : 400;
+        overflow: elide;
+        vertical-alignment: center;
+    }
 
-        Text {
-            text: root.notif.title;
-            horizontal-stretch: 1;
-            color: root.fg;
-            font-size: Theme.fs_sm;
-            font-weight: root.notif.unread ? 700 : 400;
-            overflow: elide;
-            vertical-alignment: center;
-        }
+    if root.notif.kind != "": KindBadge {
+        x: root.x-kind;
+        y: (parent.height - self.height) / 2;
+        label: root.notif.kind;
+    }
 
-        if root.notif.kind != "": KindBadge {
-            label: root.notif.kind;
-            y: (parent.height - self.height) / 2;
-        }
+    Text {
+        x: root.x-reason;
+        width: InboxCols.reason;
+        height: parent.height;
+        text: root.notif.reason;
+        color: root.fg-dim;
+        font-size: Theme.fs_xs;
+        overflow: elide;
+        vertical-alignment: center;
+    }
 
-        Text {
-            text: root.notif.reason;
-            color: root.fg-dim;
-            font-size: Theme.fs_xs;
-            vertical-alignment: center;
-        }
+    // 已加入本地库的持久反馈（dim 小字，叠在 reason 列右侧）
+    if root.notif.added: Text {
+        x: root.x-reason;
+        width: InboxCols.reason;
+        height: parent.height;
+        text: "已加入";
+        color: root.fg-dim;
+        font-size: Theme.fs_xs;
+        horizontal-alignment: right;
+        vertical-alignment: center;
+    }
 
-        // 已加入本地库的持久反馈（dim 小字，不遮挡时间列）
-        if root.notif.added: Text {
-            text: "已加入";
-            color: root.fg-dim;
-            font-size: Theme.fs_xs;
-            vertical-alignment: center;
-        }
-
-        Text {
-            text: root.notif.updated;
-            width: 40px;
-            color: root.fg-dim;
-            font-size: Theme.fs_xs;
-            horizontal-alignment: right;
-            vertical-alignment: center;
-        }
+    Text {
+        x: root.x-time;
+        width: InboxCols.time;
+        height: parent.height;
+        text: root.notif.updated;
+        color: root.fg-dim;
+        font-size: Theme.fs_xs;
+        horizontal-alignment: right;
+        vertical-alignment: center;
     }
 
     // hover 快捷操作：+ 预评审（仅 PullRequest 且未加入时）。
@@ -367,6 +495,8 @@ export component InboxView inherits FocusScope {
                 title: "没有通知";
                 hint: "GitHub 通知为空。点顶栏刷新按钮重新拉取。";
             }
+
+            if !root.needs_token && root.rows.length > 0: InboxHeader {}
 
             if !root.needs_token && root.rows.length > 0: Flickable {
                 vertical-stretch: 1;
