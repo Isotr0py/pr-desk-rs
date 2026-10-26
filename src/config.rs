@@ -24,6 +24,8 @@ theme = "light"
 llm_base_url = "https://api.openai.com/v1"
 llm_api_key = ""
 llm_model = ""
+# open-code-review CLI 路径（行级评论评审引擎；默认 "ocr" 从 PATH 查找）
+ocr_path = "ocr"
 "#;
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,8 @@ pub struct Config {
     pub llm_api_key: Option<String>,
     /// LLM 模型名（空 = 未配置，预评审不可用）
     pub llm_model: String,
+    /// ocr CLI 路径（默认 "ocr" 从 PATH 查找）
+    pub ocr_path: String,
 }
 
 impl Default for Config {
@@ -54,6 +58,7 @@ impl Default for Config {
             llm_base_url: "https://api.openai.com/v1".into(),
             llm_api_key: None,
             llm_model: String::new(),
+            ocr_path: "ocr".into(),
         }
     }
 }
@@ -146,6 +151,11 @@ impl Config {
                 cfg.llm_api_key = Some(unquote(v)).filter(|t| !t.is_empty());
             } else if let Some(v) = parse_value(line, "llm_model") {
                 cfg.llm_model = unquote(v);
+            } else if let Some(v) = parse_value(line, "ocr_path") {
+                let v = unquote(v);
+                if !v.is_empty() {
+                    cfg.ocr_path = v;
+                }
             }
         }
         Ok(cfg)
@@ -157,7 +167,7 @@ impl Config {
             "[{}]",
             self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
         );
-        let kv: [(&str, String); 9] = [
+        let kv: [(&str, String); 10] = [
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
             ("github_token", quote(self.github_token.as_deref().unwrap_or(""))),
@@ -167,13 +177,14 @@ impl Config {
             ("llm_base_url", quote(&self.llm_base_url)),
             ("llm_api_key", quote(self.llm_api_key.as_deref().unwrap_or(""))),
             ("llm_model", quote(&self.llm_model)),
+            ("ocr_path", quote(&self.ocr_path)),
         ];
 
         let mut lines: Vec<String> = match fs::read_to_string(path) {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
             Err(_) => TEMPLATE.lines().map(|l| l.to_string()).collect(),
         };
-        let mut seen = [false; 9];
+        let mut seen = [false; 10];
         for (i, line) in lines.iter_mut().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -221,6 +232,7 @@ mod tests {
         assert_eq!(cfg2.llm_base_url, "https://api.openai.com/v1");
         assert_eq!(cfg2.llm_api_key, None);
         assert_eq!(cfg2.llm_model, "");
+        assert_eq!(cfg2.ocr_path, "ocr");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -240,6 +252,7 @@ mod tests {
             llm_base_url: "http://nas:11434/v1".into(),
             llm_api_key: Some("sk-test".into()),
             llm_model: "qwen3-coder".into(),
+            ocr_path: "D:/tools/ocr.exe".into(),
         };
         cfg.save(&path).unwrap();
 
@@ -255,6 +268,7 @@ mod tests {
         assert_eq!(loaded.llm_base_url, "http://nas:11434/v1");
         assert_eq!(loaded.llm_api_key.as_deref(), Some("sk-test"));
         assert_eq!(loaded.llm_model, "qwen3-coder");
+        assert_eq!(loaded.ocr_path, "D:/tools/ocr.exe");
         assert!(loaded.is_dark());
         assert!(!loaded.is_unconfigured());
         let _ = std::fs::remove_dir_all(&dir);

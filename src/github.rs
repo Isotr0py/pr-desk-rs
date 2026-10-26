@@ -115,6 +115,50 @@ impl GitHub {
         Ok(resp.text().await?)
     }
 
+    /// 拉取单个文件在指定 ref（sha/分支）下的原始内容
+    /// （GET /repos/{repo}/contents/{path}?ref={git_ref}，Accept: raw）。
+    /// 404 / 超过 1MB / 前 8000 字节含 NUL（二进制）→ Ok(None)，调用方跳过。
+    pub async fn fetch_file_content(
+        &self,
+        repo: &str,
+        path: &str,
+        git_ref: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut url = reqwest::Url::parse(&format!("{API}/repos/{repo}/contents/"))?;
+        for seg in path.split('/') {
+            url.path_segments_mut()
+                .map_err(|_| anyhow::anyhow!("URL 拼接失败"))?
+                .push(seg);
+        }
+        url.query_pairs_mut().append_pair("ref", git_ref);
+        let resp = self
+            .client
+            .get(url)
+            .header("Accept", "application/vnd.github.raw")
+            .send()
+            .await?;
+        self.record_rate_limit(resp.headers());
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("GitHub contents {}:{} @{}: {}", repo, path, git_ref, resp.status());
+        }
+        // 超过 1MB 直接跳过（content-length 先知，兜底再按实际体判断）
+        if resp.content_length().is_some_and(|n| n > 1024 * 1024) {
+            return Ok(None);
+        }
+        let bytes = resp.bytes().await?;
+        if bytes.len() > 1024 * 1024 {
+            return Ok(None);
+        }
+        let head = &bytes[..bytes.len().min(8000)];
+        if head.contains(&0) {
+            return Ok(None);
+        }
+        Ok(Some(bytes.to_vec()))
+    }
+
     /// 拉取单个 PR 的元信息（GET /repos/{repo}/pulls/{number}，返回原始 JSON）。
     pub async fn fetch_pr_meta(&self, repo: &str, number: i64) -> Result<Value> {
         let url = format!("{API}/repos/{repo}/pulls/{number}");

@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     dimensions TEXT, summary TEXT, flagged_files TEXT, reviewed_at TEXT,
     high_value INTEGER NOT NULL DEFAULT 0, oversized INTEGER NOT NULL DEFAULT 0,
     files_changed INTEGER, additions INTEGER, deletions INTEGER, size_label TEXT,
-    pushed INTEGER NOT NULL DEFAULT 0,
+    pushed INTEGER NOT NULL DEFAULT 0, comments TEXT,
     PRIMARY KEY (repo, number, head_sha)
 );
 CREATE TABLE IF NOT EXISTS todos (
@@ -77,6 +77,12 @@ impl Db {
             "ALTER TABLE reviews ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0",
             [],
         ) {
+            if !e.to_string().contains("duplicate column name") {
+                return Err(e.into());
+            }
+        }
+        // reviews 增加 comments 列（ocr 行级评论 JSON；老库迁移，同上幂等）
+        if let Err(e) = conn.execute("ALTER TABLE reviews ADD COLUMN comments TEXT", []) {
             if !e.to_string().contains("duplicate column name") {
                 return Err(e.into());
             }
@@ -157,18 +163,24 @@ impl Db {
     }
 
     pub fn upsert_review(&self, r: &serde_json::Value) -> Result<()> {
+        // comments：数组 → JSON 字符串；字符串透传；缺失/其它类型 → NULL
+        let comments: Option<String> = match &r["comments"] {
+            serde_json::Value::Array(_) => Some(serde_json::to_string(&r["comments"])?),
+            serde_json::Value::String(s) => Some(s.clone()),
+            _ => None,
+        };
         self.conn.execute(
             "INSERT INTO reviews(repo, number, head_sha, score, dimensions, summary,
                 flagged_files, reviewed_at, high_value, oversized, files_changed,
-                additions, deletions, size_label, pushed)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0)
+                additions, deletions, size_label, pushed, comments)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0,?15)
              ON CONFLICT(repo, number, head_sha) DO UPDATE SET
                 score=excluded.score, dimensions=excluded.dimensions,
                 summary=excluded.summary, flagged_files=excluded.flagged_files,
                 reviewed_at=excluded.reviewed_at, high_value=excluded.high_value,
                 oversized=excluded.oversized, files_changed=excluded.files_changed,
                 additions=excluded.additions, deletions=excluded.deletions,
-                size_label=excluded.size_label, pushed=0",
+                size_label=excluded.size_label, pushed=0, comments=excluded.comments",
             params![
                 r["repo"].as_str().unwrap_or(""),
                 r["number"].as_i64().unwrap_or(0),
@@ -184,6 +196,7 @@ impl Db {
                 r["additions"].as_i64(),
                 r["deletions"].as_i64(),
                 r["size_label"].as_str(),
+                comments,
             ],
         )?;
         Ok(())
@@ -193,7 +206,8 @@ impl Db {
     pub fn unpushed_reviews(&self) -> Result<Vec<serde_json::Value>> {
         let mut stmt = self.conn.prepare(
             "SELECT repo, number, head_sha, score, dimensions, summary, flagged_files,
-                reviewed_at, high_value, oversized, files_changed, additions, deletions, size_label
+                reviewed_at, high_value, oversized, files_changed, additions, deletions, size_label,
+                comments
              FROM reviews WHERE pushed=0",
         )?;
         let rows = stmt
@@ -202,6 +216,8 @@ impl Db {
                     r.get::<_, Option<String>>(4)?.and_then(|s| serde_json::from_str(&s).ok());
                 let flagged: Option<serde_json::Value> =
                     r.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str(&s).ok());
+                let comments: Option<serde_json::Value> =
+                    r.get::<_, Option<String>>(14)?.and_then(|s| serde_json::from_str(&s).ok());
                 Ok(serde_json::json!({
                     "repo": r.get::<_, String>(0)?,
                     "number": r.get::<_, i64>(1)?,
@@ -217,6 +233,7 @@ impl Db {
                     "additions": r.get::<_, Option<i64>>(11)?,
                     "deletions": r.get::<_, Option<i64>>(12)?,
                     "size_label": r.get::<_, Option<String>>(13)?,
+                    "comments": comments,
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -301,11 +318,17 @@ impl Db {
 
     pub fn get_review(&self, repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
         let mut stmt = self.conn.prepare(
-            "SELECT score, dimensions, summary, flagged_files, reviewed_at, size_label
+            "SELECT score, dimensions, summary, flagged_files, reviewed_at, size_label, comments
              FROM reviews WHERE repo=?1 AND number=?2 ORDER BY reviewed_at DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![repo, number])?;
         if let Some(r) = rows.next()? {
+            // comments：TEXT 解析回 JSON 数组，失败/缺失给 null
+            let comments: serde_json::Value = r
+                .get::<_, Option<String>>(6)?
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .filter(|v| v.is_array())
+                .unwrap_or(serde_json::Value::Null);
             return Ok(Some(serde_json::json!({
                 "score": r.get::<_, Option<f64>>(0)?,
                 "dimensions": r.get::<_, Option<String>>(1)?,
@@ -313,6 +336,7 @@ impl Db {
                 "flagged_files": r.get::<_, Option<String>>(3)?,
                 "reviewed_at": r.get::<_, Option<String>>(4)?,
                 "size_label": r.get::<_, Option<String>>(5)?,
+                "comments": comments,
             })));
         }
         Ok(None)
@@ -472,6 +496,8 @@ mod tests {
             "flagged_files": "[\"src/a.rs\"]", "reviewed_at": "2026-01-01T00:00:00",
             "high_value": 1, "oversized": 0, "files_changed": 3,
             "additions": 10, "deletions": 2, "size_label": "S",
+            "comments": [{"path": "src/a.rs", "content": "越界风险", "start_line": 10,
+                "end_line": 12, "category": "bug", "severity": "high"}],
         })
     }
 
@@ -495,6 +521,74 @@ mod tests {
         assert_eq!(r["additions"], 10);
         assert_eq!(r["deletions"], 2);
         assert_eq!(r["size_label"], "S");
+        // comments 数组落库后解析回数组
+        let comments = r["comments"].as_array().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0]["path"], "src/a.rs");
+        assert_eq!(comments[0]["severity"], "high");
+    }
+
+    #[test]
+    fn get_review_comments_roundtrip() {
+        let db = Db::open_memory().unwrap();
+        // 无评论（键缺失）→ NULL → 读出 null
+        let mut bare = review_json("o/r", 1, "s1", 8.5);
+        bare.as_object_mut().unwrap().remove("comments");
+        db.upsert_review(&bare).unwrap();
+        let r = db.get_review("o/r", 1).unwrap().unwrap();
+        assert!(r["comments"].is_null());
+
+        // 数组 → 序列化落库 → 解析回数组
+        db.upsert_review(&review_json("o/r", 2, "s2", 7.0)).unwrap();
+        let r = db.get_review("o/r", 2).unwrap().unwrap();
+        let comments = r["comments"].as_array().unwrap();
+        assert_eq!(comments[0]["content"], "越界风险");
+
+        // 字符串透传（本身是 JSON 数组字符串）→ 解析回数组
+        let mut s = review_json("o/r", 3, "s3", 6.0);
+        s["comments"] = serde_json::json!("[{\"path\":\"x.rs\",\"severity\":\"low\"}]");
+        db.upsert_review(&s).unwrap();
+        let r = db.get_review("o/r", 3).unwrap().unwrap();
+        assert_eq!(r["comments"][0]["path"], "x.rs");
+
+        // 字符串透传但不是合法 JSON → 解析失败给 null
+        let mut bad = review_json("o/r", 4, "s4", 5.0);
+        bad["comments"] = serde_json::json!("自由文本评论");
+        db.upsert_review(&bad).unwrap();
+        let r = db.get_review("o/r", 4).unwrap().unwrap();
+        assert!(r["comments"].is_null());
+
+        // 未评审过的 PR → None
+        assert!(db.get_review("o/r", 99).unwrap().is_none());
+    }
+
+    #[test]
+    fn migrate_adds_comments_column_to_old_db() {
+        // 模拟老库：reviews 表无 comments 列 → Db::open 迁移后可用
+        let dir = std::env::temp_dir().join(format!("prdesk-db-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE reviews (
+                    repo TEXT NOT NULL, number INTEGER NOT NULL, head_sha TEXT NOT NULL,
+                    score REAL, dimensions TEXT, summary TEXT, flagged_files TEXT,
+                    reviewed_at TEXT, high_value INTEGER NOT NULL DEFAULT 0,
+                    oversized INTEGER NOT NULL DEFAULT 0, files_changed INTEGER,
+                    additions INTEGER, deletions INTEGER, size_label TEXT,
+                    pushed INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (repo, number, head_sha)
+                );
+                PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.upsert_review(&review_json("o/r", 1, "s1", 8.5)).unwrap();
+        let r = db.get_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(r["comments"].as_array().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

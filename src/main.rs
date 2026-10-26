@@ -15,7 +15,7 @@ mod model;
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::{self, Db};
 use pr_desk_rs::reviewer::LlmSettings;
-use pr_desk_rs::{diffview, github, reviewer, sync};
+use pr_desk_rs::{diffview, github, ocr, reviewer, sync};
 
 // ── 后台命令 / 回送消息 ──
 
@@ -89,6 +89,14 @@ enum Msg {
     },
 }
 
+/// OCR 行级评论展示数据（纯 Rust 字符串可跨线程；Slint OcrComment 在 UI 线程装配）。
+struct OcrCommentRow {
+    severity: String,
+    category: String,
+    location: String,   // 如 "src/foo.rs:42-58"
+    content: String,
+}
+
 /// 详情面板「评审」tab 的展示数据（从 db.get_review 的 JSON 格式化而来）。
 struct ReviewProps {
     has: bool,
@@ -97,6 +105,7 @@ struct ReviewProps {
     summary: String,
     flagged: Vec<String>,
     reviewed_at: String,
+    comments: Vec<OcrCommentRow>,
 }
 
 /// 评审分项键名 → 中文名（未知键原样展示）。
@@ -122,6 +131,48 @@ fn json_field(rv: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
     }
 }
 
+/// OCR 评论严重度排序权重：critical → high → medium → low → 其他。
+fn severity_rank(s: &str) -> u8 {
+    match s {
+        "critical" => 0,
+        "high" => 1,
+        "medium" => 2,
+        "low" => 3,
+        _ => 4,
+    }
+}
+
+/// OCR 评论位置格式化：path:start-end；start=end 只一个行号；都是 0 只留 path。
+fn ocr_comment_location(c: &serde_json::Value) -> String {
+    let path = c["path"].as_str().unwrap_or("");
+    let start = c["start_line"].as_i64().unwrap_or(0);
+    let end = c["end_line"].as_i64().unwrap_or(0);
+    if start == 0 && end == 0 {
+        path.to_string()
+    } else if start == end {
+        format!("{path}:{start}")
+    } else {
+        format!("{path}:{start}-{end}")
+    }
+}
+
+/// db.get_review 的 "comments" 数组 → 行级评论展示数据（按 severity 分组排序，组内保持原序）。
+fn ocr_comment_rows(rv: &serde_json::Value) -> Vec<OcrCommentRow> {
+    let mut rows: Vec<OcrCommentRow> = json_field(rv, "comments")
+        .and_then(|c| c.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|c| OcrCommentRow {
+            severity: c["severity"].as_str().filter(|s| !s.is_empty()).unwrap_or("other").to_string(),
+            category: c["category"].as_str().filter(|s| !s.is_empty()).unwrap_or("other").to_string(),
+            location: ocr_comment_location(c),
+            content: c["content"].as_str().unwrap_or("").to_string(),
+        })
+        .collect();
+    rows.sort_by_key(|c| severity_rank(&c.severity));
+    rows
+}
+
 fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
     let Some(rv) = review else {
         return ReviewProps {
@@ -131,6 +182,7 @@ fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
             summary: String::new(),
             flagged: Vec::new(),
             reviewed_at: String::new(),
+            comments: Vec::new(),
         };
     };
     let dimension_lines = json_field(rv, "dimensions")
@@ -160,6 +212,7 @@ fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
         summary: rv["summary"].as_str().unwrap_or("").to_string(),
         flagged,
         reviewed_at: rv["reviewed_at"].as_str().unwrap_or("").to_string(),
+        comments: ocr_comment_rows(rv),
     }
 }
 
@@ -268,6 +321,7 @@ fn main() -> anyhow::Result<()> {
     ui.set_s_llm_base(cfg.llm_base_url.clone().into());
     ui.set_s_llm_key(cfg.llm_api_key.clone().unwrap_or_default().into());
     ui.set_s_llm_model(cfg.llm_model.clone().into());
+    ui.set_s_ocr_path(cfg.ocr_path.clone().into());
     ui.set_gh_token_from_env(std::env::var("GITHUB_TOKEN").map(|t| !t.is_empty()).unwrap_or(false));
     let unconfigured = cfg.is_unconfigured();
     ui.set_onboarding(unconfigured);
@@ -607,6 +661,7 @@ fn main() -> anyhow::Result<()> {
                 ui.set_s_llm_base(cfg.llm_base_url.into());
                 ui.set_s_llm_key(cfg.llm_api_key.unwrap_or_default().into());
                 ui.set_s_llm_model(cfg.llm_model.into());
+                ui.set_s_ocr_path(cfg.ocr_path.into());
                 ui.set_settings_open(true);
             }
         });
@@ -615,13 +670,14 @@ fn main() -> anyhow::Result<()> {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         let ui2 = ui.as_weak();
-        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model| {
+        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model, ocr_path| {
             let repos: Vec<String> = repos_text
                 .lines()
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty() && l.contains('/'))
                 .collect();
             let poll: u64 = poll_s.trim().parse().unwrap_or(5).max(1);
+            let ocr_path = ocr_path.trim();
             let new_cfg = Config {
                 server_url: server.trim().to_string(),
                 sync_token: sync_tok.trim().to_string(),
@@ -632,6 +688,7 @@ fn main() -> anyhow::Result<()> {
                 llm_base_url: llm_base.trim().to_string(),
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),
+                ocr_path: if ocr_path.is_empty() { "ocr".into() } else { ocr_path.to_string() },
             };
             if let Err(e) = new_cfg.save(&PathBuf::from("config.toml")) {
                 send_msg(Msg::Status(format!("配置保存失败: {e}")));
@@ -1216,7 +1273,32 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     let _ = tx.send(Msg::ReviewProgress { repo: r2.clone(), number: n2, text });
                 };
                 match reviewer::run_review(&llm, g, &repo, number, &mut progress).await {
-                    Ok(v) => {
+                    Ok(mut v) => {
+                        // 第二段：OCR 行级评论（评分已拿到，OCR 失败不拖垮整单）
+                        match g.fetch_pr_meta(&repo, number).await {
+                            Ok(meta) => {
+                                match ocr::run_ocr_review(&cfg, g, &repo, number, &meta, &mut progress).await {
+                                    Ok(outcome) => {
+                                        let _ = msg_tx.send(Msg::ReviewProgress {
+                                            repo: repo.clone(),
+                                            number,
+                                            text: format!(
+                                                "OCR 完成：{} 条评论（{} 个文件）",
+                                                outcome.comments.len(),
+                                                outcome.files_reviewed
+                                            ),
+                                        });
+                                        v["comments"] = serde_json::Value::Array(outcome.comments);
+                                    }
+                                    Err(e) => {
+                                        let _ = msg_tx.send(Msg::Status(format!("OCR 明细获取失败：{e}")));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let _ = msg_tx.send(Msg::Status(format!("OCR 明细获取失败：{e}")));
+                            }
+                        }
                         let ok = { app.lock().unwrap().db.upsert_review(&v).is_ok() };
                         if ok {
                             let _ = msg_tx.send(Msg::ReviewDone { repo, number });
@@ -1353,6 +1435,18 @@ fn apply_review_props(ui: &MainWindow, p: &ReviewProps) {
             .collect::<Vec<slint::SharedString>>(),
     )));
     ui.set_d_review_reviewed_at(p.reviewed_at.clone().into());
+    // OCR 行级评论：纯字符串行 → Slint OcrComment 模型
+    ui.set_d_review_comments(ModelRc::new(VecModel::from(
+        p.comments
+            .iter()
+            .map(|c| OcrComment {
+                severity: c.severity.as_str().into(),
+                category: c.category.as_str().into(),
+                location: c.location.as_str().into(),
+                content: c.content.as_str().into(),
+            })
+            .collect::<Vec<_>>(),
+    )));
 }
 
 fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {

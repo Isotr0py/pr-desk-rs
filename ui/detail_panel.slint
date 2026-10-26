@@ -31,6 +31,14 @@ export struct FileChange {
     dels: int,
 }
 
+// OCR 行级评论：severity = critical / high / medium / low / 其他（灰显）
+export struct OcrComment {
+    severity: string,
+    category: string,
+    location: string,   // 如 "src/foo.rs:42-58"（无行号时仅路径）
+    content: string,    // 评论正文（可换行）
+}
+
 // 状态胶囊：Open 绿 / Merged 紫 / Closed 红，有色浅底 + 同色深字
 component StateBadge inherits Rectangle {
     in property <string> state: "open";   // open / merged / closed
@@ -93,6 +101,39 @@ component CiBadge inherits Rectangle {
         Text {
             text: root.ci == "success" ? "CI 通过"
                 : root.ci == "failure" ? "CI 失败" : "CI 进行中";
+            font-size: Theme.fs_xs;
+            font-weight: 600;
+            color: root.tone;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// 行级评论 severity 徽章：critical 红 / high 橙 / medium 黄 / low 灰
+//（Theme 无橙色令牌，high 由 Theme.bad 与 Theme.mid 混色得到，仍派生自主题）
+component SeverityBadge inherits Rectangle {
+    in property <string> severity: "other";
+
+    property <color> tone: root.severity == "critical" ? Theme.bad
+        : root.severity == "high" ? Theme.bad.mix(Theme.mid, 0.5)
+        : root.severity == "medium" ? Theme.mid
+        : Theme.text_faint;
+
+    height: 18px;
+    width: badge_layout.preferred-width;
+    border-radius: 9px;
+    background: root.tone.with-alpha(0.14);
+
+    badge_layout := HorizontalLayout {
+        padding-left: 7px;
+        padding-right: 7px;
+        alignment: center;
+        Text {
+            text: root.severity == "critical" ? "严重"
+                : root.severity == "high" ? "高"
+                : root.severity == "medium" ? "中"
+                : root.severity == "low" ? "低"
+                : root.severity;
             font-size: Theme.fs_xs;
             font-weight: 600;
             color: root.tone;
@@ -207,6 +248,7 @@ export component DetailPanel inherits Rectangle {
     in property <string> review_summary: "";
     in property <[string]> review_flagged: [];          // 如 "src/foo.py — 具体问题"
     in property <string> review_reviewed_at: "";        // 评审时间
+    in property <[OcrComment]> review_comments: [];     // OCR 行级评论（已按 severity 分节排序）
 
     callback close();
     callback action_board();                // 看板下拉按钮（下拉菜单由集成方弹出）
@@ -678,6 +720,86 @@ export component DetailPanel inherits Rectangle {
                                             font-weight: 500;
                                             color: Theme.text;
                                             wrap: word-wrap;
+                                        }
+                                    }
+                                }
+
+                                // 行级评论（OCR）：已按 severity 分节排序，组头在 severity 变化处出现
+                                if root.review_comments.length > 0: VerticalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    Text {
+                                        text: "行级评论";
+                                        font-size: Theme.fs_sm;
+                                        font-weight: 600;
+                                        color: Theme.text_dim;
+                                    }
+                                    for c[i] in root.review_comments: VerticalLayout {
+                                        spacing: 6px;
+                                        alignment: start;
+
+                                        // 分节组头：首条或 severity 与上一条不同
+                                        if i == 0 || root.review_comments[i - 1].severity != c.severity: Text {
+                                            text: c.severity == "critical" ? "Critical"
+                                                : c.severity == "high" ? "High"
+                                                : c.severity == "medium" ? "Medium"
+                                                : c.severity == "low" ? "Low"
+                                                : "其他";
+                                            font-size: Theme.fs_xs;
+                                            font-weight: 700;
+                                            color: c.severity == "critical" ? Theme.bad
+                                                : c.severity == "high" ? Theme.bad.mix(Theme.mid, 0.5)
+                                                : c.severity == "medium" ? Theme.mid
+                                                : Theme.text_faint;
+                                        }
+
+                                        // 评论卡片：徽章 + 类别 + 位置 + 正文（hover 覆盖层常驻，visible 切换）
+                                        comment_card := Rectangle {
+                                            border-radius: Theme.r_md;
+                                            border-width: 1px;
+                                            border-color: Theme.hairline;
+                                            background: Theme.surface2;
+                                            height: card_col.preferred-height;
+
+                                            Rectangle {
+                                                border-radius: Theme.r_md;
+                                                background: Theme.hover;
+                                                visible: card_ta.has-hover;
+                                            }
+                                            card_ta := TouchArea {}
+
+                                            card_col := VerticalLayout {
+                                                padding: 10px;
+                                                spacing: 4px;
+                                                alignment: start;
+                                                HorizontalLayout {
+                                                    spacing: 6px;
+                                                    alignment: start;
+                                                    SeverityBadge { severity: c.severity; }
+                                                    Text {
+                                                        text: c.category;
+                                                        font-size: Theme.fs_xs;
+                                                        color: Theme.text_dim;
+                                                        vertical-alignment: center;
+                                                        overflow: elide;
+                                                    }
+                                                    Text {
+                                                        text: c.location;
+                                                        font-family: "Consolas";
+                                                        font-size: Theme.fs_xs;
+                                                        color: Theme.text_faint;
+                                                        vertical-alignment: center;
+                                                        overflow: elide;
+                                                        horizontal-stretch: 1;
+                                                    }
+                                                }
+                                                Text {
+                                                    text: c.content;
+                                                    font-size: Theme.fs_sm;
+                                                    color: Theme.text;
+                                                    wrap: word-wrap;
+                                                }
+                                            }
                                         }
                                     }
                                 }
