@@ -742,9 +742,18 @@ export component NotifPreview inherits Rectangle {
             clip: true;
 
             // 会话：时间线（24px 头像 + 2px 竖线）
+            // Flickable + VerticalLayout：Markdown 块换行后的高度随宽度变化，
+            // ListView 会缓存委托高度导致条目重叠，这里整树重排更可靠
             if root.current_tab == 0: Rectangle {
-                if root.convo_entries.length > 0: ListView {
-                    for e[i] in root.convo_entries: Rectangle {
+                if root.convo_entries.length > 0: Flickable {
+                    content-width: self.width;
+                    content-height: convo_layout.preferred-height;
+
+                    convo_layout := VerticalLayout {
+                        width: 100%;
+                        alignment: start;
+
+                        for e[i] in root.convo_entries: entry_box := Rectangle {
                         height: entry_layout.preferred-height + 16px;
 
                         Rectangle {
@@ -791,17 +800,22 @@ export component NotifPreview inherits Rectangle {
                                     Rectangle { horizontal-stretch: 1; }
                                 }
                                 // 正文：有解析块 → Markdown 渲染；否则回退纯文本（换行）
+                                // 宽度必须从 entry_box（entry_layout 之外）显式推算，
+                                // 绑 parent.width 会形成 layout-cache 绑定循环
                                 if e.blocks.length == 0: Text {
                                     text: e.text;
+                                    width: entry_box.width - 66px;
                                     font-size: Theme.fs_md;
                                     color: Theme.text_dim;
                                     wrap: word-wrap;
                                 }
                                 if e.blocks.length > 0: MarkdownBlocks {
                                     blocks: e.blocks;
+                                    w: entry_box.width - 66px;
                                 }
                             }
                         }
+                    }
                     }
                 }
                 if root.convo_entries.length == 0 && !root.loading: EmptyState {

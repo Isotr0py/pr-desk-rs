@@ -20,12 +20,25 @@ impl MdBlockOut {
 }
 
 /// 剥 HTML 标签的状态机：`<` 后紧跟字母或 `/` 才视为标签起点，跳过到 `>`；
+/// `<!--` 到 `-->` 的注释整段丢弃（GitHub 机器人常塞 codex 状态 JSON 之类的注释）；
 /// 否则 `<` 按普通字符保留（避免误伤 `a < b` 之类的比较）。
 fn strip_html_tags(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
+    let mut in_comment = false;
     let mut chars = s.chars().peekable();
     while let Some(c) = chars.next() {
+        if in_comment {
+            // 见到 --> 才结束注释
+            if c == '-' && chars.peek() == Some(&'-') {
+                chars.next();
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    in_comment = false;
+                }
+            }
+            continue;
+        }
         if in_tag {
             if c == '>' {
                 in_tag = false;
@@ -37,6 +50,18 @@ fn strip_html_tags(s: &str) -> String {
                 Some(&n) if n.is_ascii_alphabetic() || n == '/' => {
                     in_tag = true;
                     continue;
+                }
+                // <!-- 注释起点（!< 两个字符都确认后跳过整段）
+                Some(&'!') => {
+                    let mut probe = chars.clone();
+                    probe.next();
+                    if probe.next() == Some('-') && probe.next() == Some('-') {
+                        chars.next(); // '!'
+                        chars.next(); // '-'
+                        chars.next(); // '-'
+                        in_comment = true;
+                        continue;
+                    }
                 }
                 _ => {}
             }
@@ -436,6 +461,20 @@ mod tests {
         // `a < b` 的 < 后不是字母/斜杠，不能被当标签剥掉
         let blocks = parse_markdown("条件 a < b 时成立");
         assert_eq!(blocks[0].text, "条件 a < b 时成立");
+    }
+
+    #[test]
+    fn html_comment_stripped() {
+        // GitHub 机器人（如 codex）常塞 <!-- 状态 JSON --> 注释，整段不显示
+        let md = "<!-- codex-review-state:v1 {\"status\":\"failed\"} -->\n\n**正文**";
+        let blocks = parse_markdown(md);
+        assert_eq!(blocks.len(), 1, "blocks={blocks:?}");
+        assert_eq!(blocks[0].text, "正文");
+        // 多行注释
+        let md2 = "<!-- 第一行\n第二行 -->\n\n可见";
+        let blocks2 = parse_markdown(md2);
+        assert_eq!(blocks2.len(), 1);
+        assert_eq!(blocks2[0].text, "可见");
     }
 
     #[test]

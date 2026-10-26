@@ -265,6 +265,9 @@ export struct MdBlock {
 // 供放进现有 Flickable/ScrollView/ListView 代理内使用，自身不产生纵向滚动。
 export component MarkdownBlocks inherits VerticalLayout {
     in property <[MdBlock]> blocks;
+    // 可用宽度：所有换行 Text 的宽度必须来自显式属性绑定而不是布局求解器分配，
+    // 否则 preferred-height 会在宽度未约束时被缓存，导致外层条目高度算小、内容溢出重叠。
+    in property <length> w: 100px;
 
     spacing: 8px;
     alignment: start;
@@ -278,6 +281,7 @@ export component MarkdownBlocks inherits VerticalLayout {
             alignment: start;
             Text {
                 text: b.text;
+                width: root.w;
                 font-size: b.kind == "h1" ? 15px : 14px;
                 font-weight: 700;
                 color: Theme.text;
@@ -292,6 +296,7 @@ export component MarkdownBlocks inherits VerticalLayout {
         // h3-h6：13px 加粗
         if b.kind == "h3" || b.kind == "h4" || b.kind == "h5" || b.kind == "h6": Text {
             text: b.text;
+            width: root.w;
             font-size: 13px;
             font-weight: 700;
             color: Theme.text;
@@ -301,6 +306,7 @@ export component MarkdownBlocks inherits VerticalLayout {
         // 段落：13px，必须换行（此前裸文本不换行被裁的 bug 由此修复）
         if b.kind == "p": Text {
             text: b.text;
+            width: root.w;
             font-size: 13px;
             color: Theme.text;
             wrap: word-wrap;
@@ -346,7 +352,7 @@ export component MarkdownBlocks inherits VerticalLayout {
                 padding-left: b.depth * 16px;
                 spacing: 6px;
                 alignment: start;
-                Text {
+                bull := Text {
                     text: b.kind == "bullet" ? "•" : "";
                     width: b.kind == "bullet" ? self.preferred-width : 0px;
                     font-size: 13px;
@@ -354,10 +360,10 @@ export component MarkdownBlocks inherits VerticalLayout {
                 }
                 Text {
                     text: b.text;
+                    width: max(0px, root.w - b.depth * 16px - (b.kind == "bullet" ? bull.preferred-width + 6px : 0px));
                     font-size: 13px;
                     color: Theme.text;
                     wrap: word-wrap;
-                    horizontal-stretch: 1;
                 }
             }
         }
@@ -388,6 +394,7 @@ export component MarkdownBlocks inherits VerticalLayout {
                                 padding: 6px;
                                 Text {
                                     text: b.cells[r * tcols + c];
+                                    width: max(0px, root.w / tcols - 12px);
                                     font-size: 12px;
                                     font-weight: r == 0 ? 600 : 400;
                                     color: Theme.text;
@@ -431,7 +438,7 @@ export component MarkdownBlocks inherits VerticalLayout {
             quote_txt := Text {
                 x: 12px;
                 y: 0;
-                width: parent.width - 12px;
+                width: max(0px, root.w - 12px);
                 text: b.text;
                 font-size: 13px;
                 color: Theme.text_faint;
