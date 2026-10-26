@@ -3,3 +3,8 @@
 # 运行时生成
 config.toml
 data/
+
+# 随包分发的 ocr CLI（scripts/fetch_ocr.py 下载，不入库）
+bin/
+__pycache__/
+*.pyc

@@ -155,6 +155,41 @@ pub fn parse_ocr_result(text: &str) -> Result<OcrRunOutcome> {
     })
 }
 
+/// ocr 可执行文件名候选（先 .exe 后裸名，Windows / 类 Unix 都覆盖）。
+const OCR_BIN_NAMES: [&str; 2] = ["ocr.exe", "ocr"];
+
+/// 参数化候选解析（纯函数，便于单测）：按序返回第一个存在的文件。
+/// a) ocr_path 显式配置（非空且非默认 "ocr"）且文件存在 → 用户配置优先
+/// b) <exe 所在目录>/bin/ocr[.exe]（随包 sidecar，跟随安装布局）
+/// c) <cwd>/bin/ocr[.exe]（开发布局：从仓库根跑 target/debug/…）
+/// d) 原样返回 ocr_path（含默认 "ocr"，走 PATH 解析）
+fn resolve_ocr_path_in(ocr_path: &str, exe_dir: Option<&Path>, cwd: &Path) -> PathBuf {
+    if !ocr_path.is_empty() && ocr_path != "ocr" && Path::new(ocr_path).is_file() {
+        return PathBuf::from(ocr_path);
+    }
+    for base in [exe_dir.map(Path::to_path_buf), Some(cwd.to_path_buf())]
+        .into_iter()
+        .flatten()
+    {
+        for name in OCR_BIN_NAMES {
+            let cand = base.join("bin").join(name);
+            if cand.is_file() {
+                return cand;
+            }
+        }
+    }
+    PathBuf::from(ocr_path)
+}
+
+/// 解析 ocr CLI 路径：显式配置 > 随包 bin/（exe 旁）> 开发布局 bin/（cwd 下）> PATH。
+pub fn resolve_ocr_path(cfg: &Config) -> PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    resolve_ocr_path_in(&cfg.ocr_path, exe_dir.as_deref(), &cwd)
+}
+
 /// 本地预评审主流程：重建临时 git 仓库 → 跑 ocr → 解析行级评论。
 /// meta 为 GitHub::fetch_pr_meta 的原始返回（取 base.sha / head.sha / title / body）。
 pub async fn run_ocr_review(
@@ -216,7 +251,8 @@ pub async fn run_ocr_review(
 
     // LLM 配置：写进临时目录的 config.json，OCR_CONFIG_PATH 指向它（不落 ocr 全局配置）。
     // 未配置 LLM 时不设该变量，ocr 用自家全局配置。
-    let mut cmd = Command::new(&cfg.ocr_path);
+    let ocr_bin = resolve_ocr_path(cfg);
+    let mut cmd = Command::new(&ocr_bin);
     cmd.arg("review")
         .arg("--repo")
         .arg(&tmp.0)
@@ -257,7 +293,7 @@ pub async fn run_ocr_review(
     progress("运行 ocr 评审中（最长 30 分钟）…".into());
     // 超时：output() future 被 drop → kill_on_drop 杀掉子进程
     let out = match tokio::time::timeout(OCR_TIMEOUT, cmd.output()).await {
-        Ok(r) => r.context(format!("启动 ocr 失败（检查 ocr_path 配置：{}）", cfg.ocr_path))?,
+        Ok(r) => r.context(format!("启动 ocr 失败（检查 ocr_path 配置：{}）", ocr_bin.display()))?,
         Err(_) => anyhow::bail!("ocr 评审超时（30 分钟），已终止"),
     };
     if !out.status.success() {
@@ -349,5 +385,97 @@ mod tests {
         assert!(safe_join(root, "a\\b").is_none());
         assert!(safe_join(root, "/abs").is_none());
         assert!(safe_join(root, "").is_none());
+    }
+
+    /// 造一组临时目录：exe_dir、cwd、以及可选的 bin/ocr 候选文件。
+    struct ResolveFixture {
+        root: PathBuf,
+        exe_dir: PathBuf,
+        cwd: PathBuf,
+    }
+
+    impl ResolveFixture {
+        fn new(tag: &str) -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "prdesk-ocr-resolve-{tag}-{}",
+                std::process::id()
+            ));
+            let exe_dir = root.join("exe");
+            let cwd = root.join("cwd");
+            std::fs::create_dir_all(&exe_dir).unwrap();
+            std::fs::create_dir_all(&cwd).unwrap();
+            Self { root, exe_dir, cwd }
+        }
+
+        fn touch(&self, base: &Path, name: &str) -> PathBuf {
+            let p = base.join("bin").join(name);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"bin").unwrap();
+            p
+        }
+    }
+
+    impl Drop for ResolveFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn resolve_explicit_config_wins() {
+        let fx = ResolveFixture::new("explicit");
+        // 显式配置存在 → 优先，即使 sidecar 也在
+        let custom = fx.root.join("custom-ocr.exe");
+        std::fs::write(&custom, b"bin").unwrap();
+        fx.touch(&fx.exe_dir, "ocr.exe");
+        assert_eq!(
+            resolve_ocr_path_in(custom.to_str().unwrap(), Some(&fx.exe_dir), &fx.cwd),
+            custom
+        );
+        // 显式配置不存在 → 落回 sidecar
+        let missing = fx.root.join("nope.exe");
+        assert_eq!(
+            resolve_ocr_path_in(missing.to_str().unwrap(), Some(&fx.exe_dir), &fx.cwd),
+            fx.exe_dir.join("bin").join("ocr.exe")
+        );
+    }
+
+    #[test]
+    fn resolve_sidecar_before_cwd_and_path() {
+        let fx = ResolveFixture::new("sidecar");
+        // exe 旁 bin/ 优先于 cwd bin/
+        let sidecar = fx.touch(&fx.exe_dir, "ocr.exe");
+        fx.touch(&fx.cwd, "ocr.exe");
+        assert_eq!(
+            resolve_ocr_path_in("ocr", Some(&fx.exe_dir), &fx.cwd),
+            sidecar
+        );
+        // 只有 cwd 布局 → 用 cwd 下的
+        std::fs::remove_file(&sidecar).unwrap();
+        assert_eq!(
+            resolve_ocr_path_in("ocr", Some(&fx.exe_dir), &fx.cwd),
+            fx.cwd.join("bin").join("ocr.exe")
+        );
+        // 裸名 ocr（非 Windows）也能命中
+        std::fs::remove_file(fx.cwd.join("bin").join("ocr.exe")).unwrap();
+        let bare = fx.touch(&fx.cwd, "ocr");
+        assert_eq!(
+            resolve_ocr_path_in("ocr", Some(&fx.exe_dir), &fx.cwd),
+            bare
+        );
+    }
+
+    #[test]
+    fn resolve_fallback_to_path() {
+        let fx = ResolveFixture::new("fallback");
+        // 无任何候选文件 → 原样返回（默认 "ocr" 走 PATH）
+        assert_eq!(
+            resolve_ocr_path_in("ocr", Some(&fx.exe_dir), &fx.cwd),
+            PathBuf::from("ocr")
+        );
+        assert_eq!(
+            resolve_ocr_path_in("ocr", None, &fx.cwd),
+            PathBuf::from("ocr")
+        );
     }
 }

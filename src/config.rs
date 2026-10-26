@@ -24,7 +24,7 @@ theme = "light"
 llm_base_url = "https://api.openai.com/v1"
 llm_api_key = ""
 llm_model = ""
-# open-code-review CLI 路径（行级评论评审引擎；默认 "ocr" 从 PATH 查找）
+# open-code-review CLI 路径（行级评论评审引擎；留空或 "ocr" = 自动查找：优先随包 bin/ 目录，其次 PATH）
 ocr_path = "ocr"
 "#;
 
@@ -42,7 +42,7 @@ pub struct Config {
     pub llm_api_key: Option<String>,
     /// LLM 模型名（空 = 未配置，预评审不可用）
     pub llm_model: String,
-    /// ocr CLI 路径（默认 "ocr" 从 PATH 查找）
+    /// ocr CLI 路径（"ocr" = 自动查找：优先随包 bin/ 目录，其次 PATH）
     pub ocr_path: String,
 }
 
