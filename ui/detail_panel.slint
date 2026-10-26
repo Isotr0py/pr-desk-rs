@@ -197,6 +197,17 @@ export component DetailPanel inherits Rectangle {
     in property <[DiffFile]> diff_files: [];
     callback diff_file_toggled(int);
 
+    // ── 评审标签页（LLM 预评审）──
+    callback action_run_review();           // 点击「开始预评审 / 重试评审」
+    in property <string> review_status: "";        // "" 未评审 / "running" / "done" / "failed"
+    in property <string> review_progress: "";      // running 时的进度文本
+    in property <bool> review_has: false;          // 是否已有评审报告
+    in property <float> review_score: 0;
+    in property <[string]> review_dimension_lines: [];  // 如 "正确性风险  8/10"
+    in property <string> review_summary: "";
+    in property <[string]> review_flagged: [];          // 如 "src/foo.py — 具体问题"
+    in property <string> review_reviewed_at: "";        // 评审时间
+
     callback close();
     callback action_board();                // 看板下拉按钮（下拉菜单由集成方弹出）
     callback action_set_priority(int);
@@ -444,24 +455,245 @@ export component DetailPanel inherits Rectangle {
             background: Theme.bg;
             clip: true;
 
-            // 评审：纯文本滚动展示
+            // 评审：LLM 预评审报告（分数徽章 / 各维度 / 总结 / 风险文件），整体可滚动
             if root.current_tab == 0: Rectangle {
-                if root.body != "": ScrollView {
+                // 转圈字符：Timer 驱动逐帧切换（仅 running 时转动）
+                property <int> spin_idx: 0;
+                Timer {
+                    interval: 130ms;
+                    running: root.review_status == "running";
+                    triggered => { spin_idx = spin_idx >= 3 ? 0 : spin_idx + 1; }
+                }
+                // 分数着色：>=8 绿 / >=6 黄 / <6 红
+                property <color> score_tone: root.review_score >= 8 ? Theme.good
+                    : root.review_score >= 6 ? Theme.mid : Theme.bad;
+
+                ScrollView {
                     VerticalLayout {
                         padding: 14px;
+                        spacing: 12px;
                         alignment: start;
-                        Text {
-                            text: root.body;
-                            color: Theme.text;
-                            font-size: Theme.fs_md;
-                            wrap: word-wrap;
+
+                        // ── 顶部操作行：开始预评审按钮 + 进度/失败提示 ──
+                        Rectangle {
+                            height: 30px;
+
+                            run_btn := Rectangle {
+                                x: 0;
+                                y: 0;
+                                width: btn_layout.preferred-width;
+                                height: 30px;
+                                border-radius: Theme.r_md;
+                                background: root.review_status == "running"
+                                    ? Theme.surface2
+                                    : (btn_ta.has-hover ? Theme.accent.darker(1.08) : Theme.accent);
+                                animate background { duration: 100ms; }
+
+                                btn_layout := HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    Text {
+                                        text: root.review_status == "running" ? "评审中…"
+                                            : root.review_status == "failed" ? "重试评审"
+                                            : "开始预评审";
+                                        font-size: Theme.fs_sm;
+                                        font-weight: 600;
+                                        color: root.review_status == "running" ? Theme.text_dim : #ffffff;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                btn_ta := TouchArea {
+                                    mouse-cursor: root.review_status == "running" ? default : pointer;
+                                    clicked => {
+                                        if (root.review_status != "running") { root.action_run_review(); }
+                                    }
+                                }
+                            }
+
+                            // running：转圈 + 进度文本（常驻，visible 切换）
+                            Text {
+                                x: run_btn.width + 10px;
+                                y: 0;
+                                height: 30px;
+                                visible: root.review_status == "running";
+                                text: (spin_idx == 0 ? "◐" : spin_idx == 1 ? "◓"
+                                    : spin_idx == 2 ? "◑" : "◒") + "  " + root.review_progress;
+                                font-size: Theme.fs_sm;
+                                color: Theme.text_dim;
+                                vertical-alignment: center;
+                            }
+                            // failed：失败提示（常驻，visible 切换）
+                            Text {
+                                x: run_btn.width + 10px;
+                                y: 0;
+                                height: 30px;
+                                visible: root.review_status == "failed";
+                                text: "上次评审失败，点击按钮重试";
+                                font-size: Theme.fs_sm;
+                                color: Theme.bad;
+                                vertical-alignment: center;
+                            }
+                        }
+
+                        // ── 报告卡片 ──
+                        if root.review_has: Rectangle {
+                            border-radius: Theme.r_md;
+                            border-width: 1px;
+                            border-color: Theme.hairline;
+                            background: Theme.card;
+                            height: report_col.preferred-height;
+
+                            report_col := VerticalLayout {
+                                padding: 14px;
+                                spacing: 12px;
+                                alignment: start;
+
+                                // 分数行：大号圆形徽章 + 标签 + 评审时间
+                                Rectangle {
+                                    height: 64px;
+
+                                    Rectangle {
+                                        x: 0;
+                                        y: 0;
+                                        width: 64px;
+                                        height: 64px;
+                                        border-radius: 32px;
+                                        border-width: 2px;
+                                        border-color: score_tone;
+                                        background: score_tone.with-alpha(0.14);
+                                        Text {
+                                            width: 100%;
+                                            height: 100%;
+                                            text: "" + round(root.review_score * 10) / 10;
+                                            font-size: Theme.fs_xl;
+                                            font-weight: 700;
+                                            color: score_tone;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                    Text {
+                                        x: 76px;
+                                        y: 14px;
+                                        width: parent.width - 76px;
+                                        text: "综合评分（/10）";
+                                        font-size: Theme.fs_md;
+                                        font-weight: 600;
+                                        color: Theme.text;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        x: 76px;
+                                        y: 36px;
+                                        width: parent.width - 76px;
+                                        text: root.review_reviewed_at == ""
+                                            ? "评审时间未知"
+                                            : "评审时间 " + root.review_reviewed_at;
+                                        font-size: Theme.fs_xs;
+                                        color: Theme.text_faint;
+                                        overflow: elide;
+                                    }
+                                }
+
+                                // 各维度评分
+                                if root.review_dimension_lines.length > 0: VerticalLayout {
+                                    spacing: 4px;
+                                    alignment: start;
+                                    Text {
+                                        text: "各维度评分";
+                                        font-size: Theme.fs_sm;
+                                        font-weight: 600;
+                                        color: Theme.text_dim;
+                                    }
+                                    for line[i] in root.review_dimension_lines: Rectangle {
+                                        height: 22px;
+                                        Text {
+                                            x: 0;
+                                            y: 0;
+                                            width: 16px;
+                                            height: 100%;
+                                            text: "●";
+                                            font-size: 8px;
+                                            color: Theme.accent;
+                                            vertical-alignment: center;
+                                        }
+                                        Text {
+                                            x: 16px;
+                                            y: 0;
+                                            width: parent.width - 16px;
+                                            height: 100%;
+                                            text: line;
+                                            font-size: Theme.fs_sm;
+                                            color: Theme.text;
+                                            overflow: elide;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+                                }
+
+                                // 评审总结
+                                if root.review_summary != "": VerticalLayout {
+                                    spacing: 4px;
+                                    alignment: start;
+                                    Text {
+                                        text: "评审总结";
+                                        font-size: Theme.fs_sm;
+                                        font-weight: 600;
+                                        color: Theme.text_dim;
+                                    }
+                                    Text {
+                                        text: root.review_summary;
+                                        font-size: Theme.fs_md;
+                                        color: Theme.text;
+                                        wrap: word-wrap;
+                                    }
+                                }
+
+                                // 风险文件列表
+                                if root.review_flagged.length > 0: VerticalLayout {
+                                    spacing: 6px;
+                                    alignment: start;
+                                    Text {
+                                        text: "风险文件";
+                                        font-size: Theme.fs_sm;
+                                        font-weight: 600;
+                                        color: Theme.text_dim;
+                                    }
+                                    for f[i] in root.review_flagged: Rectangle {
+                                        height: f_txt.preferred-height + 2px;
+                                        Text {
+                                            x: 0;
+                                            y: 0;
+                                            width: 16px;
+                                            text: "⚠";
+                                            font-size: Theme.fs_xs;
+                                            color: Theme.mid;
+                                        }
+                                        f_txt := Text {
+                                            x: 18px;
+                                            y: 0;
+                                            width: parent.width - 18px;
+                                            text: f;
+                                            font-size: Theme.fs_sm;
+                                            font-weight: 500;
+                                            color: Theme.text;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ── 空状态：无报告且非 running ──
+                        if !root.review_has && root.review_status != "running": Rectangle {
+                            height: 240px;
+                            EmptyState {
+                                icon: "◆";
+                                heading: "暂无评审报告";
+                                hint: "点击上方「开始预评审」，LLM 将对该 PR 生成结构化评审报告";
+                            }
                         }
                     }
-                }
-                if root.body == "": EmptyState {
-                    icon: "◆";
-                    heading: "暂无评审内容";
-                    hint: "评审服务生成的摘要将显示在这里";
                 }
             }
 

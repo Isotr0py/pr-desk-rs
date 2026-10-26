@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod diffview;
 pub mod github;
+pub mod reviewer;
 pub mod sync;
 
 /// 行数据 → 分组：（组标题, 该组内数据行的索引列表）。

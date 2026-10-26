@@ -20,6 +20,10 @@ repos = ["owner/repo"]
 poll_interval_min = 5
 # 界面主题：light 或 dark
 theme = "light"
+# 本地 LLM 预评审（OpenAI 兼容 API；llm_api_key 留空时可用环境变量 LLM_API_KEY）
+llm_base_url = "https://api.openai.com/v1"
+llm_api_key = ""
+llm_model = ""
 "#;
 
 #[derive(Debug, Clone)]
@@ -31,6 +35,11 @@ pub struct Config {
     pub poll_interval_min: u64,
     /// 界面主题："light" | "dark"
     pub theme: String,
+    /// OpenAI 兼容 API 地址（本地预评审用）
+    pub llm_base_url: String,
+    pub llm_api_key: Option<String>,
+    /// LLM 模型名（空 = 未配置，预评审不可用）
+    pub llm_model: String,
 }
 
 impl Default for Config {
@@ -42,6 +51,9 @@ impl Default for Config {
             repos: Vec::new(),
             poll_interval_min: 5,
             theme: "light".into(),
+            llm_base_url: "https://api.openai.com/v1".into(),
+            llm_api_key: None,
+            llm_model: String::new(),
         }
     }
 }
@@ -81,6 +93,14 @@ impl Config {
             .or_else(|| self.github_token.clone().filter(|t| !t.is_empty()))
     }
 
+    /// LLM API key：环境变量 LLM_API_KEY 优先于 config.toml。
+    pub fn llm_key(&self) -> Option<String> {
+        std::env::var("LLM_API_KEY")
+            .ok()
+            .filter(|t| !t.is_empty())
+            .or_else(|| self.llm_api_key.clone().filter(|t| !t.is_empty()))
+    }
+
     pub fn load(path: &Path) -> Result<Config> {
         if !path.exists() {
             if let Some(parent) = path.parent() {
@@ -117,6 +137,15 @@ impl Config {
                 // 只认 light/dark，其它值（老配置、手写错误）回退默认
                 let v = unquote(v);
                 cfg.theme = if v == "dark" { "dark".into() } else { "light".into() };
+            } else if let Some(v) = parse_value(line, "llm_base_url") {
+                let v = unquote(v);
+                if !v.is_empty() {
+                    cfg.llm_base_url = v;
+                }
+            } else if let Some(v) = parse_value(line, "llm_api_key") {
+                cfg.llm_api_key = Some(unquote(v)).filter(|t| !t.is_empty());
+            } else if let Some(v) = parse_value(line, "llm_model") {
+                cfg.llm_model = unquote(v);
             }
         }
         Ok(cfg)
@@ -128,20 +157,23 @@ impl Config {
             "[{}]",
             self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
         );
-        let kv: [(&str, String); 6] = [
+        let kv: [(&str, String); 9] = [
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
             ("github_token", quote(self.github_token.as_deref().unwrap_or(""))),
             ("repos", repos_toml),
             ("poll_interval_min", self.poll_interval_min.to_string()),
             ("theme", quote(&self.theme)),
+            ("llm_base_url", quote(&self.llm_base_url)),
+            ("llm_api_key", quote(self.llm_api_key.as_deref().unwrap_or(""))),
+            ("llm_model", quote(&self.llm_model)),
         ];
 
         let mut lines: Vec<String> = match fs::read_to_string(path) {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
             Err(_) => TEMPLATE.lines().map(|l| l.to_string()).collect(),
         };
-        let mut seen = [false; 6];
+        let mut seen = [false; 9];
         for (i, line) in lines.iter_mut().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -186,6 +218,9 @@ mod tests {
         let cfg2 = Config::load(&path).unwrap();
         assert_eq!(cfg2.repos, vec!["owner/repo".to_string()]);
         assert_eq!(cfg2.server_url, "http://127.0.0.1:6185");
+        assert_eq!(cfg2.llm_base_url, "https://api.openai.com/v1");
+        assert_eq!(cfg2.llm_api_key, None);
+        assert_eq!(cfg2.llm_model, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -202,6 +237,9 @@ mod tests {
             repos: vec!["a/b".into(), "c/d".into()],
             poll_interval_min: 15,
             theme: "dark".into(),
+            llm_base_url: "http://nas:11434/v1".into(),
+            llm_api_key: Some("sk-test".into()),
+            llm_model: "qwen3-coder".into(),
         };
         cfg.save(&path).unwrap();
 
@@ -214,9 +252,25 @@ mod tests {
         assert_eq!(loaded.repos, vec!["a/b".to_string(), "c/d".to_string()]);
         assert_eq!(loaded.poll_interval_min, 15);
         assert_eq!(loaded.theme, "dark");
+        assert_eq!(loaded.llm_base_url, "http://nas:11434/v1");
+        assert_eq!(loaded.llm_api_key.as_deref(), Some("sk-test"));
+        assert_eq!(loaded.llm_model, "qwen3-coder");
         assert!(loaded.is_dark());
         assert!(!loaded.is_unconfigured());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_key_fallback() {
+        // 环境变量 LLM_API_KEY 未设置时回退 config.toml；两者皆空则为 None
+        let mut c = Config::default();
+        if std::env::var("LLM_API_KEY").is_err() {
+            assert_eq!(c.llm_key(), None);
+            c.llm_api_key = Some("sk-cfg".into());
+            assert_eq!(c.llm_key().as_deref(), Some("sk-cfg"));
+            c.llm_api_key = Some(String::new()).filter(|t| !t.is_empty());
+            assert_eq!(c.llm_key(), None);
+        }
     }
 
     #[test]

@@ -115,6 +115,17 @@ impl GitHub {
         Ok(resp.text().await?)
     }
 
+    /// 拉取单个 PR 的元信息（GET /repos/{repo}/pulls/{number}，返回原始 JSON）。
+    pub async fn fetch_pr_meta(&self, repo: &str, number: i64) -> Result<Value> {
+        let url = format!("{API}/repos/{repo}/pulls/{number}");
+        let resp = self.client.get(&url).send().await?;
+        self.record_rate_limit(resp.headers());
+        if !resp.status().is_success() {
+            anyhow::bail!("GitHub PR meta {} #{}: {}", resp.status(), repo, number);
+        }
+        Ok(resp.json().await?)
+    }
+
     /// 拉取通知列表（all=true 连已读也拉，否则只返回未读；需要 token，匿名调用会 401）。
     pub async fn fetch_notifications(&self, all: bool) -> Result<Vec<Notification>> {
         let url = if all {

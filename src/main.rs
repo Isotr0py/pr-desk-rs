@@ -14,7 +14,8 @@ mod model;
 
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::{self, Db};
-use pr_desk_rs::{diffview, github, sync};
+use pr_desk_rs::reviewer::LlmSettings;
+use pr_desk_rs::{diffview, github, reviewer, sync};
 
 // ── 后台命令 / 回送消息 ──
 
@@ -28,6 +29,7 @@ enum Cmd {
     AddNotifReview { repo: String, number: i64, title: String, url: String },  // Inbox「+ 预评审」入库
     FetchNotifDetail { repo: String, number: i64, kind: String },  // Inbox 预览面板：拉会话/Files/Diff
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
+    RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
 }
 
 /// 状态栏配置状态文本。
@@ -64,8 +66,16 @@ enum Msg {
         convo_json: String,
         checks_json: String,
         files_json: String,
+        // 评审 tab 数据（db.get_review 的 JSON 已格式化为 UI 直接可用的字段）
+        review: ReviewProps,
     },
     ClosePanel,
+    // AI 评审进度：状态栏显示 text；若详情面板正打开该 PR，面板置 running 并显示进度
+    ReviewProgress { repo: String, number: i64, text: String },
+    // AI 评审完成：状态栏提示；若面板正打开该 PR，刷新评审 tab 并置 done
+    ReviewDone { repo: String, number: i64 },
+    // AI 评审失败：状态栏报错；若面板正打开该 PR，置 failed
+    ReviewFailed { repo: String, number: i64, err: String },
     // 同理：diff 以原始文本过界，DiffFile 模型在 UI 线程的 apply_msg 里构建
     DiffRaw(String),
     // Inbox 通知行：serde_json 过界，NotifRow 模型在 UI 线程装配
@@ -77,6 +87,89 @@ enum Msg {
         files_json: String,
         diff: String,
     },
+}
+
+/// 详情面板「评审」tab 的展示数据（从 db.get_review 的 JSON 格式化而来）。
+struct ReviewProps {
+    has: bool,
+    score: f32,
+    dimension_lines: Vec<String>,
+    summary: String,
+    flagged: Vec<String>,
+    reviewed_at: String,
+}
+
+/// 评审分项键名 → 中文名（未知键原样展示）。
+fn dim_label(key: &str) -> &str {
+    match key {
+        "readability" => "可读性",
+        "correctness_risk" => "正确性风险",
+        "test_coverage" => "测试覆盖",
+        "security" => "安全",
+        other => other,
+    }
+}
+
+/// 评审字段可能是 JSON 字符串（旧数据）或内联对象/数组，两种都解析。
+fn json_field(rv: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+    let v = &rv[key];
+    if let Some(s) = v.as_str() {
+        serde_json::from_str(s).ok()
+    } else if v.is_null() {
+        None
+    } else {
+        Some(v.clone())
+    }
+}
+
+fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
+    let Some(rv) = review else {
+        return ReviewProps {
+            has: false,
+            score: 0.0,
+            dimension_lines: Vec::new(),
+            summary: String::new(),
+            flagged: Vec::new(),
+            reviewed_at: String::new(),
+        };
+    };
+    let dimension_lines = json_field(rv, "dimensions")
+        .and_then(|d| d.as_object().cloned())
+        .map(|d| {
+            d.iter()
+                .map(|(k, v)| format!("{}  {}/10", dim_label(k), v))
+                .collect()
+        })
+        .unwrap_or_default();
+    let flagged = json_field(rv, "flagged_files")
+        .and_then(|f| f.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|f| {
+            format!(
+                "{} — {}",
+                f["path"].as_str().unwrap_or("?"),
+                f["issue"].as_str().unwrap_or("")
+            )
+        })
+        .collect();
+    ReviewProps {
+        has: true,
+        score: rv["score"].as_f64().unwrap_or(0.0) as f32,
+        dimension_lines,
+        summary: rv["summary"].as_str().unwrap_or("").to_string(),
+        flagged,
+        reviewed_at: rv["reviewed_at"].as_str().unwrap_or("").to_string(),
+    }
+}
+
+/// 详情面板当前是否正打开指定 PR（评审进度/结果只刷对应面板）。
+fn panel_matches(app: &Arc<Mutex<App>>, repo: &str, number: i64) -> bool {
+    let a = app.lock().unwrap();
+    a.selected
+        .and_then(|i| a.rows.get(i))
+        .map(|r| r["repo"].as_str() == Some(repo) && r["number"].as_i64() == Some(number))
+        .unwrap_or(false)
 }
 
 struct App {
@@ -172,6 +265,9 @@ fn main() -> anyhow::Result<()> {
     ui.set_s_gh_token(cfg.github_token.clone().unwrap_or_default().into());
     ui.set_s_repos(cfg.repos.join("\n").into());
     ui.set_s_poll(cfg.poll_interval_min as i32);
+    ui.set_s_llm_base(cfg.llm_base_url.clone().into());
+    ui.set_s_llm_key(cfg.llm_api_key.clone().unwrap_or_default().into());
+    ui.set_s_llm_model(cfg.llm_model.clone().into());
     ui.set_gh_token_from_env(std::env::var("GITHUB_TOKEN").map(|t| !t.is_empty()).unwrap_or(false));
     let unconfigured = cfg.is_unconfigured();
     ui.set_onboarding(unconfigured);
@@ -375,6 +471,25 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        // 详情面板「AI 评审」按钮：取当前选中行 repo/number 交给 worker 跑 LLM 评审
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        ui.on_action_run_review(move || {
+            let target = {
+                let a = app.lock().unwrap();
+                a.selected.and_then(|i| a.rows.get(i)).map(|r| {
+                    (
+                        r["repo"].as_str().unwrap_or("").to_string(),
+                        r["number"].as_i64().unwrap_or(0),
+                    )
+                })
+            };
+            if let Some((repo, number)) = target {
+                let _ = cmd_tx.send(Cmd::RunReview { repo, number });
+            }
+        });
+    }
+    {
         // DiffView 要求整体替换模型（原地改会导致其计数器重复累加）；
         // 折叠状态以 UI 侧当前模型为准（Slint 数据不过线程边界）。
         let weak = ui.as_weak();
@@ -483,9 +598,15 @@ fn main() -> anyhow::Result<()> {
     }
     // ── 设置页 ──
     {
+        let app = app.clone();
         let ui2 = ui.as_weak();
         ui.on_open_settings(move || {
             if let Some(ui) = ui2.upgrade() {
+                // 每次打开回填当前配置（LLM 字段可能在别处被改动）
+                let cfg = app.lock().unwrap().cfg.clone();
+                ui.set_s_llm_base(cfg.llm_base_url.into());
+                ui.set_s_llm_key(cfg.llm_api_key.unwrap_or_default().into());
+                ui.set_s_llm_model(cfg.llm_model.into());
                 ui.set_settings_open(true);
             }
         });
@@ -494,7 +615,7 @@ fn main() -> anyhow::Result<()> {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         let ui2 = ui.as_weak();
-        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s| {
+        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model| {
             let repos: Vec<String> = repos_text
                 .lines()
                 .map(|l| l.trim().to_string())
@@ -508,6 +629,9 @@ fn main() -> anyhow::Result<()> {
                 repos,
                 poll_interval_min: poll,
                 theme: app.lock().unwrap().cfg.theme.clone(), // 主题不在设置页，保留当前值
+                llm_base_url: llm_base.trim().to_string(),
+                llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
+                llm_model: llm_model.trim().to_string(),
             };
             if let Err(e) = new_cfg.save(&PathBuf::from("config.toml")) {
                 send_msg(Msg::Status(format!("配置保存失败: {e}")));
@@ -681,6 +805,7 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, idx: usize) {
         convo_json,
         checks_json,
         files_json,
+        review: review_props(review.as_ref()),
     });
 
     match diff_cached {
@@ -914,14 +1039,27 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     };
                     let outbox = { app.lock().unwrap().db.outbox_drain()? };
                     let (updates, ids) = sync::merge_outbox(&outbox);
+                    let reviews_new = { app.lock().unwrap().db.unpushed_reviews()? };
                     let mut pushed = sync::PushSummary::default();
-                    if !updates.is_empty() {
-                        let resp = sync_client.push_body(updates).await?;
+                    if !updates.is_empty() || !reviews_new.is_empty() {
+                        // 推送成功后才标记 reviews 已推（失败则下轮重推）
+                        let review_keys: Vec<(String, i64, String)> = reviews_new
+                            .iter()
+                            .map(|v| {
+                                (
+                                    v["repo"].as_str().unwrap_or("").to_string(),
+                                    v["number"].as_i64().unwrap_or(0),
+                                    v["head_sha"].as_str().unwrap_or("").to_string(),
+                                )
+                            })
+                            .collect();
+                        let resp = sync_client.push_body(updates, reviews_new).await?;
                         let a = app.lock().unwrap();
                         pushed = sync::apply_push_result(&a.db, &resp)?;
                         for id in ids {
                             a.db.outbox_remove(id)?;
                         }
+                        a.db.mark_reviews_pushed(&review_keys)?;
                     }
                     Ok((pulled, pushed))
                 }
@@ -1056,6 +1194,45 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 let rows = app.lock().unwrap().inbox.clone();
                 let _ = msg_tx.send(Msg::InboxRows(rows));
             }
+            Cmd::RunReview { repo, number } => {
+                let cfg = app.lock().unwrap().cfg.clone();
+                let Some(llm) = LlmSettings::from_config(&cfg) else {
+                    let _ = msg_tx.send(Msg::Status("请先在设置里配置 LLM API Key 和模型".into()));
+                    continue;
+                };
+                let Some(g) = &gh else {
+                    let _ = msg_tx.send(Msg::Status("GitHub 客户端未就绪，无法评审".into()));
+                    continue;
+                };
+                let _ = msg_tx.send(Msg::ReviewProgress {
+                    repo: repo.clone(),
+                    number,
+                    text: format!("开始评审 {repo} #{number}…"),
+                });
+                // 进度回调 → channel（状态栏 + 面板进度，见 Msg::ReviewProgress）
+                let tx = msg_tx.clone();
+                let (r2, n2) = (repo.clone(), number);
+                let mut progress = move |text: String| {
+                    let _ = tx.send(Msg::ReviewProgress { repo: r2.clone(), number: n2, text });
+                };
+                match reviewer::run_review(&llm, g, &repo, number, &mut progress).await {
+                    Ok(v) => {
+                        let ok = { app.lock().unwrap().db.upsert_review(&v).is_ok() };
+                        if ok {
+                            let _ = msg_tx.send(Msg::ReviewDone { repo, number });
+                        } else {
+                            let _ = msg_tx.send(Msg::ReviewFailed {
+                                repo,
+                                number,
+                                err: "评审结果入库失败".into(),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        let _ = msg_tx.send(Msg::ReviewFailed { repo, number, err: format!("{e}") });
+                    }
+                }
+            }
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
                 let cfg = app.lock().unwrap().cfg.clone();
@@ -1158,6 +1335,26 @@ fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     ui.set_groups(ModelRc::new(VecModel::from(groups)));
 }
 
+/// 评审 tab 属性整体写入（Msg::Panel 初次装载与 Msg::ReviewDone 刷新共用）。
+fn apply_review_props(ui: &MainWindow, p: &ReviewProps) {
+    ui.set_d_review_has(p.has);
+    ui.set_d_review_score(p.score);
+    ui.set_d_review_dimension_lines(ModelRc::new(VecModel::from(
+        p.dimension_lines
+            .iter()
+            .map(|s| s.into())
+            .collect::<Vec<slint::SharedString>>(),
+    )));
+    ui.set_d_review_summary(p.summary.clone().into());
+    ui.set_d_review_flagged(ModelRc::new(VecModel::from(
+        p.flagged
+            .iter()
+            .map(|s| s.into())
+            .collect::<Vec<slint::SharedString>>(),
+    )));
+    ui.set_d_review_reviewed_at(p.reviewed_at.clone().into());
+}
+
 fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
     match msg {
         Msg::Status(s) => {
@@ -1182,7 +1379,7 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
             rebuild_rows_ui(ui, app);
             update_status_bar(ui, app);
         }
-        Msg::Panel { title, author, state, ci, opened, updated, body, priority, pinned, on_board, convo_json, checks_json, files_json } => {
+        Msg::Panel { title, author, state, ci, opened, updated, body, priority, pinned, on_board, convo_json, checks_json, files_json, review } => {
             ui.set_d_title(title.into());
             ui.set_d_author(author.clone().into());
             // 头像在 UI 线程从磁盘缓存读（slint::Image 是 Rc，不过线程边界）
@@ -1226,9 +1423,38 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
                 })
                 .collect();
             ui.set_d_files(ModelRc::new(VecModel::from(files)));
+            // 评审 tab：装载已有评审；状态重置（避免带出上一个 PR 的 running/failed）
+            apply_review_props(ui, &review);
+            ui.set_d_review_status("".into());
+            ui.set_d_review_progress("".into());
             ui.set_d_open(true);
         }
         Msg::ClosePanel => ui.set_d_open(false),
+        Msg::ReviewProgress { repo, number, text } => {
+            app.lock().unwrap().status_msg = text.clone();
+            update_status_bar(ui, app);
+            if panel_matches(app, &repo, number) {
+                ui.set_d_review_status("running".into());
+                ui.set_d_review_progress(text.into());
+            }
+        }
+        Msg::ReviewDone { repo, number } => {
+            app.lock().unwrap().status_msg = format!("评审完成：{repo} #{number}");
+            update_status_bar(ui, app);
+            if panel_matches(app, &repo, number) {
+                let rv = { app.lock().unwrap().db.get_review(&repo, number).ok().flatten() };
+                apply_review_props(ui, &review_props(rv.as_ref()));
+                ui.set_d_review_status("done".into());
+                ui.set_d_review_progress("".into());
+            }
+        }
+        Msg::ReviewFailed { repo, number, err } => {
+            app.lock().unwrap().status_msg = format!("评审失败：{repo} #{number}：{err}");
+            update_status_bar(ui, app);
+            if panel_matches(app, &repo, number) {
+                ui.set_d_review_status("failed".into());
+            }
+        }
         Msg::InboxRows(rows_json) => {
             // 存一份原始 JSON（inbox_activated 按下标取 thread id）
             app.lock().unwrap().inbox = rows_json.clone();

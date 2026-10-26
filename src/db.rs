@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     dimensions TEXT, summary TEXT, flagged_files TEXT, reviewed_at TEXT,
     high_value INTEGER NOT NULL DEFAULT 0, oversized INTEGER NOT NULL DEFAULT 0,
     files_changed INTEGER, additions INTEGER, deletions INTEGER, size_label TEXT,
+    pushed INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (repo, number, head_sha)
 );
 CREATE TABLE IF NOT EXISTS todos (
@@ -70,6 +71,15 @@ impl Db {
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 1 {
             conn.execute_batch(SCHEMA_V1)?;
+        }
+        // reviews 增加 pushed 列（老库迁移；新库已含该列，忽略 duplicate column name）
+        if let Err(e) = conn.execute(
+            "ALTER TABLE reviews ADD COLUMN pushed INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            if !e.to_string().contains("duplicate column name") {
+                return Err(e.into());
+            }
         }
         if version < 2 {
             // v1 → v2：prs 加 extras 缓存列（幂等：列已存在则跳过）
@@ -150,15 +160,15 @@ impl Db {
         self.conn.execute(
             "INSERT INTO reviews(repo, number, head_sha, score, dimensions, summary,
                 flagged_files, reviewed_at, high_value, oversized, files_changed,
-                additions, deletions, size_label)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                additions, deletions, size_label, pushed)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0)
              ON CONFLICT(repo, number, head_sha) DO UPDATE SET
                 score=excluded.score, dimensions=excluded.dimensions,
                 summary=excluded.summary, flagged_files=excluded.flagged_files,
                 reviewed_at=excluded.reviewed_at, high_value=excluded.high_value,
                 oversized=excluded.oversized, files_changed=excluded.files_changed,
                 additions=excluded.additions, deletions=excluded.deletions,
-                size_label=excluded.size_label",
+                size_label=excluded.size_label, pushed=0",
             params![
                 r["repo"].as_str().unwrap_or(""),
                 r["number"].as_i64().unwrap_or(0),
@@ -176,6 +186,51 @@ impl Db {
                 r["size_label"].as_str(),
             ],
         )?;
+        Ok(())
+    }
+
+    /// 待推送的本地评审（pushed=0）；dimensions/flagged_files 从 JSON 字符串解析回对象/数组。
+    pub fn unpushed_reviews(&self) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repo, number, head_sha, score, dimensions, summary, flagged_files,
+                reviewed_at, high_value, oversized, files_changed, additions, deletions, size_label
+             FROM reviews WHERE pushed=0",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let dims: Option<serde_json::Value> =
+                    r.get::<_, Option<String>>(4)?.and_then(|s| serde_json::from_str(&s).ok());
+                let flagged: Option<serde_json::Value> =
+                    r.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str(&s).ok());
+                Ok(serde_json::json!({
+                    "repo": r.get::<_, String>(0)?,
+                    "number": r.get::<_, i64>(1)?,
+                    "head_sha": r.get::<_, String>(2)?,
+                    "score": r.get::<_, Option<f64>>(3)?,
+                    "dimensions": dims,
+                    "summary": r.get::<_, Option<String>>(5)?,
+                    "flagged_files": flagged,
+                    "reviewed_at": r.get::<_, Option<String>>(7)?,
+                    "high_value": r.get::<_, i64>(8)?,
+                    "oversized": r.get::<_, i64>(9)?,
+                    "files_changed": r.get::<_, Option<i64>>(10)?,
+                    "additions": r.get::<_, Option<i64>>(11)?,
+                    "deletions": r.get::<_, Option<i64>>(12)?,
+                    "size_label": r.get::<_, Option<String>>(13)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// 推送成功后按 (repo, number, head_sha) 置 pushed=1。
+    pub fn mark_reviews_pushed(&self, keys: &[(String, i64, String)]) -> Result<()> {
+        for (repo, number, head_sha) in keys {
+            self.conn.execute(
+                "UPDATE reviews SET pushed=1 WHERE repo=?1 AND number=?2 AND head_sha=?3",
+                params![repo, number, head_sha],
+            )?;
+        }
         Ok(())
     }
 
@@ -408,5 +463,54 @@ mod tests {
         assert_eq!(db.get_diff("o/r", 1).unwrap().as_deref(), Some("diff text"));
         db.put_diff("o/r", 1, "v2").unwrap();
         assert_eq!(db.get_diff("o/r", 1).unwrap().as_deref(), Some("v2"));
+    }
+
+    fn review_json(repo: &str, n: i64, sha: &str, score: f64) -> serde_json::Value {
+        serde_json::json!({
+            "repo": repo, "number": n, "head_sha": sha, "score": score,
+            "dimensions": "{\"correctness\":9}", "summary": "ok",
+            "flagged_files": "[\"src/a.rs\"]", "reviewed_at": "2026-01-01T00:00:00",
+            "high_value": 1, "oversized": 0, "files_changed": 3,
+            "additions": 10, "deletions": 2, "size_label": "S",
+        })
+    }
+
+    #[test]
+    fn unpushed_reviews_roundtrip() {
+        let db = Db::open_memory().unwrap();
+        assert!(db.unpushed_reviews().unwrap().is_empty());
+        db.upsert_review(&review_json("o/r", 1, "s1", 8.5)).unwrap();
+        let rows = db.unpushed_reviews().unwrap();
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!(r["repo"], "o/r");
+        assert_eq!(r["number"], 1);
+        assert_eq!(r["head_sha"], "s1");
+        assert_eq!(r["score"], 8.5);
+        assert_eq!(r["dimensions"], serde_json::json!({"correctness": 9}));
+        assert_eq!(r["flagged_files"], serde_json::json!(["src/a.rs"]));
+        assert_eq!(r["high_value"], 1);
+        assert_eq!(r["oversized"], 0);
+        assert_eq!(r["files_changed"], 3);
+        assert_eq!(r["additions"], 10);
+        assert_eq!(r["deletions"], 2);
+        assert_eq!(r["size_label"], "S");
+    }
+
+    #[test]
+    fn mark_reviews_pushed_then_upsert_resets() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_review(&review_json("o/r", 1, "s1", 8.5)).unwrap();
+        db.upsert_review(&review_json("o/r", 2, "s2", 7.0)).unwrap();
+        db.mark_reviews_pushed(&[("o/r".to_string(), 1, "s1".to_string())])
+            .unwrap();
+        let rows = db.unpushed_reviews().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["number"], 2);
+        // 已推送的报告再次被 upsert（本地重新评审）→ pushed 重置为 0
+        db.upsert_review(&review_json("o/r", 1, "s1", 9.0)).unwrap();
+        let rows = db.unpushed_reviews().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|r| r["number"] == 1 && r["score"] == 9.0));
     }
 }

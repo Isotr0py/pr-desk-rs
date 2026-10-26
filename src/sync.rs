@@ -83,11 +83,12 @@ impl SyncClient {
     }
 
     /// POST sync_push。
-    pub async fn push_body(&self, prs_updates: Vec<Value>) -> Result<Value> {
+    pub async fn push_body(&self, prs_updates: Vec<Value>, reviews_new: Vec<Value>) -> Result<Value> {
         let body = serde_json::json!({
             "prs_updates": prs_updates,
             "todos_updates": [],
             "todos_new": [],
+            "reviews_new": reviews_new,
         });
         let resp = self
             .client
