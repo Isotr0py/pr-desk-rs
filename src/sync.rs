@@ -135,8 +135,7 @@ impl SyncClient {
         for (k, v) in self.sign_headers("GET", &path, b"") {
             req = req.header(k, v);
         }
-        let resp = req.send().await?;
-        check_status(&resp)?;
+        let resp = ensure_success(req.send().await?).await?;
         Ok(resp.json().await?)
     }
 
@@ -159,18 +158,25 @@ impl SyncClient {
         for (k, v) in self.sign_headers("POST", &path, &body_bytes) {
             req = req.header(k, v);
         }
-        let resp = req.send().await?;
-        check_status(&resp)?;
+        let resp = ensure_success(req.send().await?).await?;
         Ok(resp.json().await?)
     }
 }
 
-fn check_status(resp: &reqwest::Response) -> Result<()> {
-    if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
-        anyhow::bail!("sync token 无效或 sync 未启用（401）");
+/// 非 2xx 时把服务器返回体带进错误（401 的原因有好几种：插件 sync 未启用 /
+/// token 不符 / 签名不匹配 / AstrBot 中间件拦截，原文是唯一的区分手段）。
+async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::Response> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
     }
-    resp.error_for_status_ref().context("sync HTTP 错误")?;
-    Ok(())
+    let body = resp.text().await.unwrap_or_default();
+    let body = body.trim().chars().take(200).collect::<String>();
+    let detail = if body.is_empty() { "服务器无详细说明".to_string() } else { body };
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        anyhow::bail!("同步认证失败（401）：{detail}");
+    }
+    anyhow::bail!("sync HTTP {status}：{detail}");
 }
 
 /// 应用 pull 响应到本地。返回 (prs, reviews, todos) 行数。
