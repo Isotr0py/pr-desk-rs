@@ -1,6 +1,7 @@
 //! PR Desk 桌面端（第一阶段）：本地 SQLite + GitHub 拉取 + 插件同步 + Slint UI。
 //! 纯逻辑在 lib（pr_desk_rs）里，`cargo test --lib` 不需要编译 Slint。
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -225,6 +226,61 @@ fn panel_matches(app: &Arc<Mutex<App>>, repo: &str, number: i64) -> bool {
         .unwrap_or(false)
 }
 
+/// 同时在跑的预评审上限。
+const REVIEW_CONCURRENCY: usize = 3;
+
+/// 预评审并发槽位（纯逻辑，可单测）：限制同时在跑的评审数，并防止同一 PR 重入。
+struct ReviewSlots {
+    capacity: usize,
+    inflight: HashSet<(String, i64)>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SlotError {
+    AlreadyRunning, // 同一 PR 已有评审在跑
+    AtCapacity,     // 槽位已满
+}
+
+impl ReviewSlots {
+    fn new(capacity: usize) -> Self {
+        Self { capacity, inflight: HashSet::new() }
+    }
+
+    /// 占用一个槽位；同一 PR 重入报 AlreadyRunning，超额报 AtCapacity。
+    fn try_acquire(&mut self, repo: &str, number: i64) -> Result<(), SlotError> {
+        if self.inflight.contains(&(repo.to_string(), number)) {
+            return Err(SlotError::AlreadyRunning);
+        }
+        if self.inflight.len() >= self.capacity {
+            return Err(SlotError::AtCapacity);
+        }
+        self.inflight.insert((repo.to_string(), number));
+        Ok(())
+    }
+
+    fn release(&mut self, repo: &str, number: i64) {
+        self.inflight.remove(&(repo.to_string(), number));
+    }
+
+    /// 面板打开时查询：该 PR 是否正在评审。
+    fn is_running(&self, repo: &str, number: i64) -> bool {
+        self.inflight.contains(&(repo.to_string(), number))
+    }
+}
+
+/// 槽位 RAII 守卫：评审任务结束（无论成败）自动释放，不泄漏槽位。
+struct SlotGuard {
+    slots: Arc<Mutex<ReviewSlots>>,
+    repo: String,
+    number: i64,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.slots.lock().unwrap().release(&self.repo, self.number);
+    }
+}
+
 struct App {
     cfg: Config,
     db: Db,
@@ -239,6 +295,7 @@ struct App {
     total: usize,                           // 全部行数（状态栏「共 N 个 PR」）
     rate_limit: Arc<Mutex<Option<u64>>>,    // GitHub X-RateLimit-Remaining 共享状态
     last_sync: sync::SharedLastSync,        // 最近同步成功时间
+    review_slots: Arc<Mutex<ReviewSlots>>,  // 预评审并发槽（worker 与 UI 侧 open_drawer 共享）
 }
 
 /// 状态栏组合逻辑已内联进 update_status_bar（三段：同步/配额/总数）。
@@ -310,6 +367,7 @@ fn main() -> anyhow::Result<()> {
         total: 0,
         rate_limit: Arc::new(Mutex::new(None)),
         last_sync: sync::shared_last_sync(),
+        review_slots: Arc::new(Mutex::new(ReviewSlots::new(REVIEW_CONCURRENCY))),
     }));
 
     // 设置页初值 + 首启引导 + 状态栏配置状态
@@ -865,6 +923,13 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, idx: usize) {
         review: review_props(review.as_ref()),
     });
 
+    // 评审进行中打开该 PR 面板：紧随 Panel 之后把面板置 running
+    //（apply_msg 顺序处理，ReviewProgress 在 Panel 重置状态后生效）
+    let running = app.lock().unwrap().review_slots.lock().unwrap().is_running(&repo, number);
+    if running {
+        send_msg(Msg::ReviewProgress { repo: repo.clone(), number, text: "评审进行中…".into() });
+    }
+
     match diff_cached {
         Some(d) => send_msg(Msg::DiffRaw(d)),
         None => {
@@ -1038,6 +1103,76 @@ async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::
         }
         Err(e) => {
             let _ = msg_tx.send(Msg::Status(format!("通知拉取失败: {e}")));
+        }
+    }
+}
+
+/// 单个预评审任务体：评分 + OCR 行级评论两段式流程，结果入库并回送消息。
+/// 由 Cmd::RunReview 臂在并发槽位内 tokio::spawn 调用（GitHub 客户端每任务自建）。
+async fn run_review_task(
+    cfg: &Config,
+    llm: &LlmSettings,
+    g: &github::GitHub,
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    repo: &str,
+    number: i64,
+) {
+    let _ = msg_tx.send(Msg::ReviewProgress {
+        repo: repo.to_string(),
+        number,
+        text: format!("开始评审 {repo} #{number}…"),
+    });
+    // 进度回调 → channel（状态栏 + 面板进度，见 Msg::ReviewProgress）
+    let tx = msg_tx.clone();
+    let (r2, n2) = (repo.to_string(), number);
+    let mut progress = move |text: String| {
+        let _ = tx.send(Msg::ReviewProgress { repo: r2.clone(), number: n2, text });
+    };
+    match reviewer::run_review(llm, g, repo, number, &mut progress).await {
+        Ok(mut v) => {
+            // 第二段：OCR 行级评论（评分已拿到，OCR 失败不拖垮整单）
+            match g.fetch_pr_meta(repo, number).await {
+                Ok(meta) => {
+                    match ocr::run_ocr_review(cfg, g, repo, number, &meta, &mut progress).await {
+                        Ok(outcome) => {
+                            let _ = msg_tx.send(Msg::ReviewProgress {
+                                repo: repo.to_string(),
+                                number,
+                                text: format!(
+                                    "OCR 完成：{} 条评论（{} 个文件）",
+                                    outcome.comments.len(),
+                                    outcome.files_reviewed
+                                ),
+                            });
+                            v["comments"] = serde_json::Value::Array(outcome.comments);
+                        }
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Status(format!("OCR 明细获取失败：{e}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = msg_tx.send(Msg::Status(format!("OCR 明细获取失败：{e}")));
+                }
+            }
+            let ok = { app.lock().unwrap().db.upsert_review(&v).is_ok() };
+            if ok {
+                let _ = msg_tx.send(Msg::ReviewDone { repo: repo.to_string(), number });
+            } else {
+                let _ = msg_tx.send(Msg::ReviewFailed {
+                    repo: repo.to_string(),
+                    number,
+                    err: "评审结果入库失败".into(),
+                });
+            }
+        }
+        Err(e) => {
+            let _ = msg_tx.send(Msg::ReviewFailed {
+                repo: repo.to_string(),
+                number,
+                err: format!("{e}"),
+            });
         }
     }
 }
@@ -1270,68 +1405,59 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 let _ = msg_tx.send(Msg::InboxRows(rows));
             }
             Cmd::RunReview { repo, number } => {
-                let cfg = app.lock().unwrap().cfg.clone();
+                let (cfg, slots) = {
+                    let a = app.lock().unwrap();
+                    (a.cfg.clone(), a.review_slots.clone())
+                };
+                // LLM 配置缺失：立即提示，不占并发槽
                 let Some(llm) = LlmSettings::from_config(&cfg) else {
                     let _ = msg_tx.send(Msg::Status("请先在设置里配置 LLM API Key 和模型".into()));
                     continue;
                 };
-                let Some(g) = &gh else {
-                    let _ = msg_tx.send(Msg::Status("GitHub 客户端未就绪，无法评审".into()));
-                    continue;
-                };
-                let _ = msg_tx.send(Msg::ReviewProgress {
-                    repo: repo.clone(),
-                    number,
-                    text: format!("开始评审 {repo} #{number}…"),
-                });
-                // 进度回调 → channel（状态栏 + 面板进度，见 Msg::ReviewProgress）
-                let tx = msg_tx.clone();
-                let (r2, n2) = (repo.clone(), number);
-                let mut progress = move |text: String| {
-                    let _ = tx.send(Msg::ReviewProgress { repo: r2.clone(), number: n2, text });
-                };
-                match reviewer::run_review(&llm, g, &repo, number, &mut progress).await {
-                    Ok(mut v) => {
-                        // 第二段：OCR 行级评论（评分已拿到，OCR 失败不拖垮整单）
-                        match g.fetch_pr_meta(&repo, number).await {
-                            Ok(meta) => {
-                                match ocr::run_ocr_review(&cfg, g, &repo, number, &meta, &mut progress).await {
-                                    Ok(outcome) => {
-                                        let _ = msg_tx.send(Msg::ReviewProgress {
-                                            repo: repo.clone(),
-                                            number,
-                                            text: format!(
-                                                "OCR 完成：{} 条评论（{} 个文件）",
-                                                outcome.comments.len(),
-                                                outcome.files_reviewed
-                                            ),
-                                        });
-                                        v["comments"] = serde_json::Value::Array(outcome.comments);
-                                    }
-                                    Err(e) => {
-                                        let _ = msg_tx.send(Msg::Status(format!("OCR 明细获取失败：{e}")));
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                let _ = msg_tx.send(Msg::Status(format!("OCR 明细获取失败：{e}")));
-                            }
-                        }
-                        let ok = { app.lock().unwrap().db.upsert_review(&v).is_ok() };
-                        if ok {
-                            let _ = msg_tx.send(Msg::ReviewDone { repo, number });
-                        } else {
-                            let _ = msg_tx.send(Msg::ReviewFailed {
-                                repo,
-                                number,
-                                err: "评审结果入库失败".into(),
-                            });
-                        }
+                // 并发槽：同一 PR 重入 / 超额都立即拒绝（槽位由任务内 SlotGuard 释放）
+                // 注意：try_acquire 的锁守卫随 let 语句结束即释放，match 臂内可再次加锁
+                let acquired = slots.lock().unwrap().try_acquire(&repo, number);
+                match acquired {
+                    Ok(()) => {}
+                    Err(SlotError::AlreadyRunning) => {
+                        let _ = msg_tx.send(Msg::Status("该 PR 正在评审中".into()));
+                        continue;
                     }
-                    Err(e) => {
-                        let _ = msg_tx.send(Msg::ReviewFailed { repo, number, err: format!("{e}") });
+                    Err(SlotError::AtCapacity) => {
+                        let _ = msg_tx.send(Msg::Status(format!(
+                            "已有 {} 个评审进行中，稍后再试",
+                            slots.lock().unwrap().capacity
+                        )));
+                        continue;
                     }
                 }
+                // 并行评审：spawn 后立即返回，worker 循环继续处理后续命令。
+                // 每个任务自建 GitHub 客户端，结束后把配额合并回 app.rate_limit。
+                let app2 = app.clone();
+                let tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let _guard = SlotGuard { slots, repo: repo.clone(), number };
+                    let rl = match github::GitHub::new(cfg.token()) {
+                        Ok(g) => {
+                            let h = g.rate_limit_handle();
+                            run_review_task(&cfg, &llm, &g, &app2, &tx, &repo, number).await;
+                            Some(h)
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::ReviewFailed {
+                                repo: repo.clone(),
+                                number,
+                                err: format!("GitHub 客户端初始化失败: {e}"),
+                            });
+                            None
+                        }
+                    };
+                    if let Some(h) = rl {
+                        if let Some(n) = *h.lock().unwrap() {
+                            *app2.lock().unwrap().rate_limit.lock().unwrap() = Some(n);
+                        }
+                    }
+                });
             }
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
@@ -1554,6 +1680,8 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
         Msg::ReviewDone { repo, number } => {
             app.lock().unwrap().status_msg = format!("评审完成：{repo} #{number}");
             update_status_bar(ui, app);
+            // 评审分数进列表 Rev 列：重建行模型
+            reload_rows_global(app);
             if panel_matches(app, &repo, number) {
                 let rv = { app.lock().unwrap().db.get_review(&repo, number).ok().flatten() };
                 apply_review_props(ui, &review_props(rv.as_ref()));
@@ -1667,5 +1795,65 @@ mod tests {
         assert_eq!(notif_url_number("https://github.com/o/r/pull/123"), Some(123));
         assert_eq!(notif_url_number("https://github.com/o/r/releases"), None);
         assert_eq!(notif_url_number(""), None);
+    }
+
+    #[test]
+    fn review_slots_acquire_and_release() {
+        let mut s = ReviewSlots::new(2);
+        assert!(s.try_acquire("o/r", 1).is_ok());
+        assert!(s.is_running("o/r", 1));
+        s.release("o/r", 1);
+        assert!(!s.is_running("o/r", 1));
+        // 释放后可再获取
+        assert!(s.try_acquire("o/r", 1).is_ok());
+    }
+
+    #[test]
+    fn review_slots_reject_duplicate_acquire() {
+        let mut s = ReviewSlots::new(3);
+        s.try_acquire("o/r", 1).unwrap();
+        assert_eq!(s.try_acquire("o/r", 1), Err(SlotError::AlreadyRunning));
+        // 同一 PR 不同 number / 不同 repo 不受影响
+        assert!(s.try_acquire("o/r", 2).is_ok());
+        assert!(s.try_acquire("a/b", 1).is_ok());
+    }
+
+    #[test]
+    fn review_slots_enforce_capacity() {
+        let mut s = ReviewSlots::new(3);
+        s.try_acquire("o/r", 1).unwrap();
+        s.try_acquire("o/r", 2).unwrap();
+        s.try_acquire("o/r", 3).unwrap();
+        assert_eq!(s.try_acquire("o/r", 4), Err(SlotError::AtCapacity));
+        // 释放一个后腾出槽位
+        s.release("o/r", 2);
+        assert!(s.try_acquire("o/r", 4).is_ok());
+        assert_eq!(s.try_acquire("o/r", 5), Err(SlotError::AtCapacity));
+    }
+
+    #[test]
+    fn review_slots_release_unknown_is_noop() {
+        let mut s = ReviewSlots::new(1);
+        s.release("o/r", 99); // 未占用：不 panic
+        assert!(s.try_acquire("o/r", 1).is_ok());
+    }
+
+    #[test]
+    fn review_slots_duplicate_check_beats_capacity() {
+        // 满槽时对重复 PR 报 AlreadyRunning 而非 AtCapacity
+        let mut s = ReviewSlots::new(1);
+        s.try_acquire("o/r", 1).unwrap();
+        assert_eq!(s.try_acquire("o/r", 1), Err(SlotError::AlreadyRunning));
+    }
+
+    #[test]
+    fn slot_guard_releases_on_drop() {
+        let slots = Arc::new(Mutex::new(ReviewSlots::new(1)));
+        slots.lock().unwrap().try_acquire("o/r", 1).unwrap();
+        {
+            let _g = SlotGuard { slots: slots.clone(), repo: "o/r".into(), number: 1 };
+        }
+        assert!(!slots.lock().unwrap().is_running("o/r", 1));
+        assert!(slots.lock().unwrap().try_acquire("o/r", 1).is_ok());
     }
 }

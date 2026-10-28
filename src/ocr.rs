@@ -198,7 +198,7 @@ pub async fn run_ocr_review(
     repo: &str,
     number: i64,
     meta: &Value,
-    progress: &mut dyn FnMut(String),
+    progress: &mut (dyn FnMut(String) + Send),
 ) -> Result<OcrRunOutcome> {
     let base_sha = meta["base"]["sha"].as_str().unwrap_or("").to_string();
     let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();

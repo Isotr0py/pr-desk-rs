@@ -390,7 +390,7 @@ pub async fn run_review(
     gh: &GitHub,
     repo: &str,
     number: i64,
-    progress: &mut dyn FnMut(String),
+    progress: &mut (dyn FnMut(String) + Send),
 ) -> Result<Value> {
     progress("拉取 PR 信息…".into());
     let meta_raw = gh.fetch_pr_meta(repo, number).await?;
