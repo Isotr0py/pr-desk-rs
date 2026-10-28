@@ -525,32 +525,25 @@ component PrRowItem inherits Rectangle {
         }
     }
 
-    // Review 状态符号：commented 用内嵌 SVG（💬 emoji 本机无字形会显示豆腐块），
-    // approved ✓ / changes_requested ✗ / 其它 ○ 文字字形渲染正常，保持原样
+    // Review 状态符号：全部用内嵌 SVG + colorize（✓/✗/○/💬 字形在本机字体下都会豆腐块）
     Rectangle {
         x: root.x-rev;
         width: Cols.review;
         height: parent.height;
-        if root.pr.review == "commented": Image {
-            source: @image-url("icons/comment.svg");
+        Image {
+            source: root.pr.review == "approved" ? @image-url("icons/check.svg")
+                : (root.pr.review == "changes_requested" ? @image-url("icons/x.svg")
+                : (root.pr.review == "commented" ? @image-url("icons/comment.svg")
+                : @image-url("icons/circle.svg")));
             width: 12px;
             height: 12px;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             image-fit: contain;
-            colorize: root.selected ? root.fg : Theme.text;
-        }
-        if root.pr.review != "commented": Text {
-            width: parent.width;
-            height: parent.height;
-            text: root.pr.review == "approved" ? "✓"
-                : (root.pr.review == "changes_requested" ? "✗" : "○");
-            color: root.selected ? root.fg
+            colorize: root.selected ? root.fg
                 : (root.pr.review == "approved" ? Theme.good
-                : (root.pr.review == "changes_requested" ? Theme.bad : Theme.text_dim));
-            font-size: Theme.fs_xs;
-            horizontal-alignment: center;
-            vertical-alignment: center;
+                : (root.pr.review == "changes_requested" ? Theme.bad
+                : (root.pr.review == "commented" ? Theme.text : Theme.text_dim)));
         }
     }
 
