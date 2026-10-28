@@ -831,7 +831,7 @@ fn local_update<V: Into<serde_json::Value>>(app: &Arc<Mutex<App>>, idx: usize, f
 fn reload_rows_global(app: &Arc<Mutex<App>>) {
     let rows = {
         let a = app.lock().unwrap();
-        a.db.list_prs().unwrap_or_default()
+        a.db.list_prs(list_sources(&a.cfg)).unwrap_or_default()
     };
     app.lock().unwrap().rows = rows.clone();
     // serde_json 行可跨线程；Slint 模型在 UI 线程（apply_msg）装配
@@ -1199,6 +1199,102 @@ async fn run_review_task(
     }
 }
 
+/// 列表来源过滤：sync 启用时只显示服务器插件数据库跟踪的 PR + 手动预评审加的；
+/// 本地模式显示全部（含 GitHub 火hose 拉下来的）。
+fn list_sources(cfg: &Config) -> &'static [&'static str] {
+    if cfg.sync_token.is_empty() {
+        &[]
+    } else {
+        &["server", "inbox"]
+    }
+}
+
+/// 本地模式刷新：拉配置仓库的全部 open PR upsert 进列表库（GitHub 火hose）。
+/// sync 启用时不走这条路——列表以服务器插件数据库为准。
+async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
+    let repos = app.lock().unwrap().cfg.repos.clone();
+    let mut total = 0;
+    for repo in &repos {
+        match gh.fetch_open_prs(repo).await {
+            Ok(prs) => {
+                total += prs.len();
+                let a = app.lock().unwrap();
+                for p in prs {
+                    let _ = a.db.upsert_pr(&serde_json::json!({
+                        "repo": p.repo, "number": p.number, "title": p.title,
+                        "author": p.author, "url": p.url, "head_sha": p.head_sha,
+                        "status": "pending", "updated_at": db::now(),
+                    }));
+                }
+            }
+            Err(e) => {
+                let _ = msg_tx.send(Msg::Status(format!("拉取 {repo} 失败: {e}")));
+            }
+        }
+    }
+    reload_rows(app, msg_tx);
+    let _ = msg_tx.send(Msg::Status(format!("GitHub 刷新完成：{total} 个 open PR")));
+}
+
+/// 一次 sync_pull → 本地应用 → outbox/reviews push 流程（Cmd::Sync 与 sync 模式下的
+/// RefreshGithub/ReloadConfig 共用）。sync 未启用时静默跳过。
+async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: &mpsc::Sender<Msg>) {
+    if !sync_client.enabled() {
+        // 本地模式：静默跳过，状态栏由 update_status_bar 显示「本地模式」
+        return;
+    }
+    // 不跨 await 持有 DB 锁：HTTP 与 DB 应用分步，各自短时加锁
+    let result: anyhow::Result<((usize, usize, usize), sync::PushSummary)> = async {
+        let since = { app.lock().unwrap().db.get_cursor()? };
+        let body = sync_client.pull_body(since).await?;
+        let pulled = {
+            let a = app.lock().unwrap();
+            sync::apply_pull(&a.db, &body)?
+        };
+        let outbox = { app.lock().unwrap().db.outbox_drain()? };
+        let (updates, ids) = sync::merge_outbox(&outbox);
+        let reviews_new = { app.lock().unwrap().db.unpushed_reviews()? };
+        let mut pushed = sync::PushSummary::default();
+        if !updates.is_empty() || !reviews_new.is_empty() {
+            // 推送成功后才标记 reviews 已推（失败则下轮重推）
+            let review_keys: Vec<(String, i64, String)> = reviews_new
+                .iter()
+                .map(|v| {
+                    (
+                        v["repo"].as_str().unwrap_or("").to_string(),
+                        v["number"].as_i64().unwrap_or(0),
+                        v["head_sha"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect();
+            let resp = sync_client.push_body(updates, reviews_new).await?;
+            let a = app.lock().unwrap();
+            pushed = sync::apply_push_result(&a.db, &resp)?;
+            for id in ids {
+                a.db.outbox_remove(id)?;
+            }
+            a.db.mark_reviews_pushed(&review_keys)?;
+        }
+        Ok((pulled, pushed))
+    }
+    .await;
+    match result {
+        Ok(((p, r, t), push)) => {
+            // 记入「已同步 X 前」共享状态（状态栏组合读取）
+            let last_sync = app.lock().unwrap().last_sync.clone();
+            sync::mark_synced(&last_sync);
+            let _ = msg_tx.send(Msg::Status(format!(
+                "已同步服务器列表：拉取 {p} PR/{r} 评审/{t} 待办；推送 {} 条（冲突 {}）",
+                push.applied, push.conflicts
+            )));
+            reload_rows(app, msg_tx);
+        }
+        Err(e) => {
+            let _ = msg_tx.send(Msg::Status(format!("同步失败: {e}")));
+        }
+    }
+}
+
 async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sender<Msg>) {
     let _ = MSG_TX.set(msg_tx.clone());
 
@@ -1226,30 +1322,16 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
         match cmd {
             Cmd::RefreshGithub => {
                 if let Some(gh) = &gh {
-                    let repos = app.lock().unwrap().cfg.repos.clone();
-                    let mut total = 0;
-                    for repo in &repos {
-                        match gh.fetch_open_prs(repo).await {
-                            Ok(prs) => {
-                                total += prs.len();
-                                let a = app.lock().unwrap();
-                                for p in prs {
-                                    let _ = a.db.upsert_pr(&serde_json::json!({
-                                        "repo": p.repo, "number": p.number, "title": p.title,
-                                        "author": p.author, "url": p.url, "head_sha": p.head_sha,
-                                        "status": "pending", "updated_at": db::now(),
-                                    }));
-                                }
-                            }
-                            Err(e) => {
-                                let _ = msg_tx.send(Msg::Status(format!("拉取 {repo} 失败: {e}")));
-                            }
-                        }
+                    if sync_client.enabled() {
+                        // sync 模式：列表来自服务器插件数据库（sync_pull）+ 手动预评审，
+                        // 不再把配置仓库的全部 open PR 灌进列表库；通知仍从 GitHub 拉
+                        fetch_inbox(gh, &app, &msg_tx).await;
+                        do_sync(&app, &sync_client, &msg_tx).await;
+                    } else {
+                        refresh_from_github(gh, &app, &msg_tx).await;
+                        // 顺便拉一次通知
+                        fetch_inbox(gh, &app, &msg_tx).await;
                     }
-                    reload_rows(&app, &msg_tx);
-                    let _ = msg_tx.send(Msg::Status(format!("GitHub 刷新完成：{total} 个 open PR")));
-                    // 顺便拉一次通知
-                    fetch_inbox(gh, &app, &msg_tx).await;
                 }
             }
             Cmd::Sync => {
@@ -1257,60 +1339,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 if let Some(g) = &gh {
                     fetch_inbox(g, &app, &msg_tx).await;
                 }
-                if !sync_client.enabled() {
-                    // 本地模式：静默跳过，状态栏由 update_status_bar 显示「本地模式」
-                    continue;
-                }
-                // 不跨 await 持有 DB 锁：HTTP 与 DB 应用分步，各自短时加锁
-                let result: anyhow::Result<((usize, usize, usize), sync::PushSummary)> = async {
-                    let since = { app.lock().unwrap().db.get_cursor()? };
-                    let body = sync_client.pull_body(since).await?;
-                    let pulled = {
-                        let a = app.lock().unwrap();
-                        sync::apply_pull(&a.db, &body)?
-                    };
-                    let outbox = { app.lock().unwrap().db.outbox_drain()? };
-                    let (updates, ids) = sync::merge_outbox(&outbox);
-                    let reviews_new = { app.lock().unwrap().db.unpushed_reviews()? };
-                    let mut pushed = sync::PushSummary::default();
-                    if !updates.is_empty() || !reviews_new.is_empty() {
-                        // 推送成功后才标记 reviews 已推（失败则下轮重推）
-                        let review_keys: Vec<(String, i64, String)> = reviews_new
-                            .iter()
-                            .map(|v| {
-                                (
-                                    v["repo"].as_str().unwrap_or("").to_string(),
-                                    v["number"].as_i64().unwrap_or(0),
-                                    v["head_sha"].as_str().unwrap_or("").to_string(),
-                                )
-                            })
-                            .collect();
-                        let resp = sync_client.push_body(updates, reviews_new).await?;
-                        let a = app.lock().unwrap();
-                        pushed = sync::apply_push_result(&a.db, &resp)?;
-                        for id in ids {
-                            a.db.outbox_remove(id)?;
-                        }
-                        a.db.mark_reviews_pushed(&review_keys)?;
-                    }
-                    Ok((pulled, pushed))
-                }
-                .await;
-                match result {
-                    Ok(((p, r, t), push)) => {
-                        // 记入「已同步 X 前」共享状态（状态栏组合读取）
-                        let last_sync = app.lock().unwrap().last_sync.clone();
-                        sync::mark_synced(&last_sync);
-                        let _ = msg_tx.send(Msg::Status(format!(
-                            "同步完成：拉取 {p} PR/{r} 评审/{t} 待办；推送 {} 条（冲突 {}）",
-                            push.applied, push.conflicts
-                        )));
-                        reload_rows(&app, &msg_tx);
-                    }
-                    Err(e) => {
-                        let _ = msg_tx.send(Msg::Status(format!("同步失败: {e}")));
-                    }
-                }
+                do_sync(&app, &sync_client, &msg_tx).await;
             }
             Cmd::FetchDiff { repo, number } => {
                 if let Some(gh) = &gh {
@@ -1411,6 +1440,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             "repo": repo, "number": number, "title": title,
                             "author": "", "url": url, "head_sha": "",
                             "status": "pending", "updated_at": db::now(),
+                            "source": "inbox",
                         })).is_ok()
                     };
                     let _ = msg_tx.send(Msg::Status(if ok {
@@ -1548,31 +1578,15 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 }
                 sync_client = sync::SyncClient::new(&cfg);
                 let _ = msg_tx.send(Msg::Status("配置已重载".into()));
-                // 复用现有流程：直接内联一次刷新 + 同步
+                // 复用现有流程：sync 模式同步服务器列表；本地模式拉全部 open PR
                 if let Some(g) = &gh {
-                    let repos = cfg.repos.clone();
-                    let mut total = 0;
-                    for repo in &repos {
-                        match g.fetch_open_prs(repo).await {
-                            Ok(prs) => {
-                                total += prs.len();
-                                let a = app.lock().unwrap();
-                                for p in prs {
-                                    let _ = a.db.upsert_pr(&serde_json::json!({
-                                        "repo": p.repo, "number": p.number, "title": p.title,
-                                        "author": p.author, "url": p.url, "head_sha": p.head_sha,
-                                        "status": "pending", "updated_at": db::now(),
-                                    }));
-                                }
-                            }
-                            Err(e) => {
-                                let _ = msg_tx.send(Msg::Status(format!("拉取 {repo} 失败: {e}")));
-                            }
-                        }
+                    if sync_client.enabled() {
+                        fetch_inbox(g, &app, &msg_tx).await;
+                        do_sync(&app, &sync_client, &msg_tx).await;
+                    } else {
+                        refresh_from_github(g, &app, &msg_tx).await;
+                        fetch_inbox(g, &app, &msg_tx).await;
                     }
-                    reload_rows(&app, &msg_tx);
-                    let _ = msg_tx.send(Msg::Status(format!("GitHub 刷新完成：{total} 个 open PR")));
-                    fetch_inbox(g, &app, &msg_tx).await;
                 }
             }
         }
@@ -1585,7 +1599,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
 fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     let rows = {
         let a = app.lock().unwrap();
-        a.db.list_prs().unwrap_or_default()
+        a.db.list_prs(list_sources(&a.cfg)).unwrap_or_default()
     };
     // 头像 / 组织图标预取名单
     let mut logins = Vec::new();

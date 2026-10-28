@@ -174,12 +174,15 @@ fn check_status(resp: &reqwest::Response) -> Result<()> {
 }
 
 /// 应用 pull 响应到本地。返回 (prs, reviews, todos) 行数。
+/// prs 行注入 source="server"：标记为服务器插件数据库跟踪的 PR（列表按来源过滤）。
 pub fn apply_pull(db: &Db, body: &Value) -> Result<(usize, usize, usize)> {
     let prs = body["prs"].as_array().cloned().unwrap_or_default();
     let reviews = body["reviews"].as_array().cloned().unwrap_or_default();
     let todos = body["todos"].as_array().cloned().unwrap_or_default();
     for p in &prs {
-        db.upsert_pr(p)?;
+        let mut p = p.clone();
+        p["source"] = Value::from("server");
+        db.upsert_pr(&p)?;
     }
     for r in &reviews {
         db.upsert_review(r)?;
@@ -331,7 +334,7 @@ mod tests {
         });
         let summary = apply_push_result(&db, &resp).unwrap();
         assert_eq!(summary.conflicts, 1);
-        let rows = db.list_prs().unwrap();
+        let rows = db.list_prs(&[]).unwrap();
         assert_eq!(rows[0]["priority"], 3); // 本地被服务器值覆盖
     }
 
@@ -345,7 +348,7 @@ mod tests {
         });
         let summary = apply_push_result(&db, &resp).unwrap();
         assert_eq!(summary.applied, 1);
-        let rows = db.list_prs().unwrap();
+        let rows = db.list_prs(&[]).unwrap();
         assert_eq!(rows[0]["priority"], 1); // 客户端值保留
     }
 
@@ -374,7 +377,10 @@ mod tests {
         let (p, r, t) = apply_pull(&db, &body).unwrap();
         assert_eq!((p, r, t), (1, 1, 1));
         assert_eq!(db.get_cursor().unwrap().as_deref(), Some("2026-01-01T00:00:00"));
-        assert_eq!(db.list_prs().unwrap().len(), 1);
+        let rows = db.list_prs(&[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // pull 下来的行标记为 server 来源（sync 模式列表过滤依据）
+        assert_eq!(rows[0]["source"], "server");
     }
 
     #[test]

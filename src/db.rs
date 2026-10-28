@@ -13,6 +13,7 @@ CREATE TABLE IF NOT EXISTS prs (
     role TEXT NOT NULL DEFAULT 'reviewer', on_board INTEGER NOT NULL DEFAULT 0,
     priority INTEGER NOT NULL DEFAULT 0, pinned INTEGER NOT NULL DEFAULT 0,
     ci_status TEXT, review_decision TEXT, turn TEXT, updated_at TEXT,
+    source TEXT NOT NULL DEFAULT 'github',
     PRIMARY KEY (repo, number)
 );
 CREATE TABLE IF NOT EXISTS reviews (
@@ -87,6 +88,16 @@ impl Db {
                 return Err(e.into());
             }
         }
+        // prs 增加 source 列：github=GitHub 火hose / server=sync_pull / inbox=手动预评审
+        // （老库迁移；表不存在或列已存在则跳过，同 MIGRATE_V2 的列检查做法）
+        let prs_cols: Vec<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(prs)")?;
+            stmt.query_map([], |r| r.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if !prs_cols.is_empty() && !prs_cols.iter().any(|c| c == "source") {
+            conn.execute_batch("ALTER TABLE prs ADD COLUMN source TEXT NOT NULL DEFAULT 'github'")?;
+        }
         if version < 2 {
             // v1 → v2：prs 加 extras 缓存列（幂等：列已存在则跳过）
             let cols: Vec<String> = {
@@ -125,8 +136,8 @@ impl Db {
         self.conn.execute(
             "INSERT INTO prs(repo, number, title, author, url, head_sha, status, tags, role,
                 on_board, priority, pinned, ci_status, review_decision, turn, updated_at,
-                recent_commits, extras_detail, extras_updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19)
+                recent_commits, extras_detail, extras_updated_at, source)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
              ON CONFLICT(repo, number) DO UPDATE SET
                 title=excluded.title, author=excluded.author, url=excluded.url,
                 head_sha=excluded.head_sha, status=excluded.status, tags=excluded.tags,
@@ -136,7 +147,11 @@ impl Db {
                 updated_at=excluded.updated_at,
                 recent_commits=excluded.recent_commits,
                 extras_detail=excluded.extras_detail,
-                extras_updated_at=excluded.extras_updated_at",
+                extras_updated_at=excluded.extras_updated_at,
+                source=CASE
+                    WHEN excluded.source='server' OR prs.source='server' THEN 'server'
+                    WHEN excluded.source='inbox' OR prs.source='inbox' THEN 'inbox'
+                    ELSE 'github' END",
             params![
                 p["repo"].as_str().unwrap_or(""),
                 p["number"].as_i64().unwrap_or(0),
@@ -157,6 +172,7 @@ impl Db {
                 p["recent_commits"].as_str().unwrap_or("[]"),
                 p["extras_detail"].as_str(),
                 p["extras_updated_at"].as_str(),
+                p["source"].as_str().unwrap_or("github"),
             ],
         )?;
         Ok(())
@@ -276,40 +292,57 @@ impl Db {
 
     // ── 列表查询 ──
     /// 列表行：prs + 最近 review 的 score/体量（与插件 list_prs 同语义）。
-    pub fn list_prs(&self) -> Result<Vec<serde_json::Value>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT p.*, r.score, r.reviewed_at, r.size_label, r.additions, r.deletions
+    /// `sources` 非空时只返回这些来源的行（sync 模式传 ["server","inbox"]，本地模式传 &[]）。
+    /// 显式列名（不用 p.*）：source 列在新库（CREATE 内）与老库（ALTER 追加）位置不同。
+    pub fn list_prs(&self, sources: &[&str]) -> Result<Vec<serde_json::Value>> {
+        let where_clause = if sources.is_empty() {
+            String::new()
+        } else {
+            let ph = (1..=sources.len())
+                .map(|i| format!("?{i}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("WHERE p.source IN ({ph})")
+        };
+        let sql = format!(
+            "SELECT p.repo, p.number, p.title, p.author, p.url, p.status, p.tags, p.role,
+                p.on_board, p.priority, p.pinned, p.ci_status, p.review_decision, p.turn,
+                p.updated_at, p.recent_commits, p.extras_detail, p.source,
+                r.score, r.reviewed_at, r.size_label, r.additions, r.deletions
              FROM prs p
              LEFT JOIN reviews r ON r.rowid = (
                 SELECT r2.rowid FROM reviews r2
                 WHERE r2.repo=p.repo AND r2.number=p.number
                 ORDER BY r2.reviewed_at DESC LIMIT 1)
-             ORDER BY p.pinned DESC, p.updated_at DESC",
-        )?;
+             {where_clause}
+             ORDER BY p.pinned DESC, p.updated_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
-            .query_map([], |row| {
+            .query_map(rusqlite::params_from_iter(sources.iter()), |row| {
                 Ok(serde_json::json!({
                     "repo": row.get::<_, String>(0)?,
                     "number": row.get::<_, i64>(1)?,
                     "title": row.get::<_, Option<String>>(2)?,
                     "author": row.get::<_, Option<String>>(3)?,
                     "url": row.get::<_, Option<String>>(4)?,
-                    "status": row.get::<_, String>(6)?,
-                    "tags": row.get::<_, String>(7)?,
-                    "role": row.get::<_, String>(8)?,
-                    "on_board": row.get::<_, i64>(9)?,
-                    "priority": row.get::<_, i64>(10)?,
-                    "pinned": row.get::<_, i64>(11)?,
-                    "ci_status": row.get::<_, Option<String>>(12)?,
-                    "review_decision": row.get::<_, Option<String>>(13)?,
-                    "turn": row.get::<_, Option<String>>(14)?,
-                    "updated_at": row.get::<_, Option<String>>(15)?,
-                    "recent_commits": row.get::<_, Option<String>>(16)?,
-                    "extras_detail": row.get::<_, Option<String>>(17)?,
-                    "score": row.get::<_, Option<f64>>(19)?,
-                    "size_label": row.get::<_, Option<String>>(21)?,
-                    "additions": row.get::<_, Option<i64>>(22)?,
-                    "deletions": row.get::<_, Option<i64>>(23)?,
+                    "status": row.get::<_, String>(5)?,
+                    "tags": row.get::<_, String>(6)?,
+                    "role": row.get::<_, String>(7)?,
+                    "on_board": row.get::<_, i64>(8)?,
+                    "priority": row.get::<_, i64>(9)?,
+                    "pinned": row.get::<_, i64>(10)?,
+                    "ci_status": row.get::<_, Option<String>>(11)?,
+                    "review_decision": row.get::<_, Option<String>>(12)?,
+                    "turn": row.get::<_, Option<String>>(13)?,
+                    "updated_at": row.get::<_, Option<String>>(14)?,
+                    "recent_commits": row.get::<_, Option<String>>(15)?,
+                    "extras_detail": row.get::<_, Option<String>>(16)?,
+                    "source": row.get::<_, String>(17)?,
+                    "score": row.get::<_, Option<f64>>(18)?,
+                    "size_label": row.get::<_, Option<String>>(20)?,
+                    "additions": row.get::<_, Option<i64>>(21)?,
+                    "deletions": row.get::<_, Option<i64>>(22)?,
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -445,13 +478,124 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_pr(&pr_json("o/r", 1, "t")).unwrap();
         db.upsert_pr(&pr_json("o/r", 1, "t")).unwrap();
-        let rows = db.list_prs().unwrap();
+        let rows = db.list_prs(&[]).unwrap();
         assert_eq!(rows.len(), 1);
         // 更新标题 → 覆盖而非新增
         db.upsert_pr(&pr_json("o/r", 1, "t2")).unwrap();
-        let rows = db.list_prs().unwrap();
+        let rows = db.list_prs(&[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["title"], "t2");
+        // 未带 source 字段 → 默认 'github'
+        assert_eq!(rows[0]["source"], "github");
+    }
+
+    fn pr_json_src(repo: &str, n: i64, title: &str, source: &str) -> serde_json::Value {
+        let mut v = pr_json(repo, n, title);
+        v["source"] = serde_json::json!(source);
+        v
+    }
+
+    fn source_of(db: &Db, n: i64) -> String {
+        let rows = db.list_prs(&[]).unwrap();
+        rows.iter()
+            .find(|r| r["number"] == n)
+            .unwrap()["source"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn source_merge_rules() {
+        let db = Db::open_memory().unwrap();
+        // server 赢 github（后到的 server 覆盖；先到的 server 不被 github 降级）
+        db.upsert_pr(&pr_json_src("o/r", 1, "t", "github")).unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 1, "t", "server")).unwrap();
+        assert_eq!(source_of(&db, 1), "server");
+        db.upsert_pr(&pr_json_src("o/r", 1, "t", "github")).unwrap();
+        assert_eq!(source_of(&db, 1), "server");
+        // inbox 保留：github 不降级 inbox，后到的 inbox 升级 github
+        db.upsert_pr(&pr_json_src("o/r", 2, "t", "inbox")).unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 2, "t", "github")).unwrap();
+        assert_eq!(source_of(&db, 2), "inbox");
+        db.upsert_pr(&pr_json_src("o/r", 3, "t", "github")).unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 3, "t", "inbox")).unwrap();
+        assert_eq!(source_of(&db, 3), "inbox");
+        // server 赢 inbox
+        db.upsert_pr(&pr_json_src("o/r", 3, "t", "server")).unwrap();
+        assert_eq!(source_of(&db, 3), "server");
+        // 缺省 source 字段（老调用方）写入 'github'，且不降级已有 server
+        db.upsert_pr(&pr_json("o/r", 3, "t")).unwrap();
+        assert_eq!(source_of(&db, 3), "server");
+        db.upsert_pr(&pr_json("o/r", 4, "t")).unwrap();
+        assert_eq!(source_of(&db, 4), "github");
+    }
+
+    #[test]
+    fn list_prs_filter_by_source() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 1, "srv", "server")).unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 2, "inbox", "inbox")).unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 3, "gh", "github")).unwrap();
+        // 空过滤 = 全部（本地模式）
+        assert_eq!(db.list_prs(&[]).unwrap().len(), 3);
+        // sync 模式：server + inbox
+        let rows = db.list_prs(&["server", "inbox"]).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r["number"] == 1 || r["number"] == 2));
+        // 单一来源
+        let rows = db.list_prs(&["server"]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["title"], "srv");
+        // 无匹配来源
+        assert_eq!(db.list_prs(&["nope"]).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn migrate_adds_source_column_to_old_db() {
+        // 模拟老库：prs 表无 source 列（含 v2 extras 列）→ Db::open 迁移后默认 'github'
+        let dir = std::env::temp_dir().join(format!("prdesk-db-mig-src-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE prs (
+                    repo TEXT NOT NULL, number INTEGER NOT NULL, title TEXT, author TEXT,
+                    url TEXT, head_sha TEXT, status TEXT NOT NULL DEFAULT 'pending',
+                    tags TEXT NOT NULL DEFAULT '[]', role TEXT NOT NULL DEFAULT 'reviewer',
+                    on_board INTEGER NOT NULL DEFAULT 0, priority INTEGER NOT NULL DEFAULT 0,
+                    pinned INTEGER NOT NULL DEFAULT 0, ci_status TEXT, review_decision TEXT,
+                    turn TEXT, updated_at TEXT,
+                    recent_commits TEXT NOT NULL DEFAULT '[]',
+                    extras_detail TEXT, extras_updated_at TEXT,
+                    PRIMARY KEY (repo, number)
+                );
+                -- reviews 表需存在（migrate 里的 reviews ALTER 假设表已建好）
+                CREATE TABLE reviews (
+                    repo TEXT NOT NULL, number INTEGER NOT NULL, head_sha TEXT NOT NULL,
+                    score REAL, dimensions TEXT, summary TEXT, flagged_files TEXT,
+                    reviewed_at TEXT, high_value INTEGER NOT NULL DEFAULT 0,
+                    oversized INTEGER NOT NULL DEFAULT 0, files_changed INTEGER,
+                    additions INTEGER, deletions INTEGER, size_label TEXT,
+                    pushed INTEGER NOT NULL DEFAULT 0, comments TEXT,
+                    PRIMARY KEY (repo, number, head_sha)
+                );
+                INSERT INTO prs(repo, number, title, status) VALUES ('o/r', 1, 'old', 'pending');
+                PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        // 老行迁移后 source='github'
+        let rows = db.list_prs(&[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["source"], "github");
+        // sync 过滤下不可见；可被 server upsert 升级
+        assert_eq!(db.list_prs(&["server", "inbox"]).unwrap().len(), 0);
+        db.upsert_pr(&pr_json_src("o/r", 1, "srv", "server")).unwrap();
+        assert_eq!(db.list_prs(&["server", "inbox"]).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -475,7 +619,7 @@ mod tests {
         db.outbox_remove(items[0].0).unwrap();
         assert_eq!(db.outbox_drain().unwrap().len(), 1);
         // 本地已立即生效
-        let rows = db.list_prs().unwrap();
+        let rows = db.list_prs(&[]).unwrap();
         assert_eq!(rows.len(), 0); // 未 upsert 过的 PR 不存在（本测试只验证 outbox）
     }
 
