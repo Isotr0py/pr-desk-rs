@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use slint::{Model as _, ModelRc, VecModel};
+use slint::{Model as _, ModelRc, SharedString, VecModel};
 
 slint::include_modules!();
 
@@ -31,6 +31,7 @@ enum Cmd {
     FetchNotifDetail { repo: String, number: i64, kind: String },  // Inbox 预览面板：拉会话/Files/Diff
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
     RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
+    FetchModels { base: String, key: String },  // 设置页「获取」：拉 OpenAI 兼容端点的模型列表
 }
 
 /// 状态栏配置状态文本。
@@ -88,6 +89,8 @@ enum Msg {
         files_json: String,
         diff: String,
     },
+    // 设置页模型列表拉取结果（id 已排序去重）
+    ModelsLoaded(Vec<String>),
 }
 
 /// OCR 行级评论展示数据（纯 Rust 字符串可跨线程；Slint OcrComment 在 UI 线程装配）。
@@ -727,6 +730,13 @@ fn main() -> anyhow::Result<()> {
                 ui.set_s_review_concurrency(cfg.review_concurrency as i32);
                 ui.set_settings_open(true);
             }
+        });
+    }
+    // 设置页「获取」模型列表：用弹窗里正在编辑的 base/key 拉取（无需先保存）
+    {
+        let cmd_tx = cmd_tx.clone();
+        ui.on_fetch_models(move |base, key| {
+            let _ = cmd_tx.send(Cmd::FetchModels { base: base.to_string(), key: key.to_string() });
         });
     }
     {
@@ -1471,6 +1481,58 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                 });
             }
+            Cmd::FetchModels { base, key } => {
+                // 设置页「获取」：拉 OpenAI 兼容端点的模型列表（base/key 是弹窗里正在编辑的值）
+                let base = if base.trim().is_empty() {
+                    app.lock().unwrap().cfg.llm_base_url.clone()
+                } else {
+                    base.trim().trim_end_matches('/').to_string()
+                };
+                let key = if key.trim().is_empty() {
+                    app.lock().unwrap().cfg.llm_key().unwrap_or_default()
+                } else {
+                    key.trim().to_string()
+                };
+                let tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send(Msg::Status("正在拉取模型列表…".into()));
+                    let url = format!("{base}/models");
+                    let result = async {
+                        let resp = reqwest::Client::new()
+                            .get(&url)
+                            .header("Authorization", format!("Bearer {key}"))
+                            .timeout(std::time::Duration::from_secs(15))
+                            .send()
+                            .await?;
+                        if !resp.status().is_success() {
+                            anyhow::bail!("HTTP {}", resp.status());
+                        }
+                        let v: serde_json::Value = resp.json().await?;
+                        let mut ids: Vec<String> = v["data"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|m| m["id"].as_str().map(|s| s.to_string()))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        ids.sort();
+                        ids.dedup();
+                        Ok::<Vec<String>, anyhow::Error>(ids)
+                    }
+                    .await;
+                    match result {
+                        Ok(ids) => {
+                            let n = ids.len();
+                            let _ = tx.send(Msg::ModelsLoaded(ids));
+                            let _ = tx.send(Msg::Status(format!("拉取到 {n} 个模型")));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Status(format!("模型列表拉取失败：{e}")));
+                        }
+                    }
+                });
+            }
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
                 let cfg = app.lock().unwrap().cfg.clone();
@@ -1612,6 +1674,10 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
             update_status_bar(ui, app);
         }
         Msg::StatusBarRefresh => update_status_bar(ui, app),
+        Msg::ModelsLoaded(models) => {
+            let v: Vec<SharedString> = models.iter().map(|m| m.as_str().into()).collect();
+            ui.set_model_list(ModelRc::new(slint::VecModel::from(v)));
+        }
         Msg::FilterChanged(q) => {
             {
                 let mut a = app.lock().unwrap();

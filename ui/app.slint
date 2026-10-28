@@ -1,7 +1,7 @@
 // PR Desk — 主窗口（组装 topbar/pr_list/detail_panel/diff_view + 设置弹窗/首启引导）
 // 键盘：PrListView 管 j/k/↑↓/Enter/Esc（reject 冒泡）；外层 FocusScope 接 p/1/2/3 和 /。
 // Esc 语义（见 dismissed）：详情开着 → 关详情；否则取消选中。
-import { SpinBox } from "std-widgets.slint";
+import { SpinBox, ComboBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TopBar, StatusBar } from "topbar.slint";
 import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
@@ -220,6 +220,10 @@ export component MainWindow inherits Window {
     callback key_priority(int);
     // 设置页（顺序：server_url, sync_token, github_token, repos, poll_interval, llm_base_url, llm_api_key, llm_model, ocr_path, review_concurrency）
     callback save_settings(string, string, string, string, string, string, string, string, string, string);
+    // 设置页「获取」模型列表（参数为弹窗里正在编辑的 base_url / api_key）
+    callback fetch_models(string, string);
+    // 拉取到的模型 id 列表（非空时模型名下方出现下拉框）
+    in property <[string]> model_list: [];
     in-out property <bool> settings_open: false;
     in-out property <string> s_server: "";
     in-out property <string> s_sync_token: "";
@@ -500,9 +504,22 @@ export component MainWindow inherits Window {
                 }
                 Field {
                     label: "模型名";
-                    FormField {
-                        placeholder: "gpt-4o-mini";
-                        text <=> root.s_llm_model;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        FormField {
+                            horizontal-stretch: 1;
+                            placeholder: "gpt-4o-mini";
+                            text <=> root.s_llm_model;
+                        }
+                        DialogButton {
+                            text: "获取";
+                            clicked => { root.fetch_models(root.s_llm_base, root.s_llm_key); }
+                        }
+                    }
+                    // 拉取成功后出现下拉框，选中即填入输入框（输入框仍可手输）
+                    if root.model_list.length > 0: ComboBox {
+                        model: root.model_list;
+                        selected(v) => { root.s_llm_model = v; }
                     }
                 }
                 Field {
