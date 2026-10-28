@@ -26,6 +26,8 @@ llm_api_key = ""
 llm_model = ""
 # open-code-review CLI 路径（行级评论评审引擎；留空或 "ocr" = 自动查找：优先随包 bin/ 目录，其次 PATH）
 ocr_path = "ocr"
+# 预评审并发数（1-8；每个 PR 评审 = 评分 + OCR 多次 LLM 调用，配额紧张时调低）
+review_concurrency = 3
 "#;
 
 #[derive(Debug, Clone)]
@@ -44,6 +46,8 @@ pub struct Config {
     pub llm_model: String,
     /// ocr CLI 路径（"ocr" = 自动查找：优先随包 bin/ 目录，其次 PATH）
     pub ocr_path: String,
+    /// 预评审并发数（1-8）
+    pub review_concurrency: u64,
 }
 
 impl Default for Config {
@@ -59,6 +63,7 @@ impl Default for Config {
             llm_api_key: None,
             llm_model: String::new(),
             ocr_path: "ocr".into(),
+            review_concurrency: 3,
         }
     }
 }
@@ -156,6 +161,12 @@ impl Config {
                 if !v.is_empty() {
                     cfg.ocr_path = v;
                 }
+            } else if let Some(v) = parse_value(line, "review_concurrency") {
+                // 1-8，超出范围回退默认 3
+                cfg.review_concurrency = match v.trim().parse::<u64>() {
+                    Ok(n) if (1..=8).contains(&n) => n,
+                    _ => 3,
+                };
             }
         }
         Ok(cfg)
@@ -167,7 +178,7 @@ impl Config {
             "[{}]",
             self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
         );
-        let kv: [(&str, String); 10] = [
+        let kv: [(&str, String); 11] = [
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
             ("github_token", quote(self.github_token.as_deref().unwrap_or(""))),
@@ -178,13 +189,14 @@ impl Config {
             ("llm_api_key", quote(self.llm_api_key.as_deref().unwrap_or(""))),
             ("llm_model", quote(&self.llm_model)),
             ("ocr_path", quote(&self.ocr_path)),
+            ("review_concurrency", self.review_concurrency.to_string()),
         ];
 
         let mut lines: Vec<String> = match fs::read_to_string(path) {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
             Err(_) => TEMPLATE.lines().map(|l| l.to_string()).collect(),
         };
-        let mut seen = [false; 10];
+        let mut seen = [false; 11];
         for (i, line) in lines.iter_mut().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -253,6 +265,7 @@ mod tests {
             llm_api_key: Some("sk-test".into()),
             llm_model: "qwen3-coder".into(),
             ocr_path: "D:/tools/ocr.exe".into(),
+            review_concurrency: 5,
         };
         cfg.save(&path).unwrap();
 
@@ -269,6 +282,7 @@ mod tests {
         assert_eq!(loaded.llm_api_key.as_deref(), Some("sk-test"));
         assert_eq!(loaded.llm_model, "qwen3-coder");
         assert_eq!(loaded.ocr_path, "D:/tools/ocr.exe");
+        assert_eq!(loaded.review_concurrency, 5);
         assert!(loaded.is_dark());
         assert!(!loaded.is_unconfigured());
         let _ = std::fs::remove_dir_all(&dir);

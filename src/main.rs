@@ -226,10 +226,8 @@ fn panel_matches(app: &Arc<Mutex<App>>, repo: &str, number: i64) -> bool {
         .unwrap_or(false)
 }
 
-/// 同时在跑的预评审上限。
-const REVIEW_CONCURRENCY: usize = 3;
-
 /// 预评审并发槽位（纯逻辑，可单测）：限制同时在跑的评审数，并防止同一 PR 重入。
+/// 容量来自配置 review_concurrency（设置页可改，保存即时生效）。
 struct ReviewSlots {
     capacity: usize,
     inflight: HashSet<(String, i64)>,
@@ -265,6 +263,11 @@ impl ReviewSlots {
     /// 面板打开时查询：该 PR 是否正在评审。
     fn is_running(&self, repo: &str, number: i64) -> bool {
         self.inflight.contains(&(repo.to_string(), number))
+    }
+
+    /// 设置页调整并发数（不影响已占用的槽位）。
+    fn set_capacity(&mut self, capacity: usize) {
+        self.capacity = capacity.max(1);
     }
 }
 
@@ -367,7 +370,7 @@ fn main() -> anyhow::Result<()> {
         total: 0,
         rate_limit: Arc::new(Mutex::new(None)),
         last_sync: sync::shared_last_sync(),
-        review_slots: Arc::new(Mutex::new(ReviewSlots::new(REVIEW_CONCURRENCY))),
+        review_slots: Arc::new(Mutex::new(ReviewSlots::new(cfg.review_concurrency as usize))),
     }));
 
     // 设置页初值 + 首启引导 + 状态栏配置状态
@@ -380,6 +383,7 @@ fn main() -> anyhow::Result<()> {
     ui.set_s_llm_key(cfg.llm_api_key.clone().unwrap_or_default().into());
     ui.set_s_llm_model(cfg.llm_model.clone().into());
     ui.set_s_ocr_path(cfg.ocr_path.clone().into());
+    ui.set_s_review_concurrency(cfg.review_concurrency as i32);
     ui.set_gh_token_from_env(std::env::var("GITHUB_TOKEN").map(|t| !t.is_empty()).unwrap_or(false));
     let unconfigured = cfg.is_unconfigured();
     ui.set_onboarding(unconfigured);
@@ -720,6 +724,7 @@ fn main() -> anyhow::Result<()> {
                 ui.set_s_llm_key(cfg.llm_api_key.unwrap_or_default().into());
                 ui.set_s_llm_model(cfg.llm_model.into());
                 ui.set_s_ocr_path(cfg.ocr_path.into());
+                ui.set_s_review_concurrency(cfg.review_concurrency as i32);
                 ui.set_settings_open(true);
             }
         });
@@ -728,13 +733,17 @@ fn main() -> anyhow::Result<()> {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         let ui2 = ui.as_weak();
-        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model, ocr_path| {
+        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model, ocr_path, review_conc_s| {
             let repos: Vec<String> = repos_text
                 .lines()
                 .map(|l| l.trim().to_string())
                 .filter(|l| !l.is_empty() && l.contains('/'))
                 .collect();
             let poll: u64 = poll_s.trim().parse().unwrap_or(5).max(1);
+            let review_concurrency: u64 = match review_conc_s.trim().parse::<u64>() {
+                Ok(n) if (1..=8).contains(&n) => n,
+                _ => 3,
+            };
             let ocr_path = ocr_path.trim();
             let new_cfg = Config {
                 server_url: server.trim().to_string(),
@@ -747,6 +756,7 @@ fn main() -> anyhow::Result<()> {
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),
                 ocr_path: if ocr_path.is_empty() { "ocr".into() } else { ocr_path.to_string() },
+                review_concurrency,
             };
             if let Err(e) = new_cfg.save(&PathBuf::from("config.toml")) {
                 send_msg(Msg::Status(format!("配置保存失败: {e}")));
@@ -756,6 +766,8 @@ fn main() -> anyhow::Result<()> {
                 let mut a = app.lock().unwrap();
                 a.cfg = new_cfg.clone();
                 a.status_msg = config_status(&new_cfg);
+                // 并发上限即时生效（不影响已占用的槽位）
+                a.review_slots.lock().unwrap().set_capacity(review_concurrency as usize);
             }
             if let Some(ui) = ui2.upgrade() {
                 ui.set_onboarding(new_cfg.is_unconfigured());
