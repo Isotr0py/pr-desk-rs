@@ -282,6 +282,7 @@ export component MainWindow inherits Window {
     // 拉取到的模型 id 列表（非空时模型名下方出现下拉框）
     in property <[string]> model_list: [];
     in-out property <bool> settings_open: false;
+    in-out property <int> settings_tab: 0;   // 0=连接与同步 1=LLM 预评审
     in-out property <string> s_server: "";
     in-out property <string> s_sync_token: "";
     in-out property <string> s_gh_token: "";
@@ -474,8 +475,8 @@ export component MainWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: 480px;
-            // 内容矮则自适应，高则限高（窗口高 - 64px）并滚动；150px = 内边距+标题+底栏+间距
-            height: min(fields.preferred-height + 150px, parent.height - 64px);
+            // 分 tab 后内容变短：固定 560px（窗口太矮则收缩 + 滚动兜底）
+            height: min(560px, parent.height - 64px);
             background: Theme.card;
             border-radius: Theme.r_lg;
             border-width: 1px;
@@ -493,6 +494,58 @@ export component MainWindow inherits Window {
                     font-weight: 600;
                 }
 
+                // 功能分 tab（macOS 风格分段控件，与顶栏同款）
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 232px;
+                        height: 26px;
+                        border-radius: Theme.r_md;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: Theme.surface2;
+
+                        Rectangle {
+                            x: 2px + root.settings_tab * 112px;
+                            y: 2px;
+                            width: 112px;
+                            height: parent.height - 4px;
+                            border-radius: Theme.r_sm;
+                            background: Theme.card;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            animate x { duration: 150ms; easing: ease-out; }
+                        }
+                        stab0 := TouchArea {
+                            x: 0; width: 112px; height: 100%;
+                            mouse-cursor: pointer;
+                            clicked => { root.settings_tab = 0; }
+                        }
+                        Text {
+                            x: 0; width: 112px; height: 100%;
+                            text: "连接与同步";
+                            font-size: Theme.fs_sm;
+                            color: root.settings_tab == 0 ? Theme.text : Theme.text_dim;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        stab1 := TouchArea {
+                            x: 112px; width: 112px; height: 100%;
+                            mouse-cursor: pointer;
+                            clicked => { root.settings_tab = 1; }
+                        }
+                        Text {
+                            x: 112px; width: 112px; height: 100%;
+                            text: "LLM 预评审";
+                            font-size: Theme.fs_sm;
+                            color: root.settings_tab == 1 ? Theme.text : Theme.text_dim;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+
                 Flickable {
                     vertical-stretch: 1;
                     content-width: self.width;
@@ -501,6 +554,10 @@ export component MainWindow inherits Window {
                     fields := VerticalLayout {
                         width: 100%;
                         spacing: 14px;
+
+                // ── tab 0：连接与同步 ──
+                if root.settings_tab == 0: VerticalLayout {
+                    spacing: 14px;
 
                 Field {
                     label: "服务器地址";
@@ -546,15 +603,12 @@ export component MainWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; }
                     }
                 }
-
-                // LLM 预评审分组
-                Rectangle { height: 1px; background: Theme.hairline; }
-                Text {
-                    text: "LLM 预评审";
-                    color: Theme.text_dim;
-                    font-size: Theme.fs_sm;
-                    font-weight: 600;
                 }
+
+                // ── tab 1：LLM 预评审 ──
+                if root.settings_tab == 1: VerticalLayout {
+                    spacing: 14px;
+
                 Field {
                     label: "API Base URL";
                     FormField {
@@ -615,6 +669,7 @@ export component MainWindow inherits Window {
                             horizontal-stretch: 1;
                         }
                     }
+                }
                 }
                 }
                 }
