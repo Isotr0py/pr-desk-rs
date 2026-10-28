@@ -10,6 +10,24 @@ pub mod ocr;
 pub mod reviewer;
 pub mod sync;
 
+/// exe 所在目录（便携应用锚点）；取不到 exe 路径时回退当前目录。
+pub fn exe_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// 由 exe 目录推导数据目录；抽出来便于测试注入路径，不碰真实 exe 目录。
+fn data_dir_from(exe_dir: &std::path::Path) -> std::path::PathBuf {
+    exe_dir.join("data")
+}
+
+/// 数据目录锚定到 exe 旁（`exe_dir()/data`），防止 cwd 不同时读到另一份数据。
+pub fn exe_data_dir() -> std::path::PathBuf {
+    data_dir_from(&exe_dir())
+}
+
 /// 行数据 → 分组：（组标题, 该组内数据行的索引列表）。
 /// 分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
 /// 行只出现在一个组里；pinned 独立成组（不再出现在其状态组）。空组不返回。
@@ -62,6 +80,18 @@ mod tests {
             "repo": "o/r", "number": n, "title": format!("t{n}"), "author": "a",
             "pinned": pinned, "on_board": on_board, "status": status,
         })
+    }
+
+    #[test]
+    fn data_dir_from_joins_under_injected_dir() {
+        assert_eq!(
+            data_dir_from(std::path::Path::new("C:/fake/exe-dir")),
+            std::path::Path::new("C:/fake/exe-dir").join("data")
+        );
+        assert_eq!(
+            data_dir_from(std::path::Path::new(".")),
+            std::path::PathBuf::from("./data")
+        );
     }
 
     #[test]

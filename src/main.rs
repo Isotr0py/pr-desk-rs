@@ -409,10 +409,7 @@ fn main() -> anyhow::Result<()> {
 
     // 配置/数据目录锚定到 exe 所在目录（便携应用惯例）：
     // 防止从不同工作目录启动时读到另一份 config.toml / 数据库（曾导致「双配置」分裂）。
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let exe_dir = pr_desk_rs::exe_dir();
     let cfg_path = exe_dir.join("config.toml");
     // 兼容迁移：exe 旁没有但旧式 cwd 里有配置时，搬过来再用
     let cwd_cfg = PathBuf::from("config.toml");

@@ -819,7 +819,7 @@ export component NotifPreview inherits Rectangle {
                     }
                 }
                 if root.convo_entries.length == 0 && !root.loading: EmptyState {
-                    icon: "💬";
+                    icon_img: @image-url("icons/comment.svg");
                     title: "暂无会话记录";
                     hint: "评论活动将显示在这里";
                 }

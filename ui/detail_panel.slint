@@ -2,7 +2,8 @@
 //
 // 布局用法：放进主区 HorizontalLayout 作为最右子元素（不要像抽屉那样做顶层覆盖）。
 // visible=false 时宽度为 0 不占位（直接用内置 visible 属性，由集成方绑定 open 状态），
-// 打开时宽度从 0 动画展开到 panel-width。
+// 打开时宽度从 0 动画展开到 panel-width。左缘 1px hairline 上有 8px 拖拽手柄，
+// 按住左拖加宽面板（clamp 320px ~ max_panel_width，集成方传入窗口宽度的 60%）。
 //
 // 设计契约：全部颜色/字号/圆角取自 theme.slint 的 Theme 令牌（浅色/深色双主题）。
 import { ScrollView, ListView } from "std-widgets.slint";
@@ -185,8 +186,10 @@ component OutlineBtn inherits Rectangle {
 }
 
 // 空状态占位：图标 + 标题 + 提示，居中
+// icon_img 优先（内嵌 SVG，规避 emoji 字形缺失豆腐块）；未传时回退 icon 文字字形
 component EmptyState inherits Rectangle {
     in property <string> icon;
+    in property <image> icon_img;
     in property <string> heading;
     in property <string> hint;
 
@@ -194,7 +197,18 @@ component EmptyState inherits Rectangle {
         padding: 24px;
         spacing: 6px;
         alignment: center;
-        Text {
+        if root.icon_img.width > 0: Rectangle {
+            height: 26px;
+            Image {
+                source: root.icon_img;
+                width: 26px;
+                height: 26px;
+                x: (parent.width - self.width) / 2;
+                image-fit: contain;
+                colorize: Theme.text_faint;
+            }
+        }
+        if root.icon_img.width == 0: Text {
             text: root.icon;
             font-size: 26px;
             color: Theme.text_faint;
@@ -219,7 +233,9 @@ component EmptyState inherits Rectangle {
 
 export component DetailPanel inherits Rectangle {
     // 显示/隐藏：直接绑定内置 visible；false 时宽度为 0 不占布局
-    in property <length> panel_width: 420px;
+    in-out property <length> panel_width: 420px;
+    // 拖拽宽度上限（集成方传窗口宽度 * 0.6）；下限固定 320px
+    in property <length> max_panel_width: 10000px;
 
     // ── detail 字段 ──
     in property <string> title: "";
@@ -269,7 +285,8 @@ export component DetailPanel inherits Rectangle {
     clip: true;
     background: Theme.card;
 
-    animate width { duration: 150ms; easing: ease-out-quad; }
+    // 拖拽期间禁用宽度动画，否则每帧重启动画导致拖拽卡顿
+    animate width { duration: drag_handle.pressed ? 0ms : 150ms; easing: ease-out-quad; }
 
     // 左缘 hairline
     Rectangle {
@@ -277,7 +294,7 @@ export component DetailPanel inherits Rectangle {
         y: 0;
         width: 1px;
         height: 100%;
-        background: Theme.hairline;
+        background: drag_handle.has-hover || drag_handle.pressed ? Theme.accent : Theme.hairline;
     }
 
     VerticalLayout {
@@ -943,7 +960,7 @@ export component DetailPanel inherits Rectangle {
                     }
                 }
                 if root.convo_entries.length == 0: EmptyState {
-                    icon: "💬";
+                    icon_img: @image-url("icons/comment.svg");
                     heading: "暂无会话记录";
                     hint: "提交、评审与评论活动将显示在这里";
                 }
@@ -1079,7 +1096,7 @@ export component DetailPanel inherits Rectangle {
                     }
                 }
                 if root.files.length == 0: EmptyState {
-                    icon: "📄";
+                    icon_img: @image-url("icons/file.svg");
                     heading: "暂无文件变更";
                     hint: "Diff 文件列表将显示在这里";
                 }
@@ -1092,7 +1109,7 @@ export component DetailPanel inherits Rectangle {
             }
 
             if root.current_tab < 0 || root.current_tab > 4: EmptyState {
-                icon: "🚧";
+                icon: "⚠";
                 heading: "即将推出";
                 hint: "这个标签页还没有实现";
             }
@@ -1159,6 +1176,25 @@ export component DetailPanel inherits Rectangle {
                         vertical-alignment: center;
                     }
                 }
+            }
+        }
+    }
+
+    // 拖拽手柄：8px 热区骑在左缘 hairline 上（内容 padding-left 16px，不挡交互元素）。
+    // 必须声明在内容之后：内容里的 ScrollView 会盖住下层 TouchArea，
+    // 后置声明让手柄在事件分发中优先拿到左缘 8px 的指针事件。
+    drag_handle := TouchArea {
+        x: 0;
+        y: 0;
+        width: 8px;
+        height: 100%;
+        mouse-cursor: col-resize;
+        moved => {
+            if (self.pressed) {
+                // 面板右缘固定：新宽度 = 当前面板宽 − 指针在面板内的 x（往左拖变宽）。
+                // 每个事件都从当前几何重算（ColHandle 同款手法），与面板移动解耦、无反馈漂移
+                root.panel_width = min(root.max_panel_width,
+                    max(320px, root.width - self.mouse-x));
             }
         }
     }

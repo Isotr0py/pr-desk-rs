@@ -457,6 +457,8 @@ export component MarkdownBlocks inherits VerticalLayout {
 // 空状态：居中图标字符 + 主文案 + 副提示（占满父级区域）
 export component EmptyState inherits Rectangle {
     in property <string> icon;
+    // icon_img 优先（内嵌 SVG，规避 emoji 字形缺失豆腐块）；未传时回退 icon 文字字形
+    in property <image> icon_img;
     in property <string> title;
     in property <string> hint;
 
@@ -466,7 +468,18 @@ export component EmptyState inherits Rectangle {
         alignment: center;
         spacing: 8px;
         padding: 24px;
-        Text {
+        if root.icon_img.width > 0: Rectangle {
+            height: 28px;
+            Image {
+                source: root.icon_img;
+                width: 28px;
+                height: 28px;
+                x: (parent.width - self.width) / 2;
+                image-fit: contain;
+                colorize: Theme.text_dim;
+            }
+        }
+        if root.icon_img.width == 0: Text {
             text: root.icon;
             font-size: 28px;
             color: Theme.text_dim;

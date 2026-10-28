@@ -460,17 +460,41 @@ component PrRowItem inherits Rectangle {
 
     // 作者：Avatar + 名字 + 组织图标占位（左对齐，与表头一致）
     // 纯 Rectangle + 手动居中：HorizontalLayout 设 alignment 后子元素垂直方向不再居中
+    // 组织行：有头像图像就照常显示；无图像时不渲染字母豆腐块，改用组织徽章
+    // （圆角方形 + Theme 描边 + org.svg 多人字形；PrListRow 只有 is_org 标记，无 org 图标字段）
     Rectangle {
         x: root.x-author;
         width: Cols.author;
         height: parent.height;
         clip: true;
-        Avatar {
+
+        property <bool> has_avatar: root.pr.avatar.width > 0 && root.pr.avatar.height > 0;
+
+        if !root.pr.is_org || has_avatar: Avatar {
             img: root.pr.avatar;
             login: root.pr.author;
             size: 16px;
             x: 0;
             y: (parent.height - 16px) / 2;
+        }
+        if root.pr.is_org && !has_avatar: Rectangle {
+            width: 16px;
+            height: 16px;
+            x: 0;
+            y: (parent.height - 16px) / 2;
+            border-radius: 4px;
+            border-width: 1px;
+            border-color: Theme.border;
+            background: Theme.surface2;
+            Image {
+                source: @image-url("icons/org.svg");
+                width: 10px;
+                height: 10px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                colorize: root.fg-dim;
+            }
         }
         Text {
             x: 20px;
@@ -501,21 +525,33 @@ component PrRowItem inherits Rectangle {
         }
     }
 
-    // Review 状态符号
-    Text {
+    // Review 状态符号：commented 用内嵌 SVG（💬 emoji 本机无字形会显示豆腐块），
+    // approved ✓ / changes_requested ✗ / 其它 ○ 文字字形渲染正常，保持原样
+    Rectangle {
         x: root.x-rev;
         width: Cols.review;
         height: parent.height;
-        text: root.pr.review == "approved" ? "✓"
-            : (root.pr.review == "changes_requested" ? "✗"
-            : (root.pr.review == "commented" ? "💬" : "○"));
-        color: root.selected ? root.fg
-            : (root.pr.review == "approved" ? Theme.good
-            : (root.pr.review == "changes_requested" ? Theme.bad
-            : (root.pr.review == "commented" ? Theme.text : Theme.text_dim)));
-        font-size: Theme.fs_xs;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+        if root.pr.review == "commented": Image {
+            source: @image-url("icons/comment.svg");
+            width: 12px;
+            height: 12px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            image-fit: contain;
+            colorize: root.selected ? root.fg : Theme.text;
+        }
+        if root.pr.review != "commented": Text {
+            width: parent.width;
+            height: parent.height;
+            text: root.pr.review == "approved" ? "✓"
+                : (root.pr.review == "changes_requested" ? "✗" : "○");
+            color: root.selected ? root.fg
+                : (root.pr.review == "approved" ? Theme.good
+                : (root.pr.review == "changes_requested" ? Theme.bad : Theme.text_dim));
+            font-size: Theme.fs_xs;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 
     Rectangle {

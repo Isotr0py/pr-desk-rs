@@ -344,6 +344,7 @@ export component MainWindow inherits Window {
                 }
                 DetailPanel {
                     visible: root.d_open;
+                    max_panel_width: root.width * 0.6;
                     title: root.d_title;
                     author: root.d_author;
                     avatar: root.d_avatar;

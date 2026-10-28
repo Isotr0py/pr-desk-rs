@@ -19,7 +19,7 @@ fn key(name: &str) -> String {
 }
 
 pub fn cache_dir() -> PathBuf {
-    PathBuf::from("data").join("avatars")
+    pr_desk_rs::exe_data_dir().join("avatars")
 }
 
 pub fn avatar_path(login: &str) -> PathBuf {
@@ -42,12 +42,22 @@ fn load(path: &Path) -> Option<slint::Image> {
     if !fresh(path) {
         return None;
     }
-    let img = slint::Image::load_from_path(path).ok()?;
+    // 加载即失败（如错误页被存成 .png、根本不是 PNG）同样删掉坏缓存，
+    // 否则文件永远留在盘上，每次启动都被打错误日志且 prefetch 因 TTL 新鲜不重拉。
+    let img = match slint::Image::load_from_path(path) {
+        Ok(img) => img,
+        Err(e) => {
+            tracing::debug!("removing unreadable avatar cache {}: {e}", path.display());
+            let _ = std::fs::remove_file(path);
+            return None;
+        }
+    };
     // 立即解码为 Rgba8 像素 buffer：坏文件在这里暴露并走降级，而不是拖到渲染时。
-    // 解码失败（如错误页被存成 .png）时删掉坏缓存，下次 prefetch 才能重新拉取。
+    // 解码失败时删掉坏缓存，下次 prefetch 才能重新拉取。
     let buf = match img.to_rgba8() {
         Some(b) if b.width() > 0 => b,
         _ => {
+            tracing::debug!("removing undecodable avatar cache {}", path.display());
             let _ = std::fs::remove_file(path);
             return None;
         }
@@ -187,5 +197,17 @@ mod tests {
         std::fs::write(&p, b"not a png at all, but long enough to pass the size check......").unwrap();
         assert!(load(&p).is_none());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn load_garbage_deletes_file() {
+        let dir = std::env::temp_dir().join("pr-desk-avatars-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("bad-deleted.png");
+        std::fs::write(&p, b"not a png at all, but long enough to pass the size check......").unwrap();
+        assert!(p.exists());
+        assert!(load(&p).is_none());
+        // 坏缓存必须被删掉，下次 prefetch 才会重新拉取（fresh 对不存在的文件返回 false）
+        assert!(!p.exists(), "garbage cache file should be removed");
     }
 }
