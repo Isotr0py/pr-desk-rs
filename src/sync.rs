@@ -97,6 +97,8 @@ pub struct SyncClient {
     client: reqwest::Client,
     base: String,
     token: String,
+    /// AstrBot 面板 API Key（新版 AstrBot 对插件路由强制鉴权；空 = 不发送，兼容旧部署）
+    api_key: String,
 }
 
 impl SyncClient {
@@ -105,11 +107,21 @@ impl SyncClient {
             client: reqwest::Client::new(),
             base: format!("{}{}", cfg.server_url.trim_end_matches('/'), API_PATH),
             token: cfg.sync_token.clone(),
+            api_key: cfg.astrbot_api_key.clone(),
         }
     }
 
     pub fn enabled(&self) -> bool {
         !self.token.is_empty()
+    }
+
+    /// AstrBot 中间件鉴权头（X-API-Key）；未配置则不加。
+    fn with_api_key(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        if self.api_key.is_empty() {
+            req
+        } else {
+            req.header("X-API-Key", &self.api_key)
+        }
     }
 
     /// 生成三个签名头（timestamp / nonce / signature），token 不出现在请求里。
@@ -131,7 +143,7 @@ impl SyncClient {
         if let Some(s) = &since {
             url = format!("{url}?since={s}");
         }
-        let mut req = self.client.get(&url);
+        let mut req = self.with_api_key(self.client.get(&url));
         for (k, v) in self.sign_headers("GET", &path, b"") {
             req = req.header(k, v);
         }
@@ -150,11 +162,12 @@ impl SyncClient {
             "reviews_new": reviews_new,
         });
         let body_bytes = serde_json::to_vec(&body)?;
-        let mut req = self
-            .client
-            .post(format!("{}/sync_push", self.base))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body_bytes.clone());
+        let mut req = self.with_api_key(
+            self.client
+                .post(format!("{}/sync_push", self.base))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body_bytes.clone()),
+        );
         for (k, v) in self.sign_headers("POST", &path, &body_bytes) {
             req = req.header(k, v);
         }

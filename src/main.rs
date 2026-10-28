@@ -379,6 +379,7 @@ fn main() -> anyhow::Result<()> {
     // 设置页初值 + 首启引导 + 状态栏配置状态
     ui.set_s_server(cfg.server_url.clone().into());
     ui.set_s_sync_token(cfg.sync_token.clone().into());
+    ui.set_s_ak(cfg.astrbot_api_key.clone().into());
     ui.set_s_gh_token(cfg.github_token.clone().unwrap_or_default().into());
     ui.set_s_repos(cfg.repos.join("\n").into());
     ui.set_s_poll(cfg.poll_interval_min as i32);
@@ -723,6 +724,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(ui) = ui2.upgrade() {
                 // 每次打开回填当前配置（LLM 字段可能在别处被改动）
                 let cfg = app.lock().unwrap().cfg.clone();
+                ui.set_s_ak(cfg.astrbot_api_key.clone().into());
                 ui.set_s_llm_base(cfg.llm_base_url.into());
                 ui.set_s_llm_key(cfg.llm_api_key.unwrap_or_default().into());
                 ui.set_s_llm_model(cfg.llm_model.into());
@@ -743,7 +745,7 @@ fn main() -> anyhow::Result<()> {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         let ui2 = ui.as_weak();
-        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model, ocr_path, review_conc_s| {
+        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model, ocr_path, review_conc_s, ak| {
             let repos: Vec<String> = repos_text
                 .lines()
                 .map(|l| l.trim().to_string())
@@ -758,6 +760,7 @@ fn main() -> anyhow::Result<()> {
             let new_cfg = Config {
                 server_url: server.trim().to_string(),
                 sync_token: sync_tok.trim().to_string(),
+                astrbot_api_key: ak.trim().to_string(),
                 github_token: Some(gh_tok.trim().to_string()).filter(|t| !t.is_empty()),
                 repos,
                 poll_interval_min: poll,

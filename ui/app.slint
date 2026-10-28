@@ -274,8 +274,8 @@ export component MainWindow inherits Window {
     callback fetch_inbox();             // 切到 Inbox 分段时拉取通知
     callback key_pin();
     callback key_priority(int);
-    // 设置页（顺序：server_url, sync_token, github_token, repos, poll_interval, llm_base_url, llm_api_key, llm_model, ocr_path, review_concurrency）
-    callback save_settings(string, string, string, string, string, string, string, string, string, string);
+    // 设置页（顺序：server_url, sync_token, github_token, repos, poll_interval, llm_base_url, llm_api_key, llm_model, ocr_path, review_concurrency, astrbot_api_key）
+    callback save_settings(string, string, string, string, string, string, string, string, string, string, string);
     // 设置页「获取」模型列表（参数为弹窗里正在编辑的 base_url / api_key）
     callback fetch_models(string, string);
     // 拉取到的模型 id 列表（非空时模型名下方出现选择列表）
@@ -286,6 +286,7 @@ export component MainWindow inherits Window {
     in-out property <int> settings_tab: 0;   // 0=连接与同步 1=LLM 预评审
     in-out property <string> s_server: "";
     in-out property <string> s_sync_token: "";
+    in-out property <string> s_ak: "";
     in-out property <string> s_gh_token: "";
     in-out property <string> s_repos: "";
     in-out property <int> s_poll: 5;
@@ -576,6 +577,14 @@ export component MainWindow inherits Window {
                     }
                 }
                 Field {
+                    label: "AstrBot API Key（面板「API 密钥」页创建，新版 AstrBot 必需）";
+                    FormField {
+                        password: true;
+                        placeholder: "旧版 AstrBot 可留空";
+                        text <=> root.s_ak;
+                    }
+                }
+                Field {
                     label: root.gh_token_from_env
                         ? "GitHub token（已检测到 GITHUB_TOKEN 环境变量，环境变量优先）"
                         : "GitHub token";
@@ -753,7 +762,7 @@ export component MainWindow inherits Window {
                         text: "保存";
                         primary: true;
                         clicked => {
-                            root.save_settings(root.s_server, root.s_sync_token, root.s_gh_token, root.s_repos, "" + root.s_poll, root.s_llm_base, root.s_llm_key, root.s_llm_model, root.s_ocr_path, "" + root.s_review_concurrency);
+                            root.save_settings(root.s_server, root.s_sync_token, root.s_gh_token, root.s_repos, "" + root.s_poll, root.s_llm_base, root.s_llm_key, root.s_llm_model, root.s_ocr_path, "" + root.s_review_concurrency, root.s_ak);
                             root.settings_open = false;
                         }
                     }

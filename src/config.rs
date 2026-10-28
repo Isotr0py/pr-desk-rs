@@ -12,6 +12,8 @@ const TEMPLATE: &str = r#"# PR Desk 桌面端配置（也可在应用内 ⚙ 设
 server_url = "http://127.0.0.1:6185"
 # 插件配置里的 sync_token（留空 = 同步关闭，仅本地浏览 GitHub 数据）
 sync_token = ""
+# AstrBot 面板的 API Key（新版 AstrBot 对插件 API 路由强制鉴权；在 AstrBot「API 密钥」管理页创建）
+astrbot_api_key = ""
 # GitHub token（明文本地存储自用；环境变量 GITHUB_TOKEN 优先级更高）
 github_token = ""
 # 关注的仓库（拉取 open PR 列表）
@@ -34,6 +36,8 @@ review_concurrency = 3
 pub struct Config {
     pub server_url: String,
     pub sync_token: String,
+    /// AstrBot 面板 API Key（新版 AstrBot 对 /api 路由强制鉴权；空 = 不发送）
+    pub astrbot_api_key: String,
     pub github_token: Option<String>,
     pub repos: Vec<String>,
     pub poll_interval_min: u64,
@@ -55,6 +59,7 @@ impl Default for Config {
         Self {
             server_url: "http://127.0.0.1:6185".into(),
             sync_token: String::new(),
+            astrbot_api_key: String::new(),
             github_token: None,
             repos: Vec::new(),
             poll_interval_min: 5,
@@ -131,6 +136,8 @@ impl Config {
                 cfg.server_url = unquote(v);
             } else if let Some(v) = parse_value(line, "sync_token") {
                 cfg.sync_token = unquote(v);
+            } else if let Some(v) = parse_value(line, "astrbot_api_key") {
+                cfg.astrbot_api_key = unquote(v);
             } else if let Some(v) = parse_value(line, "github_token") {
                 cfg.github_token = Some(unquote(v)).filter(|t| !t.is_empty());
             } else if let Some(v) = parse_value(line, "repos") {
@@ -178,9 +185,10 @@ impl Config {
             "[{}]",
             self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
         );
-        let kv: [(&str, String); 11] = [
+        let kv: [(&str, String); 12] = [
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
+            ("astrbot_api_key", quote(&self.astrbot_api_key)),
             ("github_token", quote(self.github_token.as_deref().unwrap_or(""))),
             ("repos", repos_toml),
             ("poll_interval_min", self.poll_interval_min.to_string()),
@@ -196,7 +204,7 @@ impl Config {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
             Err(_) => TEMPLATE.lines().map(|l| l.to_string()).collect(),
         };
-        let mut seen = [false; 11];
+        let mut seen = [false; 12];
         for (i, line) in lines.iter_mut().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -257,6 +265,7 @@ mod tests {
         let cfg = Config {
             server_url: "http://nas:6185".into(),
             sync_token: "tok-1".into(),
+            astrbot_api_key: "ak-1".into(),
             github_token: Some("ghp_x".into()),
             repos: vec!["a/b".into(), "c/d".into()],
             poll_interval_min: 15,
@@ -274,6 +283,7 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.server_url, "http://nas:6185");
         assert_eq!(loaded.sync_token, "tok-1");
+        assert_eq!(loaded.astrbot_api_key, "ak-1");
         assert_eq!(loaded.github_token.as_deref(), Some("ghp_x"));
         assert_eq!(loaded.repos, vec!["a/b".to_string(), "c/d".to_string()]);
         assert_eq!(loaded.poll_interval_min, 15);
