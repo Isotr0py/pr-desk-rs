@@ -351,14 +351,15 @@ impl Db {
 
     pub fn get_review(&self, repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
         let mut stmt = self.conn.prepare(
-            "SELECT score, dimensions, summary, flagged_files, reviewed_at, size_label, comments
+            "SELECT score, dimensions, summary, flagged_files, reviewed_at, size_label,
+                    files_changed, additions, deletions, comments
              FROM reviews WHERE repo=?1 AND number=?2 ORDER BY reviewed_at DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![repo, number])?;
         if let Some(r) = rows.next()? {
             // comments：TEXT 解析回 JSON 数组，失败/缺失给 null
             let comments: serde_json::Value = r
-                .get::<_, Option<String>>(6)?
+                .get::<_, Option<String>>(9)?
                 .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
                 .filter(|v| v.is_array())
                 .unwrap_or(serde_json::Value::Null);
@@ -369,6 +370,9 @@ impl Db {
                 "flagged_files": r.get::<_, Option<String>>(3)?,
                 "reviewed_at": r.get::<_, Option<String>>(4)?,
                 "size_label": r.get::<_, Option<String>>(5)?,
+                "files_changed": r.get::<_, Option<i64>>(6)?,
+                "additions": r.get::<_, Option<i64>>(7)?,
+                "deletions": r.get::<_, Option<i64>>(8)?,
                 "comments": comments,
             })));
         }

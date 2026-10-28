@@ -105,8 +105,17 @@ struct OcrCommentRow {
 struct ReviewProps {
     has: bool,
     score: f32,
+    // 旧版纯文本分项行（"可读性  8/10"）：UI 已改用结构化 dimensions，
+    // 字段保留以免破坏其它调用方/旧面板文本（open_drawer 的 body 仍按旧格式拼装）
+    #[allow(dead_code)]
     dimension_lines: Vec<String>,
+    // 结构化分项（中文标签 + 分数），与 dimension_lines 同源，供新版 UI 按条渲染
+    dimensions: Vec<(String, f32)>,
     summary: String,
+    // 摘要的 Markdown 解析块（LLM 摘要含标记，纯文本可读性差）
+    summary_blocks: Vec<pr_desk_rs::markdown::MdBlockOut>,
+    // 体量行，如 "XL（+2122/-23，24 个文件）"；缺字段时给空串
+    size_line: String,
     flagged: Vec<String>,
     reviewed_at: String,
     comments: Vec<OcrCommentRow>,
@@ -177,26 +186,58 @@ fn ocr_comment_rows(rv: &serde_json::Value) -> Vec<OcrCommentRow> {
     rows
 }
 
+/// 体量行组装："XL（+2122/-23，24 个文件）"；label/增删行/文件数全缺时给空串。
+fn size_line(rv: &serde_json::Value) -> String {
+    let label = rv["size_label"].as_str().unwrap_or("");
+    let adds = rv["additions"].as_i64();
+    let dels = rv["deletions"].as_i64();
+    let files = rv["files_changed"].as_i64();
+    if label.is_empty() && adds.is_none() && dels.is_none() && files.is_none() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    if adds.is_some() || dels.is_some() {
+        parts.push(format!("+{}/-{}", adds.unwrap_or(0), dels.unwrap_or(0)));
+    }
+    if let Some(f) = files {
+        parts.push(format!("{f} 个文件"));
+    }
+    if parts.is_empty() {
+        label.to_string()
+    } else if label.is_empty() {
+        format!("（{}）", parts.join("，"))
+    } else {
+        format!("{label}（{}）", parts.join("，"))
+    }
+}
+
 fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
     let Some(rv) = review else {
         return ReviewProps {
             has: false,
             score: 0.0,
             dimension_lines: Vec::new(),
+            dimensions: Vec::new(),
             summary: String::new(),
+            summary_blocks: Vec::new(),
+            size_line: String::new(),
             flagged: Vec::new(),
             reviewed_at: String::new(),
             comments: Vec::new(),
         };
     };
-    let dimension_lines = json_field(rv, "dimensions")
+    let dims = json_field(rv, "dimensions")
         .and_then(|d| d.as_object().cloned())
-        .map(|d| {
-            d.iter()
-                .map(|(k, v)| format!("{}  {}/10", dim_label(k), v))
-                .collect()
-        })
         .unwrap_or_default();
+    let dimension_lines = dims
+        .iter()
+        .map(|(k, v)| format!("{}  {}/10", dim_label(k), v))
+        .collect();
+    let dimensions = dims
+        .iter()
+        .map(|(k, v)| (dim_label(k).to_string(), v.as_f64().unwrap_or(0.0) as f32))
+        .collect();
+    let summary = rv["summary"].as_str().unwrap_or("").to_string();
     let flagged = json_field(rv, "flagged_files")
         .and_then(|f| f.as_array().cloned())
         .unwrap_or_default()
@@ -213,7 +254,10 @@ fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
         has: true,
         score: rv["score"].as_f64().unwrap_or(0.0) as f32,
         dimension_lines,
-        summary: rv["summary"].as_str().unwrap_or("").to_string(),
+        dimensions,
+        summary_blocks: pr_desk_rs::markdown::parse_markdown(&summary),
+        summary,
+        size_line: size_line(rv),
         flagged,
         reviewed_at: rv["reviewed_at"].as_str().unwrap_or("").to_string(),
         comments: ocr_comment_rows(rv),
@@ -221,11 +265,12 @@ fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
 }
 
 /// 详情面板当前是否正打开指定 PR（评审进度/结果只刷对应面板）。
+/// 选中态存身份（repo, number），刷新后行序变化/行被移除都不影响匹配。
 fn panel_matches(app: &Arc<Mutex<App>>, repo: &str, number: i64) -> bool {
     let a = app.lock().unwrap();
     a.selected
-        .and_then(|i| a.rows.get(i))
-        .map(|r| r["repo"].as_str() == Some(repo) && r["number"].as_i64() == Some(number))
+        .as_ref()
+        .map(|(r, n)| r == repo && *n == number)
         .unwrap_or(false)
 }
 
@@ -290,10 +335,10 @@ impl Drop for SlotGuard {
 struct App {
     cfg: Config,
     db: Db,
-    rows: Vec<serde_json::Value>,           // 扁平数据行（selected 直接索引它）
+    rows: Vec<serde_json::Value>,           // 扁平数据行（按身份查找，见 find_row）
     view: Vec<usize>,                       // 过滤后可见行 → rows 下标（UI 下标经它换算）
     filter: String,                         // 当前过滤词（空 = 全量）
-    selected: Option<usize>,                // rows 下标（已从视图下标换算）
+    selected: Option<(String, i64)>,        // 选中 PR 身份（repo, number）；刷新后行序变化也不漂移
     status_msg: String,                     // 状态栏临时消息（最近一条 Status）
     inbox: Vec<serde_json::Value>,          // 最近一批通知行（inbox_activated 按下标取 thread id）
     inbox_all: bool,                        // 通知拉取范围：true = 含已读（&all=true），false = 只看未读
@@ -337,9 +382,20 @@ fn filtered_view(rows: &[serde_json::Value], filter: &str) -> Vec<usize> {
         .collect()
 }
 
-/// UI 传来的可见行下标 → rows 原始下标。
-fn resolve_view(app: &Arc<Mutex<App>>, view_idx: usize) -> Option<usize> {
-    app.lock().unwrap().view.get(view_idx).copied()
+/// 按身份（repo, number）在 rows 里现找下标。
+/// 调用方须已持有 app 锁：查找与随后读行在同一锁内完成，避免与刷新竞态。
+fn find_row(a: &App, repo: &str, number: i64) -> Option<usize> {
+    a.rows
+        .iter()
+        .position(|r| r["repo"].as_str() == Some(repo) && r["number"].as_i64() == Some(number))
+}
+
+/// UI 传来的可见行下标 → 该行 PR 的身份（repo, number）。
+fn resolve_view(app: &Arc<Mutex<App>>, view_idx: usize) -> Option<(String, i64)> {
+    let a = app.lock().unwrap();
+    let idx = *a.view.get(view_idx)?;
+    let r = a.rows.get(idx)?;
+    Some((r["repo"].as_str()?.to_string(), r["number"].as_i64()?))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -350,8 +406,20 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let cfg = Config::load(&PathBuf::from("config.toml"))?;
-    let data_dir = PathBuf::from("data");
+    // 配置/数据目录锚定到 exe 所在目录（便携应用惯例）：
+    // 防止从不同工作目录启动时读到另一份 config.toml / 数据库（曾导致「双配置」分裂）。
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let cfg_path = exe_dir.join("config.toml");
+    // 兼容迁移：exe 旁没有但旧式 cwd 里有配置时，搬过来再用
+    let cwd_cfg = PathBuf::from("config.toml");
+    if !cfg_path.exists() && cwd_cfg.exists() && cwd_cfg != cfg_path {
+        let _ = std::fs::copy(&cwd_cfg, &cfg_path);
+    }
+    let cfg = Config::load(&cfg_path)?;
+    let data_dir = exe_dir.join("data");
     std::fs::create_dir_all(&data_dir)?;
     let db = Db::open(&data_dir.join("pr-desk.db"))?;
 
@@ -403,10 +471,11 @@ fn main() -> anyhow::Result<()> {
     // 主题切换：即时持久化到 config.toml
     {
         let app = app.clone();
+        let cfg_path = cfg_path.clone();
         ui.on_theme_toggled(move |dark| {
             let mut a = app.lock().unwrap();
             a.cfg.theme = if dark { "dark".into() } else { "light".into() };
-            if let Err(e) = a.cfg.save(&PathBuf::from("config.toml")) {
+            if let Err(e) = a.cfg.save(&cfg_path) {
                 tracing::warn!("主题写入 config.toml 失败: {e}");
             }
         });
@@ -512,44 +581,43 @@ fn main() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
-        // UI 传视图下标，先经 view 换算为 rows 原始下标
+        // UI 传视图下标，先经 view 换算为该行的身份（repo, number）
         ui.on_row_activated(move |i| {
-            if let Some(idx) = resolve_view(&app, i as usize) {
-                open_drawer(&app, &cmd_tx, idx);
+            if let Some((repo, number)) = resolve_view(&app, i as usize) {
+                open_drawer(&app, &cmd_tx, repo, number);
             }
         });
     }
     {
         let app = app.clone();
         ui.on_row_pin(move |i| {
-            if let Some(idx) = resolve_view(&app, i as usize) {
-                let v = toggle_of(&app, idx, "pinned");
-                local_update(&app, idx, "pinned", v);
+            if let Some((repo, number)) = resolve_view(&app, i as usize) {
+                let v = toggle_of(&app, &repo, number, "pinned");
+                local_update(&app, &repo, number, "pinned", v);
             }
         });
     }
     {
         let app = app.clone();
         ui.on_row_board(move |i| {
-            if let Some(idx) = resolve_view(&app, i as usize) {
-                let v = toggle_of(&app, idx, "on_board");
-                local_update(&app, idx, "on_board", v);
+            if let Some((repo, number)) = resolve_view(&app, i as usize) {
+                let v = toggle_of(&app, &repo, number, "on_board");
+                local_update(&app, &repo, number, "on_board", v);
             }
         });
     }
     {
         let app = app.clone();
         ui.on_row_reject(move |i| {
-            let Some(idx) = resolve_view(&app, i as usize) else { return };
+            let Some((repo, number)) = resolve_view(&app, i as usize) else { return };
             let cur = {
                 let a = app.lock().unwrap();
-                a.rows
-                    .get(idx)
-                    .and_then(|r| r["status"].as_str().map(|s| s.to_string()))
+                find_row(&a, &repo, number)
+                    .and_then(|idx| a.rows[idx]["status"].as_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "pending".into())
             };
             let to = if cur == "rejected" { "pending" } else { "rejected" };
-            local_update(&app, idx, "status", to);
+            local_update(&app, &repo, number, "status", to);
         });
     }
     {
@@ -561,49 +629,41 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
-        // 面板看板按钮：切换当前选中行的 on_board
+        // 面板看板按钮：切换当前选中 PR 的 on_board
         let app = app.clone();
         ui.on_panel_board(move || {
-            let sel = app.lock().unwrap().selected;
-            if let Some(i) = sel {
-                let v = toggle_of(&app, i, "on_board");
-                local_update(&app, i, "on_board", v);
+            let sel = app.lock().unwrap().selected.clone();
+            if let Some((repo, number)) = sel {
+                let v = toggle_of(&app, &repo, number, "on_board");
+                local_update(&app, &repo, number, "on_board", v);
             }
         });
     }
     {
         let app = app.clone();
         ui.on_panel_set_priority(move |p| {
-            let sel = app.lock().unwrap().selected;
-            if let Some(i) = sel {
-                local_update(&app, i, "priority", p as i64);
+            let sel = app.lock().unwrap().selected.clone();
+            if let Some((repo, number)) = sel {
+                local_update(&app, &repo, number, "priority", p as i64);
             }
         });
     }
     {
         let app = app.clone();
         ui.on_panel_toggle_pin(move || {
-            let sel = app.lock().unwrap().selected;
-            if let Some(i) = sel {
-                let v = toggle_of(&app, i, "pinned");
-                local_update(&app, i, "pinned", v);
+            let sel = app.lock().unwrap().selected.clone();
+            if let Some((repo, number)) = sel {
+                let v = toggle_of(&app, &repo, number, "pinned");
+                local_update(&app, &repo, number, "pinned", v);
             }
         });
     }
     {
-        // 详情面板「AI 评审」按钮：取当前选中行 repo/number 交给 worker 跑 LLM 评审
+        // 详情面板「AI 评审」按钮：取当前选中 PR 的身份交给 worker 跑 LLM 评审
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         ui.on_action_run_review(move || {
-            let target = {
-                let a = app.lock().unwrap();
-                a.selected.and_then(|i| a.rows.get(i)).map(|r| {
-                    (
-                        r["repo"].as_str().unwrap_or("").to_string(),
-                        r["number"].as_i64().unwrap_or(0),
-                    )
-                })
-            };
+            let target = app.lock().unwrap().selected.clone();
             if let Some((repo, number)) = target {
                 let _ = cmd_tx.send(Cmd::RunReview { repo, number });
             }
@@ -700,19 +760,19 @@ fn main() -> anyhow::Result<()> {
     {
         let app = app.clone();
         ui.on_key_pin(move || {
-            let sel = app.lock().unwrap().selected;
-            if let Some(i) = sel {
-                let v = toggle_of(&app, i, "pinned");
-                local_update(&app, i, "pinned", v);
+            let sel = app.lock().unwrap().selected.clone();
+            if let Some((repo, number)) = sel {
+                let v = toggle_of(&app, &repo, number, "pinned");
+                local_update(&app, &repo, number, "pinned", v);
             }
         });
     }
     {
         let app = app.clone();
         ui.on_key_priority(move |p| {
-            let sel = app.lock().unwrap().selected;
-            if let Some(i) = sel {
-                local_update(&app, i, "priority", p as i64);
+            let sel = app.lock().unwrap().selected.clone();
+            if let Some((repo, number)) = sel {
+                local_update(&app, &repo, number, "priority", p as i64);
             }
         });
     }
@@ -745,6 +805,7 @@ fn main() -> anyhow::Result<()> {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         let ui2 = ui.as_weak();
+        let cfg_path = cfg_path.clone();
         ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model, ocr_path, review_conc_s, ak| {
             let repos: Vec<String> = repos_text
                 .lines()
@@ -771,7 +832,7 @@ fn main() -> anyhow::Result<()> {
                 ocr_path: if ocr_path.is_empty() { "ocr".into() } else { ocr_path.to_string() },
                 review_concurrency,
             };
-            if let Err(e) = new_cfg.save(&PathBuf::from("config.toml")) {
+            if let Err(e) = new_cfg.save(&cfg_path) {
                 send_msg(Msg::Status(format!("配置保存失败: {e}")));
                 return;
             }
@@ -809,25 +870,22 @@ fn send_msg(msg: Msg) {
     }
 }
 
-fn toggle_of(app: &Arc<Mutex<App>>, idx: usize, field: &str) -> i64 {
+fn toggle_of(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str) -> i64 {
     let a = app.lock().unwrap();
-    a.rows
-        .get(idx)
-        .and_then(|r| r[field].as_i64())
+    find_row(&a, repo, number)
+        .and_then(|idx| a.rows[idx][field].as_i64())
         .map(|v| if v == 0 { 1 } else { 0 })
         .unwrap_or(1)
 }
 
-fn local_update<V: Into<serde_json::Value>>(app: &Arc<Mutex<App>>, idx: usize, field: &str, value: V) {
+/// 本地字段更新（pinned/on_board/priority/status）：按身份直改 DB，
+/// 不依赖行是否还在当前列表里（面板开着但行被刷新滤掉时操作仍生效）。
+fn local_update<V: Into<serde_json::Value>>(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str, value: V) {
     let a = app.lock().unwrap();
-    if let Some(r) = a.rows.get(idx) {
-        let repo = r["repo"].as_str().unwrap_or("").to_string();
-        let number = r["number"].as_i64().unwrap_or(0);
-        if a.db.local_pr_update(&repo, number, field, &value.into()).is_ok() {
-            drop(a);
-            reload_rows_global(app);
-            send_msg(Msg::Status(format!("已更新 {field}（待同步）")));
-        }
+    if a.db.local_pr_update(repo, number, field, &value.into()).is_ok() {
+        drop(a);
+        reload_rows_global(app);
+        send_msg(Msg::Status(format!("已更新 {field}（待同步）")));
     }
 }
 
@@ -843,18 +901,17 @@ fn reload_rows_global(app: &Arc<Mutex<App>>) {
 
 // ── 详情抽屉 ──
 
-fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, idx: usize) {
-    let (repo, number, priority) = {
+fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, number: i64) {
+    // 选中态存身份而非下标：刷新后行序变化，面板仍指向同一个 PR；
+    // 行被刷新滤掉时面板也保持打开（数据来自 DB/快照，row 允许为 None）
+    let (priority, row_idx) = {
         let mut a = app.lock().unwrap();
-        a.selected = Some(idx);
-        match a.rows.get(idx) {
-            Some(r) => (
-                r["repo"].as_str().unwrap_or("").to_string(),
-                r["number"].as_i64().unwrap_or(0),
-                r["priority"].as_i64().unwrap_or(0) as i32,
-            ),
-            None => return,
-        }
+        a.selected = Some((repo.clone(), number));
+        let idx = find_row(&a, &repo, number);
+        let priority = idx
+            .and_then(|i| a.rows[i]["priority"].as_i64())
+            .unwrap_or(0) as i32;
+        (priority, idx)
     };
 
     let (review, diff_cached, row) = {
@@ -862,7 +919,7 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, idx: usize) {
         (
             a.db.get_review(&repo, number).ok().flatten(),
             a.db.get_diff(&repo, number).ok().flatten(),
-            a.rows.get(idx).cloned(),
+            row_idx.and_then(|i| a.rows.get(i).cloned()),
         )
     };
 
@@ -1039,9 +1096,9 @@ fn files_json_from_diff(diff: &str) -> String {
     serde_json::to_string(&files).unwrap_or_else(|_| "[]".into())
 }
 
-/// 评论正文 Markdown → MdBlock 模型（会话 tab 按块渲染；text 字段仍保留原文兼容）。
-fn md_blocks(md: &str) -> ModelRc<MdBlock> {
-    let blocks: Vec<MdBlock> = pr_desk_rs::markdown::parse_markdown(md)
+/// MdBlockOut 块 → Slint MdBlock 模型。
+fn md_blocks_of(blocks: Vec<pr_desk_rs::markdown::MdBlockOut>) -> ModelRc<MdBlock> {
+    let blocks: Vec<MdBlock> = blocks
         .into_iter()
         .map(|b| MdBlock {
             kind: b.kind.into(),
@@ -1055,6 +1112,11 @@ fn md_blocks(md: &str) -> ModelRc<MdBlock> {
         })
         .collect();
     ModelRc::new(VecModel::from(blocks))
+}
+
+/// 评论正文 Markdown → MdBlock 模型（会话 tab 按块渲染；text 字段仍保留原文兼容）。
+fn md_blocks(md: &str) -> ModelRc<MdBlock> {
+    md_blocks_of(pr_desk_rs::markdown::parse_markdown(md))
 }
 
 /// diff 文本 → DiffFile 模型（前 3 个文件展开）。
@@ -1656,11 +1718,14 @@ fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
 fn apply_review_props(ui: &MainWindow, p: &ReviewProps) {
     ui.set_d_review_has(p.has);
     ui.set_d_review_score(p.score);
-    ui.set_d_review_dimension_lines(ModelRc::new(VecModel::from(
-        p.dimension_lines
+    // 新版结构化数据：体量行 / 摘要 Markdown 块 / 维度分数条
+    ui.set_d_review_size_line(p.size_line.clone().into());
+    ui.set_d_review_summary_blocks(md_blocks_of(p.summary_blocks.clone()));
+    ui.set_d_review_dimensions(ModelRc::new(VecModel::from(
+        p.dimensions
             .iter()
-            .map(|s| s.into())
-            .collect::<Vec<slint::SharedString>>(),
+            .map(|(label, score)| DimScore { label: label.as_str().into(), score: *score })
+            .collect::<Vec<_>>(),
     )));
     ui.set_d_review_summary(p.summary.clone().into());
     ui.set_d_review_flagged(ModelRc::new(VecModel::from(
@@ -1950,5 +2015,123 @@ mod tests {
         }
         assert!(!slots.lock().unwrap().is_running("o/r", 1));
         assert!(slots.lock().unwrap().try_acquire("o/r", 1).is_ok());
+    }
+
+    // ── 选中态按身份（repo, number）查找 ──
+
+    fn test_app(rows: Vec<serde_json::Value>) -> Arc<Mutex<App>> {
+        let view = (0..rows.len()).collect();
+        Arc::new(Mutex::new(App {
+            cfg: Config::default(),
+            db: Db::open_memory().unwrap(),
+            rows,
+            view,
+            filter: String::new(),
+            selected: None,
+            status_msg: String::new(),
+            inbox: Vec::new(),
+            inbox_all: true,
+            inbox_detail: None,
+            total: 0,
+            rate_limit: Arc::new(Mutex::new(None)),
+            last_sync: sync::shared_last_sync(),
+            review_slots: Arc::new(Mutex::new(ReviewSlots::new(3))),
+        }))
+    }
+
+    #[test]
+    fn find_row_locates_by_identity_surviving_reorder() {
+        let app = test_app(vec![
+            serde_json::json!({"repo": "o/r", "number": 1}),
+            serde_json::json!({"repo": "o/r", "number": 2}),
+        ]);
+        {
+            let a = app.lock().unwrap();
+            assert_eq!(find_row(&a, "o/r", 2), Some(1));
+            assert_eq!(find_row(&a, "o/r", 99), None);
+            assert_eq!(find_row(&a, "x/y", 1), None);
+        }
+        // 模拟刷新后行序颠倒：身份查找仍命中同一个 PR，不会货不对板
+        app.lock().unwrap().rows = vec![
+            serde_json::json!({"repo": "o/r", "number": 2}),
+            serde_json::json!({"repo": "o/r", "number": 1}),
+        ];
+        let a = app.lock().unwrap();
+        assert_eq!(find_row(&a, "o/r", 2), Some(0));
+        assert_eq!(find_row(&a, "o/r", 1), Some(1));
+    }
+
+    #[test]
+    fn panel_matches_identity_surviving_row_removal() {
+        let app = test_app(vec![serde_json::json!({"repo": "o/r", "number": 1})]);
+        app.lock().unwrap().selected = Some(("o/r".into(), 1));
+        assert!(panel_matches(&app, "o/r", 1));
+        assert!(!panel_matches(&app, "o/r", 2));
+        assert!(!panel_matches(&app, "x/y", 1));
+        // 刷新后该行不在列表里：面板保持打开，身份保留，匹配继续工作
+        app.lock().unwrap().rows = Vec::new();
+        assert!(panel_matches(&app, "o/r", 1));
+        // 关闭面板后不再匹配
+        app.lock().unwrap().selected = None;
+        assert!(!panel_matches(&app, "o/r", 1));
+    }
+
+    #[test]
+    fn resolve_view_maps_view_index_to_identity() {
+        let app = test_app(vec![
+            serde_json::json!({"repo": "o/r", "number": 1, "title": "aaa"}),
+            serde_json::json!({"repo": "o/r", "number": 2, "title": "bbb"}),
+        ]);
+        // 过滤后视图只含第二行：视图下标 0 → (o/r, 2)
+        {
+            let mut a = app.lock().unwrap();
+            a.filter = "bbb".into();
+            a.view = filtered_view(&a.rows, &a.filter);
+        }
+        assert_eq!(resolve_view(&app, 0), Some(("o/r".to_string(), 2)));
+        assert_eq!(resolve_view(&app, 1), None);
+    }
+
+    // ── 评审展示数据扩展 ──
+
+    #[test]
+    fn size_line_formats_and_handles_missing_fields() {
+        let rv = serde_json::json!({
+            "size_label": "XL", "additions": 2122, "deletions": 23, "files_changed": 24,
+        });
+        assert_eq!(size_line(&rv), "XL（+2122/-23，24 个文件）");
+        assert_eq!(size_line(&serde_json::json!({})), "");
+        assert_eq!(size_line(&serde_json::json!({"size_label": "S"})), "S");
+        assert_eq!(
+            size_line(&serde_json::json!({"additions": 10, "deletions": 2, "files_changed": 3})),
+            "（+10/-2，3 个文件）"
+        );
+    }
+
+    #[test]
+    fn review_props_exposes_structured_dimensions_blocks_and_size() {
+        let rv = serde_json::json!({
+            "score": 8.0,
+            "dimensions": "{\"readability\": 8, \"security\": 6}",
+            "summary": "## 结论\n整体可用",
+            "size_label": "M", "additions": 100, "deletions": 5, "files_changed": 4,
+        });
+        let p = review_props(Some(&rv));
+        assert!(p.has);
+        assert_eq!(p.size_line, "M（+100/-5，4 个文件）");
+        assert!(p.dimensions.contains(&("可读性".to_string(), 8.0)));
+        assert!(p.dimensions.contains(&("安全".to_string(), 6.0)));
+        // dimension_lines 旧字段保持可用
+        assert!(!p.dimension_lines.is_empty());
+        // 摘要按 Markdown 解析成块
+        assert!(!p.summary_blocks.is_empty());
+        assert_eq!(p.summary_blocks[0].kind, "h2");
+        assert_eq!(p.summary_blocks[0].text, "结论");
+        // 无评审：空态各字段为空
+        let p0 = review_props(None);
+        assert!(!p0.has);
+        assert!(p0.dimensions.is_empty());
+        assert!(p0.summary_blocks.is_empty());
+        assert_eq!(p0.size_line, "");
     }
 }

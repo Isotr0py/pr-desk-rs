@@ -4,12 +4,13 @@
 import { Theme } from "theme.slint";
 import { TopBar, StatusBar } from "topbar.slint";
 import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
-import { DetailPanel, ConvoEntry, CheckRun, FileChange, OcrComment } from "detail_panel.slint";
+import { DetailPanel, ConvoEntry, CheckRun, FileChange, OcrComment, DimScore } from "detail_panel.slint";
 import { DiffFile, DiffLine } from "diff_view.slint";
 import { InboxView, NotifRow, NotifPreview } from "inbox.slint";
+import { MdBlock } from "components.slint";
 
 // 类型再导出：slint-build 从本文件生成 Rust 绑定
-export { PrListRow, PrGroup, ConvoEntry, CheckRun, FileChange, DiffFile, DiffLine, NotifRow, OcrComment }
+export { PrListRow, PrGroup, ConvoEntry, CheckRun, FileChange, DiffFile, DiffLine, NotifRow, OcrComment, DimScore, MdBlock }
 
 // ── 表单输入框：30px 高、6px 圆角、1px 描边，聚焦时 accent 描边 ──
 component FormField inherits Rectangle {
@@ -231,8 +232,10 @@ export component MainWindow inherits Window {
     in property <string> d_review_progress: "";
     in property <bool> d_review_has: false;
     in property <float> d_review_score: 0;
-    in property <[string]> d_review_dimension_lines: [];
+    in property <[DimScore]> d_review_dimensions: [];
+    in property <string> d_review_size_line: "";
     in property <string> d_review_summary: "";
+    in property <[MdBlock]> d_review_summary_blocks: [];
     in property <[string]> d_review_flagged: [];
     in property <string> d_review_reviewed_at: "";
     in property <[OcrComment]> d_review_comments: [];   // OCR 行级评论明细
@@ -357,8 +360,10 @@ export component MainWindow inherits Window {
                     review_progress: root.d_review_progress;
                     review_has: root.d_review_has;
                     review_score: root.d_review_score;
-                    review_dimension_lines: root.d_review_dimension_lines;
+                    review_dimensions: root.d_review_dimensions;
+                    review_size_line: root.d_review_size_line;
                     review_summary: root.d_review_summary;
+                    review_summary_blocks: root.d_review_summary_blocks;
                     review_flagged: root.d_review_flagged;
                     review_reviewed_at: root.d_review_reviewed_at;
                     review_comments: root.d_review_comments;
