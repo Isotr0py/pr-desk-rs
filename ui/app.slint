@@ -1,7 +1,7 @@
 // PR Desk — 主窗口（组装 topbar/pr_list/detail_panel/diff_view + 设置弹窗/首启引导）
 // 键盘：PrListView 管 j/k/↑↓/Enter/Esc（reject 冒泡）；外层 FocusScope 接 p/1/2/3 和 /。
 // Esc 语义（见 dismissed）：详情开着 → 关详情；否则取消选中。
-import { SpinBox, ComboBox } from "std-widgets.slint";
+import { ComboBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TopBar, StatusBar } from "topbar.slint";
 import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
@@ -126,6 +126,63 @@ component DialogButton inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
+}
+
+// ── 数字步进器：自绘（SpinBox 在本环境的样式下不渲染，故不用它）──
+component NumStepper inherits Rectangle {
+    in-out property <int> value;
+    in property <int> minimum: 1;
+    in property <int> maximum: 99;
+
+    width: 108px;
+    height: 30px;
+    border-radius: Theme.r_md;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: Theme.surface2;
+    clip: true;
+
+    Rectangle {
+        x: 0; y: 0; width: 32px; height: 100%;
+        background: ta_minus.has-hover && root.value > root.minimum ? Theme.hover : transparent;
+        ta_minus := TouchArea {
+            mouse-cursor: root.value > root.minimum ? pointer : default;
+            clicked => { root.value = max(root.minimum, root.value - 1); }
+        }
+        Text {
+            text: "−";
+            color: root.value > root.minimum ? Theme.text : Theme.text_faint;
+            font-size: Theme.fs_md;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    Text {
+        x: 32px; width: parent.width - 64px; height: 100%;
+        text: root.value;
+        color: Theme.text;
+        font-size: Theme.fs_md;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    Rectangle {
+        x: parent.width - 32px; y: 0; width: 32px; height: 100%;
+        background: ta_plus.has-hover && root.value < root.maximum ? Theme.hover : transparent;
+        ta_plus := TouchArea {
+            mouse-cursor: root.value < root.maximum ? pointer : default;
+            clicked => { root.value = min(root.maximum, root.value + 1); }
+        }
+        Text {
+            text: "+";
+            color: root.value < root.maximum ? Theme.text : Theme.text_faint;
+            font-size: Theme.fs_md;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+    // 中缝分隔线
+    Rectangle { x: 32px; y: 6px; width: 1px; height: parent.height - 12px; background: Theme.hairline; }
+    Rectangle { x: parent.width - 33px; y: 6px; width: 1px; height: parent.height - 12px; background: Theme.hairline; }
 }
 
 export component MainWindow inherits Window {
@@ -417,15 +474,17 @@ export component MainWindow inherits Window {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             width: 480px;
-            height: form.preferred-height;
+            // 内容矮则自适应，高则限高（窗口高 - 64px）并滚动；150px = 内边距+标题+底栏+间距
+            height: min(fields.preferred-height + 150px, parent.height - 64px);
             background: Theme.card;
             border-radius: Theme.r_lg;
             border-width: 1px;
             border-color: Theme.border;
+            clip: true;
 
-            form := VerticalLayout {
+            VerticalLayout {
                 padding: 20px;
-                spacing: 14px;
+                spacing: 12px;
 
                 Text {
                     text: "设置";
@@ -433,6 +492,15 @@ export component MainWindow inherits Window {
                     font-size: 16px;
                     font-weight: 600;
                 }
+
+                Flickable {
+                    vertical-stretch: 1;
+                    content-width: self.width;
+                    content-height: fields.preferred-height;
+
+                    fields := VerticalLayout {
+                        width: 100%;
+                        spacing: 14px;
 
                 Field {
                     label: "服务器地址";
@@ -470,7 +538,7 @@ export component MainWindow inherits Window {
                     label: "轮询间隔（分钟）";
                     HorizontalLayout {
                         spacing: 8px;
-                        SpinBox {
+                        NumStepper {
                             value <=> root.s_poll;
                             minimum: 1;
                             maximum: 120;
@@ -533,7 +601,7 @@ export component MainWindow inherits Window {
                     label: "评审并发数（1-8）";
                     HorizontalLayout {
                         spacing: 8px;
-                        SpinBox {
+                        NumStepper {
                             value <=> root.s_review_concurrency;
                             minimum: 1;
                             maximum: 8;
@@ -547,6 +615,8 @@ export component MainWindow inherits Window {
                             horizontal-stretch: 1;
                         }
                     }
+                }
+                }
                 }
 
                 // 底部按钮：右对齐，保存为主色实心
