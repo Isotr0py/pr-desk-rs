@@ -630,6 +630,15 @@ export component PrListView inherits FocusScope {
     in property <[PrListRow]> rows: [];
     in-out property <[PrGroup]> groups: [];
     in-out property <int> selected_index: -1;   // in-out：集成方 Esc 取消选中时需要写
+    // 选中行的身份（PrListRow.key = repo#number）。高亮以它为准——刷新重建行后
+    // 下标会漂移，身份不会。由点击/键盘/Rust 侧（rebuild 后回写）共同维护。
+    in-out property <string> selected_key: "";
+
+    // 统一切选中：下标（键盘导航用）+ 身份（高亮/抗刷新用）
+    function select_at(i: int) {
+        root.selected_index = i;
+        root.selected_key = (i >= 0 && i < root.rows.length) ? root.rows[i].key : "";
+    }
 
     callback row_activated(int);    // 点击或 Enter：打开详情（传 rows 下标）
     callback row_pin(int);
@@ -640,10 +649,10 @@ export component PrListView inherits FocusScope {
     function move_selection(delta: int) {
         if (root.rows.length == 0) { return; }
         if (root.selected_index < 0 || root.selected_index >= root.rows.length) {
-            root.selected_index = delta > 0 ? 0 : root.rows.length - 1;
+            root.select_at(delta > 0 ? 0 : root.rows.length - 1);
             return;
         }
-        root.selected_index = Math.min(root.rows.length - 1, Math.max(0, root.selected_index + delta));
+        root.select_at(Math.min(root.rows.length - 1, Math.max(0, root.selected_index + delta)));
     }
 
     // 键盘导航：j/k 或 ↑/↓ 移动，Enter 打开，Esc 取消
@@ -702,10 +711,10 @@ export component PrListView inherits FocusScope {
                         alignment: start;
                         for r[i] in root.rows: PrRowItem {
                             pr: r;
-                            selected: i == root.selected_index;
+                            selected: root.selected_key != "" && r.key == root.selected_key;
                             zebra: mod(i, 2) == 1;
                             clicked => {
-                                root.selected_index = i;
+                                root.select_at(i);
                                 root.row_activated(i);
                             }
                             pin => { root.row_pin(i); }
@@ -728,10 +737,10 @@ export component PrListView inherits FocusScope {
                             for ri in group.count: PrRowItem {
                                 private property <int> idx: group.start + ri;
                                 pr: root.rows[self.idx];
-                                selected: self.idx == root.selected_index;
+                                selected: root.selected_key != "" && root.rows[self.idx].key == root.selected_key;
                                 zebra: mod(ri, 2) == 1;
                                 clicked => {
-                                    root.selected_index = self.idx;
+                                    root.select_at(self.idx);
                                     root.row_activated(self.idx);
                                 }
                                 pin => { root.row_pin(self.idx); }

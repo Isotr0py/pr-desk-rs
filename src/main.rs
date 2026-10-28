@@ -337,6 +337,7 @@ struct App {
     db: Db,
     rows: Vec<serde_json::Value>,           // 扁平数据行（按身份查找，见 find_row）
     view: Vec<usize>,                       // 过滤后可见行 → rows 下标（UI 下标经它换算）
+    view_keys: Vec<(String, i64)>,          // UI 实际展示顺序（build_models 分组后）→ 身份；点击映射以此为准
     filter: String,                         // 当前过滤词（空 = 全量）
     selected: Option<(String, i64)>,        // 选中 PR 身份（repo, number）；刷新后行序变化也不漂移
     status_msg: String,                     // 状态栏临时消息（最近一条 Status）
@@ -393,9 +394,9 @@ fn find_row(a: &App, repo: &str, number: i64) -> Option<usize> {
 /// UI 传来的可见行下标 → 该行 PR 的身份（repo, number）。
 fn resolve_view(app: &Arc<Mutex<App>>, view_idx: usize) -> Option<(String, i64)> {
     let a = app.lock().unwrap();
-    let idx = *a.view.get(view_idx)?;
-    let r = a.rows.get(idx)?;
-    Some((r["repo"].as_str()?.to_string(), r["number"].as_i64()?))
+    // 注意：必须用「实际发给 UI 的分组后顺序」（view_keys）——build_models 会按
+    // Pinned/看板/待评审/已评审重排，与 a.view（数据库排序）不是同一个序。
+    a.view_keys.get(view_idx).cloned()
 }
 
 fn main() -> anyhow::Result<()> {
@@ -432,6 +433,7 @@ fn main() -> anyhow::Result<()> {
         db,
         rows: Vec::new(),
         view: Vec::new(),
+        view_keys: Vec::new(),
         filter: String::new(),
         selected: None,
         status_msg: config_status(&cfg),
@@ -1700,6 +1702,16 @@ fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
         a.view.iter().map(|&i| a.rows[i].clone()).collect()
     };
     let (rows, mut groups) = model::build_models(&rows_json);
+    // UI 展示顺序（分组重排后）的身份序列——resolve_view 的点击映射以此为准，
+    // 不能用 a.view（数据库排序），两者在分组重排后不是一个序。
+    let keys: Vec<(String, i64)> = rows
+        .iter()
+        .filter_map(|r| {
+            let (repo, num) = r.key.rsplit_once('#')?;
+            Some((repo.to_string(), num.parse().ok()?))
+        })
+        .collect();
+    app.lock().unwrap().view_keys = keys;
     let old = ui.get_groups();
     for g in groups.iter_mut() {
         for gi in 0..old.row_count() {
@@ -1712,6 +1724,15 @@ fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     }
     ui.set_rows(ModelRc::new(VecModel::from(rows)));
     ui.set_groups(ModelRc::new(VecModel::from(groups)));
+    // 重建后高亮跟随选中 PR 的身份（下标已漂移，UI 侧 selected_index 由 key 反查）
+    let sel_key = app
+        .lock()
+        .unwrap()
+        .selected
+        .as_ref()
+        .map(|(r, n)| format!("{r}#{n}"))
+        .unwrap_or_default();
+    ui.set_selected_key(sel_key.into());
 }
 
 /// 评审 tab 属性整体写入（Msg::Panel 初次装载与 Msg::ReviewDone 刷新共用）。
@@ -2026,6 +2047,7 @@ mod tests {
             db: Db::open_memory().unwrap(),
             rows,
             view,
+            view_keys: Vec::new(),
             filter: String::new(),
             selected: None,
             status_msg: String::new(),
@@ -2082,14 +2104,11 @@ mod tests {
             serde_json::json!({"repo": "o/r", "number": 1, "title": "aaa"}),
             serde_json::json!({"repo": "o/r", "number": 2, "title": "bbb"}),
         ]);
-        // 过滤后视图只含第二行：视图下标 0 → (o/r, 2)
-        {
-            let mut a = app.lock().unwrap();
-            a.filter = "bbb".into();
-            a.view = filtered_view(&a.rows, &a.filter);
-        }
+        // UI 实际展示顺序（分组重排后）与数据库序不同：点击映射必须以 view_keys 为准
+        app.lock().unwrap().view_keys = vec![("o/r".into(), 2), ("o/r".into(), 1)];
         assert_eq!(resolve_view(&app, 0), Some(("o/r".to_string(), 2)));
-        assert_eq!(resolve_view(&app, 1), None);
+        assert_eq!(resolve_view(&app, 1), Some(("o/r".to_string(), 1)));
+        assert_eq!(resolve_view(&app, 2), None);
     }
 
     // ── 评审展示数据扩展 ──

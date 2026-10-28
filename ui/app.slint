@@ -203,6 +203,8 @@ export component MainWindow inherits Window {
 
     // ── 列表 ──
     in property <[PrListRow]> rows: [];
+    // 选中行身份（repo#number）：Rust 侧重建列表后回写，高亮跟随 PR 而非下标
+    in-out property <string> selected_key: "";
     in-out property <[PrGroup]> groups: [];
     in-out property <string> filter_text: "";
     in-out property <int> view_mode: 0;      // 0=列表 1=Inbox（TopBar 分段控件，唯一一套视图切换）
@@ -331,12 +333,13 @@ export component MainWindow inherits Window {
                     horizontal-stretch: 1;
                     rows: root.rows;
                     groups: root.groups;
+                    selected_key <=> root.selected_key;
                     row_activated(i) => { root.row_activated(i); }
                     row_pin(i) => { root.row_pin(i); }
                     row_reject(i) => { root.row_reject(i); }
                     row_board(i) => { root.row_board(i); }
                     dismissed => {
-                        if (root.d_open) { root.panel_close(); } else { self.selected_index = -1; }
+                        if (root.d_open) { root.panel_close(); } else { self.selected_index = -1; self.selected_key = ""; }
                     }
                 }
                 DetailPanel {
