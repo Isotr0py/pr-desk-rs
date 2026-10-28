@@ -1,7 +1,6 @@
 // PR Desk — 主窗口（组装 topbar/pr_list/detail_panel/diff_view + 设置弹窗/首启引导）
 // 键盘：PrListView 管 j/k/↑↓/Enter/Esc（reject 冒泡）；外层 FocusScope 接 p/1/2/3 和 /。
 // Esc 语义（见 dismissed）：详情开着 → 关详情；否则取消选中。
-import { ComboBox } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TopBar, StatusBar } from "topbar.slint";
 import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
@@ -279,8 +278,10 @@ export component MainWindow inherits Window {
     callback save_settings(string, string, string, string, string, string, string, string, string, string);
     // 设置页「获取」模型列表（参数为弹窗里正在编辑的 base_url / api_key）
     callback fetch_models(string, string);
-    // 拉取到的模型 id 列表（非空时模型名下方出现下拉框）
+    // 拉取到的模型 id 列表（非空时模型名下方出现选择列表）
     in property <[string]> model_list: [];
+    // 模型选择列表展开状态（拉取成功默认展开，可折叠）
+    in-out property <bool> model_list_open: true;
     in-out property <bool> settings_open: false;
     in-out property <int> settings_tab: 0;   // 0=连接与同步 1=LLM 预评审
     in-out property <string> s_server: "";
@@ -638,10 +639,75 @@ export component MainWindow inherits Window {
                             clicked => { root.fetch_models(root.s_llm_base, root.s_llm_key); }
                         }
                     }
-                    // 拉取成功后出现下拉框，选中即填入输入框（输入框仍可手输）
-                    if root.model_list.length > 0: ComboBox {
-                        model: root.model_list;
-                        selected(v) => { root.s_llm_model = v; }
+                    // 拉取成功后出现模型选择列表（自绘：std ComboBox 在本环境样式坏掉）
+                    // 选中即填入输入框（输入框仍可手输）；标题行可折叠
+                    if root.model_list.length > 0: Rectangle {
+                        border-radius: Theme.r_md;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: Theme.surface2;
+                        clip: true;
+                        height: root.model_list_open ? 178px : 30px;
+                        animate height { duration: 120ms; easing: ease-out; }
+
+                        // 标题行：「选择模型（N 个）▾」点击折叠/展开
+                        TouchArea {
+                            x: 0; y: 0; width: 100%; height: 30px;
+                            mouse-cursor: pointer;
+                            clicked => { root.model_list_open = !root.model_list_open; }
+                        }
+                        Text {
+                            x: 10px; y: 0; height: 30px;
+                            text: "选择模型（" + root.model_list.length + " 个）";
+                            color: Theme.text_dim;
+                            font-size: Theme.fs_sm;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            x: parent.width - 26px; y: 0; height: 30px; width: 16px;
+                            text: root.model_list_open ? "▴" : "▾";
+                            color: Theme.text_faint;
+                            font-size: Theme.fs_sm;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+
+                        // 列表区（展开时可见；标题行以下，含分隔线）
+                        Rectangle {
+                            x: 0; y: 30px; width: 100%; height: 1px;
+                            background: Theme.hairline;
+                        }
+                        Flickable {
+                            x: 0; y: 31px;
+                            width: 100%;
+                            height: max(0px, parent.height - 31px);
+                            content-width: self.width;
+                            content-height: ml_layout.preferred-height;
+
+                            ml_layout := VerticalLayout {
+                                width: 100%;
+                                alignment: start;
+
+                                for m in root.model_list: Rectangle {
+                                    height: 28px;
+                                    background: mi_ta.has-hover ? Theme.hover
+                                        : (m == root.s_llm_model ? Theme.sel : transparent);
+
+                                    mi_ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.s_llm_model = m; }
+                                    }
+                                    Text {
+                                        x: 10px; width: parent.width - 20px; height: 100%;
+                                        text: m;
+                                        color: m == root.s_llm_model ? Theme.sel_text : Theme.text;
+                                        font-size: Theme.fs_sm;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Field {
