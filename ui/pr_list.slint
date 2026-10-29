@@ -417,16 +417,35 @@ component PrRowItem inherits Rectangle {
         }
     }
 
-    Text {
+    // PR 号即超链接（hover 高亮+手型，点击浏览器打开，不触发选中/详情）
+    Rectangle {
         x: root.x-num;
         width: Cols.number;
         height: parent.height;
-        text: "#" + root.pr.number;
-        color: root.fg-dim;
-        font-size: Theme.fs_xs;
-        horizontal-alignment: center;
-        overflow: elide;
-        vertical-alignment: center;
+
+        num-ta := TouchArea {
+            mouse-cursor: pointer;
+            clicked => { root.open_browser(); }
+        }
+        Text {
+            width: parent.width;
+            height: parent.height;
+            text: "#" + root.pr.number;
+            color: num-ta.has-hover ? Theme.accent : root.fg-dim;
+            font-size: Theme.fs_xs;
+            horizontal-alignment: center;
+            overflow: elide;
+            vertical-alignment: center;
+        }
+        // hover 时下划线，链接语义一眼可辨
+        Rectangle {
+            x: 0;
+            y: parent.height - 6px;
+            width: parent.width;
+            height: 1px;
+            background: Theme.accent;
+            visible: num-ta.has-hover;
+        }
     }
 
     // 标题区：标题吃剩余空间并 elide；活动文本/评分徽章右端对齐
