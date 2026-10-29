@@ -32,6 +32,7 @@ enum Cmd {
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
     RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
     FetchModels { base: String, key: String },  // 设置页「获取」：拉 OpenAI 兼容端点的模型列表
+    FetchPrMeta { repo: String, number: i64 },  // 补齐残缺行的 author/url/head_sha（Inbox 入库的行缺这些）
 }
 
 /// 状态栏配置状态文本。
@@ -91,6 +92,8 @@ enum Msg {
     },
     // 设置页模型列表拉取结果（id 已排序去重）
     ModelsLoaded(Vec<String>),
+    // 行元数据补齐完成：若面板正开着该 PR，重新装载面板（worker 只在成功补齐后发）
+    ReopenPanel,
 }
 
 /// OCR 行级评论展示数据（纯 Rust 字符串可跨线程；Slint OcrComment 在 UI 线程装配）。
@@ -484,9 +487,10 @@ fn main() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let msg_tx = msg_tx.clone();
+        let cmd_tx_worker = cmd_tx.clone();   // worker 内部自入队（如补齐元数据）用
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(worker(app, cmd_rx, msg_tx));
+            rt.block_on(worker(app, cmd_rx, msg_tx, cmd_tx_worker));
         });
     }
 
@@ -507,14 +511,16 @@ fn main() -> anyhow::Result<()> {
     {
         let weak = ui.as_weak();
         let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
         std::thread::spawn(move || loop {
             match msg_rx.recv() {
                 Ok(msg) => {
                     let weak = weak.clone();
                     let app = app.clone();
+                    let cmd_tx = cmd_tx.clone();
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
-                            apply_msg(&ui, &app, msg);
+                            apply_msg(&ui, &app, &cmd_tx, msg);
                         }
                     });
                 }
@@ -1033,8 +1039,21 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
     match diff_cached {
         Some(d) => send_msg(Msg::DiffRaw(d)),
         None => {
-            let _ = cmd_tx.send(Cmd::FetchDiff { repo, number });
+            let _ = cmd_tx.send(Cmd::FetchDiff { repo: repo.clone(), number });
         }
+    }
+
+    // 行数据残缺（Inbox「+ 预评审」入库只带 title/url）：后台补齐 author/head_sha，
+    // 成功后 worker 发 Msg::ReopenPanel 重新装载面板
+    let damaged = match &row {
+        Some(r) => {
+            r["author"].as_str().unwrap_or("").is_empty()
+                || r["head_sha"].as_str().unwrap_or("").is_empty()
+        }
+        None => true,
+    };
+    if damaged {
+        let _ = cmd_tx.send(Cmd::FetchPrMeta { repo: repo.clone(), number });
     }
 }
 
@@ -1378,7 +1397,7 @@ async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: 
     }
 }
 
-async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sender<Msg>) {
+async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sender<Msg>, cmd_tx: mpsc::Sender<Cmd>) {
     let _ = MSG_TX.set(msg_tx.clone());
 
     let token = {
@@ -1533,6 +1552,8 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }));
                     if ok {
                         reload_rows(&app, &msg_tx);
+                        // 通知只带 title/url：补拉 author/head_sha 等元数据（入库即补齐，不留残缺行）
+                        let _ = cmd_tx.send(Cmd::FetchPrMeta { repo: repo.clone(), number });
                     }
                 }
                 // 重发当前通知行：apply_msg 重新计算「已加入」标记
@@ -1645,6 +1666,34 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         }
                     }
                 });
+            }
+            Cmd::FetchPrMeta { repo, number } => {
+                // 补齐残缺行（Inbox 入库的 PR 缺 author/head_sha）：拉 GitHub PR meta，
+                // 只填空缺字段，成功后刷新列表；面板正开着该 PR 则重新装载
+                if let Some(g) = &gh {
+                    match g.fetch_pr_meta(&repo, number).await {
+                        Ok(meta) => {
+                            let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
+                            let url = meta["html_url"].as_str().unwrap_or("").to_string();
+                            let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
+                            let title = meta["title"].as_str().unwrap_or("").to_string();
+                            let filled = {
+                                let a = app.lock().unwrap();
+                                a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &head_sha, &title)
+                                    .unwrap_or(false)
+                            };
+                            if filled {
+                                reload_rows(&app, &msg_tx);
+                                if panel_matches(&app, &repo, number) {
+                                    let _ = msg_tx.send(Msg::ReopenPanel);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Status(format!("补齐 PR 元数据失败 {repo} #{number}: {e}")));
+                        }
+                    }
+                }
             }
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
@@ -1800,7 +1849,7 @@ fn apply_review_props(ui: &MainWindow, p: &ReviewProps) {
     )));
 }
 
-fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
+fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, msg: Msg) {
     match msg {
         Msg::Status(s) => {
             app.lock().unwrap().status_msg = s;
@@ -1810,6 +1859,13 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, msg: Msg) {
         Msg::ModelsLoaded(models) => {
             let v: Vec<SharedString> = models.iter().map(|m| m.as_str().into()).collect();
             ui.set_model_list(ModelRc::new(slint::VecModel::from(v)));
+        }
+        Msg::ReopenPanel => {
+            // 元数据补齐后重开面板（内容已变，身份不变）
+            let sel = app.lock().unwrap().selected.clone();
+            if let Some((repo, number)) = sel {
+                open_drawer(app, cmd_tx, repo, number);
+            }
         }
         Msg::FilterChanged(q) => {
             {

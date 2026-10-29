@@ -389,6 +389,29 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// 只补空缺字段（Inbox「+ 预评审」入库的行缺 author/head_sha 等）：
+    /// 空/NULL 才写入，已有值一律不动；行不存在返回 false。
+    pub fn fill_pr_meta_if_empty(
+        &self,
+        repo: &str,
+        number: i64,
+        author: &str,
+        url: &str,
+        head_sha: &str,
+        title: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE prs SET
+                author   = CASE WHEN author   IS NULL OR author   = '' THEN ?1 ELSE author   END,
+                url      = CASE WHEN url      IS NULL OR url      = '' THEN ?2 ELSE url      END,
+                head_sha = CASE WHEN head_sha IS NULL OR head_sha = '' THEN ?3 ELSE head_sha END,
+                title    = CASE WHEN title    IS NULL OR title    = '' THEN ?4 ELSE title    END
+             WHERE repo=?5 AND number=?6",
+            params![author, url, head_sha, title, repo, number],
+        )?;
+        Ok(n > 0)
+    }
+
     // ── 本地改动（立即生效 + 入队 outbox 待推送） ──
     pub fn local_pr_update(&self, repo: &str, number: i64, field: &str, value: &serde_json::Value) -> Result<()> {
         // 立即应用到本地
@@ -754,5 +777,36 @@ mod tests {
         let rows = db.unpushed_reviews().unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().any(|r| r["number"] == 1 && r["score"] == 9.0));
+    }
+
+    #[test]
+    fn fill_pr_meta_only_fills_empty_fields() {
+        let db = Db::open_memory().unwrap();
+        // Inbox 入库的残缺行：author/head_sha 为空
+        db.upsert_pr(&serde_json::json!({
+            "repo": "o/r", "number": 1, "title": "t", "author": "", "url": "u1",
+            "head_sha": "", "status": "pending", "updated_at": "t", "source": "inbox",
+        }))
+        .unwrap();
+        assert!(db.fill_pr_meta_if_empty("o/r", 1, "alice", "u2", "sha1", "t2").unwrap());
+        let row = &db.list_prs(&[]).unwrap()[0];
+        assert_eq!(row["author"], "alice");       // 空字段被补齐
+        assert_eq!(row["url"], "u1");             // 已有值不动
+        assert_eq!(row["title"], "t");
+        // head_sha 不在 list_prs 的选择列里，直接查表验证
+        let sha: String = db.conn.query_row(
+            "SELECT head_sha FROM prs WHERE repo='o/r' AND number=1", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sha, "sha1");
+        // 再补一次：全部已有值 → 什么都不变
+        assert!(db.fill_pr_meta_if_empty("o/r", 1, "bob", "u3", "sha2", "t3").unwrap());
+        let row = &db.list_prs(&[]).unwrap()[0];
+        assert_eq!(row["author"], "alice");
+        let sha: String = db.conn.query_row(
+            "SELECT head_sha FROM prs WHERE repo='o/r' AND number=1", [], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(sha, "sha1");
+        // 不存在的行：false
+        assert!(!db.fill_pr_meta_if_empty("o/r", 99, "x", "u", "s", "t").unwrap());
     }
 }
