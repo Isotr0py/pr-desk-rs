@@ -731,6 +731,25 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        // 列表行内 hover 按钮：浏览器打开（下标 → 身份 → url）
+        let app = app.clone();
+        ui.on_row_open(move |i| {
+            if let Some((repo, number)) = resolve_view(&app, i as usize) {
+                open_pr_url(&app, &repo, &number);
+            }
+        });
+    }
+    {
+        // 快捷键 o：浏览器打开当前选中 PR
+        let app = app.clone();
+        ui.on_key_open(move || {
+            let sel = app.lock().unwrap().selected.clone();
+            if let Some((repo, number)) = sel {
+                open_pr_url(&app, &repo, &number);
+            }
+        });
+    }
+    {
         // 预览面板关闭（× 按钮 / Esc）
         let app = app.clone();
         let weak = ui.as_weak();
@@ -1730,6 +1749,20 @@ fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
         .map(|(r, n)| format!("{r}#{n}"))
         .unwrap_or_default();
     ui.set_selected_key(sel_key.into());
+}
+
+/// 浏览器打开 PR：优先用行数据里的 url，缺失时按 repo/number 拼 GitHub 链接兜底。
+fn open_pr_url(app: &Arc<Mutex<App>>, repo: &str, number: &i64) {
+    let url = {
+        let a = app.lock().unwrap();
+        find_row(&a, repo, *number)
+            .and_then(|i| a.rows[i]["url"].as_str().map(|s| s.to_string()))
+            .filter(|u| !u.is_empty())
+            .unwrap_or_else(|| format!("https://github.com/{repo}/pull/{number}"))
+    };
+    if let Err(e) = open::that(&url) {
+        send_msg(Msg::Status(format!("打开浏览器失败: {e}")));
+    }
 }
 
 /// 评审 tab 属性整体写入（Msg::Panel 初次装载与 Msg::ReviewDone 刷新共用）。

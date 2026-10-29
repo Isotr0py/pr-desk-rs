@@ -292,6 +292,7 @@ component GroupHeader inherits Rectangle {
 // ── hover 快捷操作按钮 ──
 component QuickAction inherits Rectangle {
     in property <string> glyph;
+    in property <image> icon;   // 优先于 glyph（内嵌 SVG，规避字形缺失豆腐块）
     out property <bool> hovered: qa-ta.has-hover;   // 暴露给父级：并入行 hover 条件，防覆盖层抖动
     callback activated();
 
@@ -304,7 +305,16 @@ component QuickAction inherits Rectangle {
         mouse-cursor: pointer;
         clicked => { root.activated(); }
     }
-    Text {
+    if root.icon.width > 0: Image {
+        source: root.icon;
+        width: 12px;
+        height: 12px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        image-fit: contain;
+        colorize: Theme.text_dim;
+    }
+    if root.icon.width == 0: Text {
         text: root.glyph;
         color: Theme.text_dim;
         font-size: Theme.fs_xs;
@@ -349,6 +359,7 @@ component PrRowItem inherits Rectangle {
     callback pin();
     callback board();
     callback reject();
+    callback open_browser();
 
     // 选中行上所有文字统一用 sel_text（选中态前景色）
     property <color> fg: root.selected ? Theme.sel_text : Theme.text;
@@ -616,15 +627,15 @@ component PrRowItem inherits Rectangle {
         vertical-alignment: center;
     }
 
-    // hover 快捷操作：置顶 / 加看板 / 不采纳（浮现于行右端）。
+    // hover 快捷操作：浏览器打开 / 置顶 / 加看板 / 不采纳（浮现于行右端）。
     // 常驻元素 + visible 切换（不用 if 销毁重建）；可见性同时看行 hover 与覆盖层自身 hover，
     // 否则鼠标移上按钮时遮住 row-ta → has-hover 变 false → 覆盖层消失 → 无限抖动点不中。
     actions-overlay := Rectangle {
         x: parent.width - self.width - 4px;
         y: 3px;
-        width: 88px;
+        width: 112px;
         height: parent.height - 6px;
-        visible: row-ta.has-hover || actions-ta.has-hover || qa-pin.hovered || qa-board.hovered || qa-reject.hovered;
+        visible: row-ta.has-hover || actions-ta.has-hover || qa-open.hovered || qa-pin.hovered || qa-board.hovered || qa-reject.hovered;
         border-radius: Theme.r_sm;
         background: root.selected ? Theme.sel : Theme.card;
 
@@ -635,6 +646,7 @@ component PrRowItem inherits Rectangle {
             x: 4px;
             y: (parent.height - self.preferred-height) / 2;
             spacing: 4px;
+            qa-open := QuickAction { icon: @image-url("icons/open.svg"); activated => { root.open_browser(); } }
             qa-pin := QuickAction { glyph: "📌"; activated => { root.pin(); } }
             qa-board := QuickAction { glyph: "＋"; activated => { root.board(); } }
             qa-reject := QuickAction { glyph: "×"; activated => { root.reject(); } }
@@ -673,6 +685,7 @@ export component PrListView inherits FocusScope {
     callback row_pin(int);
     callback row_reject(int);
     callback row_board(int);
+    callback row_open(int);         // 行内外链按钮：浏览器打开（传 rows 下标）
     callback dismissed();           // Esc
 
     function move_selection(delta: int) {
@@ -749,6 +762,7 @@ export component PrListView inherits FocusScope {
                             pin => { root.row_pin(i); }
                             board => { root.row_board(i); }
                             reject => { root.row_reject(i); }
+                            open_browser => { root.row_open(i); }
                         }
                     }
 
@@ -775,6 +789,7 @@ export component PrListView inherits FocusScope {
                                 pin => { root.row_pin(self.idx); }
                                 board => { root.row_board(self.idx); }
                                 reject => { root.row_reject(self.idx); }
+                                open_browser => { root.row_open(self.idx); }
                             }
                         }
                     }

@@ -263,6 +263,8 @@ export component MainWindow inherits Window {
     callback row_pin(int);
     callback row_reject(int);
     callback row_board(int);
+    callback row_open(int);         // 行内外链按钮：浏览器打开
+    callback key_open();            // o 快捷键：浏览器打开选中 PR
     callback panel_close();
     callback panel_board();
     callback panel_set_priority(int);
@@ -321,6 +323,7 @@ export component MainWindow inherits Window {
             vertical-stretch: 1;
             key-pressed(event) => {
                 if (event.text == "p") { root.key_pin(); return accept; }
+                if (event.text == "o") { root.key_open(); return accept; }
                 if (event.text == "1") { root.key_priority(1); return accept; }
                 if (event.text == "2") { root.key_priority(2); return accept; }
                 if (event.text == "3") { root.key_priority(3); return accept; }
@@ -338,6 +341,7 @@ export component MainWindow inherits Window {
                     row_pin(i) => { root.row_pin(i); }
                     row_reject(i) => { root.row_reject(i); }
                     row_board(i) => { root.row_board(i); }
+                    row_open(i) => { root.row_open(i); }
                     dismissed => {
                         if (root.d_open) { root.panel_close(); } else { self.selected_index = -1; self.selected_key = ""; }
                     }
