@@ -32,7 +32,34 @@ llm_model = ""
 ocr_path = "ocr"
 # 预评审并发数（1-8；每个 PR 评审 = 评分 + OCR 多次 LLM 调用，配额紧张时调低）
 review_concurrency = 3
+# 多数据源：active_profile 选择当前数据源（"local" = 本地库 / "default" = 顶层键 / 自定义档案名）
+# 自定义远程档案三段式（name 仅允许 a-z0-9_-）：
+# profile.<name>.server_url / profile.<name>.sync_token / profile.<name>.api_key
 "#;
+
+/// 一个远程数据源档案（AstrBot 插件服务器连接参数）。
+/// 名为 "default" 的档案不单独落盘——它是顶层 server_url/sync_token/astrbot_api_key 的映射。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Profile {
+    pub name: String,
+    pub server_url: String,
+    pub sync_token: String,
+    pub api_key: String,
+}
+
+/// 档案名字符合法性：非空、≤64 字符、仅 a-z 0-9 _ -（防路径穿越，兼作 profile.* 键解析约束）。
+pub fn valid_profile_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'_' | b'-'))
+}
+
+/// 保留档案名：local（本地模式）与 default（顶层键映射）不可用作自定义档案。
+pub fn is_reserved_profile_name(name: &str) -> bool {
+    name == "local" || name == "default"
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -56,6 +83,10 @@ pub struct Config {
     pub ocr_path: String,
     /// 预评审并发数（1-8）
     pub review_concurrency: u64,
+    /// 远程数据源档案列表（自定义档；"default" 档由顶层键合成，见 load 的兼容迁移）
+    pub profiles: Vec<Profile>,
+    /// 当前数据源："local" = 本地模式；"default" = 顶层 server_url/sync_token；其它 = profiles 里的档案名
+    pub active_profile: String,
 }
 
 impl Default for Config {
@@ -74,6 +105,8 @@ impl Default for Config {
             llm_model: String::new(),
             ocr_path: "ocr".into(),
             review_concurrency: 3,
+            profiles: Vec::new(),
+            active_profile: "local".into(),
         }
     }
 }
@@ -91,6 +124,36 @@ fn unquote(s: &str) -> String {
 
 fn quote(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// 解析一行 `profile.<name>.<field> = value`（rest 已去掉 "profile." 前缀）。
+/// 非法名字/保留名/未知字段跳过并告警，不让手写的坏行炸掉整个配置加载。
+fn parse_profile_line(rest: &str, profiles: &mut Vec<Profile>) {
+    let Some((name, rest)) = rest.split_once('.') else { return };
+    let Some((field, value)) = rest.split_once('=') else { return };
+    if !valid_profile_name(name) || is_reserved_profile_name(name) {
+        tracing::warn!("忽略非法/保留档案名的配置行: profile.{name}.*");
+        return;
+    }
+    let value = unquote(value);
+    let idx = match profiles.iter().position(|p| p.name == name) {
+        Some(i) => i,
+        None => {
+            profiles.push(Profile {
+                name: name.to_string(),
+                server_url: String::new(),
+                sync_token: String::new(),
+                api_key: String::new(),
+            });
+            profiles.len() - 1
+        }
+    };
+    match field.trim() {
+        "server_url" => profiles[idx].server_url = value,
+        "sync_token" => profiles[idx].sync_token = value,
+        "api_key" => profiles[idx].api_key = value,
+        other => tracing::warn!("忽略未知档案字段: profile.{name}.{other}"),
+    }
 }
 
 impl Config {
@@ -121,6 +184,59 @@ impl Config {
             .or_else(|| self.llm_api_key.clone().filter(|t| !t.is_empty()))
     }
 
+    /// 当前生效的同步档案："local" → None（本地模式）；"default" → 用顶层键构造；
+    /// 其它 → profiles 查找。sync_token 为空一律视为 None（同步关闭）。
+    pub fn active_sync(&self) -> Option<Profile> {
+        match self.active_profile.as_str() {
+            "local" => None,
+            "default" => {
+                if self.sync_token.is_empty() {
+                    None
+                } else {
+                    Some(Profile {
+                        name: "default".into(),
+                        server_url: self.server_url.clone(),
+                        sync_token: self.sync_token.clone(),
+                        api_key: self.astrbot_api_key.clone(),
+                    })
+                }
+            }
+            name => self
+                .profiles
+                .iter()
+                .find(|p| p.name == name)
+                .filter(|p| !p.sync_token.is_empty())
+                .cloned(),
+        }
+    }
+
+    /// "default" 档案是否可用：顶层 sync_token 非空（load 的迁移会同时合成进 profiles）。
+    pub fn has_default_profile(&self) -> bool {
+        !self.sync_token.is_empty() || self.profiles.iter().any(|p| p.name == "default")
+    }
+
+    /// 档案是否存在（local 恒存在；default 需顶层 token；自定义查 profiles）。
+    pub fn has_profile(&self, name: &str) -> bool {
+        name == "local"
+            || (name == "default" && self.has_default_profile())
+            || self.profiles.iter().any(|p| p.name == name)
+    }
+
+    /// UI 展示名单：第一个恒为 "local"，第二个 "default"（存在的话），然后自定义名。
+    pub fn profile_names(&self) -> Vec<String> {
+        let mut out = vec!["local".to_string()];
+        if self.has_default_profile() {
+            out.push("default".into());
+        }
+        out.extend(
+            self.profiles
+                .iter()
+                .filter(|p| !is_reserved_profile_name(&p.name))
+                .map(|p| p.name.clone()),
+        );
+        out
+    }
+
     pub fn load(path: &Path) -> Result<Config> {
         if !path.exists() {
             if let Some(parent) = path.parent() {
@@ -132,9 +248,15 @@ impl Config {
         }
         let text = fs::read_to_string(path).context("读取 config.toml 失败")?;
         let mut cfg = Config::default();
+        let mut active: Option<String> = None;
         for raw in text.lines() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            // 自定义档案：profile.<name>.<server_url|sync_token|api_key> = "..."
+            if let Some(rest) = line.strip_prefix("profile.") {
+                parse_profile_line(rest, &mut cfg.profiles);
                 continue;
             }
             if let Some(v) = parse_value(line, "server_url") {
@@ -183,8 +305,31 @@ impl Config {
                     Ok(n) if (1..=8).contains(&n) => n,
                     _ => 3,
                 };
+            } else if let Some(v) = parse_value(line, "active_profile") {
+                active = Some(unquote(v)).filter(|s| !s.is_empty());
             }
         }
+        // 兼容迁移：顶层 sync_token 非空 = 旧版单服务器配置 → 合成 "default" 档（不落新键，
+        // 值始终与顶层键同步：active_sync("default") 直接用顶层键构造）
+        if !cfg.sync_token.is_empty() && !cfg.profiles.iter().any(|p| p.name == "default") {
+            cfg.profiles.push(Profile {
+                name: "default".into(),
+                server_url: cfg.server_url.clone(),
+                sync_token: cfg.sync_token.clone(),
+                api_key: cfg.astrbot_api_key.clone(),
+            });
+        }
+        // active_profile 缺省：有顶层 sync_token 的旧配置落 "default"，否则本地模式
+        cfg.active_profile = match active {
+            Some(name) => name,
+            None => {
+                if cfg.sync_token.is_empty() {
+                    "local".into()
+                } else {
+                    "default".into()
+                }
+            }
+        };
         Ok(cfg)
     }
 
@@ -194,7 +339,7 @@ impl Config {
             "[{}]",
             self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
         );
-        let kv: [(&str, String); 13] = [
+        let kv: [(&str, String); 14] = [
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
             ("astrbot_api_key", quote(&self.astrbot_api_key)),
@@ -208,13 +353,19 @@ impl Config {
             ("llm_model", quote(&self.llm_model)),
             ("ocr_path", quote(&self.ocr_path)),
             ("review_concurrency", self.review_concurrency.to_string()),
+            ("active_profile", quote(&self.active_profile)),
         ];
 
         let mut lines: Vec<String> = match fs::read_to_string(path) {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
             Err(_) => TEMPLATE.lines().map(|l| l.to_string()).collect(),
         };
-        let mut seen = [false; 13];
+        // 自定义档案行全部摘除后按 self.profiles 重写（profile.* 是唯一前缀，不碰注释行）
+        lines.retain(|l| {
+            let t = l.trim_start();
+            t.is_empty() || t.starts_with('#') || !t.starts_with("profile.")
+        });
+        let mut seen = [false; 14];
         for (i, line) in lines.iter_mut().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -233,6 +384,15 @@ impl Config {
             if !seen[k] {
                 lines.push(format!("{key} = {val}"));
             }
+        }
+        // 自定义档案重写到末尾（"default" 映射顶层键不落 profile.* 行；非法名防御性跳过）
+        for p in &self.profiles {
+            if is_reserved_profile_name(&p.name) || !valid_profile_name(&p.name) {
+                continue;
+            }
+            lines.push(format!("profile.{}.server_url = {}", p.name, quote(&p.server_url)));
+            lines.push(format!("profile.{}.sync_token = {}", p.name, quote(&p.sync_token)));
+            lines.push(format!("profile.{}.api_key = {}", p.name, quote(&p.api_key)));
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).ok();
@@ -287,6 +447,8 @@ mod tests {
             llm_model: "qwen3-coder".into(),
             ocr_path: "D:/tools/ocr.exe".into(),
             review_concurrency: 5,
+            profiles: Vec::new(),
+            active_profile: "local".into(),
         };
         cfg.save(&path).unwrap();
 
@@ -332,5 +494,159 @@ mod tests {
         assert!(c.is_unconfigured()); // 模板占位
         c.repos = vec!["vllm-project/vllm".into()];
         assert!(!c.is_unconfigured());
+    }
+
+    // ── 多数据源档案（P1）──
+
+    fn profile(name: &str, url: &str, token: &str, key: &str) -> Profile {
+        Profile {
+            name: name.into(),
+            server_url: url.into(),
+            sync_token: token.into(),
+            api_key: key.into(),
+        }
+    }
+
+    #[test]
+    fn profile_roundtrip_and_stale_lines_removed() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-prof-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = Config::load(&path).unwrap(); // 生成模板
+
+        let mut cfg = Config::default();
+        cfg.profiles = vec![
+            profile("nas", "http://nas:6185", "tok-nas", "ak-nas"),
+            profile("home_srv", "http://home:6185", "tok-home", ""),
+        ];
+        cfg.active_profile = "nas".into();
+        cfg.save(&path).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("profile.nas.server_url = \"http://nas:6185\""));
+        assert!(text.contains("profile.home_srv.api_key = \"\""));
+        assert!(text.contains("active_profile = \"nas\""));
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.profiles, cfg.profiles);
+        assert_eq!(loaded.active_profile, "nas");
+        assert_eq!(
+            loaded.active_sync(),
+            Some(profile("nas", "http://nas:6185", "tok-nas", "ak-nas"))
+        );
+        assert_eq!(loaded.profile_names(), vec!["local".to_string(), "nas".to_string(), "home_srv".to_string()]);
+
+        // 删掉一个档案后保存：旧的 profile.home_srv.* 行应被清除（先摘后重写）
+        loaded.profiles.iter().find(|p| p.name == "home_srv").unwrap();
+        let mut cfg2 = loaded;
+        cfg2.profiles.retain(|p| p.name != "home_srv");
+        cfg2.save(&path).unwrap();
+        let text2 = std::fs::read_to_string(&path).unwrap();
+        assert!(!text2.contains("profile.home_srv."), "已删档案的行应被清除");
+        assert!(text2.contains("profile.nas.sync_token"));
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.profiles.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_config_migrates_to_default_profile() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-mig-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 旧版配置：只有顶层服务器三键，没有 active_profile / profile.* 行
+        std::fs::write(
+            &path,
+            "server_url = \"http://nas:6185\"\nsync_token = \"tok-1\"\nastrbot_api_key = \"ak-1\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        // 迁移：合成 default 档；active_profile 缺省落 "default"
+        assert!(cfg.profiles.contains(&profile("default", "http://nas:6185", "tok-1", "ak-1")));
+        assert_eq!(cfg.active_profile, "default");
+        assert_eq!(
+            cfg.active_sync(),
+            Some(profile("default", "http://nas:6185", "tok-1", "ak-1"))
+        );
+        assert_eq!(cfg.profile_names(), vec!["local".to_string(), "default".to_string()]);
+        // 保存：default 档不落 profile.* 新键；重载后迁移仍成立
+        cfg.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("profile.default."), "default 档不应落 profile.* 行");
+        assert!(text.contains("active_profile = \"default\""));
+        let reloaded = Config::load(&path).unwrap();
+        assert_eq!(reloaded.active_profile, "default");
+        assert!(reloaded.has_profile("default"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_profile_defaults_to_local_without_token() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-nod-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "server_url = \"http://x:6185\"\nsync_token = \"\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.active_profile, "local");
+        assert!(!cfg.has_profile("default"));
+        assert_eq!(cfg.profile_names(), vec!["local".to_string()]);
+        assert_eq!(cfg.active_sync(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalid_profile_names_rejected_on_parse() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-bad-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            "profile.bad name.sync_token = \"x\"\n\
+             profile..sync_token = \"x\"\n\
+             profile.UPPER.sync_token = \"x\"\n\
+             profile.default.sync_token = \"x\"\n\
+             profile.nas.sync_token = \"tok\"\n\
+             profile.nas.server_url = \"http://nas:6185\"\n\
+             profile.nas.bogus = \"?\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        // 含空格 / 空名 / 大写 / 保留名 全部拒绝；只有 nas 建档
+        assert_eq!(cfg.profiles.len(), 1);
+        assert_eq!(cfg.profiles[0].name, "nas");
+        assert_eq!(cfg.profiles[0].sync_token, "tok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn active_sync_semantics() {
+        let mut c = Config::default();
+        c.active_profile = "local".into();
+        assert_eq!(c.active_sync(), None);
+        // default：顶层 token 空 → None；非空 → Some（用顶层键构造）
+        c.active_profile = "default".into();
+        assert_eq!(c.active_sync(), None);
+        c.sync_token = "tok".into();
+        assert_eq!(c.active_sync().unwrap().sync_token, "tok");
+        // 自定义：token 空 → None；非空 → Some；未知名 → None
+        c.profiles = vec![profile("nas", "http://nas:6185", "", ""), profile("home", "http://h:1", "t2", "")];
+        c.active_profile = "nas".into();
+        assert_eq!(c.active_sync(), None);
+        c.active_profile = "home".into();
+        assert_eq!(c.active_sync().unwrap().name, "home");
+        c.active_profile = "ghost".into();
+        assert_eq!(c.active_sync(), None);
+    }
+
+    #[test]
+    fn profile_name_validation() {
+        assert!(valid_profile_name("nas"));
+        assert!(valid_profile_name("home-srv_2"));
+        assert!(!valid_profile_name(""));
+        assert!(!valid_profile_name("Bad"));
+        assert!(!valid_profile_name("a b"));
+        assert!(!valid_profile_name("../etc"));
+        assert!(!valid_profile_name(&"x".repeat(65)));
+        assert!(is_reserved_profile_name("local"));
+        assert!(is_reserved_profile_name("default"));
+        assert!(!is_reserved_profile_name("nas"));
     }
 }

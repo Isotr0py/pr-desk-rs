@@ -18,12 +18,15 @@ component FormField inherits Rectangle {
     in-out property <string> text <=> input.text;
     in property <string> placeholder: "";
     in property <bool> password: false;
+    in property <bool> enabled: true;   // false = 禁用（本地档案时锁服务器字段）
+    callback accepted();                // Enter 确认（新档案名输入用）
+    public function focus_input() { input.focus(); }
 
     height: 30px;
     border-radius: Theme.r_md;
     border-width: 1px;
     border-color: input.has-focus ? Theme.accent : Theme.border;
-    background: Theme.bg;
+    background: root.enabled ? Theme.bg : Theme.surface2;
     animate border-color { duration: 120ms; }
 
     input := TextInput {
@@ -33,8 +36,10 @@ component FormField inherits Rectangle {
         vertical-alignment: center;
         single-line: true;
         font-size: Theme.fs_md;
-        color: Theme.text;
+        color: root.enabled ? Theme.text : Theme.text_faint;
+        enabled: root.enabled;
         input-type: root.password ? InputType.password : InputType.text;
+        accepted => { root.accepted(); }
     }
 
     // 占位提示（空内容时显示，不拦截点击）
@@ -317,15 +322,36 @@ export component MainWindow inherits Window {
     in property <bool> onboarding: false;   // 未配置（首启引导）
     in property <bool> gh_token_from_env: false;  // GITHUB_TOKEN 环境变量优先提示
 
+    // ── 数据源档案（本地 / 多远程服务器）──
+    in property <[string]> profile_names: [];    // 第一个恒为 "local"，然后 "default"、自定义名
+    in-out property <string> active_profile: "local";
+    callback switch_profile(string);
+    callback profile_add(string);      // 参数为新档案名（Rust 侧校验）
+    callback profile_remove(string);
+    // 设置弹窗当前编辑的档案：变化时回调 settings_profile_focus，
+    // Rust 把该档案的值回填进 s_server / s_sync_token / s_ak；save_settings 按当前档案写回。
+    // Rust 侧可在 profile_add / profile_remove 后直接写本属性（in-out），changed 会自动触发回填。
+    in-out property <string> settings_profile: "local";
+    callback settings_profile_focus(string);
+    // 正在编辑 local 档案（锁服务器三字段）
+    property <bool> editing_local: root.settings_profile == "local";
+    // 档案选择行的「+」输入模式（内联输入新档案名）
+    property <bool> adding_profile: false;
+
     // 顶栏搜索框内容变化（双向绑定）→ 通知 Rust 重建过滤视图
     changed filter_text => { root.filter_changed(root.filter_text); }
     // 切到 Inbox 分段时拉一次通知
     changed view_mode => { if (root.view_mode == 1) { root.fetch_inbox(); } }
+    // 档案选择器切换 → 通知 Rust 回填该档案的服务器字段
+    changed settings_profile => { root.settings_profile_focus(root.settings_profile); }
 
     VerticalLayout {
         topbar := TopBar {
             filter_text <=> root.filter_text;
             view_mode <=> root.view_mode;
+            profile_names: root.profile_names;
+            active_profile <=> root.active_profile;
+            switch_profile(n) => { root.switch_profile(n); }
             refresh => { root.refresh(); }
             sync => { root.sync_now(); }
             open_settings => { root.open_settings(); }
@@ -587,9 +613,249 @@ export component MainWindow inherits Window {
                 if root.settings_tab == 0: VerticalLayout {
                     spacing: 14px;
 
+                // ── 数据源档案选择行：以下服务器地址 / sync_token / AstrBot Key 三字段按档案独立保存 ──
+                // 切换档案只写 settings_profile（changed 触发 settings_profile_focus → Rust 回填三字段）；
+                // 表单字段仍绑定 s_server / s_sync_token / s_ak，保存仍走 save_settings（Rust 按当前档案写回）。
+                Field {
+                    label: I18n.settings_profile_label;
+                    HorizontalLayout {
+                        spacing: 8px;
+
+                        // 当前编辑档案（下拉浮层用 PopupWindow，不被弹窗 clip 裁切）
+                        profile-btn := Rectangle {
+                            width: 160px;
+                            height: 30px;
+                            border-radius: Theme.r_md;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            background: profile-ta.has-hover ? Theme.hover : Theme.surface2;
+                            animate background { duration: 120ms; }
+
+                            profile-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { profile-popup.show(); }
+                            }
+                            Image {
+                                x: 10px;
+                                y: (parent.height - 12px) / 2;
+                                width: 12px;
+                                height: 12px;
+                                source: @image-url("icons/database.svg");
+                                image-fit: contain;
+                                colorize: Theme.text_dim;
+                            }
+                            Text {
+                                x: 28px;
+                                width: parent.width - 52px;
+                                height: 100%;
+                                text: root.settings_profile == "local" ? I18n.source_local : root.settings_profile;
+                                font-size: Theme.fs_md;
+                                color: Theme.text;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Image {
+                                x: parent.width - 20px;
+                                y: (parent.height - 10px) / 2;
+                                width: 10px;
+                                height: 10px;
+                                source: @image-url("icons/chevron-down.svg");
+                                image-fit: contain;
+                                colorize: Theme.text_faint;
+                            }
+
+                            profile-popup := PopupWindow {
+                                x: 0;
+                                y: parent.height + 4px;
+                                width: max(180px, parent.width);
+                                height: root.profile_names.length * 26px + 8px;
+                                close-policy: close-on-click-outside;
+
+                                Rectangle {
+                                    width: 100%;
+                                    height: 100%;
+                                    border-radius: Theme.r_md;
+                                    background: Theme.card;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+
+                                    VerticalLayout {
+                                        x: 0;
+                                        y: 4px;
+                                        width: 100%;
+                                        spacing: 0;
+
+                                        for p in root.profile_names: Rectangle {
+                                            height: 26px;
+                                            background: pi-ta.has-hover ? Theme.hover
+                                                : (p == root.settings_profile ? Theme.sel : transparent);
+
+                                            pi-ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => {
+                                                    root.settings_profile = p;
+                                                    profile-popup.close();
+                                                }
+                                            }
+                                            Image {
+                                                x: 8px;
+                                                y: (parent.height - 10px) / 2;
+                                                width: 10px;
+                                                height: 10px;
+                                                source: @image-url("icons/check.svg");
+                                                image-fit: contain;
+                                                colorize: p == root.settings_profile ? Theme.sel_text : transparent;
+                                            }
+                                            Text {
+                                                x: 24px;
+                                                width: parent.width - 32px;
+                                                height: 100%;
+                                                text: p == "local" ? I18n.source_local : p;
+                                                font-size: Theme.fs_sm;
+                                                color: p == root.settings_profile ? Theme.sel_text : Theme.text;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // 「+」新档案：点击后在选择行内联展开输入框（避免 PopupWindow 内部元素外部不可达的限制），
+                        // Enter 确认 → profile_add(name)（Rust 侧校验并更新 profile_names），✕ 取消
+                        add-input := FormField {
+                            width: 160px;
+                            visible: root.adding_profile;
+                            placeholder: I18n.profile_add_hint;
+                            accepted => {
+                                if (self.text != "") {
+                                    root.profile_add(self.text);
+                                    // 即时切到新档案（空值起步）；非法名由 Rust 回写 settings_profile 纠正
+                                    root.settings_profile = self.text;
+                                }
+                                self.text = "";
+                                root.adding_profile = false;
+                            }
+                        }
+                        if !root.adding_profile: add-btn := Rectangle {
+                            width: 30px;
+                            height: 30px;
+                            border-radius: Theme.r_md;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            background: add-ta.has-hover ? Theme.hover : transparent;
+                            animate background { duration: 120ms; }
+
+                            add-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => {
+                                    root.adding_profile = true;
+                                    add-input.text = "";
+                                    add-input.focus_input();
+                                }
+                            }
+                            Image {
+                                x: (parent.width - 14px) / 2;
+                                y: (parent.height - 14px) / 2;
+                                width: 14px;
+                                height: 14px;
+                                source: @image-url("icons/plus.svg");
+                                image-fit: contain;
+                                colorize: add-ta.has-hover ? Theme.text : Theme.text_dim;
+                            }
+                            if add-ta.has-hover: Rectangle {
+                                x: (parent.width - self.width) / 2;
+                                y: parent.height + 4px;
+                                width: add-tip.preferred-width + 12px;
+                                height: 20px;
+                                border-radius: Theme.r_sm;
+                                background: Theme.card;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                add-tip := Text {
+                                    text: I18n.profile_add_tooltip;
+                                    font-size: Theme.fs_xs;
+                                    color: Theme.text;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                        // 输入模式下的取消按钮
+                        if root.adding_profile: Rectangle {
+                            width: 30px;
+                            height: 30px;
+                            border-radius: Theme.r_md;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            background: cancel-ta.has-hover ? Theme.hover : transparent;
+                            animate background { duration: 120ms; }
+
+                            cancel-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.adding_profile = false; }
+                            }
+                            Image {
+                                x: (parent.width - 12px) / 2;
+                                y: (parent.height - 12px) / 2;
+                                width: 12px;
+                                height: 12px;
+                                source: @image-url("icons/x.svg");
+                                image-fit: contain;
+                                colorize: cancel-ta.has-hover ? Theme.text : Theme.text_dim;
+                            }
+                        }
+
+                        // 删除当前档案（local 不可删；Rust 侧删除后负责回写 settings_profile / profile_names）
+                        if !root.adding_profile && root.settings_profile != "local": Rectangle {
+                            width: 30px;
+                            height: 30px;
+                            border-radius: Theme.r_md;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            background: del-ta.has-hover ? Theme.hover : transparent;
+                            animate background { duration: 120ms; }
+
+                            del-ta := TouchArea {
+                                mouse-cursor: pointer;
+                                clicked => { root.profile_remove(root.settings_profile); }
+                            }
+                            Image {
+                                x: (parent.width - 12px) / 2;
+                                y: (parent.height - 12px) / 2;
+                                width: 12px;
+                                height: 12px;
+                                source: @image-url("icons/x.svg");
+                                image-fit: contain;
+                                colorize: del-ta.has-hover ? Theme.bad : Theme.text_dim;
+                            }
+                            if del-ta.has-hover: Rectangle {
+                                x: (parent.width - self.width) / 2;
+                                y: parent.height + 4px;
+                                width: del-tip.preferred-width + 12px;
+                                height: 20px;
+                                border-radius: Theme.r_sm;
+                                background: Theme.card;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                del-tip := Text {
+                                    text: I18n.profile_delete_tooltip;
+                                    font-size: Theme.fs_xs;
+                                    color: Theme.text;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
                 Field {
                     label: I18n.settings_server_url;
                     FormField {
+                        enabled: !root.editing_local;
                         placeholder: I18n.settings_server_placeholder;
                         text <=> root.s_server;
                     }
@@ -597,6 +863,7 @@ export component MainWindow inherits Window {
                 Field {
                     label: I18n.settings_sync_token;
                     FormField {
+                        enabled: !root.editing_local;
                         password: true;
                         placeholder: I18n.settings_sync_token_placeholder;
                         text <=> root.s_sync_token;
@@ -605,9 +872,39 @@ export component MainWindow inherits Window {
                 Field {
                     label: I18n.settings_astrbot_key;
                     FormField {
+                        enabled: !root.editing_local;
                         password: true;
                         placeholder: I18n.settings_astrbot_key_placeholder;
                         text <=> root.s_ak;
+                    }
+                }
+                if root.editing_local: Text {
+                    text: I18n.source_local_hint;
+                    color: Theme.text_faint;
+                    font-size: Theme.fs_xs;
+                }
+
+                // ── 分隔线：以下为全局设置（GitHub token / 仓库列表 / 轮询间隔 / 语言），不随档案切换 ──
+                Rectangle {
+                    height: 13px;
+                    Rectangle {
+                        y: (parent.height - 1px) / 2;
+                        width: 100%;
+                        height: 1px;
+                        background: Theme.hairline;
+                    }
+                    Rectangle {
+                        x: parent.width - global-tag.preferred-width - 10px;
+                        width: global-tag.preferred-width + 10px;
+                        height: 100%;
+                        background: Theme.card;
+                        global-tag := Text {
+                            text: I18n.settings_profile_global;
+                            color: Theme.text_faint;
+                            font-size: Theme.fs_xs;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
                     }
                 }
                 Field {

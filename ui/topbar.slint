@@ -129,6 +129,118 @@ component SearchBox inherits Rectangle {
     }
 }
 
+// ── 数据源切换器：数据库图标 + 当前档案名 + 下拉浮层 ──
+// "local" 显示 I18n.source_local，其余档案名原样显示；当前项高亮 + 对勾。
+// 下拉用 PopupWindow（独立浮层，不会被顶栏/列表裁切或遮挡）。
+component SourceSwitcher inherits Rectangle {
+    in property <[string]> profile_names: [];
+    in-out property <string> active_profile: "local";
+    callback switch_profile(string);
+
+    function profile_label(n: string) -> string {
+        n == "local" ? I18n.source_local : n
+    }
+
+    height: 26px;
+    width: btn-row.preferred-width;
+    border-radius: Theme.r_md;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: ta.has-hover ? Theme.hover : Theme.surface2;
+    animate background { duration: 120ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+
+    btn-row := HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 6px;
+
+        Image {
+            source: @image-url("icons/database.svg");
+            width: 12px;
+            height: 12px;
+            image-fit: contain;
+            colorize: ta.has-hover ? Theme.text : Theme.text_dim;
+        }
+        Text {
+            text: root.profile_label(root.active_profile);
+            font-size: Theme.fs_sm;
+            color: Theme.text;
+            vertical-alignment: center;
+        }
+        Image {
+            source: @image-url("icons/chevron-down.svg");
+            width: 10px;
+            height: 10px;
+            image-fit: contain;
+            colorize: Theme.text_faint;
+        }
+    }
+
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: max(150px, root.width);
+        height: root.profile_names.length * 26px + 8px;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: Theme.r_md;
+            background: Theme.card;
+            border-width: 1px;
+            border-color: Theme.border;
+
+            VerticalLayout {
+                x: 0;
+                y: 4px;
+                width: 100%;
+                spacing: 0;
+
+                for p in root.profile_names: Rectangle {
+                    height: 26px;
+                    background: item-ta.has-hover ? Theme.hover
+                        : (p == root.active_profile ? Theme.sel : transparent);
+
+                    item-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.active_profile = p;   // 即时反馈；Rust 拒绝时可回写纠正
+                            root.switch_profile(p);
+                            popup.close();
+                        }
+                    }
+                    // 当前项对勾（其余留空占位对齐）
+                    Image {
+                        x: 8px;
+                        y: (parent.height - 10px) / 2;
+                        width: 10px;
+                        height: 10px;
+                        source: @image-url("icons/check.svg");
+                        image-fit: contain;
+                        colorize: p == root.active_profile ? Theme.sel_text : transparent;
+                    }
+                    Text {
+                        x: 24px;
+                        width: parent.width - 32px;
+                        height: 100%;
+                        text: root.profile_label(p);
+                        font-size: Theme.fs_sm;
+                        color: p == root.active_profile ? Theme.sel_text : Theme.text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── 顶栏 ──
 // view_mode: 0 = 列表，1 = Inbox。回调：refresh / sync / open_settings。
 export component TopBar inherits Rectangle {
@@ -137,6 +249,10 @@ export component TopBar inherits Rectangle {
     callback refresh();
     callback sync();
     callback open_settings();
+    // ── 数据源档案（切换器在同步图标左边）──
+    in property <[string]> profile_names: [];
+    in-out property <string> active_profile: "local";
+    callback switch_profile(string);
     // 图标按钮 tooltip 文案（可覆盖）
     in property <string> refresh_tooltip: I18n.refresh_tooltip;
     in property <string> sync_tooltip: I18n.sync_tooltip;
@@ -237,6 +353,12 @@ export component TopBar inherits Rectangle {
             icon: @image-url("icons/refresh.svg");
             tooltip: root.refresh_tooltip;
             clicked => { root.refresh(); }
+        }
+        // 数据源切换器（本地 / 远程服务器档案）
+        SourceSwitcher {
+            profile_names: root.profile_names;
+            active_profile <=> root.active_profile;
+            switch_profile(n) => { root.switch_profile(n); }
         }
         IconButton {
             icon: @image-url("icons/sync.svg");

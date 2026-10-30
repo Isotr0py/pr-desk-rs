@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{Local, NaiveDateTime};
 use hmac::{Hmac, Mac};
 use rusqlite::params;
@@ -104,11 +104,16 @@ pub struct SyncClient {
 
 impl SyncClient {
     pub fn new(cfg: &Config) -> Self {
+        // 数据源取当前生效档案（多数据源）：local 档 / 空 token → enabled() = false
+        let p = cfg.active_sync();
         Self {
             client: reqwest::Client::new(),
-            base: format!("{}{}", cfg.server_url.trim_end_matches('/'), API_PATH),
-            token: cfg.sync_token.clone(),
-            api_key: cfg.astrbot_api_key.clone(),
+            base: p
+                .as_ref()
+                .map(|p| format!("{}{}", p.server_url.trim_end_matches('/'), API_PATH))
+                .unwrap_or_default(),
+            token: p.as_ref().map(|p| p.sync_token.clone()).unwrap_or_default(),
+            api_key: p.map(|p| p.api_key).unwrap_or_default(),
         }
     }
 

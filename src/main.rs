@@ -13,7 +13,7 @@ slint::include_modules!();
 mod avatars;
 mod model;
 
-use pr_desk_rs::config::Config;
+use pr_desk_rs::config::{Config, Profile};
 use pr_desk_rs::db::{self, Db};
 use pr_desk_rs::i18n::{tr, trf};
 use pr_desk_rs::reviewer::LlmSettings;
@@ -31,6 +31,7 @@ enum Cmd {
     AddNotifReview { repo: String, number: i64, title: String, url: String },  // Inbox「+ 预评审」入库
     FetchNotifDetail { repo: String, number: i64, kind: String },  // Inbox 预览面板：拉会话/Files/Diff
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
+    SwitchProfile(String),  // 切换数据源档案（"local"/"default"/自定义名）：换库 + 重建同步客户端
     RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
     FetchModels { base: String, key: String },  // 设置页「获取」：拉 OpenAI 兼容端点的模型列表
     FetchPrMeta { repo: String, number: i64 },  // 补齐残缺行的 author/url/head_sha（Inbox 入库的行缺这些）
@@ -49,7 +50,7 @@ fn config_status(cfg: &Config) -> String {
         return tr(lang, "cfg_unconfigured").into();
     }
     let mut parts = vec![trf(lang, "cfg_repos", &[&cfg.repos.len().to_string()])];
-    parts.push(if cfg.sync_token.is_empty() {
+    parts.push(if cfg.active_sync().is_none() {
         tr(lang, "cfg_sync_off").into()
     } else {
         tr(lang, "cfg_sync_on").into()
@@ -109,6 +110,11 @@ enum Msg {
     },
     // 设置页模型列表拉取结果（id 已排序去重）
     ModelsLoaded(Vec<String>),
+    // 数据源档案回填：名单 + 当前选中（启动/切换/增删档案后）
+    Profiles { names: Vec<String>, active: String },
+    // 设置页档案名校正：新增档案非法时把 settings_profile 写回之前的有效值
+    //（Slint 侧在 profile_add 返回后才写 settings_profile，回调内直接 set 会被覆盖，故走消息延迟纠正）
+    SettingsProfile(String),
     // 行元数据补齐完成：若面板正开着该 PR，重新装载面板（worker 只在成功补齐后发）
     ReopenPanel,
     // 实时拉取完成：面板正开着该 PR 时覆盖对应区块（None = 该区块本次未拉，不动）；
@@ -393,7 +399,7 @@ fn update_status_bar(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     // 状态栏三段：同步/临时消息 · API 配额 · PR 总数
     let sync_text = if !a.status_msg.is_empty() {
         a.status_msg.clone()
-    } else if a.cfg.sync_token.is_empty() {
+    } else if a.cfg.active_sync().is_none() {
         // 未配置同步：明确提示本地模式，不留空白
         tr(lang, "sb_local_mode").into()
     } else {
@@ -456,7 +462,18 @@ fn main() -> anyhow::Result<()> {
     let cfg = Config::load(&cfg_path)?;
     let data_dir = exe_dir.join("data");
     std::fs::create_dir_all(&data_dir)?;
-    let db = Db::open(&data_dir.join("pr-desk.db"))?;
+    // 启动档案名收口：active_profile 指向不存在/非法的档案时回退本地（内存修正，不写盘）
+    let active_name = if cfg.has_profile(&cfg.active_profile) {
+        cfg.active_profile.clone()
+    } else {
+        "local".to_string()
+    };
+    let db_path = profile_db_path(&data_dir, &active_name);
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let db = Db::open(&db_path)?;
+    let cfg = Config { active_profile: active_name, ..cfg };
 
     let ui = MainWindow::new()?;
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
@@ -505,6 +522,11 @@ fn main() -> anyhow::Result<()> {
     ui.set_dark_mode(cfg.is_dark());
     // 启动时把配置的语言应用到 UI（Slint 侧 I18n 单例由 app.slint 的 changed language 回调处理）
     ui.set_language(cfg.language.clone().into());
+    // 数据源档案回填：名单（local 恒首位）+ 当前选中
+    ui.set_profile_names(ModelRc::new(VecModel::from(
+        cfg.profile_names().iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
+    )));
+    ui.set_active_profile(cfg.active_profile.clone().into());
 
     // 主题切换：即时持久化到 config.toml
     {
@@ -545,9 +567,10 @@ fn main() -> anyhow::Result<()> {
         let app = app.clone();
         let msg_tx = msg_tx.clone();
         let cmd_tx_worker = cmd_tx.clone();   // worker 内部自入队（如补齐元数据）用
+        let cfg_path = cfg_path.clone();      // 切换数据源时持久化 active_profile 用
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-            rt.block_on(worker(app, cmd_rx, msg_tx, cmd_tx_worker));
+            rt.block_on(worker(app, cmd_rx, msg_tx, cmd_tx_worker, cfg_path));
         });
     }
 
@@ -883,13 +906,33 @@ fn main() -> anyhow::Result<()> {
             if let Some(ui) = ui2.upgrade() {
                 // 每次打开回填当前配置（LLM 字段可能在别处被改动）
                 let cfg = app.lock().unwrap().cfg.clone();
-                ui.set_s_ak(cfg.astrbot_api_key.clone().into());
+                // 服务器三字段按「正在编辑的档案」回填（local 档为空且字段锁定）
+                let (server, token, ak) = profile_fields(&cfg, &ui.get_settings_profile());
+                ui.set_s_server(server.into());
+                ui.set_s_sync_token(token.into());
+                ui.set_s_ak(ak.into());
                 ui.set_s_llm_base(cfg.llm_base_url.into());
                 ui.set_s_llm_key(cfg.llm_api_key.unwrap_or_default().into());
                 ui.set_s_llm_model(cfg.llm_model.into());
                 ui.set_s_ocr_path(cfg.ocr_path.into());
                 ui.set_s_review_concurrency(cfg.review_concurrency as i32);
                 ui.set_settings_open(true);
+            }
+        });
+    }
+    {
+        // 设置页切换编辑档案 → 回填该档案的服务器三字段（local → 空，字段锁定）
+        let app = app.clone();
+        let ui2 = ui.as_weak();
+        ui.on_settings_profile_focus(move |name| {
+            let (server, token, ak) = {
+                let a = app.lock().unwrap();
+                profile_fields(&a.cfg, &name)
+            };
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_s_server(server.into());
+                ui.set_s_sync_token(token.into());
+                ui.set_s_ak(ak.into());
             }
         });
     }
@@ -917,20 +960,65 @@ fn main() -> anyhow::Result<()> {
                 _ => 3,
             };
             let ocr_path = ocr_path.trim();
+            // 服务器三字段按「正在编辑的档案」写回（local 档字段锁定，不读表单值）
+            let edit_profile = ui2
+                .upgrade()
+                .map(|u| u.get_settings_profile().to_string())
+                .unwrap_or_else(|| "default".into());
+            let (theme, language, mut profiles, active_profile, mut server_url, mut sync_token, mut ak_s) = {
+                let a = app.lock().unwrap();
+                // 主题/语言/数据源档案/活跃档不在设置页表单里，保留当前值
+                (
+                    a.cfg.theme.clone(),
+                    a.cfg.language.clone(),
+                    a.cfg.profiles.clone(),
+                    a.cfg.active_profile.clone(),
+                    a.cfg.server_url.clone(),
+                    a.cfg.sync_token.clone(),
+                    a.cfg.astrbot_api_key.clone(),
+                )
+            };
+            match edit_profile.as_str() {
+                "local" => {} // 本地档无服务器字段，顶层键（= default 档）保持不动
+                "default" => {
+                    server_url = server.trim().to_string();
+                    sync_token = sync_tok.trim().to_string();
+                    ak_s = ak.trim().to_string();
+                }
+                name => {
+                    let vals = (server.trim().to_string(), sync_tok.trim().to_string(), ak.trim().to_string());
+                    match profiles.iter_mut().find(|p| p.name == name) {
+                        Some(p) => {
+                            p.server_url = vals.0;
+                            p.sync_token = vals.1;
+                            p.api_key = vals.2;
+                        }
+                        // 档案在编辑期间被别处删了：按当前表单值重建，不丢用户输入
+                        None => profiles.push(Profile {
+                            name: name.into(),
+                            server_url: vals.0,
+                            sync_token: vals.1,
+                            api_key: vals.2,
+                        }),
+                    }
+                }
+            }
             let new_cfg = Config {
-                server_url: server.trim().to_string(),
-                sync_token: sync_tok.trim().to_string(),
-                astrbot_api_key: ak.trim().to_string(),
+                server_url,
+                sync_token,
+                astrbot_api_key: ak_s,
                 github_token: Some(gh_tok.trim().to_string()).filter(|t| !t.is_empty()),
                 repos,
                 poll_interval_min: poll,
-                theme: app.lock().unwrap().cfg.theme.clone(), // 主题不在设置页，保留当前值
-                language: app.lock().unwrap().cfg.language.clone(), // 语言不在设置页，保留当前值
+                theme,
+                language,
                 llm_base_url: llm_base.trim().to_string(),
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),
                 ocr_path: if ocr_path.is_empty() { "ocr".into() } else { ocr_path.to_string() },
                 review_concurrency,
+                profiles,
+                active_profile,
             };
             if let Err(e) = new_cfg.save(&cfg_path) {
                 let lang = lang_of(&app);
@@ -947,10 +1035,109 @@ fn main() -> anyhow::Result<()> {
             if let Some(ui) = ui2.upgrade() {
                 ui.set_onboarding(new_cfg.is_unconfigured());
                 ui.set_inbox_needs_token(new_cfg.token().is_none());
+                // 设置页改的是顶层键（= "default" 档）：token 从空变非空时名单要多出 default
+                ui.set_profile_names(ModelRc::new(VecModel::from(
+                    new_cfg.profile_names().iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
+                )));
                 update_status_bar(&ui, &app);
             }
             send_msg(Msg::Status(tr(&lang_of(&app), "cfg_saved").into()));
             let _ = cmd_tx.send(Cmd::ReloadConfig); // 热生效，不用重启
+        });
+    }
+
+    // ── 数据源档案（多数据源切换）──
+    {
+        // 切换：worker 校验档案存在 → 换库 + 重建同步客户端 + 刷新（结果经 Msg::Profiles 回填）
+        let cmd_tx = cmd_tx.clone();
+        ui.on_switch_profile(move |name| {
+            let _ = cmd_tx.send(Cmd::SwitchProfile(name.to_string()));
+        });
+    }
+    {
+        // 新增自定义档案：校验名字（非空/字符合法/非保留/不重名）→ 空档案入库 + save + 回填名单
+        let app = app.clone();
+        let cfg_path = cfg_path.clone();
+        let weak = ui.as_weak();
+        ui.on_profile_add(move |name| {
+            let name = name.trim().to_string();
+            let lang = lang_of(&app);
+            // Slint 侧在回调返回后才写 settings_profile = 新名；回调内拿不到之后的值，
+            // 这里的 prev 仍是旧值，失败时经 Msg::SettingsProfile 延迟纠正回去
+            let prev = weak.upgrade().map(|u| u.get_settings_profile().to_string());
+            let names = {
+                let mut a = app.lock().unwrap();
+                if !pr_desk_rs::config::valid_profile_name(&name) {
+                    send_msg(Msg::Status(tr(&lang, "profile_invalid_name").into()));
+                    if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
+                    return;
+                }
+                if pr_desk_rs::config::is_reserved_profile_name(&name) {
+                    send_msg(Msg::Status(trf(&lang, "profile_reserved", &[&name])));
+                    if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
+                    return;
+                }
+                if a.cfg.profiles.iter().any(|p| p.name == name) {
+                    send_msg(Msg::Status(trf(&lang, "profile_exists", &[&name])));
+                    if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
+                    return;
+                }
+                a.cfg.profiles.push(Profile {
+                    name: name.clone(),
+                    server_url: String::new(),
+                    sync_token: String::new(),
+                    api_key: String::new(),
+                });
+                if let Err(e) = a.cfg.save(&cfg_path) {
+                    a.cfg.profiles.retain(|p| p.name != name);
+                    send_msg(Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])));
+                    if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
+                    return;
+                }
+                a.cfg.profile_names()
+            };
+            if let Some(ui) = weak.upgrade() {
+                ui.set_profile_names(ModelRc::new(VecModel::from(
+                    names.iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
+                )));
+            }
+            send_msg(Msg::Status(trf(&lang, "profile_added", &[&name])));
+        });
+    }
+    {
+        // 删除自定义档案：只允许删非保留且非当前 active 的（db 文件保留，不删数据）
+        let app = app.clone();
+        let cfg_path = cfg_path.clone();
+        let weak = ui.as_weak();
+        ui.on_profile_remove(move |name| {
+            let name = name.trim().to_string();
+            let lang = lang_of(&app);
+            let names = {
+                let mut a = app.lock().unwrap();
+                let removable = !pr_desk_rs::config::is_reserved_profile_name(&name)
+                    && a.cfg.profiles.iter().any(|p| p.name == name)
+                    && a.cfg.active_profile != name;
+                if !removable {
+                    send_msg(Msg::Status(tr(&lang, "profile_remove_denied").into()));
+                    return;
+                }
+                let backup = a.cfg.profiles.clone();
+                a.cfg.profiles.retain(|p| p.name != name);
+                if let Err(e) = a.cfg.save(&cfg_path) {
+                    a.cfg.profiles = backup;
+                    send_msg(Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])));
+                    return;
+                }
+                a.cfg.profile_names()
+            };
+            if let Some(ui) = weak.upgrade() {
+                ui.set_profile_names(ModelRc::new(VecModel::from(
+                    names.iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
+                )));
+                // 被删的正是设置页在编辑的档案：编辑目标回到 local（changed 触发三字段回填）
+                ui.set_settings_profile("local".into());
+            }
+            send_msg(Msg::Status(trf(&lang, "profile_removed", &[&name])));
         });
     }
 
@@ -1466,10 +1653,39 @@ async fn run_review_task(
 /// 列表来源过滤：sync 启用时只显示服务器插件数据库跟踪的 PR + 手动预评审加的；
 /// 本地模式显示全部（含 GitHub 火hose 拉下来的）。
 fn list_sources(cfg: &Config) -> &'static [&'static str] {
-    if cfg.sync_token.is_empty() {
+    if cfg.active_sync().is_none() {
         &[]
     } else {
         &["server", "inbox"]
+    }
+}
+
+/// 档案名 → db 文件路径：local → pr-desk.db；其它档 → profiles/<name>.db。
+/// 名字先过字符合性校验（防路径穿越），非法名防御性回退本地库。
+/// 每个档案独立 db 文件：sync 游标（sync_state 表）与 outbox 随库天然隔离。
+fn profile_db_path(data_dir: &std::path::Path, name: &str) -> PathBuf {
+    if name == "local" || !pr_desk_rs::config::valid_profile_name(name) {
+        data_dir.join("pr-desk.db")
+    } else {
+        data_dir.join("profiles").join(format!("{name}.db"))
+    }
+}
+
+/// 设置页档案聚焦回填：local → 空（表单字段锁定）；default → 顶层键；自定义 → 档案值。
+fn profile_fields(cfg: &Config, name: &str) -> (String, String, String) {
+    match name {
+        "local" => (String::new(), String::new(), String::new()),
+        "default" => (
+            cfg.server_url.clone(),
+            cfg.sync_token.clone(),
+            cfg.astrbot_api_key.clone(),
+        ),
+        n => cfg
+            .profiles
+            .iter()
+            .find(|p| p.name == n)
+            .map(|p| (p.server_url.clone(), p.sync_token.clone(), p.api_key.clone()))
+            .unwrap_or_default(),
     }
 }
 
@@ -1572,7 +1788,7 @@ async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: 
     }
 }
 
-async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sender<Msg>, cmd_tx: mpsc::Sender<Cmd>) {
+async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sender<Msg>, cmd_tx: mpsc::Sender<Cmd>, cfg_path: PathBuf) {
     let _ = MSG_TX.set(msg_tx.clone());
 
     let token = {
@@ -2090,6 +2306,86 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                 }
             }
+            Cmd::SwitchProfile(name) => {
+                // 校验：档案必须存在且名字合法（防路径穿越）；非法则回填纠正 UI 选中
+                let valid = {
+                    let a = app.lock().unwrap();
+                    a.cfg.has_profile(&name)
+                        && (name == "local" || pr_desk_rs::config::valid_profile_name(&name))
+                };
+                if !valid {
+                    let _ = msg_tx.send(Msg::Status(trf(&lang, "profile_unknown", &[&name])));
+                    let (names, active) = {
+                        let a = app.lock().unwrap();
+                        (a.cfg.profile_names(), a.cfg.active_profile.clone())
+                    };
+                    let _ = msg_tx.send(Msg::Profiles { names, active });
+                    continue;
+                }
+                if app.lock().unwrap().cfg.active_profile == name {
+                    continue; // 同档重选：无操作
+                }
+                // 换库：local → pr-desk.db；其它档 → profiles/<name>.db
+                //（sync 游标/outbox 在库文件内，换库天然隔离；远程新库游标为空 = 首次全量拉）
+                let db_path = profile_db_path(&pr_desk_rs::exe_data_dir(), &name);
+                if let Some(parent) = db_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let new_db = match Db::open(&db_path) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        let _ = msg_tx.send(Msg::Status(trf(
+                            &lang,
+                            "profile_db_failed",
+                            &[&name, &e.to_string()],
+                        )));
+                        // 换库失败：回填纠正 UI 选中（顶栏是乐观切换）
+                        let (names, active) = {
+                            let a = app.lock().unwrap();
+                            (a.cfg.profile_names(), a.cfg.active_profile.clone())
+                        };
+                        let _ = msg_tx.send(Msg::Profiles { names, active });
+                        continue;
+                    }
+                };
+                {
+                    let mut a = app.lock().unwrap();
+                    a.cfg.active_profile = name.clone();
+                    if let Err(e) = a.cfg.save(&cfg_path) {
+                        // 落盘失败不阻断切换（内存态已切），仅提示
+                        let _ = msg_tx.send(Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])));
+                    }
+                    a.db = new_db; // 旧 Db 随 drop 关闭连接
+                    a.selected = None;
+                    a.inbox_detail = None;
+                    a.rows.clear();
+                    a.view.clear();
+                    a.view_keys.clear();
+                    a.total = 0;
+                    *a.last_sync.lock().unwrap() = None; // 「已同步 X 前」不跨档案沿用
+                }
+                // SyncClient 按新档案重建（local → enabled()=false）
+                sync_client = {
+                    let a = app.lock().unwrap();
+                    sync::SyncClient::new(&a.cfg)
+                };
+                let names = app.lock().unwrap().cfg.profile_names();
+                let _ = msg_tx.send(Msg::Profiles { names, active: name.clone() });
+                let _ = msg_tx.send(Msg::ClosePanel);
+                let _ = msg_tx.send(Msg::Status(trf(&lang, "profile_switched", &[&name])));
+                // 走现有刷新路径：远程档 do_sync 全量拉；本地档 GitHub 火hose
+                if let Some(g) = &gh {
+                    if sync_client.enabled() {
+                        fetch_inbox(g, &app, &msg_tx).await;
+                        do_sync(&app, &sync_client, &msg_tx).await;
+                    } else {
+                        refresh_from_github(g, &app, &msg_tx).await;
+                        fetch_inbox(g, &app, &msg_tx).await;
+                    }
+                } else {
+                    reload_rows(&app, &msg_tx);
+                }
+            }
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
                 let cfg = app.lock().unwrap().cfg.clone();
@@ -2258,6 +2554,16 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
         Msg::ModelsLoaded(models) => {
             let v: Vec<SharedString> = models.iter().map(|m| m.as_str().into()).collect();
             ui.set_model_list(ModelRc::new(slint::VecModel::from(v)));
+        }
+        Msg::Profiles { names, active } => {
+            ui.set_profile_names(ModelRc::new(VecModel::from(
+                names.iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
+            )));
+            ui.set_active_profile(active.into());
+        }
+        Msg::SettingsProfile(name) => {
+            // 写回 settings_profile 会触发 changed → settings_profile_focus 回填三字段
+            ui.set_settings_profile(name.into());
         }
         Msg::ReopenPanel => {
             // 元数据补齐后重开面板（内容已变，身份不变）；
