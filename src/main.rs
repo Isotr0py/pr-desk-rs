@@ -607,7 +607,7 @@ fn main() -> anyhow::Result<()> {
         // UI 传视图下标，先经 view 换算为该行的身份（repo, number）
         ui.on_row_activated(move |i| {
             if let Some((repo, number)) = resolve_view(&app, i as usize) {
-                open_drawer(&app, &cmd_tx, repo, number);
+                open_drawer(&app, &cmd_tx, repo, number, true);
             }
         });
     }
@@ -960,7 +960,7 @@ fn reload_rows_global(app: &Arc<Mutex<App>>) {
 
 // ── 详情抽屉 ──
 
-fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, number: i64) {
+fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, number: i64, refetch: bool) {
     // 选中态存身份而非下标：刷新后行序变化，面板仍指向同一个 PR；
     // 行被刷新滤掉时面板也保持打开（数据来自 DB/快照，row 允许为 None）
     let (priority, row_idx) = {
@@ -1079,20 +1079,22 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
     }
 
     // 行数据残缺（Inbox「+ 预评审」入库只带 title/url）：后台补齐 author/head_sha，
-    // 成功后 worker 发 Msg::ReopenPanel 重新装载面板
+    // 成功后 worker 发 Msg::ReopenPanel 重新装载面板。
+    // 注意：只能看 author——head_sha 不在 list_prs 的返回列里，看它会造成「永远残缺」
+    // → FetchPrMeta → ReopenPanel → open_drawer 的死循环（烧穿 API 限额的教训）。
     let damaged = match &row {
-        Some(r) => {
-            r["author"].as_str().unwrap_or("").is_empty()
-                || r["head_sha"].as_str().unwrap_or("").is_empty()
-        }
-        None => true,
+        Some(r) => r["author"].as_str().unwrap_or("").is_empty(),
+        None => false,
     };
-    if damaged {
+    if refetch && damaged {
         let _ = cmd_tx.send(Cmd::FetchPrMeta { repo: repo.clone(), number });
     }
 
-    // 面板先显示缓存（可能陈旧）；后台实时拉取最新状态，回来后覆盖面板与列表行
-    let _ = cmd_tx.send(Cmd::FetchPrLive { repo, number, parts: PART_CHECKS });
+    // 面板先显示缓存（可能陈旧）；后台实时拉取最新状态，回来后覆盖面板与列表行。
+    // ReopenPanel 重开时 refetch=false，不再重复派发。
+    if refetch {
+        let _ = cmd_tx.send(Cmd::FetchPrLive { repo, number, parts: PART_CHECKS });
+    }
 }
 
 /// 评审结论推导：取 time（submitted_at）最新一条 approved/changes_requested 为准；
@@ -1526,6 +1528,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
     // 实时刷新节流：同一 PR 同一部分（parts 位标志）的上次拉取时间（120s 内不重复拉）
     let mut live_fetched: std::collections::HashMap<(String, i64, u8), std::time::Instant> =
         Default::default();
+    // 元数据补齐节流：同一行 300s 内最多补一次（兜底防 open_drawer↔ReopenPanel 循环）
+    let mut meta_healed: std::collections::HashMap<(String, i64), std::time::Instant> =
+        Default::default();
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -1776,7 +1781,16 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             }
             Cmd::FetchPrMeta { repo, number } => {
                 // 补齐残缺行（Inbox 入库的 PR 缺 author/head_sha）：拉 GitHub PR meta，
-                // 只填空缺字段，成功后刷新列表；面板正开着该 PR 则重新装载
+                // 只填空缺字段，成功后刷新列表；面板正开着该 PR 则重新装载。
+                // 节流：同一行 300s 内最多一次（兜底防死循环烧穿 API 限额）。
+                let recently = meta_healed
+                    .get(&(repo.clone(), number))
+                    .map(|t| t.elapsed().as_secs() < 300)
+                    .unwrap_or(false);
+                if recently {
+                    continue;
+                }
+                meta_healed.insert((repo.clone(), number), std::time::Instant::now());
                 if let Some(g) = &gh {
                     match g.fetch_pr_meta(&repo, number).await {
                         Ok(meta) => {
@@ -2163,10 +2177,11 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
             ui.set_model_list(ModelRc::new(slint::VecModel::from(v)));
         }
         Msg::ReopenPanel => {
-            // 元数据补齐后重开面板（内容已变，身份不变）
+            // 元数据补齐后重开面板（内容已变，身份不变）；
+            // refetch=false：这是刷新重载，不许再派发拉取命令（防 FetchPrMeta 死循环）
             let sel = app.lock().unwrap().selected.clone();
             if let Some((repo, number)) = sel {
-                open_drawer(app, cmd_tx, repo, number);
+                open_drawer(app, cmd_tx, repo, number, false);
             }
         }
         Msg::FilterChanged(q) => {
