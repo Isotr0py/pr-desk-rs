@@ -2,6 +2,7 @@
 // 键盘：PrListView 管 j/k/↑↓/Enter/Esc（reject 冒泡）；外层 FocusScope 接 p/1/2/3 和 /。
 // Esc 语义（见 dismissed）：详情开着 → 关详情；否则取消选中。
 import { Theme } from "theme.slint";
+import { I18n } from "i18n.slint";
 import { TopBar, StatusBar } from "topbar.slint";
 import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
 import { DetailPanel, ConvoEntry, CheckRun, FileChange, OcrComment, DimScore } from "detail_panel.slint";
@@ -186,7 +187,7 @@ component NumStepper inherits Rectangle {
 }
 
 export component MainWindow inherits Window {
-    title: "PR Desk";
+    title: I18n.app_name;
     // 窗口图标：内嵌 SVG（默认图标在本机字体环境下标题栏显示为豆腐块）
     icon: @image-url("icons/app.svg");
     preferred-width: 1280px;
@@ -201,6 +202,14 @@ export component MainWindow inherits Window {
     changed dark_mode => {
         Theme.dark = root.dark_mode;
         root.theme_toggled(root.dark_mode);
+    }
+
+    // ── 语言（language 写回 I18n 并通知 Rust 持久化，仿 dark_mode）──
+    in-out property <string> language: "zh";   // "zh" | "en"
+    callback language_changed(string);
+    changed language => {
+        I18n.lang = root.language;
+        root.language_changed(root.language);
     }
 
     // ── 列表 ──
@@ -456,14 +465,14 @@ export component MainWindow inherits Window {
                 spacing: 14px;
 
                 Text {
-                    text: "欢迎使用 PR Desk";
+                    text: I18n.welcome_title;
                     color: Theme.text;
                     font-size: 20px;
                     font-weight: 700;
                     horizontal-alignment: center;
                 }
                 Text {
-                    text: "还没有配置服务器与仓库。\n打开设置，填入服务器地址、令牌和要关注的仓库即可开始。";
+                    text: I18n.welcome_hint;
                     color: Theme.text_dim;
                     font-size: Theme.fs_md;
                     horizontal-alignment: center;
@@ -472,7 +481,7 @@ export component MainWindow inherits Window {
                 HorizontalLayout {
                     Rectangle { horizontal-stretch: 1; }
                     DialogButton {
-                        text: "打开设置";
+                        text: I18n.welcome_open_settings;
                         primary: true;
                         button-width: 120px;
                         clicked => { root.open_settings(); }
@@ -507,7 +516,7 @@ export component MainWindow inherits Window {
                 spacing: 12px;
 
                 Text {
-                    text: "设置";
+                    text: I18n.settings_title;
                     color: Theme.text;
                     font-size: 16px;
                     font-weight: 600;
@@ -542,7 +551,7 @@ export component MainWindow inherits Window {
                         }
                         Text {
                             x: 0; width: 112px; height: 100%;
-                            text: "连接与同步";
+                            text: I18n.settings_tab_connection;
                             font-size: Theme.fs_sm;
                             color: root.settings_tab == 0 ? Theme.text : Theme.text_dim;
                             horizontal-alignment: center;
@@ -555,7 +564,7 @@ export component MainWindow inherits Window {
                         }
                         Text {
                             x: 112px; width: 112px; height: 100%;
-                            text: "LLM 预评审";
+                            text: I18n.settings_tab_llm;
                             font-size: Theme.fs_sm;
                             color: root.settings_tab == 1 ? Theme.text : Theme.text_dim;
                             horizontal-alignment: center;
@@ -579,53 +588,107 @@ export component MainWindow inherits Window {
                     spacing: 14px;
 
                 Field {
-                    label: "服务器地址";
+                    label: I18n.settings_server_url;
                     FormField {
-                        placeholder: "http://127.0.0.1:6185（AstrBot 地址）";
+                        placeholder: I18n.settings_server_placeholder;
                         text <=> root.s_server;
                     }
                 }
                 Field {
-                    label: "sync_token（插件配置里的同步令牌）";
+                    label: I18n.settings_sync_token;
                     FormField {
                         password: true;
-                        placeholder: "留空 = 同步关闭";
+                        placeholder: I18n.settings_sync_token_placeholder;
                         text <=> root.s_sync_token;
                     }
                 }
                 Field {
-                    label: "AstrBot API Key（面板「API 密钥」页创建，新版 AstrBot 必需）";
+                    label: I18n.settings_astrbot_key;
                     FormField {
                         password: true;
-                        placeholder: "旧版 AstrBot 可留空";
+                        placeholder: I18n.settings_astrbot_key_placeholder;
                         text <=> root.s_ak;
                     }
                 }
                 Field {
                     label: root.gh_token_from_env
-                        ? "GitHub token（已检测到 GITHUB_TOKEN 环境变量，环境变量优先）"
-                        : "GitHub token";
+                        ? I18n.settings_gh_token_env
+                        : I18n.settings_gh_token;
                     FormField {
                         password: true;
-                        placeholder: root.gh_token_from_env ? "环境变量生效中，此处可留空" : "公开仓库可留空（限速更低）";
+                        placeholder: root.gh_token_from_env ? I18n.settings_gh_token_placeholder_env : I18n.settings_gh_token_placeholder;
                         text <=> root.s_gh_token;
                     }
                 }
                 Field {
-                    label: "仓库列表（每行一个 owner/repo）";
+                    label: I18n.settings_repos;
                     FormArea {
                         placeholder: "owner/repo";
                         text <=> root.s_repos;
                     }
                 }
                 Field {
-                    label: "轮询间隔（分钟）";
+                    label: I18n.settings_poll_interval;
                     HorizontalLayout {
                         spacing: 8px;
                         NumStepper {
                             value <=> root.s_poll;
                             minimum: 1;
                             maximum: 120;
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+                Field {
+                    label: I18n.settings_language;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        // 分段控件（与设置页 tab 切换同款样式）；切换即时生效并持久化
+                        Rectangle {
+                            width: 152px;
+                            height: 26px;
+                            border-radius: Theme.r_md;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            background: Theme.surface2;
+
+                            Rectangle {
+                                x: 2px + (root.language == "en" ? 1 : 0) * 72px;
+                                y: 2px;
+                                width: 72px;
+                                height: parent.height - 4px;
+                                border-radius: Theme.r_sm;
+                                background: Theme.card;
+                                border-width: 1px;
+                                border-color: Theme.border;
+                                animate x { duration: 150ms; easing: ease-out; }
+                            }
+                            lang-zh := TouchArea {
+                                x: 0; width: 72px; height: 100%;
+                                mouse-cursor: pointer;
+                                clicked => { root.language = "zh"; }
+                            }
+                            Text {
+                                x: 0; width: 72px; height: 100%;
+                                text: I18n.lang_name_zh;
+                                font-size: Theme.fs_sm;
+                                color: root.language == "zh" ? Theme.text : Theme.text_dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            lang-en := TouchArea {
+                                x: 72px; width: 72px; height: 100%;
+                                mouse-cursor: pointer;
+                                clicked => { root.language = "en"; }
+                            }
+                            Text {
+                                x: 72px; width: 72px; height: 100%;
+                                text: I18n.lang_name_en;
+                                font-size: Theme.fs_sm;
+                                color: root.language == "en" ? Theme.text : Theme.text_dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
                         }
                         Rectangle { horizontal-stretch: 1; }
                     }
@@ -652,7 +715,7 @@ export component MainWindow inherits Window {
                     }
                 }
                 Field {
-                    label: "模型名";
+                    label: I18n.settings_model_name;
                     HorizontalLayout {
                         spacing: 8px;
                         FormField {
@@ -661,7 +724,7 @@ export component MainWindow inherits Window {
                             text <=> root.s_llm_model;
                         }
                         DialogButton {
-                            text: "获取";
+                            text: I18n.settings_fetch_models;
                             clicked => { root.fetch_models(root.s_llm_base, root.s_llm_key); }
                         }
                     }
@@ -684,7 +747,7 @@ export component MainWindow inherits Window {
                         }
                         Text {
                             x: 10px; y: 0; height: 30px;
-                            text: "选择模型（" + root.model_list.length + " 个）";
+                            text: I18n.settings_model_list_pre + root.model_list.length + I18n.settings_model_list_post;
                             color: Theme.text_dim;
                             font-size: Theme.fs_sm;
                             vertical-alignment: center;
@@ -737,14 +800,14 @@ export component MainWindow inherits Window {
                     }
                 }
                 Field {
-                    label: "OCR 路径（open-code-review CLI 路径）";
+                    label: I18n.settings_ocr_path;
                     FormField {
                         placeholder: "ocr";
                         text <=> root.s_ocr_path;
                     }
                 }
                 Field {
-                    label: "评审并发数（1-8）";
+                    label: I18n.settings_review_concurrency;
                     HorizontalLayout {
                         spacing: 8px;
                         NumStepper {
@@ -753,7 +816,7 @@ export component MainWindow inherits Window {
                             maximum: 8;
                         }
                         Text {
-                            text: "每个 PR 评审会发起多次 LLM 调用，配额紧张时调低";
+                            text: I18n.settings_concurrency_hint;
                             color: Theme.text_faint;
                             font-size: Theme.fs_xs;
                             vertical-alignment: center;
@@ -772,11 +835,11 @@ export component MainWindow inherits Window {
                     spacing: 8px;
                     Rectangle { horizontal-stretch: 1; }
                     DialogButton {
-                        text: "取消";
+                        text: I18n.cancel;
                         clicked => { root.settings_open = false; }
                     }
                     DialogButton {
-                        text: "保存";
+                        text: I18n.save;
                         primary: true;
                         clicked => {
                             root.save_settings(root.s_server, root.s_sync_token, root.s_gh_token, root.s_repos, "" + root.s_poll, root.s_llm_base, root.s_llm_key, root.s_llm_model, root.s_ocr_path, "" + root.s_review_concurrency, root.s_ak);

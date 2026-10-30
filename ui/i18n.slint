@@ -1,0 +1,157 @@
+// PR Desk — 界面文案目录（中英双语）
+// 使用方：import { I18n } from "i18n.slint"; 然后 text: I18n.xxx;
+// 切换语言：写 I18n.lang = "zh" | "en"，所有文案随绑定即时刷新。
+export global I18n {
+    in-out property <string> lang: "zh";   // "zh" | "en"
+
+    out property <string> app_name: "PR Desk";
+
+    // ── topbar.slint ──
+    out property <string> search_placeholder: root.lang == "en" ? "Search PRs…" : "搜索 PR…";
+    out property <string> refresh_tooltip: root.lang == "en" ? "Refresh from GitHub" : "刷新 GitHub";
+    out property <string> sync_tooltip: root.lang == "en" ? "Sync server" : "同步服务器";
+    out property <string> settings_tooltip: root.lang == "en" ? "Settings" : "设置";
+    out property <string> tab_list: root.lang == "en" ? "List" : "列表";
+    out property <string> tab_inbox: "Inbox";
+    out property <string> theme_tooltip_light: root.lang == "en" ? "Switch to light theme" : "切换到浅色主题";
+    out property <string> theme_tooltip_dark: root.lang == "en" ? "Switch to dark theme" : "切换到深色主题";
+    out property <string> statusbar_hints: root.lang == "en"
+        ? "j/k move · Enter details · o open in browser · p pin · 1/2/3 priority · / search · Esc back"
+        : "j/k 移动 · Enter 详情 · o 浏览器打开 · p 置顶 · 1/2/3 优先级 · / 搜索 · Esc 返回";
+    // 状态栏总数：pre + 数字 + post（zh: 「共 N 个 PR」，en: 「N PRs」）
+    out property <string> statusbar_total_pre: root.lang == "en" ? "" : "共 ";
+    out property <string> statusbar_total_post: root.lang == "en" ? " PRs" : " 个 PR";
+
+    // ── app.slint · 首启引导 ──
+    out property <string> welcome_title: root.lang == "en" ? "Welcome to PR Desk" : "欢迎使用 PR Desk";
+    out property <string> welcome_hint: root.lang == "en"
+        ? "No server or repositories configured yet.\nOpen Settings and fill in the server URL, token, and repositories to get started."
+        : "还没有配置服务器与仓库。\n打开设置，填入服务器地址、令牌和要关注的仓库即可开始。";
+    out property <string> welcome_open_settings: root.lang == "en" ? "Open Settings" : "打开设置";
+
+    // ── app.slint · 设置弹窗 ──
+    out property <string> settings_title: root.lang == "en" ? "Settings" : "设置";
+    out property <string> settings_tab_connection: root.lang == "en" ? "Connection & Sync" : "连接与同步";
+    out property <string> settings_tab_llm: root.lang == "en" ? "LLM Pre-review" : "LLM 预评审";
+    out property <string> settings_server_url: root.lang == "en" ? "Server URL" : "服务器地址";
+    out property <string> settings_server_placeholder: root.lang == "en" ? "http://127.0.0.1:6185 (AstrBot address)" : "http://127.0.0.1:6185（AstrBot 地址）";
+    out property <string> settings_sync_token: root.lang == "en" ? "sync_token (sync token from plugin config)" : "sync_token（插件配置里的同步令牌）";
+    out property <string> settings_sync_token_placeholder: root.lang == "en" ? "Empty = sync disabled" : "留空 = 同步关闭";
+    out property <string> settings_astrbot_key: root.lang == "en" ? "AstrBot API Key (create on the dashboard \"API Keys\" page; required by newer AstrBot)" : "AstrBot API Key（面板「API 密钥」页创建，新版 AstrBot 必需）";
+    out property <string> settings_astrbot_key_placeholder: root.lang == "en" ? "Can be empty on older AstrBot" : "旧版 AstrBot 可留空";
+    out property <string> settings_gh_token: "GitHub token";
+    out property <string> settings_gh_token_env: root.lang == "en" ? "GitHub token (GITHUB_TOKEN env var detected; env takes priority)" : "GitHub token（已检测到 GITHUB_TOKEN 环境变量，环境变量优先）";
+    out property <string> settings_gh_token_placeholder_env: root.lang == "en" ? "Env var is active; can be left empty" : "环境变量生效中，此处可留空";
+    out property <string> settings_gh_token_placeholder: root.lang == "en" ? "Optional for public repos (lower rate limit)" : "公开仓库可留空（限速更低）";
+    out property <string> settings_repos: root.lang == "en" ? "Repositories (one owner/repo per line)" : "仓库列表（每行一个 owner/repo）";
+    out property <string> settings_poll_interval: root.lang == "en" ? "Poll interval (minutes)" : "轮询间隔（分钟）";
+    out property <string> settings_model_name: root.lang == "en" ? "Model name" : "模型名";
+    out property <string> settings_fetch_models: root.lang == "en" ? "Fetch" : "获取";
+    // 模型列表标题：pre + 数量 + post（zh: 「选择模型（N 个）」，en: 「Select model (N)」）
+    out property <string> settings_model_list_pre: root.lang == "en" ? "Select model (" : "选择模型（";
+    out property <string> settings_model_list_post: root.lang == "en" ? ")" : " 个）";
+    out property <string> settings_ocr_path: root.lang == "en" ? "OCR path (open-code-review CLI path)" : "OCR 路径（open-code-review CLI 路径）";
+    out property <string> settings_review_concurrency: root.lang == "en" ? "Review concurrency (1-8)" : "评审并发数（1-8）";
+    out property <string> settings_concurrency_hint: root.lang == "en" ? "Each PR review makes multiple LLM calls; lower this when quota is tight" : "每个 PR 评审会发起多次 LLM 调用，配额紧张时调低";
+    out property <string> settings_language: "语言 / Language";
+    out property <string> lang_name_zh: "中文";
+    out property <string> lang_name_en: "English";
+    out property <string> cancel: root.lang == "en" ? "Cancel" : "取消";
+    out property <string> save: root.lang == "en" ? "Save" : "保存";
+
+    // ── pr_list.slint ──
+    out property <string> empty_no_pr: root.lang == "en" ? "No PRs" : "没有 PR";
+
+    // ── inbox.slint ──
+    out property <string> inbox_title: root.lang == "en" ? "Notifications" : "通知";
+    out property <string> inbox_mark_all_read: root.lang == "en" ? "Mark all read" : "全部已读";
+    out property <string> inbox_unread_only: root.lang == "en" ? "Unread only" : "只看未读";
+    out property <string> inbox_needs_token_title: root.lang == "en" ? "GitHub token required" : "需要 GitHub token";
+    out property <string> inbox_needs_token_hint: root.lang == "en"
+        ? "The notifications API requires auth. Open Settings to add a GitHub token, or set the GITHUB_TOKEN environment variable."
+        : "通知接口需要鉴权。打开设置填入 GitHub token，或配置 GITHUB_TOKEN 环境变量。";
+    out property <string> inbox_empty_title: root.lang == "en" ? "No notifications" : "没有通知";
+    out property <string> inbox_empty_hint: root.lang == "en" ? "Your GitHub inbox is empty. Click the refresh button in the top bar to fetch again." : "GitHub 通知为空。点顶栏刷新按钮重新拉取。";
+    out property <string> inbox_added: root.lang == "en" ? "Added" : "已加入";
+    out property <string> inbox_add_review: root.lang == "en" ? "+ Review" : "+ 预评审";
+    out property <string> inbox_not_selected: root.lang == "en" ? "Nothing selected" : "未选择";
+    out property <string> inbox_open_browser: root.lang == "en" ? "Open in browser" : "在浏览器打开";
+    out property <string> inbox_convo_empty_hint: root.lang == "en" ? "Comment activity will appear here" : "评论活动将显示在这里";
+    out property <string> inbox_loading: root.lang == "en" ? "Loading…" : "加载中…";
+
+    // ── diff_view.slint ──
+    out property <string> diff_empty_title: root.lang == "en" ? "No diff content" : "暂无 Diff 内容";
+    out property <string> diff_empty_hint: root.lang == "en" ? "Select a file or commit with changes to view here" : "选择包含变更的文件或提交后在此查看";
+    out property <string> diff_expand: root.lang == "en" ? "Expand" : "展开";
+    out property <string> diff_collapse: root.lang == "en" ? "Collapse" : "收起";
+    // 截断提示：p1 + 已显示行数 + p2 + 总行数 + p3
+    // zh: 「… 已截断：仅显示前 N 行（共 M 行）」  en: 「… Truncated: showing first N of M lines」
+    out property <string> diff_truncated_p1: root.lang == "en" ? "… Truncated: showing first " : "… 已截断：仅显示前 ";
+    out property <string> diff_truncated_p2: root.lang == "en" ? " of " : " 行（共 ";
+    out property <string> diff_truncated_p3: root.lang == "en" ? " lines" : " 行）";
+
+    // ── detail_panel.slint · 状态/徽章 ──
+    out property <string> state_merged: root.lang == "en" ? "Merged" : "已合并";
+    out property <string> state_closed: root.lang == "en" ? "Closed" : "已关闭";
+    out property <string> state_open: "Open";
+    out property <string> ci_success: root.lang == "en" ? "CI passed" : "CI 通过";
+    out property <string> ci_failure: root.lang == "en" ? "CI failed" : "CI 失败";
+    out property <string> ci_pending: root.lang == "en" ? "CI running" : "CI 进行中";
+    out property <string> severity_critical: root.lang == "en" ? "Critical" : "严重";
+    out property <string> severity_high: root.lang == "en" ? "High" : "高";
+    out property <string> severity_medium: root.lang == "en" ? "Medium" : "中";
+    out property <string> severity_low: root.lang == "en" ? "Low" : "低";
+    out property <string> severity_other: root.lang == "en" ? "Other" : "其他";
+
+    // ── detail_panel.slint / inbox.slint · 标签页 ──
+    out property <string> tab_review: root.lang == "en" ? "Review" : "评审";
+    out property <string> tab_conversation: root.lang == "en" ? "Conversation" : "会话";
+    out property <string> tab_checks: "Checks";
+    out property <string> tab_files: "Files";
+    out property <string> tab_diff: "Diff";
+
+    // ── detail_panel.slint · 详情面板 ──
+    out property <string> detail_no_pr_selected: root.lang == "en" ? "No PR selected" : "未选择 PR";
+    out property <string> detail_pin: root.lang == "en" ? "Pin" : "置顶";
+    out property <string> detail_pinned: root.lang == "en" ? "Pinned" : "已置顶";
+    out property <string> detail_board: root.lang == "en" ? "Board" : "看板";
+    out property <string> detail_add_board: root.lang == "en" ? "Add to board" : "加入看板";
+    out property <string> review_running: root.lang == "en" ? "Reviewing…" : "评审中…";
+    out property <string> review_retry: root.lang == "en" ? "Retry review" : "重试评审";
+    out property <string> review_start: root.lang == "en" ? "Start review" : "开始预评审";
+    out property <string> review_failed_hint: root.lang == "en" ? "Last review failed; click the button to retry" : "上次评审失败，点击按钮重试";
+    out property <string> review_score_label: root.lang == "en" ? "Overall score" : "综合评分";
+    out property <string> review_time_unknown: root.lang == "en" ? "Review time unknown" : "评审时间未知";
+    out property <string> review_time_prefix: root.lang == "en" ? "Reviewed " : "评审时间 ";
+    out property <string> review_dimensions: root.lang == "en" ? "Dimension scores" : "各维度评分";
+    out property <string> review_size_prefix: root.lang == "en" ? "Size: " : "体量：";
+    out property <string> review_summary_title: root.lang == "en" ? "Review summary" : "评审总结";
+    out property <string> review_flagged_title: root.lang == "en" ? "Flagged files" : "风险文件";
+    out property <string> review_comments_title: root.lang == "en" ? "Line comments" : "行级评论";
+    out property <string> review_empty_title: root.lang == "en" ? "No review report" : "暂无评审报告";
+    out property <string> review_empty_hint: root.lang == "en" ? "Click \"Start review\" above and the LLM will generate a structured report for this PR" : "点击上方「开始预评审」，LLM 将对该 PR 生成结构化评审报告";
+    out property <string> convo_empty_title: root.lang == "en" ? "No activity yet" : "暂无会话记录";
+    out property <string> convo_empty_hint: root.lang == "en" ? "Commits, reviews and comments will appear here" : "提交、评审与评论活动将显示在这里";
+    out property <string> check_success: root.lang == "en" ? "Passed" : "通过";
+    out property <string> check_failure: root.lang == "en" ? "Failed" : "失败";
+    out property <string> check_pending: root.lang == "en" ? "Running" : "进行中";
+    out property <string> checks_empty_title: root.lang == "en" ? "No checks" : "暂无 Checks";
+    out property <string> checks_empty_hint: root.lang == "en" ? "This PR has no associated CI check runs" : "这个 PR 还没有关联的 CI 检查记录";
+    out property <string> files_empty_title: root.lang == "en" ? "No file changes" : "暂无文件变更";
+    out property <string> files_empty_hint: root.lang == "en" ? "The diff file list will appear here" : "Diff 文件列表将显示在这里";
+    out property <string> coming_soon_title: root.lang == "en" ? "Coming soon" : "即将推出";
+    out property <string> coming_soon_hint: root.lang == "en" ? "This tab is not implemented yet" : "这个标签页还没有实现";
+    out property <string> comment_readonly_hint: root.lang == "en" ? "Read-only for now; commenting coming later" : "只读模式，评论功能后续开放";
+    out property <string> send: root.lang == "en" ? "Send" : "发送";
+
+    // ── components.slint ──
+    out property <string> score_oversized: root.lang == "en" ? "XL" : "超大";
+
+    // ── detail_panel/components/inbox 补充 ──
+    // inbox 表头列名
+    out property <string> inbox_col_repo: root.lang == "en" ? "Repo" : "仓库";
+    out property <string> inbox_col_title: root.lang == "en" ? "Title" : "标题";
+    out property <string> inbox_col_type: root.lang == "en" ? "Type" : "类型";
+    out property <string> inbox_col_reason: root.lang == "en" ? "Reason" : "原因";
+    out property <string> inbox_col_time: root.lang == "en" ? "Time" : "时间";
+}

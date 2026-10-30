@@ -22,6 +22,8 @@ repos = ["owner/repo"]
 poll_interval_min = 5
 # 界面主题：light 或 dark
 theme = "light"
+# 界面语言：zh 或 en
+language = "zh"
 # 本地 LLM 预评审（OpenAI 兼容 API；llm_api_key 留空时可用环境变量 LLM_API_KEY）
 llm_base_url = "https://api.openai.com/v1"
 llm_api_key = ""
@@ -43,6 +45,8 @@ pub struct Config {
     pub poll_interval_min: u64,
     /// 界面主题："light" | "dark"
     pub theme: String,
+    /// 界面语言："zh" | "en"
+    pub language: String,
     /// OpenAI 兼容 API 地址（本地预评审用）
     pub llm_base_url: String,
     pub llm_api_key: Option<String>,
@@ -64,6 +68,7 @@ impl Default for Config {
             repos: Vec::new(),
             poll_interval_min: 5,
             theme: "light".into(),
+            language: "zh".into(),
             llm_base_url: "https://api.openai.com/v1".into(),
             llm_api_key: None,
             llm_model: String::new(),
@@ -154,6 +159,10 @@ impl Config {
                 // 只认 light/dark，其它值（老配置、手写错误）回退默认
                 let v = unquote(v);
                 cfg.theme = if v == "dark" { "dark".into() } else { "light".into() };
+            } else if let Some(v) = parse_value(line, "language") {
+                // 只认 zh/en，其它值（老配置、手写错误）回退默认
+                let v = unquote(v);
+                cfg.language = if v == "en" { "en".into() } else { "zh".into() };
             } else if let Some(v) = parse_value(line, "llm_base_url") {
                 let v = unquote(v);
                 if !v.is_empty() {
@@ -185,7 +194,7 @@ impl Config {
             "[{}]",
             self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
         );
-        let kv: [(&str, String); 12] = [
+        let kv: [(&str, String); 13] = [
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
             ("astrbot_api_key", quote(&self.astrbot_api_key)),
@@ -193,6 +202,7 @@ impl Config {
             ("repos", repos_toml),
             ("poll_interval_min", self.poll_interval_min.to_string()),
             ("theme", quote(&self.theme)),
+            ("language", quote(&self.language)),
             ("llm_base_url", quote(&self.llm_base_url)),
             ("llm_api_key", quote(self.llm_api_key.as_deref().unwrap_or(""))),
             ("llm_model", quote(&self.llm_model)),
@@ -204,7 +214,7 @@ impl Config {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
             Err(_) => TEMPLATE.lines().map(|l| l.to_string()).collect(),
         };
-        let mut seen = [false; 12];
+        let mut seen = [false; 13];
         for (i, line) in lines.iter_mut().enumerate() {
             let trimmed = line.trim_start();
             if trimmed.starts_with('#') || trimmed.is_empty() {
@@ -253,6 +263,7 @@ mod tests {
         assert_eq!(cfg2.llm_api_key, None);
         assert_eq!(cfg2.llm_model, "");
         assert_eq!(cfg2.ocr_path, "ocr");
+        assert_eq!(cfg2.language, "zh");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -270,6 +281,7 @@ mod tests {
             repos: vec!["a/b".into(), "c/d".into()],
             poll_interval_min: 15,
             theme: "dark".into(),
+            language: "en".into(),
             llm_base_url: "http://nas:11434/v1".into(),
             llm_api_key: Some("sk-test".into()),
             llm_model: "qwen3-coder".into(),
@@ -288,6 +300,7 @@ mod tests {
         assert_eq!(loaded.repos, vec!["a/b".to_string(), "c/d".to_string()]);
         assert_eq!(loaded.poll_interval_min, 15);
         assert_eq!(loaded.theme, "dark");
+        assert_eq!(loaded.language, "en");
         assert_eq!(loaded.llm_base_url, "http://nas:11434/v1");
         assert_eq!(loaded.llm_api_key.as_deref(), Some("sk-test"));
         assert_eq!(loaded.llm_model, "qwen3-coder");

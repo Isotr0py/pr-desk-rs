@@ -1,5 +1,6 @@
 // PR Desk 基础组件库 — 纯矢量绘制，无外部资源；颜色全部取自 Theme 令牌
 import { Theme } from "theme.slint";
+import { I18n } from "i18n.slint";
 
 // 圆形头像：img 有效时裁剪为圆形图片；否则显示 login 首字母。
 // 无图底色：按 login 长度做稳定伪哈希，从 4 个主题色相中选 1 个，
@@ -82,7 +83,7 @@ export component ScoreChip inherits Rectangle {
         padding-left: 8px;
         padding-right: 8px;
         Text {
-            text: root.oversized ? "超大" : "" + (Math.round(root.score * 10) / 10);
+            text: root.oversized ? I18n.score_oversized : "" + (Math.round(root.score * 10) / 10);
             font-size: Theme.fs_xs;
             font-weight: 500;
             color: root.tone;

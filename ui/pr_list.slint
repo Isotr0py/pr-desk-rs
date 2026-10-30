@@ -3,6 +3,7 @@
 // 依赖共享契约：theme.slint 的 global Theme（sel/sel_text/hover/hairline/fs_*/r_*），
 // components.slint 的 Avatar / StatusDot / ScoreChip / SizeBadge / PriorityDot / TagChip。
 import { Theme } from "theme.slint";
+import { I18n } from "i18n.slint";
 import { Avatar, StatusDot, ScoreChip, SizeBadge, PriorityDot, TagChip } from "components.slint";
 
 // 单行 PR 数据（分组头不在此数组里，见 PrGroup）
@@ -779,7 +780,7 @@ export component PrListView inherits FocusScope {
 
                     // 空态
                     if root.rows.length == 0: Text {
-                        text: "没有 PR";
+                        text: I18n.empty_no_pr;
                         color: Theme.text_dim;
                         font-size: Theme.fs_md;
                         horizontal-alignment: center;

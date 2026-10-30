@@ -134,8 +134,8 @@ async fn git_commit_all(repo: &Path, message: &str) -> Result<()> {
 }
 
 /// 解析 ocr 的 result.json：status=failed 报错；comments 原样收集；
-/// summary.files_reviewed 进 files_reviewed。
-pub fn parse_ocr_result(text: &str) -> Result<OcrRunOutcome> {
+/// summary.files_reviewed 进 files_reviewed。lang：错误文案语言（"zh"/"en"）。
+pub fn parse_ocr_result(text: &str, lang: &str) -> Result<OcrRunOutcome> {
     let data: Value = serde_json::from_str(text.trim()).context("ocr result.json 不是合法 JSON")?;
     if !data.is_object() {
         anyhow::bail!("ocr result.json 顶层不是 JSON 对象");
@@ -143,7 +143,7 @@ pub fn parse_ocr_result(text: &str) -> Result<OcrRunOutcome> {
     let status = data["status"].as_str().unwrap_or("").to_string();
     if status == "failed" {
         let msg = data["error"].as_str().unwrap_or("");
-        anyhow::bail!("ocr 评审失败（status=failed）：{msg}");
+        anyhow::bail!("{}", crate::i18n::trf(lang, "err_ocr_failed_status", &[msg]));
     }
     // complete / partial / success（及未知非 failed 状态）都算可用
     let comments = data["comments"].as_array().cloned().unwrap_or_default();
@@ -192,6 +192,7 @@ pub fn resolve_ocr_path(cfg: &Config) -> PathBuf {
 
 /// 本地预评审主流程：重建临时 git 仓库 → 跑 ocr → 解析行级评论。
 /// meta 为 GitHub::fetch_pr_meta 的原始返回（取 base.sha / head.sha / title / body）。
+/// lang："zh"/"en"，进度回调与错误文案语言。
 pub async fn run_ocr_review(
     cfg: &Config,
     gh: &GitHub,
@@ -199,11 +200,13 @@ pub async fn run_ocr_review(
     number: i64,
     meta: &Value,
     progress: &mut (dyn FnMut(String) + Send),
+    lang: &str,
 ) -> Result<OcrRunOutcome> {
+    use crate::i18n::{tr, trf};
     let base_sha = meta["base"]["sha"].as_str().unwrap_or("").to_string();
     let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
     if base_sha.is_empty() || head_sha.is_empty() {
-        anyhow::bail!("PR 元信息缺少 base/head sha");
+        anyhow::bail!("{}", tr(lang, "err_missing_sha"));
     }
     let title = meta["title"].as_str().unwrap_or("");
     let body = meta["body"].as_str().unwrap_or("");
@@ -212,22 +215,22 @@ pub async fn run_ocr_review(
         .take(BACKGROUND_MAX_CHARS)
         .collect();
 
-    progress("创建临时仓库…".into());
+    progress(tr(lang, "prog_create_repo").into());
     let tmp = TempDir::new()?;
     git(&tmp.0, &["init", "--quiet"]).await?;
 
-    progress("拉取 PR diff…".into());
+    progress(tr(lang, "prog_fetch_pr_diff").into());
     let diff = gh.fetch_diff(repo, number).await?;
     let files = reviewer::split_diff_files(&diff);
     if files.is_empty() {
-        anyhow::bail!("PR diff 为空，无文件可评审");
+        anyhow::bail!("{}", tr(lang, "err_empty_diff"));
     }
     let total = files.len();
 
     // 第一个 commit：base 版本（新增文件在 base 侧 404 → None → 跳过；
     // 二进制/超大文件两边都跳过，ocr 反正会排除）。
     for (i, (path, _chunk)) in files.iter().enumerate() {
-        progress(format!("重建 base 版本（{}/{total}）…", i + 1));
+        progress(trf(lang, "prog_rebuild_base", &[&(i + 1).to_string(), &total.to_string()]));
         if let Some(bytes) = gh.fetch_file_content(repo, path, &base_sha).await? {
             write_file(&tmp.0, path, &bytes)?;
         }
@@ -236,7 +239,7 @@ pub async fn run_ocr_review(
 
     // 第二个 commit：head 版本（新增/修改写 head 内容；被删文件从磁盘移除）。
     for (i, (path, chunk)) in files.iter().enumerate() {
-        progress(format!("重建 head 版本（{}/{total}）…", i + 1));
+        progress(trf(lang, "prog_rebuild_head", &[&(i + 1).to_string(), &total.to_string()]));
         if file_status(chunk) == "deleted" {
             if let Some(p) = safe_join(&tmp.0, path) {
                 let _ = std::fs::remove_file(p);
@@ -290,25 +293,29 @@ pub async fn run_ocr_review(
         cmd.env("OCR_CONFIG_PATH", &cfg_path);
     }
 
-    progress("运行 ocr 评审中（最长 30 分钟）…".into());
+    progress(tr(lang, "prog_ocr_running").into());
     // 超时：output() future 被 drop → kill_on_drop 杀掉子进程
     let out = match tokio::time::timeout(OCR_TIMEOUT, cmd.output()).await {
-        Ok(r) => r.context(format!("启动 ocr 失败（检查 ocr_path 配置：{}）", ocr_bin.display()))?,
-        Err(_) => anyhow::bail!("ocr 评审超时（30 分钟），已终止"),
+        Ok(r) => r.context(trf(lang, "err_ocr_spawn", &[&ocr_bin.display().to_string()]))?,
+        Err(_) => anyhow::bail!("{}", tr(lang, "err_ocr_timeout")),
     };
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let tail: String = stderr.chars().rev().take(500).collect::<String>().chars().rev().collect();
-        anyhow::bail!("ocr 退出码 {:?}：{}", out.status.code(), tail.trim());
+        anyhow::bail!(
+            "{}",
+            trf(lang, "err_ocr_exit", &[&format!("{:?}", out.status.code()), tail.trim()])
+        );
     }
 
-    progress("解析 ocr 结果…".into());
-    let text = std::fs::read_to_string(tmp.0.join("result.json")).context("ocr 未生成 result.json")?;
-    let outcome = parse_ocr_result(&text)?;
-    progress(format!(
-        "ocr 完成：{} 条行级评论，{} 个文件",
-        outcome.comments.len(),
-        outcome.files_reviewed
+    progress(tr(lang, "prog_parse_ocr").into());
+    let text = std::fs::read_to_string(tmp.0.join("result.json"))
+        .context(tr(lang, "err_ocr_no_result"))?;
+    let outcome = parse_ocr_result(&text, lang)?;
+    progress(trf(
+        lang,
+        "ocr_done",
+        &[&outcome.comments.len().to_string(), &outcome.files_reviewed.to_string()],
     ));
     Ok(outcome)
 }
@@ -330,7 +337,7 @@ mod tests {
             ],
             "summary": {"files_reviewed": 5}
         }"#;
-        let out = parse_ocr_result(text).unwrap();
+        let out = parse_ocr_result(text, "zh").unwrap();
         assert_eq!(out.status, "complete");
         assert_eq!(out.files_reviewed, 5);
         assert_eq!(out.comments.len(), 2);
@@ -343,19 +350,19 @@ mod tests {
 
     #[test]
     fn parse_result_partial_and_success_ok() {
-        let out = parse_ocr_result(r#"{"status":"partial","comments":[],"summary":{"files_reviewed":2}}"#).unwrap();
+        let out = parse_ocr_result(r#"{"status":"partial","comments":[],"summary":{"files_reviewed":2}}"#, "zh").unwrap();
         assert_eq!(out.status, "partial");
         assert_eq!(out.files_reviewed, 2);
         assert!(out.comments.is_empty());
 
-        let out = parse_ocr_result(r#"{"status":"success","comments":[]}"#).unwrap();
+        let out = parse_ocr_result(r#"{"status":"success","comments":[]}"#, "zh").unwrap();
         assert_eq!(out.status, "success");
         assert_eq!(out.files_reviewed, 0); // summary 缺失 → 0
     }
 
     #[test]
     fn parse_result_failed_errors() {
-        let e = parse_ocr_result(r#"{"status":"failed","error":"LLM 连接失败","comments":[]}"#)
+        let e = parse_ocr_result(r#"{"status":"failed","error":"LLM 连接失败","comments":[]}"#, "zh")
             .unwrap_err();
         assert!(e.to_string().contains("failed"));
         assert!(e.to_string().contains("LLM 连接失败"));
@@ -363,9 +370,9 @@ mod tests {
 
     #[test]
     fn parse_result_bad_json_errors() {
-        assert!(parse_ocr_result("").is_err());
-        assert!(parse_ocr_result("not json").is_err());
-        assert!(parse_ocr_result("[1,2]").is_err()); // 非对象
+        assert!(parse_ocr_result("", "zh").is_err());
+        assert!(parse_ocr_result("not json", "zh").is_err());
+        assert!(parse_ocr_result("[1,2]", "zh").is_err()); // 非对象
     }
 
     #[test]

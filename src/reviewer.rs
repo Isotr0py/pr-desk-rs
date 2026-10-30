@@ -385,14 +385,17 @@ async fn chat_completion(llm: &LlmSettings, user_prompt: &str) -> Result<String>
 
 /// 本地预评审主流程：拉 PR 元信息 + diff → 过滤 → LLM 评审 → 组装结果 JSON。
 /// 返回的 JSON 可直接传给 Db::upsert_review。
+/// lang："zh"/"en"，进度回调与失败摘要的文案语言（LLM prompt 本身保持中文）。
 pub async fn run_review(
     llm: &LlmSettings,
     gh: &GitHub,
     repo: &str,
     number: i64,
     progress: &mut (dyn FnMut(String) + Send),
+    lang: &str,
 ) -> Result<Value> {
-    progress("拉取 PR 信息…".into());
+    use crate::i18n::{tr, trf};
+    progress(tr(lang, "prog_fetch_pr").into());
     let meta_raw = gh.fetch_pr_meta(repo, number).await?;
     let head_sha = meta_raw["head"]["sha"].as_str().unwrap_or("").to_string();
     let meta = PrMeta {
@@ -403,7 +406,7 @@ pub async fn run_review(
         url: meta_raw["html_url"].as_str().unwrap_or("").to_string(),
     };
 
-    progress("拉取 diff…".into());
+    progress(tr(lang, "prog_fetch_diff").into());
     let diff_full = gh.fetch_diff(repo, number).await?;
     let (diff_text, included, omitted) = filter_diff(&diff_full, MAX_DIFF_FILES, MAX_DIFF_CHARS);
 
@@ -446,14 +449,14 @@ pub async fn run_review(
         return Ok(finish(
             Value::Null,
             json!({}),
-            "diff 为空（可能全部为 lock/生成文件），未评审。".into(),
+            tr(lang, "empty_diff_summary").into(),
             json!([]),
         ));
     }
 
     let prompt = build_prompt(&meta, &diff_text, &omitted, "", Some(&stats));
 
-    progress("调用 LLM 评审中…".into());
+    progress(tr(lang, "prog_llm_review").into());
     let mut last_raw = String::new();
     let mut parsed = None;
     for attempt in 0..2 {
@@ -474,18 +477,22 @@ pub async fn run_review(
         }
     }
 
-    progress("解析评审结果…".into());
+    progress(tr(lang, "prog_parse_review").into());
     let Some(mut parsed) = parsed else {
         anyhow::bail!(
-            "LLM 评审结果 JSON 解析失败（重试后仍失败）：{}",
-            last_raw.chars().take(200).collect::<String>()
+            "{}",
+            trf(
+                lang,
+                "err_parse_failed",
+                &[&last_raw.chars().take(200).collect::<String>()]
+            )
         );
     };
     if !omitted.is_empty() {
         let summary = parsed["summary"].as_str().unwrap_or("").to_string();
         parsed["summary"] = json!(format!(
-            "{summary}\n（注：diff 超长，{} 个文件未纳入评审）",
-            omitted.len()
+            "{summary}\n{}",
+            trf(lang, "oversized_note", &[&omitted.len().to_string()])
         ));
     }
     Ok(finish(

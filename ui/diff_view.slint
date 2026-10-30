@@ -11,6 +11,7 @@
 // - DiffLine 结构没有真实行号字段，行号列暂以「文件内行序号」代替。
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { I18n } from "i18n.slint";
 
 export struct DiffLine {
     kind: string,   // add / del / hunk / meta / ctx
@@ -57,13 +58,13 @@ export component DiffView inherits Rectangle {
             }
         }
         Text {
-            text: "暂无 Diff 内容";
+            text: I18n.diff_empty_title;
             font-size: Theme.fs_md;
             color: Theme.text_dim;
             horizontal-alignment: center;
         }
         Text {
-            text: "选择包含变更的文件或提交后在此查看";
+            text: I18n.diff_empty_hint;
             font-size: Theme.fs_xs;
             color: Theme.text_faint;
             horizontal-alignment: center;
@@ -175,7 +176,7 @@ export component DiffView inherits Rectangle {
                         vertical-alignment: center;
                     }
                     Text {
-                        text: file.expanded ? "收起" : "展开";
+                        text: file.expanded ? I18n.diff_collapse : I18n.diff_expand;
                         color: Theme.text_faint;
                         font-size: Theme.fs_xs;
                         vertical-alignment: center;
@@ -257,8 +258,8 @@ export component DiffView inherits Rectangle {
                     Text {
                         x: root.gutter-w + 8px;
                         height: 100%;
-                        text: "… 已截断：仅显示前 " + root.max-render-lines
-                            + " 行（共 " + file.lines.length + " 行）";
+                        text: I18n.diff_truncated_p1 + root.max-render-lines
+                            + I18n.diff_truncated_p2 + file.lines.length + I18n.diff_truncated_p3;
                         color: Theme.text_dim;
                         font-family: "Consolas";
                         font-size: Theme.fs_xs;

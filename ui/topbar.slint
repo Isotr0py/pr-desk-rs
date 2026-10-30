@@ -3,6 +3,7 @@
 // StatusBar：24px 高，左侧快捷键提示 · 右侧同步状态 / 配额 / 总数
 // 依赖共享契约：theme.slint 的 global Theme（颜色 / 字号 fs_* / 圆角 r_* / dark 开关）
 import { Theme } from "theme.slint";
+import { I18n } from "i18n.slint";
 
 // ── 图标按钮：28×28，hover 底色（120ms），悬停 tooltip ──
 // 图标用内嵌 SVG（Image + colorize），不依赖字体字形，避免豆腐块。
@@ -101,7 +102,7 @@ component SearchBox inherits Rectangle {
             x: 28px;
             width: parent.width - 62px;
             height: parent.height;
-            text: "搜索 PR…";
+            text: I18n.search_placeholder;
             font-size: Theme.fs_md;
             color: Theme.text_faint;
             vertical-alignment: center;
@@ -137,9 +138,9 @@ export component TopBar inherits Rectangle {
     callback sync();
     callback open_settings();
     // 图标按钮 tooltip 文案（可覆盖）
-    in property <string> refresh_tooltip: "刷新 GitHub";
-    in property <string> sync_tooltip: "同步服务器";
-    in property <string> settings_tooltip: "设置";
+    in property <string> refresh_tooltip: I18n.refresh_tooltip;
+    in property <string> sync_tooltip: I18n.sync_tooltip;
+    in property <string> settings_tooltip: I18n.settings_tooltip;
     // 供全局 / 快捷键调用：聚焦搜索框
     public function focus_search() { search.focus_search(); }
 
@@ -157,7 +158,7 @@ export component TopBar inherits Rectangle {
 
         // 左：应用名
         Text {
-            text: "PR Desk";
+            text: I18n.app_name;
             color: Theme.text;
             font-size: Theme.fs_lg;
             font-weight: 600;
@@ -199,7 +200,7 @@ export component TopBar inherits Rectangle {
                 x: 0;
                 width: root.seg-w;
                 height: parent.height;
-                text: "列表";
+                text: I18n.tab_list;
                 font-size: Theme.fs_sm;
                 color: root.view_mode == 0 ? Theme.text
                     : seg-list.has-hover ? Theme.text : Theme.text_dim;
@@ -217,7 +218,7 @@ export component TopBar inherits Rectangle {
                 x: root.seg-w;
                 width: root.seg-w;
                 height: parent.height;
-                text: "Inbox";
+                text: I18n.tab_inbox;
                 font-size: Theme.fs_sm;
                 color: root.view_mode == 1 ? Theme.text
                     : seg-inbox.has-hover ? Theme.text : Theme.text_dim;
@@ -244,7 +245,7 @@ export component TopBar inherits Rectangle {
         }
         IconButton {
             icon: @image-url("icons/theme.svg");
-            tooltip: Theme.dark ? "切换到浅色主题" : "切换到深色主题";
+            tooltip: Theme.dark ? I18n.theme_tooltip_light : I18n.theme_tooltip_dark;
             clicked => { Theme.dark = !Theme.dark; }
         }
         IconButton {
@@ -284,7 +285,7 @@ export component StatusBar inherits Rectangle {
 
         // 左：快捷键提示（· 分隔）
         Text {
-            text: "j/k 移动 · Enter 详情 · o 浏览器打开 · p 置顶 · 1/2/3 优先级 · / 搜索 · Esc 返回";
+            text: I18n.statusbar_hints;
             font-size: Theme.fs_xs;
             color: Theme.text_faint;
             vertical-alignment: center;
@@ -321,7 +322,7 @@ export component StatusBar inherits Rectangle {
                 vertical-alignment: center;
             }
             Text {
-                text: "共 " + root.total_count + " 个 PR";
+                text: I18n.statusbar_total_pre + root.total_count + I18n.statusbar_total_post;
                 font-size: Theme.fs_xs;
                 color: Theme.text_dim;
                 vertical-alignment: center;

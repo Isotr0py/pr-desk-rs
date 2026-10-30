@@ -6,6 +6,7 @@
 //! 在 to_row 里加一行 `activity_text: activity_text(r).into()` 即可。
 
 use chrono::{Local, NaiveDateTime};
+use pr_desk_rs::i18n::trf;
 use pr_desk_rs::build_sections;
 
 use crate::avatars;
@@ -76,10 +77,14 @@ fn review_count(r: &serde_json::Value) -> i64 {
 }
 
 /// 次级活动行（dim 文本）：「3 条评审」；无评审时返回 ""。
-/// 不含时间——更新时间在 Upd 列已展示，避免重复。
-pub fn activity_text(r: &serde_json::Value) -> String {
+/// 不含时间——更新时间在 Upd 列已展示，避免重复。lang："zh"/"en"。
+pub fn activity_text(r: &serde_json::Value, lang: &str) -> String {
     let reviews = review_count(r);
-    if reviews > 0 { format!("{reviews} 条评审") } else { String::new() }
+    if reviews > 0 {
+        trf(lang, "reviews_count", &[&reviews.to_string()])
+    } else {
+        String::new()
+    }
 }
 
 /// 大小写不敏感子串匹配：title / number（query 可带 # 前缀）/ author / repo。
@@ -130,17 +135,17 @@ pub fn author_orgs(r: &serde_json::Value) -> Vec<String> {
     }
 }
 
-/// 组标题 → PrGroup.key。
+/// 组标题 → PrGroup.key（中/英文标题都识别；build_sections 的标题随 lang 变化）。
 fn group_key(title: &str) -> &'static str {
     if title.contains("Pinned") {
         "pinned"
-    } else if title.contains("看板") {
+    } else if title.contains("看板") || title.contains("Board") {
         "board"
-    } else if title.contains("待评审") {
+    } else if title.contains("待评审") || title.contains("To Review") {
         "needs-review"
-    } else if title.contains("已评审") {
+    } else if title.contains("已评审") || title.contains("Reviewed") {
         "reviewed"
-    } else if title.contains("不采纳") {
+    } else if title.contains("不采纳") || title.contains("Rejected") {
         "rejected"
     } else {
         "closed"
@@ -149,13 +154,14 @@ fn group_key(title: &str) -> &'static str {
 
 /// 行数据 → (扁平 PrListRow 模型, PrGroup 切片元数据)。
 /// PrListView 的 rows 不含组头，groups 以 start/count 切片；selected_index 直接是 rows 下标。
-pub fn build_models(rows: &[serde_json::Value]) -> (Vec<PrListRow>, Vec<PrGroup>) {
+/// lang："zh"/"en"（组标题与 activity_text 的文案语言）。
+pub fn build_models(rows: &[serde_json::Value], lang: &str) -> (Vec<PrListRow>, Vec<PrGroup>) {
     let mut out_rows: Vec<PrListRow> = Vec::new();
     let mut groups: Vec<PrGroup> = Vec::new();
-    for (title, idxs) in build_sections(rows) {
+    for (title, idxs) in build_sections(rows, lang) {
         let start = out_rows.len() as i32;
         for i in &idxs {
-            out_rows.push(to_row(&rows[*i]));
+            out_rows.push(to_row(&rows[*i], lang));
         }
         groups.push(PrGroup {
             key: group_key(&title).into(),
@@ -168,7 +174,7 @@ pub fn build_models(rows: &[serde_json::Value]) -> (Vec<PrListRow>, Vec<PrGroup>
     (out_rows, groups)
 }
 
-pub fn to_row(r: &serde_json::Value) -> PrListRow {
+pub fn to_row(r: &serde_json::Value, lang: &str) -> PrListRow {
     let author = r["author"].as_str().unwrap_or("");
     PrListRow {
         key: format!("{}#{}", r["repo"].as_str().unwrap_or(""), r["number"].as_i64().unwrap_or(0)).into(),
@@ -187,7 +193,7 @@ pub fn to_row(r: &serde_json::Value) -> PrListRow {
         score: r["score"].as_f64().unwrap_or(0.0) as f32,
         age: age_text(r).into(),
         updated: age_text(r).into(),
-        activity_text: activity_text(r).into(),
+        activity_text: activity_text(r, lang).into(),
         pinned: r["pinned"].as_i64() == Some(1),
         on_board: r["on_board"].as_i64() == Some(1),
     }
@@ -252,14 +258,15 @@ mod tests {
                 "reviews": [{"author": "a"}, {"author": "b"}, {"author": "c"}]
             })).unwrap(),
         });
-        assert_eq!(activity_text(&r), "3 条评审");
+        assert_eq!(activity_text(&r, "zh"), "3 条评审");
+        assert_eq!(activity_text(&r, "en"), "3 reviews");
         let r2 = serde_json::json!({"updated_at": recent, "reviews": 2});
-        assert_eq!(activity_text(&r2), "2 条评审");
+        assert_eq!(activity_text(&r2, "zh"), "2 条评审");
         // 只有时间 → 空
         let r3 = serde_json::json!({"updated_at": recent});
-        assert_eq!(activity_text(&r3), "");
+        assert_eq!(activity_text(&r3, "zh"), "");
         // 都没有
-        assert_eq!(activity_text(&serde_json::json!({})), "");
+        assert_eq!(activity_text(&serde_json::json!({}), "zh"), "");
     }
 
     fn frow(repo: &str, number: i64, title: &str, author: &str) -> serde_json::Value {

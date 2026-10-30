@@ -8,6 +8,7 @@
 // 设计契约：全部颜色/字号/圆角取自 theme.slint 的 Theme 令牌（浅色/深色双主题）。
 import { ScrollView, ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
+import { I18n } from "i18n.slint";
 import { Avatar, MarkdownBlocks, MdBlock } from "components.slint";
 import { DiffView, DiffFile } from "diff_view.slint";
 
@@ -77,8 +78,8 @@ component StateBadge inherits Rectangle {
             }
         }
         Text {
-            text: root.state == "merged" ? "已合并"
-                : root.state == "closed" ? "已关闭" : "Open";
+            text: root.state == "merged" ? I18n.state_merged
+                : root.state == "closed" ? I18n.state_closed : I18n.state_open;
             font-size: Theme.fs_xs;
             font-weight: 600;
             color: root.tone;
@@ -120,8 +121,8 @@ component CiBadge inherits Rectangle {
             }
         }
         Text {
-            text: root.ci == "success" ? "CI 通过"
-                : root.ci == "failure" ? "CI 失败" : "CI 进行中";
+            text: root.ci == "success" ? I18n.ci_success
+                : root.ci == "failure" ? I18n.ci_failure : I18n.ci_pending;
             font-size: Theme.fs_xs;
             font-weight: 600;
             color: root.tone;
@@ -150,10 +151,10 @@ component SeverityBadge inherits Rectangle {
         padding-right: 7px;
         alignment: center;
         Text {
-            text: root.severity == "critical" ? "严重"
-                : root.severity == "high" ? "高"
-                : root.severity == "medium" ? "中"
-                : root.severity == "low" ? "低"
+            text: root.severity == "critical" ? I18n.severity_critical
+                : root.severity == "high" ? I18n.severity_high
+                : root.severity == "medium" ? I18n.severity_medium
+                : root.severity == "low" ? I18n.severity_low
                 : root.severity;
             font-size: Theme.fs_xs;
             font-weight: 600;
@@ -293,7 +294,7 @@ export component DetailPanel inherits Rectangle {
     in property <bool> on_board: false;
 
     // ── 标签页与数据 ──
-    in property <[string]> tabs: ["评审", "会话", "Checks", "Files", "Diff"];
+    in property <[string]> tabs: [I18n.tab_review, I18n.tab_conversation, I18n.tab_checks, I18n.tab_files, I18n.tab_diff];
     in-out property <int> current_tab: 0;
     in property <[ConvoEntry]> convo_entries: [];
     in property <[CheckRun]> check_runs: [];
@@ -359,7 +360,7 @@ export component DetailPanel inherits Rectangle {
                         clip: true;
                         Text {
                             width: parent.width;
-                            text: root.title == "" ? "未选择 PR" : root.title;
+                            text: root.title == "" ? I18n.detail_no_pr_selected : root.title;
                             color: Theme.text;
                             font-size: Theme.fs_lg;
                             font-weight: 600;
@@ -428,14 +429,14 @@ export component DetailPanel inherits Rectangle {
                     spacing: 8px;
                     alignment: start;
                     OutlineBtn {
-                        label: root.pinned ? "已置顶" : "置顶";
+                        label: root.pinned ? I18n.detail_pinned : I18n.detail_pin;
                         icon: @image-url("icons/pin.svg");
                         tint: Theme.mid;
                         active: root.pinned;
                         clicked => { root.action_toggle_pin(); }
                     }
                     OutlineBtn {
-                        label: root.on_board ? "看板" : "加入看板";
+                        label: root.on_board ? I18n.detail_board : I18n.detail_add_board;
                         trailing: @image-url("icons/chevron-down.svg");
                         active: root.on_board;
                         clicked => { root.action_board(); }
@@ -608,9 +609,9 @@ export component DetailPanel inherits Rectangle {
                                     padding-left: 12px;
                                     padding-right: 12px;
                                     Text {
-                                        text: root.review_status == "running" ? "评审中…"
-                                            : root.review_status == "failed" ? "重试评审"
-                                            : "开始预评审";
+                                        text: root.review_status == "running" ? I18n.review_running
+                                            : root.review_status == "failed" ? I18n.review_retry
+                                            : I18n.review_start;
                                         font-size: Theme.fs_sm;
                                         font-weight: 600;
                                         color: root.review_status == "running" ? Theme.text_dim : #ffffff;
@@ -660,7 +661,7 @@ export component DetailPanel inherits Rectangle {
                                 y: 0;
                                 height: 30px;
                                 visible: root.review_status == "failed";
-                                text: "上次评审失败，点击按钮重试";
+                                text: I18n.review_failed_hint;
                                 font-size: Theme.fs_sm;
                                 color: Theme.bad;
                                 vertical-alignment: center;
@@ -688,7 +689,7 @@ export component DetailPanel inherits Rectangle {
                                         spacing: 10px;
                                         alignment: start;
                                         Text {
-                                            text: "综合评分";
+                                            text: I18n.review_score_label;
                                             font-size: Theme.fs_md;
                                             font-weight: 600;
                                             color: Theme.text;
@@ -714,8 +715,8 @@ export component DetailPanel inherits Rectangle {
                                         Rectangle { horizontal-stretch: 1; }
                                         Text {
                                             text: root.review_reviewed_at == ""
-                                                ? "评审时间未知"
-                                                : "评审时间 " + root.review_reviewed_at;
+                                                ? I18n.review_time_unknown
+                                                : I18n.review_time_prefix + root.review_reviewed_at;
                                             font-size: Theme.fs_xs;
                                             color: Theme.text_faint;
                                             overflow: elide;
@@ -729,7 +730,7 @@ export component DetailPanel inherits Rectangle {
                                     spacing: 6px;
                                     alignment: start;
                                     Text {
-                                        text: "各维度评分";
+                                        text: I18n.review_dimensions;
                                         font-size: Theme.fs_sm;
                                         font-weight: 600;
                                         color: Theme.text_dim;
@@ -782,7 +783,7 @@ export component DetailPanel inherits Rectangle {
 
                                 // 体量行：XL（+990/-114，24 个文件），空串不显示
                                 if root.review_size_line != "": Text {
-                                    text: "体量：" + root.review_size_line;
+                                    text: I18n.review_size_prefix + root.review_size_line;
                                     font-size: Theme.fs_sm;
                                     color: Theme.text_dim;
                                 }
@@ -792,7 +793,7 @@ export component DetailPanel inherits Rectangle {
                                     spacing: 4px;
                                     alignment: start;
                                     Text {
-                                        text: "评审总结";
+                                        text: I18n.review_summary_title;
                                         font-size: Theme.fs_sm;
                                         font-weight: 600;
                                         color: Theme.text_dim;
@@ -817,7 +818,7 @@ export component DetailPanel inherits Rectangle {
                                     spacing: 6px;
                                     alignment: start;
                                     Text {
-                                        text: "风险文件";
+                                        text: I18n.review_flagged_title;
                                         font-size: Theme.fs_sm;
                                         font-weight: 600;
                                         color: Theme.text_dim;
@@ -851,7 +852,7 @@ export component DetailPanel inherits Rectangle {
                                     spacing: 6px;
                                     alignment: start;
                                     Text {
-                                        text: "行级评论";
+                                        text: I18n.review_comments_title;
                                         font-size: Theme.fs_sm;
                                         font-weight: 600;
                                         color: Theme.text_dim;
@@ -862,11 +863,11 @@ export component DetailPanel inherits Rectangle {
 
                                         // 分节组头：首条或 severity 与上一条不同
                                         if i == 0 || root.review_comments[i - 1].severity != c.severity: Text {
-                                            text: c.severity == "critical" ? "Critical"
-                                                : c.severity == "high" ? "High"
-                                                : c.severity == "medium" ? "Medium"
-                                                : c.severity == "low" ? "Low"
-                                                : "其他";
+                                            text: c.severity == "critical" ? I18n.severity_critical
+                                                : c.severity == "high" ? I18n.severity_high
+                                                : c.severity == "medium" ? I18n.severity_medium
+                                                : c.severity == "low" ? I18n.severity_low
+                                                : I18n.severity_other;
                                             font-size: Theme.fs_xs;
                                             font-weight: 700;
                                             color: c.severity == "critical" ? Theme.bad
@@ -933,8 +934,8 @@ export component DetailPanel inherits Rectangle {
                             height: 240px;
                             EmptyState {
                                 icon_img: @image-url("icons/diamond.svg");
-                                heading: "暂无评审报告";
-                                hint: "点击上方「开始预评审」，LLM 将对该 PR 生成结构化评审报告";
+                                heading: I18n.review_empty_title;
+                                hint: I18n.review_empty_hint;
                             }
                         }
                     }
@@ -1022,8 +1023,8 @@ export component DetailPanel inherits Rectangle {
                 }
                 if root.convo_entries.length == 0: EmptyState {
                     icon_img: @image-url("icons/comment.svg");
-                    heading: "暂无会话记录";
-                    hint: "提交、评审与评论活动将显示在这里";
+                    heading: I18n.convo_empty_title;
+                    hint: I18n.convo_empty_hint;
                 }
             }
 
@@ -1064,9 +1065,9 @@ export component DetailPanel inherits Rectangle {
                                 vertical-alignment: center;
                             }
                             Text {
-                                text: c.conclusion == "success" ? "通过"
-                                    : c.conclusion == "failure" ? "失败"
-                                    : c.conclusion == "pending" ? "进行中"
+                                text: c.conclusion == "success" ? I18n.check_success
+                                    : c.conclusion == "failure" ? I18n.check_failure
+                                    : c.conclusion == "pending" ? I18n.check_pending
                                     : (c.conclusion == "" ? "—" : c.conclusion);
                                 font-size: Theme.fs_xs;
                                 color: check_row.tone;
@@ -1084,8 +1085,8 @@ export component DetailPanel inherits Rectangle {
                 }
                 if root.check_runs.length == 0: EmptyState {
                     icon_img: @image-url("icons/check.svg");
-                    heading: "暂无 Checks";
-                    hint: "这个 PR 还没有关联的 CI 检查记录";
+                    heading: I18n.checks_empty_title;
+                    hint: I18n.checks_empty_hint;
                 }
             }
 
@@ -1159,8 +1160,8 @@ export component DetailPanel inherits Rectangle {
                 }
                 if root.files.length == 0: EmptyState {
                     icon_img: @image-url("icons/file.svg");
-                    heading: "暂无文件变更";
-                    hint: "Diff 文件列表将显示在这里";
+                    heading: I18n.files_empty_title;
+                    hint: I18n.files_empty_hint;
                 }
             }
 
@@ -1172,8 +1173,8 @@ export component DetailPanel inherits Rectangle {
 
             if root.current_tab < 0 || root.current_tab > 4: EmptyState {
                 icon_img: @image-url("icons/warning.svg");
-                heading: "即将推出";
-                hint: "这个标签页还没有实现";
+                heading: I18n.coming_soon_title;
+                hint: I18n.coming_soon_hint;
             }
         }
 
@@ -1215,7 +1216,7 @@ export component DetailPanel inherits Rectangle {
                     if comment_input.text == "": Text {
                         x: 10px;
                         width: parent.width - 20px;
-                        text: "只读模式，评论功能后续开放";
+                        text: I18n.comment_readonly_hint;
                         color: Theme.text_faint;
                         font-size: Theme.fs_sm;
                         overflow: elide;
@@ -1229,7 +1230,7 @@ export component DetailPanel inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.border;
                     Text {
-                        text: "发送";
+                        text: I18n.send;
                         width: 100%;
                         height: 100%;
                         font-size: Theme.fs_sm;

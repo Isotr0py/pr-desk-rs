@@ -3,6 +3,7 @@
 // 顶部工具栏：全部已读 / 只看未读开关。键盘：j/k/↑↓ 移动，Enter 打开浏览器，Esc 取消选中。
 // 样式全部走 Theme 令牌；空态用 components.slint 的 EmptyState。
 import { Theme } from "theme.slint";
+import { I18n } from "i18n.slint";
 import { EmptyState, Avatar, MarkdownBlocks } from "components.slint";
 import { ScrollView, ListView } from "std-widgets.slint";
 import { ConvoEntry, FileChange } from "detail_panel.slint";
@@ -122,11 +123,11 @@ component InboxHeader inherits Rectangle {
     property <length> x-reason: x-kind + InboxCols.kind + 8px;
     property <length> x-time: x-reason + InboxCols.reason + 8px;
 
-    Text { x: root.x-repo; height: 100%; text: "Repo"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
-    Text { x: root.x-title; height: 100%; text: "Title"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
-    Text { x: root.x-kind; width: InboxCols.kind; height: 100%; text: "Type"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-reason; width: InboxCols.reason; height: 100%; text: "Reason"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
-    Text { x: root.x-time; width: InboxCols.time; height: 100%; text: "Time"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: right; vertical-alignment: center; }
+    Text { x: root.x-repo; height: 100%; text: I18n.inbox_col_repo; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
+    Text { x: root.x-title; height: 100%; text: I18n.inbox_col_title; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
+    Text { x: root.x-kind; width: InboxCols.kind; height: 100%; text: I18n.inbox_col_type; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-reason; width: InboxCols.reason; height: 100%; text: I18n.inbox_col_reason; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; vertical-alignment: center; }
+    Text { x: root.x-time; width: InboxCols.time; height: 100%; text: I18n.inbox_col_time; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: right; vertical-alignment: center; }
 
     // 列宽拖拽手柄（Title 弹性吸收）
     // Repo | Title：Repo 变宽，Title 吸收
@@ -323,7 +324,7 @@ component NotifRowItem inherits Rectangle {
         x: root.x-reason;
         width: InboxCols.reason;
         height: parent.height;
-        text: "已加入";
+        text: I18n.inbox_added;
         color: root.fg-dim;
         font-size: Theme.fs_xs;
         horizontal-alignment: right;
@@ -365,7 +366,7 @@ component NotifRowItem inherits Rectangle {
                 clicked => { root.add_review(); }
             }
             Text {
-                text: "+ 预评审";
+                text: I18n.inbox_add_review;
                 font-size: Theme.fs_xs;
                 color: root.selected ? root.fg : Theme.text_dim;
                 horizontal-alignment: center;
@@ -456,7 +457,7 @@ export component InboxView inherits FocusScope {
                     spacing: 8px;
 
                     Text {
-                        text: "通知";
+                        text: I18n.inbox_title;
                         font-size: Theme.fs_xs;
                         font-weight: 600;
                         color: Theme.text_dim;
@@ -464,11 +465,11 @@ export component InboxView inherits FocusScope {
                     }
                     Rectangle { horizontal-stretch: 1; }
                     ToolButton {
-                        label: "全部已读";
+                        label: I18n.inbox_mark_all_read;
                         clicked => { root.mark_all_read(); }
                     }
                     TogglePill {
-                        label: "只看未读";
+                        label: I18n.inbox_unread_only;
                         on: root.unread_only;
                         clicked => {
                             root.unread_only = !root.unread_only;
@@ -489,15 +490,15 @@ export component InboxView inherits FocusScope {
             if root.needs_token: EmptyState {
                 vertical-stretch: 1;
                 icon_img: @image-url("icons/key.svg");
-                title: "需要 GitHub token";
-                hint: "通知接口需要鉴权。打开设置填入 GitHub token，或配置 GITHUB_TOKEN 环境变量。";
+                title: I18n.inbox_needs_token_title;
+                hint: I18n.inbox_needs_token_hint;
             }
 
             if !root.needs_token && root.rows.length == 0: EmptyState {
                 vertical-stretch: 1;
                 icon_img: @image-url("icons/inbox.svg");
-                title: "没有通知";
-                hint: "GitHub 通知为空。点顶栏刷新按钮重新拉取。";
+                title: I18n.inbox_empty_title;
+                hint: I18n.inbox_empty_hint;
             }
 
             if !root.needs_token && root.rows.length > 0: InboxHeader {}
@@ -585,7 +586,7 @@ export component NotifPreview inherits Rectangle {
     callback diff_file_toggled(int);
 
     property <bool> is_pr: root.kind == "PullRequest";
-    property <[string]> tabs: root.is_pr ? ["会话", "Files", "Diff"] : ["会话"];
+    property <[string]> tabs: root.is_pr ? [I18n.tab_conversation, I18n.tab_files, I18n.tab_diff] : [I18n.tab_conversation];
     in-out property <int> current_tab: 0;
 
     width: root.visible ? root.panel_width : 0px;
@@ -623,7 +624,7 @@ export component NotifPreview inherits Rectangle {
                         clip: true;
                         Text {
                             width: parent.width;
-                            text: root.title == "" ? "未选择" : root.title;
+                            text: root.title == "" ? I18n.inbox_not_selected : root.title;
                             color: Theme.text;
                             font-size: Theme.fs_lg;
                             font-weight: 600;
@@ -661,11 +662,11 @@ export component NotifPreview inherits Rectangle {
                     }
                     Rectangle { horizontal-stretch: 1; }
                     OutlineBtn {
-                        label: "在浏览器打开";
+                        label: I18n.inbox_open_browser;
                         clicked => { root.open_browser(); }
                     }
                     if root.is_pr: OutlineBtn {
-                        label: root.added ? "已加入" : "+ 预评审";
+                        label: root.added ? I18n.inbox_added : I18n.inbox_add_review;
                         active: root.added;
                         tint: Theme.good;
                         clicked => { if (!root.added) { root.add_review(); } }
@@ -824,8 +825,8 @@ export component NotifPreview inherits Rectangle {
                 }
                 if root.convo_entries.length == 0 && !root.loading: EmptyState {
                     icon_img: @image-url("icons/comment.svg");
-                    title: "暂无会话记录";
-                    hint: "评论活动将显示在这里";
+                    title: I18n.convo_empty_title;
+                    hint: I18n.inbox_convo_empty_hint;
                 }
             }
 
@@ -873,8 +874,8 @@ export component NotifPreview inherits Rectangle {
                 }
                 if root.files.length == 0 && !root.loading: EmptyState {
                     icon_img: @image-url("icons/file.svg");
-                    title: "暂无文件变更";
-                    hint: "Diff 文件列表将显示在这里";
+                    title: I18n.files_empty_title;
+                    hint: I18n.files_empty_hint;
                 }
             }
 
@@ -888,7 +889,7 @@ export component NotifPreview inherits Rectangle {
             if root.loading: Rectangle {
                 background: Theme.bg.with-alpha(0.7);
                 Text {
-                    text: "加载中…";
+                    text: I18n.inbox_loading;
                     color: Theme.text_dim;
                     font-size: Theme.fs_md;
                     horizontal-alignment: center;

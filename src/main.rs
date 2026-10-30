@@ -15,6 +15,7 @@ mod model;
 
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::{self, Db};
+use pr_desk_rs::i18n::{tr, trf};
 use pr_desk_rs::reviewer::LlmSettings;
 use pr_desk_rs::{diffview, github, ocr, reviewer, sync};
 
@@ -41,14 +42,24 @@ const PART_CONVO: u8 = 1;   // 会话 tab：评论 + 评审意见
 const PART_FILES: u8 = 2;   // Files tab
 const PART_CHECKS: u8 = 4;  // Checks tab / 打开面板（含 meta：状态徽章/更新时间）
 
-/// 状态栏配置状态文本。
+/// 状态栏配置状态文本（语言取 cfg.language）。
 fn config_status(cfg: &Config) -> String {
+    let lang = cfg.language.as_str();
     if cfg.is_unconfigured() {
-        return "未配置（点右上角设置）".into();
+        return tr(lang, "cfg_unconfigured").into();
     }
-    let mut parts = vec![format!("GitHub 已配置 {} 个仓库", cfg.repos.len())];
-    parts.push(if cfg.sync_token.is_empty() { "sync 未启用".into() } else { "sync 已配置".into() });
+    let mut parts = vec![trf(lang, "cfg_repos", &[&cfg.repos.len().to_string()])];
+    parts.push(if cfg.sync_token.is_empty() {
+        tr(lang, "cfg_sync_off").into()
+    } else {
+        tr(lang, "cfg_sync_on").into()
+    });
     parts.join(" · ")
+}
+
+/// 当前界面语言（"zh"/"en"），从配置读取。
+fn lang_of(app: &Arc<Mutex<App>>) -> String {
+    app.lock().unwrap().cfg.language.clone()
 }
 
 enum Msg {
@@ -142,14 +153,14 @@ struct ReviewProps {
     comments: Vec<OcrCommentRow>,
 }
 
-/// 评审分项键名 → 中文名（未知键原样展示）。
-fn dim_label(key: &str) -> &str {
+/// 评审分项键名 → 界面语言名（未知键原样展示）。
+fn dim_label<'a>(key: &'a str, lang: &str) -> std::borrow::Cow<'a, str> {
     match key {
-        "readability" => "可读性",
-        "correctness_risk" => "正确性风险",
-        "test_coverage" => "测试覆盖",
-        "security" => "安全",
-        other => other,
+        "readability" => tr(lang, "dim_readability").into(),
+        "correctness_risk" => tr(lang, "dim_correctness_risk").into(),
+        "test_coverage" => tr(lang, "dim_test_coverage").into(),
+        "security" => tr(lang, "dim_security").into(),
+        other => other.into(),
     }
 }
 
@@ -208,7 +219,8 @@ fn ocr_comment_rows(rv: &serde_json::Value) -> Vec<OcrCommentRow> {
 }
 
 /// 体量行组装："XL（+2122/-23，24 个文件）"；label/增删行/文件数全缺时给空串。
-fn size_line(rv: &serde_json::Value) -> String {
+/// lang："zh"/"en"（分隔符与「个文件」文案随语言切换）。
+fn size_line(rv: &serde_json::Value, lang: &str) -> String {
     let label = rv["size_label"].as_str().unwrap_or("");
     let adds = rv["additions"].as_i64();
     let dels = rv["deletions"].as_i64();
@@ -221,18 +233,21 @@ fn size_line(rv: &serde_json::Value) -> String {
         parts.push(format!("+{}/-{}", adds.unwrap_or(0), dels.unwrap_or(0)));
     }
     if let Some(f) = files {
-        parts.push(format!("{f} 个文件"));
+        parts.push(trf(lang, "size_files", &[&f.to_string()]));
     }
     if parts.is_empty() {
         label.to_string()
-    } else if label.is_empty() {
-        format!("（{}）", parts.join("，"))
     } else {
-        format!("{label}（{}）", parts.join("，"))
+        let joined = parts.join(tr(lang, "list_sep"));
+        if label.is_empty() {
+            trf(lang, "size_wrap_fmt", &[&joined])
+        } else {
+            trf(lang, "size_full_fmt", &[label, &joined])
+        }
     }
 }
 
-fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
+fn review_props(review: Option<&serde_json::Value>, lang: &str) -> ReviewProps {
     let Some(rv) = review else {
         return ReviewProps {
             has: false,
@@ -252,11 +267,11 @@ fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
         .unwrap_or_default();
     let dimension_lines = dims
         .iter()
-        .map(|(k, v)| format!("{}  {}/10", dim_label(k), v))
+        .map(|(k, v)| format!("{}  {}/10", dim_label(k, lang), v))
         .collect();
     let dimensions = dims
         .iter()
-        .map(|(k, v)| (dim_label(k).to_string(), v.as_f64().unwrap_or(0.0) as f32))
+        .map(|(k, v)| (dim_label(k, lang).to_string(), v.as_f64().unwrap_or(0.0) as f32))
         .collect();
     let summary = rv["summary"].as_str().unwrap_or("").to_string();
     let flagged = json_field(rv, "flagged_files")
@@ -278,7 +293,7 @@ fn review_props(review: Option<&serde_json::Value>) -> ReviewProps {
         dimensions,
         summary_blocks: pr_desk_rs::markdown::parse_markdown(&summary),
         summary,
-        size_line: size_line(rv),
+        size_line: size_line(rv, lang),
         flagged,
         reviewed_at: rv["reviewed_at"].as_str().unwrap_or("").to_string(),
         comments: ocr_comment_rows(rv),
@@ -374,17 +389,18 @@ struct App {
 /// 状态栏组合逻辑已内联进 update_status_bar（三段：同步/配额/总数）。
 fn update_status_bar(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     let a = app.lock().unwrap();
+    let lang = a.cfg.language.as_str();
     // 状态栏三段：同步/临时消息 · API 配额 · PR 总数
     let sync_text = if !a.status_msg.is_empty() {
         a.status_msg.clone()
     } else if a.cfg.sync_token.is_empty() {
         // 未配置同步：明确提示本地模式，不留空白
-        "本地模式 · 未配置同步服务器".into()
+        tr(lang, "sb_local_mode").into()
     } else {
-        sync::last_sync_text(&a.last_sync).unwrap_or_else(|| "等待首次同步…".into())
+        sync::last_sync_text(&a.last_sync, lang).unwrap_or_else(|| tr(lang, "sb_wait_sync").into())
     };
     let quota = a.rate_limit.lock().unwrap()
-        .map(|n| format!("API 配额 {n}"))
+        .map(|n| trf(lang, "sb_api_quota", &[&n.to_string()]))
         .unwrap_or_default();
     ui.set_sb_sync(sync_text.into());
     ui.set_sb_quota(quota.into());
@@ -487,6 +503,8 @@ fn main() -> anyhow::Result<()> {
     ui.set_inbox_needs_token(cfg.token().is_none());
     // 启动时把配置的主题应用到 UI
     ui.set_dark_mode(cfg.is_dark());
+    // 启动时把配置的语言应用到 UI（Slint 侧 I18n 单例由 app.slint 的 changed language 回调处理）
+    ui.set_language(cfg.language.clone().into());
 
     // 主题切换：即时持久化到 config.toml
     {
@@ -498,6 +516,27 @@ fn main() -> anyhow::Result<()> {
             if let Err(e) = a.cfg.save(&cfg_path) {
                 tracing::warn!("主题写入 config.toml 失败: {e}");
             }
+        });
+    }
+
+    // 语言切换：持久化到 config.toml，并重建行模型（组标题/活动行语言跟随）
+    {
+        let app = app.clone();
+        let cfg_path = cfg_path.clone();
+        ui.on_language_changed(move |lang| {
+            let lang = if lang.as_str() == "en" { "en" } else { "zh" }.to_string();
+            {
+                let mut a = app.lock().unwrap();
+                if a.cfg.language == lang {
+                    return; // 启动 set_language 的同值回调：不落盘不重建
+                }
+                a.cfg.language = lang;
+                if let Err(e) = a.cfg.save(&cfg_path) {
+                    tracing::warn!("语言写入 config.toml 失败: {e}");
+                }
+            }
+            reload_rows_global(&app);
+            send_msg(Msg::StatusBarRefresh);
         });
     }
 
@@ -765,7 +804,8 @@ fn main() -> anyhow::Result<()> {
             if let Some((_, _, _, url)) = detail {
                 if !url.is_empty() {
                     if let Err(e) = open::that(&url) {
-                        send_msg(Msg::Status(format!("打开浏览器失败: {e}")));
+                        let lang = lang_of(&app);
+                        send_msg(Msg::Status(trf(&lang, "open_browser_failed", &[&e.to_string()])));
                     }
                 }
             }
@@ -885,6 +925,7 @@ fn main() -> anyhow::Result<()> {
                 repos,
                 poll_interval_min: poll,
                 theme: app.lock().unwrap().cfg.theme.clone(), // 主题不在设置页，保留当前值
+                language: app.lock().unwrap().cfg.language.clone(), // 语言不在设置页，保留当前值
                 llm_base_url: llm_base.trim().to_string(),
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),
@@ -892,7 +933,8 @@ fn main() -> anyhow::Result<()> {
                 review_concurrency,
             };
             if let Err(e) = new_cfg.save(&cfg_path) {
-                send_msg(Msg::Status(format!("配置保存失败: {e}")));
+                let lang = lang_of(&app);
+                send_msg(Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])));
                 return;
             }
             {
@@ -907,7 +949,7 @@ fn main() -> anyhow::Result<()> {
                 ui.set_inbox_needs_token(new_cfg.token().is_none());
                 update_status_bar(&ui, &app);
             }
-            send_msg(Msg::Status("配置已保存并生效".into()));
+            send_msg(Msg::Status(tr(&lang_of(&app), "cfg_saved").into()));
             let _ = cmd_tx.send(Cmd::ReloadConfig); // 热生效，不用重启
         });
     }
@@ -942,9 +984,10 @@ fn toggle_of(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str) -> i64
 fn local_update<V: Into<serde_json::Value>>(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str, value: V) {
     let a = app.lock().unwrap();
     if a.db.local_pr_update(repo, number, field, &value.into()).is_ok() {
+        let lang = a.cfg.language.clone();
         drop(a);
         reload_rows_global(app);
-        send_msg(Msg::Status(format!("已更新 {field}（待同步）")));
+        send_msg(Msg::Status(trf(&lang, "field_updated", &[field])));
     }
 }
 
@@ -961,6 +1004,7 @@ fn reload_rows_global(app: &Arc<Mutex<App>>) {
 // ── 详情抽屉 ──
 
 fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, number: i64, refetch: bool) {
+    let lang = lang_of(app);
     // 选中态存身份而非下标：刷新后行序变化，面板仍指向同一个 PR；
     // 行被刷新滤掉时面板也保持打开（数据来自 DB/快照，row 允许为 None）
     let (priority, row_idx) = {
@@ -986,18 +1030,22 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
     let mut body = String::new();
     if let Some(rv) = &review {
         if let Some(s) = rv["score"].as_f64() {
-            body.push_str(&format!("综合评分：{s:.1}/10\n"));
+            body.push_str(&trf(&lang, "body_score", &[&format!("{s:.1}")]));
+            body.push('\n');
         } else {
-            body.push_str("评审解析失败（分数为空）\n");
+            body.push_str(tr(&lang, "body_score_failed"));
+            body.push('\n');
         }
         if let Some(dims) = rv["dimensions"].as_str() {
             if let Ok(d) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(dims) {
                 let parts: Vec<String> = d.iter().map(|(k, v)| format!("{k} {}", v)).collect();
-                body.push_str(&format!("分项：{}\n", parts.join(" | ")));
+                body.push_str(&trf(&lang, "body_dimensions", &[&parts.join(" | ")]));
+                body.push('\n');
             }
         }
         if let Some(sz) = rv["size_label"].as_str() {
-            body.push_str(&format!("体量：{sz}\n"));
+            body.push_str(&trf(&lang, "body_size", &[sz]));
+            body.push('\n');
         }
         if let Some(s) = rv["summary"].as_str() {
             body.push_str(&format!("\n{s}"));
@@ -1005,12 +1053,15 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
         if let Some(fl) = rv["flagged_files"].as_str() {
             if let Ok(files) = serde_json::from_str::<Vec<serde_json::Value>>(fl) {
                 if !files.is_empty() {
-                    body.push_str("\n\n风险文件：");
+                    body.push_str(&format!("\n\n{}", tr(&lang, "body_flagged")));
                     for f in files {
-                        body.push_str(&format!(
-                            "\n- {}：{}",
-                            f["path"].as_str().unwrap_or("?"),
-                            f["issue"].as_str().unwrap_or("")
+                        body.push_str(&trf(
+                            &lang,
+                            "flagged_item_fmt",
+                            &[
+                                f["path"].as_str().unwrap_or("?"),
+                                f["issue"].as_str().unwrap_or(""),
+                            ],
                         ));
                     }
                 }
@@ -1061,14 +1112,14 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
         convo_json,
         checks_json,
         files_json,
-        review: review_props(review.as_ref()),
+        review: review_props(review.as_ref(), &lang),
     });
 
     // 评审进行中打开该 PR 面板：紧随 Panel 之后把面板置 running
     //（apply_msg 顺序处理，ReviewProgress 在 Panel 重置状态后生效）
     let running = app.lock().unwrap().review_slots.lock().unwrap().is_running(&repo, number);
     if running {
-        send_msg(Msg::ReviewProgress { repo: repo.clone(), number, text: "评审进行中…".into() });
+        send_msg(Msg::ReviewProgress { repo: repo.clone(), number, text: tr(&lang, "review_running").into() });
     }
 
     match diff_cached {
@@ -1332,7 +1383,8 @@ async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::
             let _ = msg_tx.send(Msg::InboxRows(rows));
         }
         Err(e) => {
-            let _ = msg_tx.send(Msg::Status(format!("通知拉取失败: {e}")));
+            let lang = lang_of(app);
+            let _ = msg_tx.send(Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])));
         }
     }
 }
@@ -1348,10 +1400,11 @@ async fn run_review_task(
     repo: &str,
     number: i64,
 ) {
+    let lang = cfg.language.as_str();
     let _ = msg_tx.send(Msg::ReviewProgress {
         repo: repo.to_string(),
         number,
-        text: format!("开始评审 {repo} #{number}…"),
+        text: trf(lang, "review_start", &[repo, &number.to_string()]),
     });
     // 进度回调 → channel（状态栏 + 面板进度，见 Msg::ReviewProgress）
     let tx = msg_tx.clone();
@@ -1359,31 +1412,34 @@ async fn run_review_task(
     let mut progress = move |text: String| {
         let _ = tx.send(Msg::ReviewProgress { repo: r2.clone(), number: n2, text });
     };
-    match reviewer::run_review(llm, g, repo, number, &mut progress).await {
+    match reviewer::run_review(llm, g, repo, number, &mut progress, lang).await {
         Ok(mut v) => {
             // 第二段：OCR 行级评论（评分已拿到，OCR 失败不拖垮整单）
             match g.fetch_pr_meta(repo, number).await {
                 Ok(meta) => {
-                    match ocr::run_ocr_review(cfg, g, repo, number, &meta, &mut progress).await {
+                    match ocr::run_ocr_review(cfg, g, repo, number, &meta, &mut progress, lang).await {
                         Ok(outcome) => {
                             let _ = msg_tx.send(Msg::ReviewProgress {
                                 repo: repo.to_string(),
                                 number,
-                                text: format!(
-                                    "OCR 完成：{} 条评论（{} 个文件）",
-                                    outcome.comments.len(),
-                                    outcome.files_reviewed
+                                text: trf(
+                                    lang,
+                                    "ocr_done_status",
+                                    &[
+                                        &outcome.comments.len().to_string(),
+                                        &outcome.files_reviewed.to_string(),
+                                    ],
                                 ),
                             });
                             v["comments"] = serde_json::Value::Array(outcome.comments);
                         }
                         Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(format!("OCR 明细获取失败：{e}")));
+                            let _ = msg_tx.send(Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])));
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = msg_tx.send(Msg::Status(format!("OCR 明细获取失败：{e}")));
+                    let _ = msg_tx.send(Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])));
                 }
             }
             let ok = { app.lock().unwrap().db.upsert_review(&v).is_ok() };
@@ -1393,7 +1449,7 @@ async fn run_review_task(
                 let _ = msg_tx.send(Msg::ReviewFailed {
                     repo: repo.to_string(),
                     number,
-                    err: "评审结果入库失败".into(),
+                    err: tr(lang, "review_save_failed").into(),
                 });
             }
         }
@@ -1436,12 +1492,14 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
                 }
             }
             Err(e) => {
-                let _ = msg_tx.send(Msg::Status(format!("拉取 {repo} 失败: {e}")));
+                let lang = lang_of(app);
+                let _ = msg_tx.send(Msg::Status(trf(&lang, "repo_fetch_failed", &[repo, &e.to_string()])));
             }
         }
     }
     reload_rows(app, msg_tx);
-    let _ = msg_tx.send(Msg::Status(format!("GitHub 刷新完成：{total} 个 open PR")));
+    let lang = lang_of(app);
+    let _ = msg_tx.send(Msg::Status(trf(&lang, "gh_refresh_done", &[&total.to_string()])));
 }
 
 /// 一次 sync_pull → 本地应用 → outbox/reviews push 流程（Cmd::Sync 与 sync 模式下的
@@ -1489,16 +1547,27 @@ async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: 
     match result {
         Ok(((p, r, t), push)) => {
             // 记入「已同步 X 前」共享状态（状态栏组合读取）
-            let last_sync = app.lock().unwrap().last_sync.clone();
+            let (last_sync, lang) = {
+                let a = app.lock().unwrap();
+                (a.last_sync.clone(), a.cfg.language.clone())
+            };
             sync::mark_synced(&last_sync);
-            let _ = msg_tx.send(Msg::Status(format!(
-                "已同步服务器列表：拉取 {p} PR/{r} 评审/{t} 待办；推送 {} 条（冲突 {}）",
-                push.applied, push.conflicts
+            let _ = msg_tx.send(Msg::Status(trf(
+                &lang,
+                "sync_done",
+                &[
+                    &p.to_string(),
+                    &r.to_string(),
+                    &t.to_string(),
+                    &push.applied.to_string(),
+                    &push.conflicts.to_string(),
+                ],
             )));
             reload_rows(app, msg_tx);
         }
         Err(e) => {
-            let _ = msg_tx.send(Msg::Status(format!("同步失败: {e}")));
+            let lang = lang_of(app);
+            let _ = msg_tx.send(Msg::Status(trf(&lang, "sync_failed", &[&e.to_string()])));
         }
     }
 }
@@ -1513,7 +1582,8 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
     let mut gh = match github::GitHub::new(token) {
         Ok(g) => Some(g),
         Err(e) => {
-            let _ = msg_tx.send(Msg::Status(format!("GitHub 客户端初始化失败: {e}")));
+            let lang = lang_of(&app);
+            let _ = msg_tx.send(Msg::Status(trf(&lang, "gh_client_init_failed", &[&e.to_string()])));
             None
         }
     };
@@ -1533,6 +1603,8 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
         Default::default();
 
     while let Ok(cmd) = rx.recv() {
+        // 每条命令开始时取一次界面语言（设置页切换语言后下条命令即生效）
+        let lang = lang_of(&app);
         match cmd {
             Cmd::RefreshGithub => {
                 if let Some(gh) = &gh {
@@ -1568,7 +1640,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             let _ = msg_tx.send(Msg::StatusBarRefresh);
                         }
                         Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(format!("diff 拉取失败: {e}")));
+                            let _ = msg_tx.send(Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
                         }
                     }
                 }
@@ -1583,7 +1655,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     match gh.mark_notification_read(&thread_id).await {
                         Ok(()) => fetch_inbox(gh, &app, &msg_tx).await,
                         Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(format!("标记已读失败: {e}")));
+                            let _ = msg_tx.send(Msg::Status(trf(&lang, "mark_read_failed", &[&e.to_string()])));
                         }
                     }
                     let _ = msg_tx.send(Msg::StatusBarRefresh);
@@ -1595,7 +1667,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     let convo = match gh.fetch_pr_convo(&repo, number).await {
                         Ok(c) => c,
                         Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(format!("会话拉取失败: {e}")));
+                            let _ = msg_tx.send(Msg::Status(trf(&lang, "convo_fetch_failed", &[&e.to_string()])));
                             Vec::new()
                         }
                     };
@@ -1603,14 +1675,14 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         let files = match gh.fetch_pr_files(&repo, number).await {
                             Ok(f) => f,
                             Err(e) => {
-                                let _ = msg_tx.send(Msg::Status(format!("文件列表拉取失败: {e}")));
+                                let _ = msg_tx.send(Msg::Status(trf(&lang, "files_fetch_failed", &[&e.to_string()])));
                                 Vec::new()
                             }
                         };
                         let diff = match gh.fetch_diff(&repo, number).await {
                             Ok(d) => d,
                             Err(e) => {
-                                let _ = msg_tx.send(Msg::Status(format!("diff 拉取失败: {e}")));
+                                let _ = msg_tx.send(Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
                                 String::new()
                             }
                         };
@@ -1629,11 +1701,11 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             Cmd::MarkAllNotifsRead => {                if let Some(gh) = &gh {
                     match gh.mark_all_notifications_read().await {
                         Ok(()) => {
-                            let _ = msg_tx.send(Msg::Status("通知已全部标记已读".into()));
+                            let _ = msg_tx.send(Msg::Status(tr(&lang, "all_marked_read").into()));
                             fetch_inbox(gh, &app, &msg_tx).await;
                         }
                         Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(format!("全部已读失败: {e}")));
+                            let _ = msg_tx.send(Msg::Status(trf(&lang, "mark_all_read_failed", &[&e.to_string()])));
                         }
                     }
                     let _ = msg_tx.send(Msg::StatusBarRefresh);
@@ -1646,7 +1718,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     a.db.pr_exists(&repo, number).unwrap_or(false)
                 };
                 if exists {
-                    let _ = msg_tx.send(Msg::Status(format!("{repo} #{number} 已在列表中")));
+                    let _ = msg_tx.send(Msg::Status(trf(&lang, "already_in_list", &[&repo, &number.to_string()])));
                 } else {
                     let ok = {
                         let a = app.lock().unwrap();
@@ -1658,9 +1730,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         })).is_ok()
                     };
                     let _ = msg_tx.send(Msg::Status(if ok {
-                        format!("已加入预评审：{repo} #{number}")
+                        trf(&lang, "added_review", &[&repo, &number.to_string()])
                     } else {
-                        format!("加入预评审失败：{repo} #{number}")
+                        trf(&lang, "add_review_failed", &[&repo, &number.to_string()])
                     }));
                     if ok {
                         reload_rows(&app, &msg_tx);
@@ -1679,7 +1751,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 };
                 // LLM 配置缺失：立即提示，不占并发槽
                 let Some(llm) = LlmSettings::from_config(&cfg) else {
-                    let _ = msg_tx.send(Msg::Status("请先在设置里配置 LLM API Key 和模型".into()));
+                    let _ = msg_tx.send(Msg::Status(tr(&lang, "llm_not_configured").into()));
                     continue;
                 };
                 // 并发槽：同一 PR 重入 / 超额都立即拒绝（槽位由任务内 SlotGuard 释放）
@@ -1688,14 +1760,12 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 match acquired {
                     Ok(()) => {}
                     Err(SlotError::AlreadyRunning) => {
-                        let _ = msg_tx.send(Msg::Status("该 PR 正在评审中".into()));
+                        let _ = msg_tx.send(Msg::Status(tr(&lang, "review_already_running").into()));
                         continue;
                     }
                     Err(SlotError::AtCapacity) => {
-                        let _ = msg_tx.send(Msg::Status(format!(
-                            "已有 {} 个评审进行中，稍后再试",
-                            slots.lock().unwrap().capacity
-                        )));
+                        let cap = slots.lock().unwrap().capacity.to_string();
+                        let _ = msg_tx.send(Msg::Status(trf(&lang, "review_slots_full", &[&cap])));
                         continue;
                     }
                 }
@@ -1715,7 +1785,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             let _ = tx.send(Msg::ReviewFailed {
                                 repo: repo.clone(),
                                 number,
-                                err: format!("GitHub 客户端初始化失败: {e}"),
+                                err: trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
                             });
                             None
                         }
@@ -1740,8 +1810,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     key.trim().to_string()
                 };
                 let tx = msg_tx.clone();
+                let lang2 = lang.clone();
                 tokio::spawn(async move {
-                    let _ = tx.send(Msg::Status("正在拉取模型列表…".into()));
+                    let _ = tx.send(Msg::Status(tr(&lang2, "models_fetching").into()));
                     let url = format!("{base}/models");
                     let result = async {
                         let resp = reqwest::Client::new()
@@ -1771,10 +1842,10 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         Ok(ids) => {
                             let n = ids.len();
                             let _ = tx.send(Msg::ModelsLoaded(ids));
-                            let _ = tx.send(Msg::Status(format!("拉取到 {n} 个模型")));
+                            let _ = tx.send(Msg::Status(trf(&lang2, "models_fetched", &[&n.to_string()])));
                         }
                         Err(e) => {
-                            let _ = tx.send(Msg::Status(format!("模型列表拉取失败：{e}")));
+                            let _ = tx.send(Msg::Status(trf(&lang2, "models_fetch_failed", &[&e.to_string()])));
                         }
                     }
                 });
@@ -1811,7 +1882,11 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             }
                         }
                         Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(format!("补齐 PR 元数据失败 {repo} #{number}: {e}")));
+                            let _ = msg_tx.send(Msg::Status(trf(
+                                &lang,
+                                "meta_fill_failed",
+                                &[&repo, &number.to_string(), &e.to_string()],
+                            )));
                         }
                     }
                 }
@@ -1840,7 +1915,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     .unwrap_or(false);
                 if (!want_convo && !want_files && !want_checks) || quota_low {
                     if quota_low {
-                        let _ = msg_tx.send(Msg::Status("API 配额不足，跳过实时刷新（整点恢复）".into()));
+                        let _ = msg_tx.send(Msg::Status(tr(&lang, "quota_low_skip").into()));
                     }
                     continue;
                 }
@@ -1856,7 +1931,11 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         match g.fetch_pr_meta(&repo, number).await {
                             Ok(m) => Some(m),
                             Err(e) => {
-                                let _ = msg_tx.send(Msg::Status(format!("实时刷新失败 {repo} #{number}: {e}")));
+                                let _ = msg_tx.send(Msg::Status(trf(
+                                    &lang,
+                                    "live_refresh_failed",
+                                    &[&repo, &number.to_string(), &e.to_string()],
+                                )));
                                 continue;
                             }
                         }
@@ -2021,11 +2100,11 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         gh = Some(g);
                     }
                     Err(e) => {
-                        let _ = msg_tx.send(Msg::Status(format!("GitHub 客户端重建失败: {e}")));
+                        let _ = msg_tx.send(Msg::Status(trf(&lang, "gh_client_rebuild_failed", &[&e.to_string()])));
                     }
                 }
                 sync_client = sync::SyncClient::new(&cfg);
-                let _ = msg_tx.send(Msg::Status("配置已重载".into()));
+                let _ = msg_tx.send(Msg::Status(tr(&lang, "cfg_reloaded").into()));
                 // 复用现有流程：sync 模式同步服务器列表；本地模式拉全部 open PR
                 if let Some(g) = &gh {
                     if sync_client.enabled() {
@@ -2078,11 +2157,14 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
 /// 用当前 filter 过滤 app.rows 并重建 rows/groups 模型（折叠状态按组 key 从旧模型带回）。
 fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     // 在 UI 线程装配 Slint 模型（SharedString/Image 是 Rc，不跨线程）
-    let rows_json: Vec<serde_json::Value> = {
+    let (rows_json, lang) = {
         let a = app.lock().unwrap();
-        a.view.iter().map(|&i| a.rows[i].clone()).collect()
+        (
+            a.view.iter().map(|&i| a.rows[i].clone()).collect::<Vec<serde_json::Value>>(),
+            a.cfg.language.clone(),
+        )
     };
-    let (rows, mut groups) = model::build_models(&rows_json);
+    let (rows, mut groups) = model::build_models(&rows_json, &lang);
     // UI 展示顺序（分组重排后）的身份序列——resolve_view 的点击映射以此为准，
     // 不能用 a.view（数据库排序），两者在分组重排后不是一个序。
     let keys: Vec<(String, i64)> = rows
@@ -2126,7 +2208,8 @@ fn open_pr_url(app: &Arc<Mutex<App>>, repo: &str, number: &i64) {
             .unwrap_or_else(|| format!("https://github.com/{repo}/pull/{number}"))
     };
     if let Err(e) = open::that(&url) {
-        send_msg(Msg::Status(format!("打开浏览器失败: {e}")));
+        let lang = lang_of(app);
+        send_msg(Msg::Status(trf(&lang, "open_browser_failed", &[&e.to_string()])));
     }
 }
 
@@ -2234,19 +2317,21 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
             }
         }
         Msg::ReviewDone { repo, number } => {
-            app.lock().unwrap().status_msg = format!("评审完成：{repo} #{number}");
+            let lang = lang_of(app);
+            app.lock().unwrap().status_msg = trf(&lang, "review_done", &[&repo, &number.to_string()]);
             update_status_bar(ui, app);
             // 评审分数进列表 Rev 列：重建行模型
             reload_rows_global(app);
             if panel_matches(app, &repo, number) {
                 let rv = { app.lock().unwrap().db.get_review(&repo, number).ok().flatten() };
-                apply_review_props(ui, &review_props(rv.as_ref()));
+                apply_review_props(ui, &review_props(rv.as_ref(), &lang));
                 ui.set_d_review_status("done".into());
                 ui.set_d_review_progress("".into());
             }
         }
         Msg::ReviewFailed { repo, number, err } => {
-            app.lock().unwrap().status_msg = format!("评审失败：{repo} #{number}：{err}");
+            let lang = lang_of(app);
+            app.lock().unwrap().status_msg = trf(&lang, "review_failed", &[&repo, &number.to_string(), &err]);
             update_status_bar(ui, app);
             if panel_matches(app, &repo, number) {
                 ui.set_d_review_status("failed".into());
@@ -2497,11 +2582,12 @@ mod tests {
         let rv = serde_json::json!({
             "size_label": "XL", "additions": 2122, "deletions": 23, "files_changed": 24,
         });
-        assert_eq!(size_line(&rv), "XL（+2122/-23，24 个文件）");
-        assert_eq!(size_line(&serde_json::json!({})), "");
-        assert_eq!(size_line(&serde_json::json!({"size_label": "S"})), "S");
+        assert_eq!(size_line(&rv, "zh"), "XL（+2122/-23，24 个文件）");
+        assert_eq!(size_line(&rv, "en"), "XL (+2122/-23, 24 files)");
+        assert_eq!(size_line(&serde_json::json!({}), "zh"), "");
+        assert_eq!(size_line(&serde_json::json!({"size_label": "S"}), "zh"), "S");
         assert_eq!(
-            size_line(&serde_json::json!({"additions": 10, "deletions": 2, "files_changed": 3})),
+            size_line(&serde_json::json!({"additions": 10, "deletions": 2, "files_changed": 3}), "zh"),
             "（+10/-2，3 个文件）"
         );
     }
@@ -2514,7 +2600,7 @@ mod tests {
             "summary": "## 结论\n整体可用",
             "size_label": "M", "additions": 100, "deletions": 5, "files_changed": 4,
         });
-        let p = review_props(Some(&rv));
+        let p = review_props(Some(&rv), "zh");
         assert!(p.has);
         assert_eq!(p.size_line, "M（+100/-5，4 个文件）");
         assert!(p.dimensions.contains(&("可读性".to_string(), 8.0)));
@@ -2525,8 +2611,13 @@ mod tests {
         assert!(!p.summary_blocks.is_empty());
         assert_eq!(p.summary_blocks[0].kind, "h2");
         assert_eq!(p.summary_blocks[0].text, "结论");
+        // 英文：分项标签与体量行切换
+        let pe = review_props(Some(&rv), "en");
+        assert_eq!(pe.size_line, "M (+100/-5, 4 files)");
+        assert!(pe.dimensions.contains(&("Readability".to_string(), 8.0)));
+        assert!(pe.dimensions.contains(&("Security".to_string(), 6.0)));
         // 无评审：空态各字段为空
-        let p0 = review_props(None);
+        let p0 = review_props(None, "zh");
         assert!(!p0.has);
         assert!(p0.dimensions.is_empty());
         assert!(p0.summary_blocks.is_empty());

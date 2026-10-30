@@ -76,9 +76,10 @@ pub fn mark_synced(state: &SharedLastSync) {
 }
 
 /// 「已同步 27m 前」状态栏片段；从未同步过返回 None。
-pub fn last_sync_text(state: &SharedLastSync) -> Option<String> {
+/// lang："zh"/"en"（i18n::tr）。
+pub fn last_sync_text(state: &SharedLastSync, lang: &str) -> Option<String> {
     let ts = *state.lock().unwrap();
-    ts.map(|ts| format!("已同步 {} 前", rel_short(ts)))
+    ts.map(|ts| crate::i18n::trf(lang, "sync_last", &[&rel_short(ts)]))
 }
 
 /// 相对时间简写："27m" / "2h" / "3d"；未来时间归零为 "0m"。
@@ -405,9 +406,11 @@ mod tests {
     #[test]
     fn last_sync_state() {
         let state = shared_last_sync();
-        assert_eq!(last_sync_text(&state), None); // 从未同步
+        assert_eq!(last_sync_text(&state, "zh"), None); // 从未同步
         mark_synced(&state);
-        let text = last_sync_text(&state).unwrap();
+        let text = last_sync_text(&state, "zh").unwrap();
         assert!(text.starts_with("已同步 0m 前"), "got: {text}");
+        let text_en = last_sync_text(&state, "en").unwrap();
+        assert!(text_en.starts_with("Synced 0m ago"), "got: {text_en}");
     }
 }

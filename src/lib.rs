@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod diffview;
 pub mod github;
+pub mod i18n;
 pub mod markdown;
 pub mod ocr;
 pub mod reviewer;
@@ -31,9 +32,10 @@ pub fn exe_data_dir() -> std::path::PathBuf {
 /// 行数据 → 分组：（组标题, 该组内数据行的索引列表）。
 /// 分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
 /// 行只出现在一个组里；pinned 独立成组（不再出现在其状态组）。空组不返回。
-pub fn build_sections(rows: &[serde_json::Value]) -> Vec<(String, Vec<usize>)> {
+/// lang："zh"/"en"，组标题文案经 i18n::tr 取对应语言。
+pub fn build_sections(rows: &[serde_json::Value], lang: &str) -> Vec<(String, Vec<usize>)> {
     let mut out: Vec<(String, Vec<usize>)> = Vec::new();
-    let mut emit = |title: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
+    let mut emit = |title_key: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
         let idx: Vec<usize> = rows
             .iter()
             .enumerate()
@@ -41,30 +43,31 @@ pub fn build_sections(rows: &[serde_json::Value]) -> Vec<(String, Vec<usize>)> {
             .map(|(i, _)| i)
             .collect();
         if !idx.is_empty() {
-            out.push((format!("{title}（{}）", idx.len()), idx));
+            let title = i18n::tr(lang, title_key);
+            out.push((i18n::trf(lang, "section_title_fmt", &[title, &idx.len().to_string()]), idx));
         }
     };
     // 组标题纯文本（图标由 UI 层按 PrGroup.key 画 SVG；📌 等字形在部分字体下会豆腐块）
-    emit("Pinned", &|r| r["pinned"].as_i64() == Some(1));
-    emit("看板", &|r| {
+    emit("section_pinned", &|r| r["pinned"].as_i64() == Some(1));
+    emit("section_board", &|r| {
         r["pinned"].as_i64() != Some(1) && r["on_board"].as_i64() == Some(1)
     });
-    emit("待评审", &|r| {
+    emit("section_pending", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
             && r["status"].as_str() == Some("pending")
     });
-    emit("已评审", &|r| {
+    emit("section_reviewed", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
             && matches!(r["status"].as_str(), Some("reviewed") | Some("failed"))
     });
-    emit("不采纳", &|r| {
+    emit("section_rejected", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
             && r["status"].as_str() == Some("rejected")
     });
-    emit("已合入 / 已关闭", &|r| {
+    emit("section_closed", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
             && matches!(r["status"].as_str(), Some("merged") | Some("closed"))
@@ -103,18 +106,23 @@ mod tests {
             row(3, 0, 0, "pending"),  // 待评审
             row(4, 0, 0, "reviewed"), // 已评审
         ];
-        let sections = build_sections(&rows);
+        let sections = build_sections(&rows, "zh");
         assert_eq!(sections.len(), 4);
         assert!(sections[0].0.contains("Pinned") && sections[0].1 == vec![0]);
         assert!(sections[1].0.contains("看板") && sections[1].1 == vec![1]);
         assert!(sections[2].0.contains("待评审") && sections[2].1 == vec![2]);
         assert!(sections[3].0.contains("已评审") && sections[3].1 == vec![3]);
+        // 英文：组标题与计数格式切换
+        let sections = build_sections(&rows, "en");
+        assert_eq!(sections.len(), 4);
+        assert_eq!(sections[1].0, "Board (1)");
+        assert_eq!(sections[2].0, "To Review (1)");
     }
 
     #[test]
     fn sections_empty_hidden() {
         let rows = vec![row(1, 0, 0, "pending")];
-        let sections = build_sections(&rows);
+        let sections = build_sections(&rows, "zh");
         assert_eq!(sections.len(), 1);
         assert!(sections[0].0.contains("待评审"));
     }
@@ -123,7 +131,7 @@ mod tests {
     fn sections_pinned_exclusive() {
         // pinned 的行不再出现在其状态组
         let rows = vec![row(1, 1, 1, "pending")];
-        let sections = build_sections(&rows);
+        let sections = build_sections(&rows, "zh");
         assert_eq!(sections.len(), 1);
         assert!(sections[0].0.contains("Pinned"));
     }
