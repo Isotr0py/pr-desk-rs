@@ -1501,6 +1501,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
         let cfg = app.lock().unwrap().cfg.clone();
         sync::SyncClient::new(&cfg)
     };
+    // 实时刷新节流：同一 PR 的上次拉取时间（120s 内不重复拉，防烧穿 GitHub 限额）
+    let mut live_fetched: std::collections::HashMap<(String, i64), std::time::Instant> =
+        Default::default();
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -1780,6 +1783,28 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             Cmd::FetchPrLive { repo, number } => {
                 // 打开面板时实时拉取：meta 必须成功（state/updated/sha 都靠它），
                 // 其余四项允许单独失败（记 debug，用部分数据继续）
+                //
+                // 节流：同一 PR 120s 内不重复拉（打开面板就发 5 个请求，连点会烧穿
+                // GitHub 5000/时的限额）；配额剩余 <50 时直接跳过。
+                let recently = live_fetched
+                    .get(&(repo.clone(), number))
+                    .map(|t| t.elapsed().as_secs() < 120)
+                    .unwrap_or(false);
+                let quota_low = app
+                    .lock()
+                    .unwrap()
+                    .rate_limit
+                    .lock()
+                    .unwrap()
+                    .map(|r| r < 50)
+                    .unwrap_or(false);
+                if recently || quota_low {
+                    if quota_low && !recently {
+                        let _ = msg_tx.send(Msg::Status("API 配额不足，跳过实时刷新（整点恢复）".into()));
+                    }
+                    continue;
+                }
+                live_fetched.insert((repo.clone(), number), std::time::Instant::now());
                 if let Some(g) = &gh {
                     match g.fetch_pr_meta(&repo, number).await {
                         Ok(meta) => {
