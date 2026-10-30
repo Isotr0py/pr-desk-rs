@@ -44,8 +44,9 @@ pub fn build_sections(rows: &[serde_json::Value]) -> Vec<(String, Vec<usize>)> {
             out.push((format!("{title}（{}）", idx.len()), idx));
         }
     };
-    emit("📌 Pinned", &|r| r["pinned"].as_i64() == Some(1));
-    emit("📌 看板", &|r| {
+    // 组标题纯文本（图标由 UI 层按 PrGroup.key 画 SVG；📌 等字形在部分字体下会豆腐块）
+    emit("Pinned", &|r| r["pinned"].as_i64() == Some(1));
+    emit("看板", &|r| {
         r["pinned"].as_i64() != Some(1) && r["on_board"].as_i64() == Some(1)
     });
     emit("待评审", &|r| {

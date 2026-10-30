@@ -44,7 +44,7 @@ const PART_CHECKS: u8 = 4;  // Checks tab / 打开面板（含 meta：状态徽�
 /// 状态栏配置状态文本。
 fn config_status(cfg: &Config) -> String {
     if cfg.is_unconfigured() {
-        return "未配置（点 ⚙ 设置）".into();
+        return "未配置（点右上角设置）".into();
     }
     let mut parts = vec![format!("GitHub 已配置 {} 个仓库", cfg.repos.len())];
     parts.push(if cfg.sync_token.is_empty() { "sync 未启用".into() } else { "sync 已配置".into() });
@@ -1005,7 +1005,7 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
         if let Some(fl) = rv["flagged_files"].as_str() {
             if let Ok(files) = serde_json::from_str::<Vec<serde_json::Value>>(fl) {
                 if !files.is_empty() {
-                    body.push_str("\n\n⚠ 风险文件：");
+                    body.push_str("\n\n风险文件：");
                     for f in files {
                         body.push_str(&format!(
                             "\n- {}：{}",

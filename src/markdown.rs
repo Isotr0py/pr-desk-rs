@@ -156,7 +156,7 @@ pub fn parse_markdown(md: &str) -> Vec<MdBlockOut> {
         }
         let mut t = t;
         if let Some(checked) = item.task {
-            t = format!("{} {}", if checked { "☑" } else { "☐" }, t);
+            t = format!("{} {}", if checked { "[x]" } else { "[ ]" }, t);
         }
         if item.ordered {
             t = format!("{}. {}", item.num, t);
@@ -437,8 +437,8 @@ mod tests {
     fn task_list_marker_prefix() {
         let blocks = parse_markdown("- [x] 已完成\n- [ ] 待办");
         assert_eq!(blocks.len(), 2);
-        assert!(blocks[0].text.starts_with("☑ "));
-        assert!(blocks[1].text.starts_with("☐ "));
+        assert!(blocks[0].text.starts_with("[x] "));
+        assert!(blocks[1].text.starts_with("[ ] "));
         assert!(blocks[0].text.contains("已完成"));
         assert!(blocks[1].text.contains("待办"));
     }

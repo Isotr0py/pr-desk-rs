@@ -65,11 +65,16 @@ component StateBadge inherits Rectangle {
         padding-right: 8px;
         spacing: 5px;
         alignment: center;
-        Text {
-            text: "●";
-            font-size: 7px;
-            color: root.tone;
-            vertical-alignment: center;
+        Rectangle {
+            width: 6px;
+            Image {
+                source: @image-url("icons/dot.svg");
+                width: 6px;
+                height: 6px;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                colorize: root.tone;
+            }
         }
         Text {
             text: root.state == "merged" ? "已合并"
@@ -100,11 +105,19 @@ component CiBadge inherits Rectangle {
         padding-right: 8px;
         spacing: 4px;
         alignment: center;
-        Text {
-            text: root.ci == "success" ? "✓" : root.ci == "failure" ? "✗" : "●";
-            font-size: 9px;
-            color: root.tone;
-            vertical-alignment: center;
+        Rectangle {
+            width: 10px;
+            Image {
+                source: root.ci == "success" ? @image-url("icons/check.svg")
+                    : root.ci == "failure" ? @image-url("icons/x.svg")
+                    : @image-url("icons/dot.svg");
+                width: root.ci == "pending" || (root.ci != "success" && root.ci != "failure") ? 6px : 10px;
+                height: self.width;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                colorize: root.tone;
+            }
         }
         Text {
             text: root.ci == "success" ? "CI 通过"
@@ -151,11 +164,16 @@ component SeverityBadge inherits Rectangle {
 }
 
 // 小号描边按钮：hover 淡底，active 时描边与文字着 tint 色
+// icon / trailing：前置/后置内嵌 SVG 图标（colorize 随文字色），规避字形缺失豆腐块
 component OutlineBtn inherits Rectangle {
     in property <string> label;
+    in property <image> icon;
+    in property <image> trailing;
     in property <bool> active: false;
     in property <color> tint: Theme.accent;
     callback clicked();
+
+    property <color> fg: root.active ? root.tint : (ta.has-hover ? Theme.text : Theme.text_dim);
 
     height: 26px;
     width: layout.preferred-width;
@@ -171,11 +189,34 @@ component OutlineBtn inherits Rectangle {
     layout := HorizontalLayout {
         padding-left: 10px;
         padding-right: 10px;
+        spacing: 5px;
+        if root.icon.width > 0: Rectangle {
+            width: 11px;
+            Image {
+                source: root.icon;
+                width: 11px;
+                height: 11px;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                colorize: root.fg;
+            }
+        }
         Text {
             text: root.label;
             font-size: Theme.fs_sm;
-            color: root.active ? root.tint : (ta.has-hover ? Theme.text : Theme.text_dim);
+            color: root.fg;
             vertical-alignment: center;
+        }
+        if root.trailing.width > 0: Rectangle {
+            width: 10px;
+            Image {
+                source: root.trailing;
+                width: 10px;
+                height: 10px;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                colorize: root.fg;
+            }
         }
     }
 
@@ -245,7 +286,7 @@ export component DetailPanel inherits Rectangle {
     in property <string> ci: "";            // success / failure / pending / ""（空不显示 CI 徽章）
     in property <string> opened: "";        // 创建相对时间，如 "3d"
     in property <string> updated: "";       // 更新相对时间，如 "2h"
-    in property <string> branches: "";      // 分支信息，如 "feature/x → main"
+    in property <string> branches: "";      // 分支信息，如 "feature/x -> main"
     in property <string> body: "";          // 评审文本（空串 → 空状态）
     in property <int> priority: 0;          // 0 未排 / 1 高 / 2 中 / 3 低
     in property <bool> pinned: false;
@@ -335,14 +376,14 @@ export component DetailPanel inherits Rectangle {
                             mouse-cursor: pointer;
                             clicked => { root.close(); }
                         }
-                        Text {
-                            text: "×";
-                            width: 100%;
-                            height: 100%;
-                            font-size: Theme.fs_lg;
-                            color: close_ta.has-hover ? Theme.text : Theme.text_dim;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        Image {
+                            source: @image-url("icons/x.svg");
+                            width: 11px;
+                            height: 11px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            image-fit: contain;
+                            colorize: close_ta.has-hover ? Theme.text : Theme.text_dim;
                         }
                     }
                 }
@@ -387,13 +428,15 @@ export component DetailPanel inherits Rectangle {
                     spacing: 8px;
                     alignment: start;
                     OutlineBtn {
-                        label: root.pinned ? "📌 已置顶" : "📌 置顶";
+                        label: root.pinned ? "已置顶" : "置顶";
+                        icon: @image-url("icons/pin.svg");
                         tint: Theme.mid;
                         active: root.pinned;
                         clicked => { root.action_toggle_pin(); }
                     }
                     OutlineBtn {
-                        label: root.on_board ? "看板 ▼" : "加入看板 ▼";
+                        label: root.on_board ? "看板" : "加入看板";
+                        trailing: @image-url("icons/chevron-down.svg");
                         active: root.on_board;
                         clicked => { root.action_board(); }
                     }
@@ -525,7 +568,7 @@ export component DetailPanel inherits Rectangle {
 
             // 评审：LLM 预评审报告（分数胶囊 / 维度进度条 / 体量行 / 总结 / 风险文件），整体可滚动
             if root.current_tab == 0: Rectangle {
-                // 转圈字符：Timer 驱动逐帧切换（仅 running 时转动）
+                // 转圈指示：Timer 驱动逐帧切换 4 帧旋转 SVG（Slint 无元素旋转属性，故用帧切换；仅 running 时转动）
                 property <int> spin_idx: 0;
                 Timer {
                     interval: 130ms;
@@ -582,17 +625,34 @@ export component DetailPanel inherits Rectangle {
                                 }
                             }
 
-                            // running：转圈 + 进度文本（常驻，visible 切换）
-                            Text {
+                            // running：转圈 SVG（帧动画）+ 进度文本（常驻，visible 切换）
+                            Rectangle {
                                 x: run_btn.width + 10px;
                                 y: 0;
                                 height: 30px;
+                                width: spin_img.width + 6px + spin_txt.preferred-width;
                                 visible: root.review_status == "running";
-                                text: (spin_idx == 0 ? "◐" : spin_idx == 1 ? "◓"
-                                    : spin_idx == 2 ? "◑" : "◒") + "  " + root.review_progress;
-                                font-size: Theme.fs_sm;
-                                color: Theme.text_dim;
-                                vertical-alignment: center;
+                                spin_img := Image {
+                                    x: 0;
+                                    y: (parent.height - self.height) / 2;
+                                    width: 14px;
+                                    height: 14px;
+                                    source: spin_idx == 0 ? @image-url("icons/spin-0.svg")
+                                        : spin_idx == 1 ? @image-url("icons/spin-1.svg")
+                                        : spin_idx == 2 ? @image-url("icons/spin-2.svg")
+                                        : @image-url("icons/spin-3.svg");
+                                    image-fit: contain;
+                                    colorize: Theme.text_dim;
+                                }
+                                spin_txt := Text {
+                                    x: spin_img.width + 6px;
+                                    y: 0;
+                                    height: 100%;
+                                    text: root.review_progress;
+                                    font-size: Theme.fs_sm;
+                                    color: Theme.text_dim;
+                                    vertical-alignment: center;
+                                }
                             }
                             // failed：失败提示（常驻，visible 切换）
                             Text {
@@ -720,9 +780,9 @@ export component DetailPanel inherits Rectangle {
                                     }
                                 }
 
-                                // 体量行：📦 XL（+990/-114，24 个文件），空串不显示
+                                // 体量行：XL（+990/-114，24 个文件），空串不显示
                                 if root.review_size_line != "": Text {
-                                    text: "📦 体量：" + root.review_size_line;
+                                    text: "体量：" + root.review_size_line;
                                     font-size: Theme.fs_sm;
                                     color: Theme.text_dim;
                                 }
@@ -764,13 +824,14 @@ export component DetailPanel inherits Rectangle {
                                     }
                                     for f[i] in root.review_flagged: Rectangle {
                                         height: f_txt.preferred-height + 2px;
-                                        Text {
+                                        Image {
                                             x: 0;
-                                            y: 0;
-                                            width: 16px;
-                                            text: "⚠";
-                                            font-size: Theme.fs_xs;
-                                            color: Theme.mid;
+                                            y: 2px;
+                                            width: 12px;
+                                            height: 12px;
+                                            source: @image-url("icons/warning.svg");
+                                            image-fit: contain;
+                                            colorize: Theme.mid;
                                         }
                                         f_txt := Text {
                                             x: 18px;
@@ -871,7 +932,7 @@ export component DetailPanel inherits Rectangle {
                         if !root.review_has && root.review_status != "running": Rectangle {
                             height: 240px;
                             EmptyState {
-                                icon: "◆";
+                                icon_img: @image-url("icons/diamond.svg");
                                 heading: "暂无评审报告";
                                 hint: "点击上方「开始预评审」，LLM 将对该 PR 生成结构化评审报告";
                             }
@@ -981,16 +1042,17 @@ export component DetailPanel inherits Rectangle {
                             spacing: 10px;
                             Rectangle {
                                 width: 16px;
-                                Text {
-                                    text: c.conclusion == "success" ? "✓"
-                                        : c.conclusion == "failure" ? "✗"
-                                        : c.conclusion == "pending" ? "◐" : "○";
-                                    width: 100%;
-                                    height: 100%;
-                                    font-size: Theme.fs_sm;
-                                    color: check_row.tone;
-                                    horizontal-alignment: center;
-                                    vertical-alignment: center;
+                                Image {
+                                    source: c.conclusion == "success" ? @image-url("icons/check.svg")
+                                        : c.conclusion == "failure" ? @image-url("icons/x.svg")
+                                        : c.conclusion == "pending" ? @image-url("icons/pending.svg")
+                                        : @image-url("icons/circle.svg");
+                                    width: 12px;
+                                    height: 12px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    image-fit: contain;
+                                    colorize: check_row.tone;
                                 }
                             }
                             Text {
@@ -1021,7 +1083,7 @@ export component DetailPanel inherits Rectangle {
                     }
                 }
                 if root.check_runs.length == 0: EmptyState {
-                    icon: "✓";
+                    icon_img: @image-url("icons/check.svg");
                     heading: "暂无 Checks";
                     hint: "这个 PR 还没有关联的 CI 检查记录";
                 }
@@ -1109,7 +1171,7 @@ export component DetailPanel inherits Rectangle {
             }
 
             if root.current_tab < 0 || root.current_tab > 4: EmptyState {
-                icon: "⚠";
+                icon_img: @image-url("icons/warning.svg");
                 heading: "即将推出";
                 hint: "这个标签页还没有实现";
             }

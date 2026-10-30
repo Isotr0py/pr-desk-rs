@@ -247,12 +247,32 @@ component GroupHeader inherits Rectangle {
         padding-right: 10px;
         spacing: 6px;
 
-        Text {
-            text: root.group.collapsed ? "▸" : "▾";
-            color: Theme.text_dim;
-            font-size: Theme.fs_xs;
+        Rectangle {
             width: 12px;
-            vertical-alignment: center;
+            Image {
+                source: root.group.collapsed
+                    ? @image-url("icons/chevron-right.svg")
+                    : @image-url("icons/chevron-down.svg");
+                width: 10px;
+                height: 10px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                colorize: Theme.text_dim;
+            }
+        }
+        // 置顶/看板组名前画 pin.svg（组标题已不含 📌 字形，见 lib.rs build_sections）
+        if root.group.key == "pinned" || root.group.key == "board": Rectangle {
+            width: 12px;
+            Image {
+                source: @image-url("icons/pin.svg");
+                width: 11px;
+                height: 11px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                colorize: root.group.key == "pinned" ? Theme.bad : Theme.text_dim;
+            }
         }
         Text {
             text: root.group.name.to-uppercase();
@@ -666,9 +686,9 @@ component PrRowItem inherits Rectangle {
             y: (parent.height - self.preferred-height) / 2;
             spacing: 4px;
             qa-open := QuickAction { icon: @image-url("icons/open.svg"); activated => { root.open_browser(); } }
-            qa-pin := QuickAction { glyph: "📌"; activated => { root.pin(); } }
-            qa-board := QuickAction { glyph: "＋"; activated => { root.board(); } }
-            qa-reject := QuickAction { glyph: "×"; activated => { root.reject(); } }
+            qa-pin := QuickAction { icon: @image-url("icons/pin.svg"); activated => { root.pin(); } }
+            qa-board := QuickAction { icon: @image-url("icons/plus.svg"); activated => { root.board(); } }
+            qa-reject := QuickAction { icon: @image-url("icons/x.svg"); activated => { root.reject(); } }
         }
     }
 

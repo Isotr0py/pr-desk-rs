@@ -122,7 +122,7 @@ impl Config {
                 fs::create_dir_all(parent).ok();
             }
             fs::write(path, TEMPLATE).context("写入 config.toml 模板失败")?;
-            tracing::info!("已生成配置模板 {:?}，请在应用内 ⚙ 设置页填写", path);
+            tracing::info!("已生成配置模板 {:?}，请在应用内设置页填写", path);
             return Ok(Config::default());
         }
         let text = fs::read_to_string(path).context("读取 config.toml 失败")?;

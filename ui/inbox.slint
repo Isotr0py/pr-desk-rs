@@ -189,12 +189,16 @@ component TogglePill inherits Rectangle {
         padding-left: 8px;
         padding-right: 8px;
         spacing: 4px;
-        Text {
-            text: root.on ? "✓" : "";
-            width: root.on ? self.preferred-width : 0px;
-            font-size: Theme.fs_xs;
-            color: Theme.accent;
-            vertical-alignment: center;
+        if root.on: Rectangle {
+            width: 10px;
+            Image {
+                source: @image-url("icons/check.svg");
+                width: 9px;
+                height: 9px;
+                y: (parent.height - self.height) / 2;
+                image-fit: contain;
+                colorize: Theme.accent;
+            }
         }
         Text {
             text: root.label;
@@ -484,14 +488,14 @@ export component InboxView inherits FocusScope {
 
             if root.needs_token: EmptyState {
                 vertical-stretch: 1;
-                icon: "🔑";
+                icon_img: @image-url("icons/key.svg");
                 title: "需要 GitHub token";
-                hint: "通知接口需要鉴权。打开设置（⚙）填入 GitHub token，或配置 GITHUB_TOKEN 环境变量。";
+                hint: "通知接口需要鉴权。打开设置填入 GitHub token，或配置 GITHUB_TOKEN 环境变量。";
             }
 
             if !root.needs_token && root.rows.length == 0: EmptyState {
                 vertical-stretch: 1;
-                icon: "📭";
+                icon_img: @image-url("icons/inbox.svg");
                 title: "没有通知";
                 hint: "GitHub 通知为空。点顶栏刷新按钮重新拉取。";
             }
@@ -636,14 +640,14 @@ export component NotifPreview inherits Rectangle {
                             mouse-cursor: pointer;
                             clicked => { root.close(); }
                         }
-                        Text {
-                            text: "×";
-                            width: 100%;
-                            height: 100%;
-                            font-size: Theme.fs_lg;
-                            color: close_ta.has-hover ? Theme.text : Theme.text_dim;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        Image {
+                            source: @image-url("icons/x.svg");
+                            width: 11px;
+                            height: 11px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            image-fit: contain;
+                            colorize: close_ta.has-hover ? Theme.text : Theme.text_dim;
                         }
                     }
                 }
@@ -868,7 +872,7 @@ export component NotifPreview inherits Rectangle {
                     }
                 }
                 if root.files.length == 0 && !root.loading: EmptyState {
-                    icon: "📄";
+                    icon_img: @image-url("icons/file.svg");
                     title: "暂无文件变更";
                     hint: "Diff 文件列表将显示在这里";
                 }

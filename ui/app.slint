@@ -150,7 +150,7 @@ component NumStepper inherits Rectangle {
             clicked => { root.value = max(root.minimum, root.value - 1); }
         }
         Text {
-            text: "−";
+            text: "-";
             color: root.value > root.minimum ? Theme.text : Theme.text_faint;
             font-size: Theme.fs_md;
             horizontal-alignment: center;
@@ -187,6 +187,8 @@ component NumStepper inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "PR Desk";
+    // 窗口图标：内嵌 SVG（默认图标在本机字体环境下标题栏显示为豆腐块）
+    icon: @image-url("icons/app.svg");
     preferred-width: 1280px;
     preferred-height: 760px;
     min-width: 900px;
@@ -454,7 +456,7 @@ export component MainWindow inherits Window {
                 spacing: 14px;
 
                 Text {
-                    text: "👋 欢迎使用 PR Desk";
+                    text: "欢迎使用 PR Desk";
                     color: Theme.text;
                     font-size: 20px;
                     font-weight: 700;
@@ -674,7 +676,7 @@ export component MainWindow inherits Window {
                         height: root.model_list_open ? 178px : 30px;
                         animate height { duration: 120ms; easing: ease-out; }
 
-                        // 标题行：「选择模型（N 个）▾」点击折叠/展开
+                        // 标题行：「选择模型（N 个）」点击折叠/展开，右侧 chevron 指示展开态
                         TouchArea {
                             x: 0; y: 0; width: 100%; height: 30px;
                             mouse-cursor: pointer;
@@ -687,13 +689,13 @@ export component MainWindow inherits Window {
                             font-size: Theme.fs_sm;
                             vertical-alignment: center;
                         }
-                        Text {
-                            x: parent.width - 26px; y: 0; height: 30px; width: 16px;
-                            text: root.model_list_open ? "▴" : "▾";
-                            color: Theme.text_faint;
-                            font-size: Theme.fs_sm;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        Image {
+                            x: parent.width - 24px; y: 9px; width: 12px; height: 12px;
+                            source: root.model_list_open
+                                ? @image-url("icons/chevron-up.svg")
+                                : @image-url("icons/chevron-down.svg");
+                            image-fit: contain;
+                            colorize: Theme.text_faint;
                         }
 
                         // 列表区（展开时可见；标题行以下，含分隔线）

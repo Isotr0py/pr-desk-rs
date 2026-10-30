@@ -345,22 +345,29 @@ export component MarkdownBlocks inherits VerticalLayout {
             }
         }
 
-        // 无序/有序列表项：按 depth 每级缩进 16px；bullet 前缀 "•"，num 编号已含在 text 里
+        // 无序/有序列表项：按 depth 每级缩进 16px；bullet 前缀用内嵌 SVG 圆点（字形会豆腐块），num 编号已含在 text 里
         if b.kind == "bullet" || b.kind == "num": Rectangle {
             height: item_row.preferred-height;
             item_row := HorizontalLayout {
                 padding-left: b.depth * 16px;
                 spacing: 6px;
                 alignment: start;
-                bull := Text {
-                    text: b.kind == "bullet" ? "•" : "";
-                    width: b.kind == "bullet" ? self.preferred-width : 0px;
-                    font-size: 13px;
-                    color: Theme.text_dim;
+                bull := Rectangle {
+                    width: b.kind == "bullet" ? 10px : 0px;
+                    Image {
+                        visible: b.kind == "bullet";
+                        source: @image-url("icons/dot.svg");
+                        width: 5px;
+                        height: 5px;
+                        x: (parent.width - self.width) / 2;
+                        y: 7px;
+                        image-fit: contain;
+                        colorize: Theme.text_dim;
+                    }
                 }
                 Text {
                     text: b.text;
-                    width: max(0px, root.w - b.depth * 16px - (b.kind == "bullet" ? bull.preferred-width + 6px : 0px));
+                    width: max(0px, root.w - b.depth * 16px - (b.kind == "bullet" ? 16px : 0px));
                     font-size: 13px;
                     color: Theme.text;
                     wrap: word-wrap;

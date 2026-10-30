@@ -41,15 +41,20 @@ export component DiffView inherits Rectangle {
     background: Theme.bg;
     clip: true;
 
-    // ── 空状态：居中大号图标字符 + 提示文案 ──
+    // ── 空状态：居中 SVG 图标 + 提示文案 ──
     if root.files.length == 0: VerticalLayout {
         alignment: center;
         spacing: 8px;
-        Text {
-            text: "∅";
-            font-size: 40px;
-            color: Theme.text_faint;
-            horizontal-alignment: center;
+        Rectangle {
+            height: 32px;
+            Image {
+                source: @image-url("icons/file.svg");
+                width: 30px;
+                height: 30px;
+                x: (parent.width - self.width) / 2;
+                image-fit: contain;
+                colorize: Theme.text_faint;
+            }
         }
         Text {
             text: "暂无 Diff 内容";
@@ -129,12 +134,19 @@ export component DiffView inherits Rectangle {
                     padding-right: 12px;
                     spacing: 8px;
 
-                    Text {
+                    Rectangle {
                         width: 14px;
-                        text: file.expanded ? "▾" : "▸";
-                        color: Theme.text_dim;
-                        font-size: Theme.fs_sm;
-                        vertical-alignment: center;
+                        Image {
+                            source: file.expanded
+                                ? @image-url("icons/chevron-down.svg")
+                                : @image-url("icons/chevron-right.svg");
+                            width: 10px;
+                            height: 10px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            image-fit: contain;
+                            colorize: Theme.text_dim;
+                        }
                     }
                     Text {
                         text: file.path;
@@ -155,7 +167,7 @@ export component DiffView inherits Rectangle {
                         vertical-alignment: center;
                     }
                     Text {
-                        text: "−" + dels;
+                        text: "-" + dels;
                         color: Theme.bad;
                         font-family: "Consolas";
                         font-size: Theme.fs_xs;
@@ -200,7 +212,7 @@ export component DiffView inherits Rectangle {
                             x: 0px;
                             width: parent.width - 8px;
                             height: 100%;
-                            text: line.kind == "hunk" ? "⋯" : "\{li + 1}";
+                            text: line.kind == "hunk" ? "..." : "\{li + 1}";
                             horizontal-alignment: right;
                             vertical-alignment: center;
                             color: Theme.text_faint;
