@@ -8,6 +8,37 @@ use serde_json::Value;
 
 const API: &str = "https://api.github.com";
 
+/// 聚合 check runs → ci_status：任一失败类 conclusion → "failure"；
+/// 否则任一未完成（status 为 queued/in_progress/waiting 或 conclusion 为空）→ "pending"；
+/// 空列表 → "none"；全部成功 → "success"。
+/// runs 为 check-runs API 原始条目（读 status/conclusion 字段）。
+pub fn aggregate_ci(runs: &[Value]) -> String {
+    if runs.is_empty() {
+        return "none".into();
+    }
+    let has_failure = runs.iter().any(|r| {
+        matches!(
+            r["conclusion"].as_str(),
+            Some("failure") | Some("timed_out") | Some("cancelled") | Some("action_required")
+        )
+    });
+    if has_failure {
+        return "failure".into();
+    }
+    let has_pending = runs.iter().any(|r| {
+        r["conclusion"].as_str().map_or(true, |c| c.is_empty())
+            || matches!(
+                r["status"].as_str(),
+                Some("queued") | Some("in_progress") | Some("waiting")
+            )
+    });
+    if has_pending {
+        "pending".into()
+    } else {
+        "success".into()
+    }
+}
+
 pub struct GitHub {
     client: reqwest::Client,
     /// 最近一次响应的 X-RateLimit-Remaining（worker 写入，UI 状态栏读取）。
@@ -243,6 +274,59 @@ impl GitHub {
             .collect())
     }
 
+    /// 拉取 PR 的评审列表（GET /repos/{repo}/pulls/{number}/reviews）。
+    /// 返回 [{author, state(小写), time(submitted_at), text(body 截 2000 字符)}]。
+    pub async fn fetch_pr_reviews(&self, repo: &str, number: i64) -> Result<Vec<Value>> {
+        let url = format!("{API}/repos/{repo}/pulls/{number}/reviews?per_page=100");
+        let resp = self.client.get(&url).send().await?;
+        self.record_rate_limit(resp.headers());
+        if !resp.status().is_success() {
+            anyhow::bail!("GitHub reviews {} #{}: {}", resp.status(), repo, number);
+        }
+        let body: Vec<Value> = resp.json().await?;
+        Ok(body
+            .into_iter()
+            .map(|r| {
+                let text = r["body"].as_str().unwrap_or("");
+                serde_json::json!({
+                    "author": r["user"]["login"].as_str().unwrap_or(""),
+                    "state": r["state"].as_str().unwrap_or("").to_lowercase(),
+                    "time": r["submitted_at"].as_str().unwrap_or(""),
+                    "text": text.chars().take(2000).collect::<String>(),
+                })
+            })
+            .collect())
+    }
+
+    /// 拉取指定 commit 的 check runs（GET /repos/{repo}/commits/{sha}/check-runs）。
+    /// 返回 (聚合 ci_status, [{name, conclusion}])；条目 conclusion 为空时取 status。
+    pub async fn fetch_pr_checks(&self, repo: &str, sha: &str) -> Result<(String, Vec<Value>)> {
+        let url = format!("{API}/repos/{repo}/commits/{sha}/check-runs?per_page=100");
+        let resp = self.client.get(&url).send().await?;
+        self.record_rate_limit(resp.headers());
+        if !resp.status().is_success() {
+            anyhow::bail!("GitHub check-runs {} @{}: {}", resp.status(), repo, sha);
+        }
+        let body: Value = resp.json().await?;
+        let runs = body["check_runs"].as_array().cloned().unwrap_or_default();
+        let ci = aggregate_ci(&runs);
+        let items = runs
+            .iter()
+            .map(|c| {
+                let conclusion = c["conclusion"].as_str().unwrap_or("");
+                serde_json::json!({
+                    "name": c["name"].as_str().unwrap_or(""),
+                    "conclusion": if conclusion.is_empty() {
+                        c["status"].as_str().unwrap_or("")
+                    } else {
+                        conclusion
+                    },
+                })
+            })
+            .collect();
+        Ok((ci, items))
+    }
+
     /// 拉取 PR 的文件清单（仅 PullRequest 有；返回 [{path, adds, dels}]）。
     pub async fn fetch_pr_files(&self, repo: &str, number: i64) -> Result<Vec<Value>> {
         let url = format!("{API}/repos/{repo}/pulls/{number}/files?per_page=100");
@@ -262,5 +346,56 @@ impl GitHub {
                 })
             })
             .collect())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(status: &str, conclusion: Option<&str>) -> Value {
+        match conclusion {
+            Some(c) => serde_json::json!({"name": "n", "status": status, "conclusion": c}),
+            None => serde_json::json!({"name": "n", "status": status, "conclusion": null}),
+        }
+    }
+
+    #[test]
+    fn aggregate_ci_empty_is_none() {
+        assert_eq!(aggregate_ci(&[]), "none");
+    }
+
+    #[test]
+    fn aggregate_ci_success() {
+        let runs = vec![run("completed", Some("success")), run("completed", Some("skipped"))];
+        assert_eq!(aggregate_ci(&runs), "success");
+    }
+
+    #[test]
+    fn aggregate_ci_failure_variants() {
+        for c in ["failure", "timed_out", "cancelled", "action_required"] {
+            let runs = vec![run("completed", Some("success")), run("completed", Some(c))];
+            assert_eq!(aggregate_ci(&runs), "failure", "conclusion={c}");
+        }
+    }
+
+    #[test]
+    fn aggregate_ci_pending_on_unfinished_status() {
+        for s in ["queued", "in_progress", "waiting"] {
+            let runs = vec![run("completed", Some("success")), run(s, None)];
+            assert_eq!(aggregate_ci(&runs), "pending", "status={s}");
+        }
+    }
+
+    #[test]
+    fn aggregate_ci_pending_on_null_conclusion() {
+        let runs = vec![run("completed", None)];
+        assert_eq!(aggregate_ci(&runs), "pending");
+    }
+
+    #[test]
+    fn aggregate_ci_failure_beats_pending() {
+        let runs = vec![run("in_progress", None), run("completed", Some("failure"))];
+        assert_eq!(aggregate_ci(&runs), "failure");
     }
 }

@@ -33,6 +33,7 @@ enum Cmd {
     RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
     FetchModels { base: String, key: String },  // 设置页「获取」：拉 OpenAI 兼容端点的模型列表
     FetchPrMeta { repo: String, number: i64 },  // 补齐残缺行的 author/url/head_sha（Inbox 入库的行缺这些）
+    FetchPrLive { repo: String, number: i64 },  // 打开面板时实时拉取该 PR 最新状态（meta+会话+评审+Files+Checks）刷新面板与列表行
 }
 
 /// 状态栏配置状态文本。
@@ -94,6 +95,18 @@ enum Msg {
     ModelsLoaded(Vec<String>),
     // 行元数据补齐完成：若面板正开着该 PR，重新装载面板（worker 只在成功补齐后发）
     ReopenPanel,
+    // 实时拉取完成：面板正开着该 PR 时覆盖状态/CI/更新时间与会话/Checks/Files 模型；
+    // 列表行已随 worker 落库后的 reload_rows 刷新
+    PanelLive {
+        repo: String,
+        number: i64,
+        ci: String,
+        state: String,
+        updated: String,
+        convo_json: String,
+        checks_json: String,
+        files_json: String,
+    },
 }
 
 /// OCR 行级评论展示数据（纯 Rust 字符串可跨线程；Slint OcrComment 在 UI 线程装配）。
@@ -1055,6 +1068,34 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
     if damaged {
         let _ = cmd_tx.send(Cmd::FetchPrMeta { repo: repo.clone(), number });
     }
+
+    // 面板先显示缓存（可能陈旧）；后台实时拉取最新状态，回来后覆盖面板与列表行
+    let _ = cmd_tx.send(Cmd::FetchPrLive { repo, number });
+}
+
+/// 评审结论推导：取 time（submitted_at）最新一条 approved/changes_requested 为准；
+/// 只有 commented → "commented"；无评审 → None。dismissed 不计。
+fn derive_review_decision(reviews: &[serde_json::Value]) -> Option<&'static str> {
+    let mut latest: Option<(&str, &'static str)> = None; // (time, decision)
+    for r in reviews {
+        let decision = match r["state"].as_str().unwrap_or("") {
+            "approved" => "approved",
+            "changes_requested" => "changes_requested",
+            _ => continue,
+        };
+        let time = r["time"].as_str().unwrap_or("");
+        if latest.is_none_or(|(t, _)| time >= t) {
+            latest = Some((time, decision));
+        }
+    }
+    if let Some((_, d)) = latest {
+        return Some(d);
+    }
+    if reviews.iter().any(|r| r["state"].as_str() == Some("commented")) {
+        Some("commented")
+    } else {
+        None
+    }
 }
 
 /// extras_detail / recent_commits → (会话条目 JSON, Checks JSON)。
@@ -1186,6 +1227,47 @@ fn build_diff_files(diff: &str) -> Vec<DiffFile> {
 }
 
 // ── 后台 worker ──
+
+/// 会话 JSON → ConvoEntry 模型（Msg::Panel / PanelLive / NotifDetail 共用装配；
+/// kind 缺失（通知预览的评论条目无 kind 字段）时按 "comment" 处理）。
+fn convo_entries(json: &str) -> Vec<ConvoEntry> {
+    serde_json::from_str::<Vec<serde_json::Value>>(json)
+        .unwrap_or_default()
+        .iter()
+        .map(|e| ConvoEntry {
+            kind: e["kind"].as_str().unwrap_or("comment").into(),
+            author: e["author"].as_str().unwrap_or("").into(),
+            time: model::rel_time(e["time"].as_str().unwrap_or("")).into(),
+            text: e["text"].as_str().unwrap_or("").into(),
+            blocks: md_blocks(e["text"].as_str().unwrap_or("")),
+        })
+        .collect()
+}
+
+/// Checks JSON → CheckRun 模型（Msg::Panel / PanelLive 共用装配）。
+fn check_run_models(json: &str) -> Vec<CheckRun> {
+    serde_json::from_str::<Vec<serde_json::Value>>(json)
+        .unwrap_or_default()
+        .iter()
+        .map(|c| CheckRun {
+            name: c["name"].as_str().unwrap_or("").into(),
+            conclusion: c["conclusion"].as_str().unwrap_or("").into(),
+        })
+        .collect()
+}
+
+/// Files JSON → FileChange 模型（Msg::Panel / PanelLive / NotifDetail 共用装配）。
+fn file_change_models(json: &str) -> Vec<FileChange> {
+    serde_json::from_str::<Vec<serde_json::Value>>(json)
+        .unwrap_or_default()
+        .iter()
+        .map(|f| FileChange {
+            path: f["path"].as_str().unwrap_or("").into(),
+            adds: f["adds"].as_i64().unwrap_or(0) as i32,
+            dels: f["dels"].as_i64().unwrap_or(0) as i32,
+        })
+        .collect()
+}
 
 /// subject.url（API URL）→ 浏览器可打开的 HTML URL：
 /// `api.github.com/repos/` → `github.com/`，`/pulls/` → `/pull/`（issues 路径不变）。
@@ -1695,6 +1777,116 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                 }
             }
+            Cmd::FetchPrLive { repo, number } => {
+                // 打开面板时实时拉取：meta 必须成功（state/updated/sha 都靠它），
+                // 其余四项允许单独失败（记 debug，用部分数据继续）
+                if let Some(g) = &gh {
+                    match g.fetch_pr_meta(&repo, number).await {
+                        Ok(meta) => {
+                            let sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
+                            let (convo, reviews, files, checks) = tokio::join!(
+                                g.fetch_pr_convo(&repo, number),
+                                g.fetch_pr_reviews(&repo, number),
+                                g.fetch_pr_files(&repo, number),
+                                async {
+                                    if sha.is_empty() {
+                                        anyhow::bail!("head.sha 为空")
+                                    } else {
+                                        g.fetch_pr_checks(&repo, &sha).await
+                                    }
+                                },
+                            );
+                            let convo = convo
+                                .map_err(|e| tracing::debug!("实时会话拉取失败 {repo} #{number}: {e}"))
+                                .unwrap_or_default();
+                            let reviews = reviews
+                                .map_err(|e| tracing::debug!("实时评审拉取失败 {repo} #{number}: {e}"))
+                                .unwrap_or_default();
+                            let files = files
+                                .map_err(|e| tracing::debug!("实时文件列表拉取失败 {repo} #{number}: {e}"))
+                                .unwrap_or_default();
+                            let checks = checks
+                                .map_err(|e| tracing::debug!("实时 Checks 拉取失败 {repo} #{number}: {e}"))
+                                .ok();
+
+                            // 落库：残缺字段只补空；ci_status/updated_at 总是覆盖为实时值；
+                            // review_decision 有结论才更新。直改 DB，不进 outbox（非用户改动，不该推送）
+                            let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
+                            let url = meta["html_url"].as_str().unwrap_or("").to_string();
+                            let title = meta["title"].as_str().unwrap_or("").to_string();
+                            let meta_updated = meta["updated_at"].as_str().unwrap_or("").to_string();
+                            let review_decision = derive_review_decision(&reviews);
+                            // Checks 拉取失败时不覆盖 ci_status，面板 ci 回退为库内现值（不清空指示）
+                            let mut ci_fallback: Option<String> = None;
+                            {
+                                let a = app.lock().unwrap();
+                                let _ = a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &sha, &title);
+                                if let Some((ci, _)) = &checks {
+                                    let _ = a.db.conn.execute(
+                                        "UPDATE prs SET ci_status=?1, updated_at=?2 WHERE repo=?3 AND number=?4",
+                                        rusqlite::params![ci, meta_updated, repo, number],
+                                    );
+                                } else {
+                                    if !meta_updated.is_empty() {
+                                        let _ = a.db.conn.execute(
+                                            "UPDATE prs SET updated_at=?1 WHERE repo=?2 AND number=?3",
+                                            rusqlite::params![meta_updated, repo, number],
+                                        );
+                                    }
+                                    ci_fallback = a.db.conn.query_row(
+                                        "SELECT ci_status FROM prs WHERE repo=?1 AND number=?2",
+                                        rusqlite::params![repo, number],
+                                        |r| r.get::<_, Option<String>>(0),
+                                    ).ok().flatten();
+                                }
+                                if let Some(rd) = review_decision {
+                                    let _ = a.db.conn.execute(
+                                        "UPDATE prs SET review_decision=?1 WHERE repo=?2 AND number=?3",
+                                        rusqlite::params![rd, repo, number],
+                                    );
+                                }
+                            }
+                            reload_rows(&app, &msg_tx);
+
+                            // 面板覆盖：会话 = 评论 + 评审（按时间升序）；Checks/Files 用实时数据
+                            let mut convo_items: Vec<serde_json::Value> = convo
+                                .into_iter()
+                                .map(|mut c| {
+                                    c["kind"] = serde_json::json!("comment");
+                                    c
+                                })
+                                .collect();
+                            convo_items.extend(reviews.into_iter().map(|mut r| {
+                                r["kind"] = serde_json::json!("review");
+                                r
+                            }));
+                            convo_items.sort_by(|x, y| {
+                                x["time"].as_str().unwrap_or("~").cmp(y["time"].as_str().unwrap_or("~"))
+                            });
+                            let state = if meta["merged_at"].is_null() {
+                                meta["state"].as_str().unwrap_or("open").to_string()
+                            } else {
+                                "merged".into()
+                            };
+                            let (ci, checks_items) = checks.unwrap_or_else(|| (ci_fallback.unwrap_or_default(), Vec::new()));
+                            let _ = msg_tx.send(Msg::PanelLive {
+                                repo,
+                                number,
+                                ci,
+                                state,
+                                updated: model::rel_time(&meta_updated),
+                                convo_json: serde_json::to_string(&convo_items).unwrap_or_else(|_| "[]".into()),
+                                checks_json: serde_json::to_string(&checks_items).unwrap_or_else(|_| "[]".into()),
+                                files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
+                            });
+                            let _ = msg_tx.send(Msg::StatusBarRefresh);
+                        }
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Status(format!("实时刷新失败 {repo} #{number}: {e}")));
+                        }
+                    }
+                }
+            }
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
                 let cfg = app.lock().unwrap().cfg.clone();
@@ -1898,37 +2090,9 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
             ui.set_d_pinned(pinned);
             ui.set_d_on_board(on_board);
             // JSON → Slint 模型（UI 线程装配）
-            let convo: Vec<ConvoEntry> = serde_json::from_str::<Vec<serde_json::Value>>(&convo_json)
-                .unwrap_or_default()
-                .iter()
-                .map(|e| ConvoEntry {
-                    kind: e["kind"].as_str().unwrap_or("").into(),
-                    author: e["author"].as_str().unwrap_or("").into(),
-                    time: model::rel_time(e["time"].as_str().unwrap_or("")).into(),
-                    text: e["text"].as_str().unwrap_or("").into(),
-                    blocks: md_blocks(e["text"].as_str().unwrap_or("")),
-                })
-                .collect();
-            ui.set_d_convo(ModelRc::new(VecModel::from(convo)));
-            let checks: Vec<CheckRun> = serde_json::from_str::<Vec<serde_json::Value>>(&checks_json)
-                .unwrap_or_default()
-                .iter()
-                .map(|c| CheckRun {
-                    name: c["name"].as_str().unwrap_or("").into(),
-                    conclusion: c["conclusion"].as_str().unwrap_or("").into(),
-                })
-                .collect();
-            ui.set_d_checks(ModelRc::new(VecModel::from(checks)));
-            let files: Vec<FileChange> = serde_json::from_str::<Vec<serde_json::Value>>(&files_json)
-                .unwrap_or_default()
-                .iter()
-                .map(|f| FileChange {
-                    path: f["path"].as_str().unwrap_or("").into(),
-                    adds: f["adds"].as_i64().unwrap_or(0) as i32,
-                    dels: f["dels"].as_i64().unwrap_or(0) as i32,
-                })
-                .collect();
-            ui.set_d_files(ModelRc::new(VecModel::from(files)));
+            ui.set_d_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
+            ui.set_d_checks(ModelRc::new(VecModel::from(check_run_models(&checks_json))));
+            ui.set_d_files(ModelRc::new(VecModel::from(file_change_models(&files_json))));
             // 评审 tab：装载已有评审；状态重置（避免带出上一个 PR 的 running/failed）
             apply_review_props(ui, &review);
             ui.set_d_review_status("".into());
@@ -2009,30 +2173,21 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
         }
         Msg::NotifDetail { convo_json, files_json, diff } => {
             // JSON → Slint 模型（UI 线程装配，同 Msg::Panel 的模式）
-            let convo: Vec<ConvoEntry> = serde_json::from_str::<Vec<serde_json::Value>>(&convo_json)
-                .unwrap_or_default()
-                .iter()
-                .map(|e| ConvoEntry {
-                    kind: "comment".into(),
-                    author: e["author"].as_str().unwrap_or("").into(),
-                    time: model::rel_time(e["time"].as_str().unwrap_or("")).into(),
-                    text: e["text"].as_str().unwrap_or("").into(),
-                    blocks: md_blocks(e["text"].as_str().unwrap_or("")),
-                })
-                .collect();
-            ui.set_nd_convo(ModelRc::new(VecModel::from(convo)));
-            let files: Vec<FileChange> = serde_json::from_str::<Vec<serde_json::Value>>(&files_json)
-                .unwrap_or_default()
-                .iter()
-                .map(|f| FileChange {
-                    path: f["path"].as_str().unwrap_or("").into(),
-                    adds: f["adds"].as_i64().unwrap_or(0) as i32,
-                    dels: f["dels"].as_i64().unwrap_or(0) as i32,
-                })
-                .collect();
-            ui.set_nd_files(ModelRc::new(VecModel::from(files)));
+            ui.set_nd_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
+            ui.set_nd_files(ModelRc::new(VecModel::from(file_change_models(&files_json))));
             ui.set_nd_diff_files(ModelRc::new(VecModel::from(build_diff_files(&diff))));
             ui.set_nd_loading(false);
+        }
+        Msg::PanelLive { repo, number, ci, state, updated, convo_json, checks_json, files_json } => {
+            // 实时数据只刷当前打开的面板；面板已切走/关闭则丢弃（列表行已随落库 reload 更新）
+            if panel_matches(app, &repo, number) {
+                ui.set_d_ci(ci.into());
+                ui.set_d_state(state.into());
+                ui.set_d_updated(updated.into());
+                ui.set_d_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
+                ui.set_d_checks(ModelRc::new(VecModel::from(check_run_models(&checks_json))));
+                ui.set_d_files(ModelRc::new(VecModel::from(file_change_models(&files_json))));
+            }
         }
         Msg::DiffRaw(diff) => {
             // 在 UI 线程构建 Slint 模型（DiffView 依赖整体替换）
@@ -2238,5 +2393,49 @@ mod tests {
         assert!(p0.dimensions.is_empty());
         assert!(p0.summary_blocks.is_empty());
         assert_eq!(p0.size_line, "");
+    }
+
+    // ── 实时拉取的评审结论推导 ──
+
+    fn review(state: &str, time: &str) -> serde_json::Value {
+        serde_json::json!({"author": "a", "state": state, "time": time, "text": ""})
+    }
+
+    #[test]
+    fn derive_review_decision_latest_decisive_wins() {
+        // 最新一条 approved 胜过更早的 changes_requested
+        let rvs = vec![
+            review("changes_requested", "2026-01-01T00:00:00Z"),
+            review("approved", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(derive_review_decision(&rvs), Some("approved"));
+        // 反过来：最新的 changes_requested 胜过更早的 approved
+        let rvs = vec![
+            review("approved", "2026-01-01T00:00:00Z"),
+            review("changes_requested", "2026-01-02T00:00:00Z"),
+        ];
+        assert_eq!(derive_review_decision(&rvs), Some("changes_requested"));
+    }
+
+    #[test]
+    fn derive_review_decision_ignores_commented_and_dismissed() {
+        // commented/dismissed 不参与最新结论；更早的 approved 仍生效
+        let rvs = vec![
+            review("approved", "2026-01-01T00:00:00Z"),
+            review("commented", "2026-01-03T00:00:00Z"),
+            review("dismissed", "2026-01-04T00:00:00Z"),
+        ];
+        assert_eq!(derive_review_decision(&rvs), Some("approved"));
+        // 只有 commented
+        assert_eq!(
+            derive_review_decision(&[review("commented", "2026-01-01T00:00:00Z")]),
+            Some("commented")
+        );
+        // 空 / 只有 dismissed → None
+        assert_eq!(derive_review_decision(&[]), None);
+        assert_eq!(
+            derive_review_decision(&[review("dismissed", "2026-01-01T00:00:00Z")]),
+            None
+        );
     }
 }
