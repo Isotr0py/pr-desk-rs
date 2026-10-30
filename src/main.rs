@@ -33,8 +33,13 @@ enum Cmd {
     RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
     FetchModels { base: String, key: String },  // 设置页「获取」：拉 OpenAI 兼容端点的模型列表
     FetchPrMeta { repo: String, number: i64 },  // 补齐残缺行的 author/url/head_sha（Inbox 入库的行缺这些）
-    FetchPrLive { repo: String, number: i64 },  // 打开面板时实时拉取该 PR 最新状态（meta+会话+评审+Files+Checks）刷新面板与列表行
+    FetchPrLive { repo: String, number: i64, parts: u8 },  // 面板实时拉取（parts 位标志：1=会话+评审 2=Files 4=Checks+meta；按 tab 惰性拉取）
 }
+
+/// FetchPrLive 的 parts 位标志：按 tab 惰性拉取（打开面板只带 CHECKS，会话/Files 切到才拉）。
+const PART_CONVO: u8 = 1;   // 会话 tab：评论 + 评审意见
+const PART_FILES: u8 = 2;   // Files tab
+const PART_CHECKS: u8 = 4;  // Checks tab / 打开面板（含 meta：状态徽章/更新时间）
 
 /// 状态栏配置状态文本。
 fn config_status(cfg: &Config) -> String {
@@ -95,17 +100,17 @@ enum Msg {
     ModelsLoaded(Vec<String>),
     // 行元数据补齐完成：若面板正开着该 PR，重新装载面板（worker 只在成功补齐后发）
     ReopenPanel,
-    // 实时拉取完成：面板正开着该 PR 时覆盖状态/CI/更新时间与会话/Checks/Files 模型；
+    // 实时拉取完成：面板正开着该 PR 时覆盖对应区块（None = 该区块本次未拉，不动）；
     // 列表行已随 worker 落库后的 reload_rows 刷新
     PanelLive {
         repo: String,
         number: i64,
-        ci: String,
-        state: String,
-        updated: String,
-        convo_json: String,
-        checks_json: String,
-        files_json: String,
+        ci: Option<String>,
+        state: Option<String>,
+        updated: Option<String>,
+        convo_json: Option<String>,
+        checks_json: Option<String>,
+        files_json: Option<String>,
     },
 }
 
@@ -625,6 +630,23 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        // 详情面板 tab 切换 → 惰性拉取对应数据（会话/Checks/Files；各自 120s 节流）
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        ui.on_panel_tab_changed(move |t| {
+            let parts = match t {
+                1 => PART_CONVO,
+                2 => PART_CHECKS,
+                3 => PART_FILES,
+                _ => return, // 评审/Diff 用本地数据
+            };
+            let sel = app.lock().unwrap().selected.clone();
+            if let Some((repo, number)) = sel {
+                let _ = cmd_tx.send(Cmd::FetchPrLive { repo, number, parts });
+            }
+        });
+    }
+    {
         let app = app.clone();
         ui.on_row_reject(move |i| {
             let Some((repo, number)) = resolve_view(&app, i as usize) else { return };
@@ -1070,7 +1092,7 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
     }
 
     // 面板先显示缓存（可能陈旧）；后台实时拉取最新状态，回来后覆盖面板与列表行
-    let _ = cmd_tx.send(Cmd::FetchPrLive { repo, number });
+    let _ = cmd_tx.send(Cmd::FetchPrLive { repo, number, parts: PART_CHECKS });
 }
 
 /// 评审结论推导：取 time（submitted_at）最新一条 approved/changes_requested 为准；
@@ -1501,8 +1523,8 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
         let cfg = app.lock().unwrap().cfg.clone();
         sync::SyncClient::new(&cfg)
     };
-    // 实时刷新节流：同一 PR 的上次拉取时间（120s 内不重复拉，防烧穿 GitHub 限额）
-    let mut live_fetched: std::collections::HashMap<(String, i64), std::time::Instant> =
+    // 实时刷新节流：同一 PR 同一部分（parts 位标志）的上次拉取时间（120s 内不重复拉）
+    let mut live_fetched: std::collections::HashMap<(String, i64, u8), std::time::Instant> =
         Default::default();
 
     while let Ok(cmd) = rx.recv() {
@@ -1780,16 +1802,20 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                 }
             }
-            Cmd::FetchPrLive { repo, number } => {
-                // 打开面板时实时拉取：meta 必须成功（state/updated/sha 都靠它），
-                // 其余四项允许单独失败（记 debug，用部分数据继续）
-                //
-                // 节流：同一 PR 120s 内不重复拉（打开面板就发 5 个请求，连点会烧穿
-                // GitHub 5000/时的限额）；配额剩余 <50 时直接跳过。
-                let recently = live_fetched
-                    .get(&(repo.clone(), number))
-                    .map(|t| t.elapsed().as_secs() < 120)
-                    .unwrap_or(false);
+            Cmd::FetchPrLive { repo, number, parts } => {
+                // 面板实时刷新：按位标志惰性拉取——打开面板只带 Checks（2 个请求），
+                // 会话/Files 切到对应 tab 才拉。每部分独立 120s 节流；配额 <50 跳过。
+                let fresh = |bit: u8| {
+                    live_fetched
+                        .get(&(repo.clone(), number, bit))
+                        .map(|t| t.elapsed().as_secs() < 120)
+                        .unwrap_or(false)
+                };
+                let (want_convo, want_files, want_checks) = (
+                    parts & PART_CONVO != 0 && !fresh(PART_CONVO),
+                    parts & PART_FILES != 0 && !fresh(PART_FILES),
+                    parts & PART_CHECKS != 0 && !fresh(PART_CHECKS),
+                );
                 let quota_low = app
                     .lock()
                     .unwrap()
@@ -1798,117 +1824,176 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     .unwrap()
                     .map(|r| r < 50)
                     .unwrap_or(false);
-                if recently || quota_low {
-                    if quota_low && !recently {
+                if (!want_convo && !want_files && !want_checks) || quota_low {
+                    if quota_low {
                         let _ = msg_tx.send(Msg::Status("API 配额不足，跳过实时刷新（整点恢复）".into()));
                     }
                     continue;
                 }
-                live_fetched.insert((repo.clone(), number), std::time::Instant::now());
+                let now = std::time::Instant::now();
+                for (bit, w) in [(PART_CONVO, want_convo), (PART_FILES, want_files), (PART_CHECKS, want_checks)] {
+                    if w {
+                        live_fetched.insert((repo.clone(), number, bit), now);
+                    }
+                }
                 if let Some(g) = &gh {
-                    match g.fetch_pr_meta(&repo, number).await {
-                        Ok(meta) => {
-                            let sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
-                            let (convo, reviews, files, checks) = tokio::join!(
-                                g.fetch_pr_convo(&repo, number),
-                                g.fetch_pr_reviews(&repo, number),
-                                g.fetch_pr_files(&repo, number),
-                                async {
-                                    if sha.is_empty() {
-                                        anyhow::bail!("head.sha 为空")
-                                    } else {
-                                        g.fetch_pr_checks(&repo, &sha).await
+                    // meta 只在 checks 部分需要（head.sha → check runs；state/updated → 面板头部）
+                    let meta = if want_checks {
+                        match g.fetch_pr_meta(&repo, number).await {
+                            Ok(m) => Some(m),
+                            Err(e) => {
+                                let _ = msg_tx.send(Msg::Status(format!("实时刷新失败 {repo} #{number}: {e}")));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let (convo_pair, files, checks) = tokio::join!(
+                        async {
+                            if want_convo {
+                                // 评论失败 → None（整块不碰面板缓存）；评审失败只少评审条目
+                                match g.fetch_pr_convo(&repo, number).await {
+                                    Ok(c) => {
+                                        let r = g.fetch_pr_reviews(&repo, number).await
+                                            .map_err(|e| tracing::debug!("实时评审拉取失败 {repo} #{number}: {e}"))
+                                            .unwrap_or_default();
+                                        Some((c, r))
                                     }
-                                },
-                            );
-                            let convo = convo
-                                .map_err(|e| tracing::debug!("实时会话拉取失败 {repo} #{number}: {e}"))
+                                    Err(e) => {
+                                        tracing::debug!("实时会话拉取失败 {repo} #{number}: {e}");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        },
+                        async {
+                            if want_files {
+                                match g.fetch_pr_files(&repo, number).await {
+                                    Ok(f) => Some(f),
+                                    Err(e) => {
+                                        tracing::debug!("实时文件列表拉取失败 {repo} #{number}: {e}");
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        },
+                        async {
+                            let sha = meta
+                                .as_ref()
+                                .map(|m| m["head"]["sha"].as_str().unwrap_or("").to_string())
                                 .unwrap_or_default();
-                            let reviews = reviews
-                                .map_err(|e| tracing::debug!("实时评审拉取失败 {repo} #{number}: {e}"))
-                                .unwrap_or_default();
-                            let files = files
-                                .map_err(|e| tracing::debug!("实时文件列表拉取失败 {repo} #{number}: {e}"))
-                                .unwrap_or_default();
-                            let checks = checks
-                                .map_err(|e| tracing::debug!("实时 Checks 拉取失败 {repo} #{number}: {e}"))
-                                .ok();
+                            if !want_checks || sha.is_empty() {
+                                None
+                            } else {
+                                g.fetch_pr_checks(&repo, &sha).await
+                                    .map_err(|e| tracing::debug!("实时 Checks 拉取失败 {repo} #{number}: {e}"))
+                                    .ok()
+                            }
+                        },
+                    );
 
-                            // 落库：残缺字段只补空；ci_status/updated_at 总是覆盖为实时值；
-                            // review_decision 有结论才更新。直改 DB，不进 outbox（非用户改动，不该推送）
-                            let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
-                            let url = meta["html_url"].as_str().unwrap_or("").to_string();
-                            let title = meta["title"].as_str().unwrap_or("").to_string();
-                            let meta_updated = meta["updated_at"].as_str().unwrap_or("").to_string();
-                            let review_decision = derive_review_decision(&reviews);
-                            // Checks 拉取失败时不覆盖 ci_status，面板 ci 回退为库内现值（不清空指示）
-                            let mut ci_fallback: Option<String> = None;
-                            {
-                                let a = app.lock().unwrap();
-                                let _ = a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &sha, &title);
-                                if let Some((ci, _)) = &checks {
+                    let mut ci_out: Option<String> = None;
+                    let mut state_out: Option<String> = None;
+                    let mut updated_out: Option<String> = None;
+                    let mut checks_json_out: Option<String> = None;
+                    let mut convo_json_out: Option<String> = None;
+                    let mut files_json_out: Option<String> = None;
+                    let mut dirty = false;
+
+                    // 落库（直改 DB，不进 outbox：非用户改动，不该推送）
+                    if let Some(meta) = &meta {
+                        let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
+                        let url = meta["html_url"].as_str().unwrap_or("").to_string();
+                        let title = meta["title"].as_str().unwrap_or("").to_string();
+                        let sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
+                        let meta_updated = meta["updated_at"].as_str().unwrap_or("").to_string();
+                        {
+                            let a = app.lock().unwrap();
+                            let _ = a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &sha, &title);
+                            match &checks {
+                                Some((ci, _)) => {
                                     let _ = a.db.conn.execute(
                                         "UPDATE prs SET ci_status=?1, updated_at=?2 WHERE repo=?3 AND number=?4",
                                         rusqlite::params![ci, meta_updated, repo, number],
                                     );
-                                } else {
+                                    ci_out = Some(ci.clone());
+                                }
+                                None => {
+                                    // Checks 拉取失败：不覆盖 ci_status，面板回退库内现值（不清空指示）
                                     if !meta_updated.is_empty() {
                                         let _ = a.db.conn.execute(
                                             "UPDATE prs SET updated_at=?1 WHERE repo=?2 AND number=?3",
                                             rusqlite::params![meta_updated, repo, number],
                                         );
                                     }
-                                    ci_fallback = a.db.conn.query_row(
+                                    ci_out = a.db.conn.query_row(
                                         "SELECT ci_status FROM prs WHERE repo=?1 AND number=?2",
                                         rusqlite::params![repo, number],
                                         |r| r.get::<_, Option<String>>(0),
                                     ).ok().flatten();
                                 }
-                                if let Some(rd) = review_decision {
-                                    let _ = a.db.conn.execute(
-                                        "UPDATE prs SET review_decision=?1 WHERE repo=?2 AND number=?3",
-                                        rusqlite::params![rd, repo, number],
-                                    );
-                                }
                             }
-                            reload_rows(&app, &msg_tx);
-
-                            // 面板覆盖：会话 = 评论 + 评审（按时间升序）；Checks/Files 用实时数据
-                            let mut convo_items: Vec<serde_json::Value> = convo
-                                .into_iter()
-                                .map(|mut c| {
-                                    c["kind"] = serde_json::json!("comment");
-                                    c
-                                })
-                                .collect();
-                            convo_items.extend(reviews.into_iter().map(|mut r| {
-                                r["kind"] = serde_json::json!("review");
-                                r
-                            }));
-                            convo_items.sort_by(|x, y| {
-                                x["time"].as_str().unwrap_or("~").cmp(y["time"].as_str().unwrap_or("~"))
-                            });
-                            let state = if meta["merged_at"].is_null() {
-                                meta["state"].as_str().unwrap_or("open").to_string()
-                            } else {
-                                "merged".into()
-                            };
-                            let (ci, checks_items) = checks.unwrap_or_else(|| (ci_fallback.unwrap_or_default(), Vec::new()));
-                            let _ = msg_tx.send(Msg::PanelLive {
-                                repo,
-                                number,
-                                ci,
-                                state,
-                                updated: model::rel_time(&meta_updated),
-                                convo_json: serde_json::to_string(&convo_items).unwrap_or_else(|_| "[]".into()),
-                                checks_json: serde_json::to_string(&checks_items).unwrap_or_else(|_| "[]".into()),
-                                files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
-                            });
-                            let _ = msg_tx.send(Msg::StatusBarRefresh);
                         }
-                        Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(format!("实时刷新失败 {repo} #{number}: {e}")));
+                        state_out = Some(if meta["merged_at"].is_null() {
+                            meta["state"].as_str().unwrap_or("open").to_string()
+                        } else {
+                            "merged".into()
+                        });
+                        updated_out = Some(model::rel_time(&meta_updated));
+                        checks_json_out = checks.map(|(_, items)| {
+                            serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
+                        });
+                        dirty = true;
+                    }
+                    if let Some((convo, reviews)) = convo_pair {
+                        if let Some(rd) = derive_review_decision(&reviews) {
+                            let a = app.lock().unwrap();
+                            let _ = a.db.conn.execute(
+                                "UPDATE prs SET review_decision=?1 WHERE repo=?2 AND number=?3",
+                                rusqlite::params![rd, repo, number],
+                            );
                         }
+                        // 会话 = 评论 + 评审（按时间升序）
+                        let mut convo_items: Vec<serde_json::Value> = convo
+                            .into_iter()
+                            .map(|mut c| {
+                                c["kind"] = serde_json::json!("comment");
+                                c
+                            })
+                            .collect();
+                        convo_items.extend(reviews.into_iter().map(|mut r| {
+                            r["kind"] = serde_json::json!("review");
+                            r
+                        }));
+                        convo_items.sort_by(|x, y| {
+                            x["time"].as_str().unwrap_or("~").cmp(y["time"].as_str().unwrap_or("~"))
+                        });
+                        convo_json_out =
+                            Some(serde_json::to_string(&convo_items).unwrap_or_else(|_| "[]".into()));
+                        dirty = true;
+                    }
+                    if let Some(files) = files {
+                        files_json_out =
+                            Some(serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()));
+                    }
+                    if dirty {
+                        reload_rows(&app, &msg_tx);
+                        let _ = msg_tx.send(Msg::PanelLive {
+                            repo,
+                            number,
+                            ci: ci_out,
+                            state: state_out,
+                            updated: updated_out,
+                            convo_json: convo_json_out,
+                            checks_json: checks_json_out,
+                            files_json: files_json_out,
+                        });
+                        let _ = msg_tx.send(Msg::StatusBarRefresh);
                     }
                 }
             }
@@ -2204,14 +2289,27 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
             ui.set_nd_loading(false);
         }
         Msg::PanelLive { repo, number, ci, state, updated, convo_json, checks_json, files_json } => {
-            // 实时数据只刷当前打开的面板；面板已切走/关闭则丢弃（列表行已随落库 reload 更新）
+            // 实时数据只刷当前打开的面板；None 的区块本次未拉取，保持不动。
+            // 面板已切走/关闭则丢弃（列表行已随落库 reload 更新）
             if panel_matches(app, &repo, number) {
-                ui.set_d_ci(ci.into());
-                ui.set_d_state(state.into());
-                ui.set_d_updated(updated.into());
-                ui.set_d_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
-                ui.set_d_checks(ModelRc::new(VecModel::from(check_run_models(&checks_json))));
-                ui.set_d_files(ModelRc::new(VecModel::from(file_change_models(&files_json))));
+                if let Some(ci) = ci {
+                    ui.set_d_ci(ci.into());
+                }
+                if let Some(state) = state {
+                    ui.set_d_state(state.into());
+                }
+                if let Some(updated) = updated {
+                    ui.set_d_updated(updated.into());
+                }
+                if let Some(convo_json) = convo_json {
+                    ui.set_d_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
+                }
+                if let Some(checks_json) = checks_json {
+                    ui.set_d_checks(ModelRc::new(VecModel::from(check_run_models(&checks_json))));
+                }
+                if let Some(files_json) = files_json {
+                    ui.set_d_files(ModelRc::new(VecModel::from(file_change_models(&files_json))));
+                }
             }
         }
         Msg::DiffRaw(diff) => {

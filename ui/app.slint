@@ -265,6 +265,7 @@ export component MainWindow inherits Window {
     callback row_board(int);
     callback row_open(int);         // 行内外链按钮：浏览器打开
     callback key_open();            // o 快捷键：浏览器打开选中 PR
+    callback panel_tab_changed(int);   // 详情面板 tab 切换（惰性拉取对应数据）
     callback panel_close();
     callback panel_board();
     callback panel_set_priority(int);
@@ -381,6 +382,7 @@ export component MainWindow inherits Window {
                     action_toggle_pin => { root.panel_toggle_pin(); }
                     action_run_review => { root.action_run_review(); }
                     diff_file_toggled(i) => { root.diff_file_toggled(i); }
+                    tab_changed(t) => { root.panel_tab_changed(t); }
                 }
             }
             if root.view_mode == 1: HorizontalLayout {
