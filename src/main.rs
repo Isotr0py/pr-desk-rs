@@ -906,6 +906,14 @@ fn main() -> anyhow::Result<()> {
             if let Some(ui) = ui2.upgrade() {
                 // 每次打开回填当前配置（LLM 字段可能在别处被改动）
                 let cfg = app.lock().unwrap().cfg.clone();
+                // 首启兜底：default 档未配置且无自定义档案时，编辑目标停在 local 会把
+                // 服务器三字段锁死、永远填不了服务器地址 → 自动切到 default 编辑
+                if ui.get_settings_profile() == "local"
+                    && !cfg.has_default_profile()
+                    && cfg.profiles.is_empty()
+                {
+                    ui.set_settings_profile("default".into()); // changed → focus 回调回填（空值）
+                }
                 // 服务器三字段按「正在编辑的档案」回填（local 档为空且字段锁定）
                 let (server, token, ak) = profile_fields(&cfg, &ui.get_settings_profile());
                 ui.set_s_server(server.into());
@@ -1055,7 +1063,7 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
-        // 新增自定义档案：校验名字（非空/字符合法/非保留/不重名）→ 空档案入库 + save + 回填名单
+        // 新增自定义档案：校验名字（非空/字符合法/非保留/不重名）→ 复制 default 档配置入库 + save + 回填名单
         let app = app.clone();
         let cfg_path = cfg_path.clone();
         let weak = ui.as_weak();
@@ -1082,11 +1090,17 @@ fn main() -> anyhow::Result<()> {
                     if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
                     return;
                 }
+                // 以 default 档（顶层键）服务器配置为起点：用户通常只需改主机名
+                let (d_url, d_tok, d_key) = (
+                    a.cfg.server_url.clone(),
+                    a.cfg.sync_token.clone(),
+                    a.cfg.astrbot_api_key.clone(),
+                );
                 a.cfg.profiles.push(Profile {
                     name: name.clone(),
-                    server_url: String::new(),
-                    sync_token: String::new(),
-                    api_key: String::new(),
+                    server_url: d_url,
+                    sync_token: d_tok,
+                    api_key: d_key,
                 });
                 if let Err(e) = a.cfg.save(&cfg_path) {
                     a.cfg.profiles.retain(|p| p.name != name);

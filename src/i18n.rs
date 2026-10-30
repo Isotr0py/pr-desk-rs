@@ -85,7 +85,7 @@ const ZH: &[(&str, &str)] = &[
     ("profile_invalid_name", "档案名非法（仅允许小写字母/数字/_/-）"),
     ("profile_reserved", "{0} 是保留档案名"),
     ("profile_exists", "档案 {0} 已存在"),
-    ("profile_added", "已新增档案：{0}（在 config.toml 填 server_url/sync_token 后生效）"),
+    ("profile_added", "已新增档案：{0}（已复制 default 档服务器配置，可在设置中修改）"),
     ("profile_removed", "已删除档案：{0}"),
     ("profile_remove_denied", "只能删除非当前使用的自定义档案"),
     // ── reviewer.rs 评审进度回调 ──
@@ -188,7 +188,7 @@ const EN: &[(&str, &str)] = &[
     ("profile_invalid_name", "Invalid profile name (lowercase letters/digits/_/- only)"),
     ("profile_reserved", "{0} is a reserved profile name"),
     ("profile_exists", "Profile {0} already exists"),
-    ("profile_added", "Profile added: {0} (fill server_url/sync_token in config.toml to activate)"),
+    ("profile_added", "Profile added: {0} (server settings copied from the default profile; edit in Settings)"),
     ("profile_removed", "Profile removed: {0}"),
     ("profile_remove_denied", "Only inactive custom profiles can be removed"),
     ("prog_fetch_pr", "Fetching PR info…"),

@@ -142,7 +142,8 @@ component SourceSwitcher inherits Rectangle {
     }
 
     height: 26px;
-    width: btn-row.preferred-width;
+    // 宽度 = 图标 12 + 文字 + chevron 10 + 间隙/内边距（显式坐标布局，见下）
+    width: name-txt.preferred-width + 52px;
     border-radius: Theme.r_md;
     border-width: 1px;
     border-color: Theme.border;
@@ -154,31 +155,33 @@ component SourceSwitcher inherits Rectangle {
         clicked => { popup.show(); }
     }
 
-    btn-row := HorizontalLayout {
-        padding-left: 8px;
-        padding-right: 8px;
-        spacing: 6px;
-
-        Image {
-            source: @image-url("icons/database.svg");
-            width: 12px;
-            height: 12px;
-            image-fit: contain;
-            colorize: ta.has-hover ? Theme.text : Theme.text_dim;
-        }
-        Text {
-            text: root.profile_label(root.active_profile);
-            font-size: Theme.fs_sm;
-            color: Theme.text;
-            vertical-alignment: center;
-        }
-        Image {
-            source: @image-url("icons/chevron-down.svg");
-            width: 10px;
-            height: 10px;
-            image-fit: contain;
-            colorize: Theme.text_faint;
-        }
+    // 图标 / 文字 / chevron 全部显式坐标定位：HorizontalLayout 里 Image 的垂直居中
+    // 在顶栏这条渲染路径下不可靠（实测图标偏上、下半被裁），绝对定位最稳
+    Image {
+        x: 8px;
+        y: (parent.height - self.height) / 2;
+        width: 12px;
+        height: 12px;
+        source: @image-url("icons/database.svg");
+        image-fit: contain;
+        colorize: ta.has-hover ? Theme.text : Theme.text_dim;
+    }
+    name-txt := Text {
+        x: 26px;
+        height: 100%;
+        text: root.profile_label(root.active_profile);
+        font-size: Theme.fs_sm;
+        color: Theme.text;
+        vertical-alignment: center;
+    }
+    Image {
+        x: parent.width - 18px;
+        y: (parent.height - self.height) / 2;
+        width: 10px;
+        height: 10px;
+        source: @image-url("icons/chevron-down.svg");
+        image-fit: contain;
+        colorize: Theme.text_faint;
     }
 
     popup := PopupWindow {
@@ -204,8 +207,10 @@ component SourceSwitcher inherits Rectangle {
 
                 for p in root.profile_names: Rectangle {
                     height: 26px;
-                    background: item-ta.has-hover ? Theme.hover
-                        : (p == root.active_profile ? Theme.sel : transparent);
+                    // 当前项优先给 sel 实底（hover 不得盖掉），非当前项给显式 card 底：
+                    // PopupWindow 合成路径下 transparent 行底会出现「白纱」发淡
+                    background: p == root.active_profile ? Theme.sel
+                        : item-ta.has-hover ? Theme.hover : Theme.card;
 
                     item-ta := TouchArea {
                         mouse-cursor: pointer;
@@ -215,15 +220,16 @@ component SourceSwitcher inherits Rectangle {
                             popup.close();
                         }
                     }
-                    // 当前项对勾（其余留空占位对齐）
+                    // 当前项对勾：用 visible 控制（colorize: transparent 在部分渲染路径下仍会画出残影）
                     Image {
+                        visible: p == root.active_profile;
                         x: 8px;
                         y: (parent.height - 10px) / 2;
                         width: 10px;
                         height: 10px;
                         source: @image-url("icons/check.svg");
                         image-fit: contain;
-                        colorize: p == root.active_profile ? Theme.sel_text : transparent;
+                        colorize: Theme.sel_text;
                     }
                     Text {
                         x: 24px;

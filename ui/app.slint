@@ -687,8 +687,9 @@ export component MainWindow inherits Window {
 
                                         for p in root.profile_names: Rectangle {
                                             height: 26px;
-                                            background: pi-ta.has-hover ? Theme.hover
-                                                : (p == root.settings_profile ? Theme.sel : transparent);
+                                            // 与顶栏下拉同款修复：sel 优先 + 显式 card 底，避免 PopupWindow 下发淡
+                                            background: p == root.settings_profile ? Theme.sel
+                                                : pi-ta.has-hover ? Theme.hover : Theme.card;
 
                                             pi-ta := TouchArea {
                                                 mouse-cursor: pointer;
@@ -698,13 +699,14 @@ export component MainWindow inherits Window {
                                                 }
                                             }
                                             Image {
+                                                visible: p == root.settings_profile;
                                                 x: 8px;
                                                 y: (parent.height - 10px) / 2;
                                                 width: 10px;
                                                 height: 10px;
                                                 source: @image-url("icons/check.svg");
                                                 image-fit: contain;
-                                                colorize: p == root.settings_profile ? Theme.sel_text : transparent;
+                                                colorize: Theme.sel_text;
                                             }
                                             Text {
                                                 x: 24px;
@@ -730,9 +732,10 @@ export component MainWindow inherits Window {
                             placeholder: I18n.profile_add_hint;
                             accepted => {
                                 if (self.text != "") {
-                                    root.profile_add(self.text);
-                                    // 即时切到新档案（空值起步）；非法名由 Rust 回写 settings_profile 纠正
+                                    root.profile_add(self.text);   // Rust 校验；新档案复制 default 档服务器配置起步
+                                    // 即时切到新档案并聚焦 Server URL（非法名由 Rust 回写 settings_profile 纠正）
                                     root.settings_profile = self.text;
+                                    server-field.focus_input();
                                 }
                                 self.text = "";
                                 root.adding_profile = false;
@@ -854,7 +857,7 @@ export component MainWindow inherits Window {
                 }
                 Field {
                     label: I18n.settings_server_url;
-                    FormField {
+                    server-field := FormField {
                         enabled: !root.editing_local;
                         placeholder: I18n.settings_server_placeholder;
                         text <=> root.s_server;
