@@ -307,7 +307,7 @@ export component MainWindow inherits Window {
     // 模型选择列表展开状态（拉取成功默认展开，可折叠）
     in-out property <bool> model_list_open: true;
     in-out property <bool> settings_open: false;
-    in-out property <int> settings_tab: 0;   // 0=连接与同步 1=LLM 预评审
+    in-out property <int> settings_tab: 0;   // 0=数据源 1=通用 2=LLM 预评审
     in-out property <string> s_server: "";
     in-out property <string> s_sync_token: "";
     in-out property <string> s_ak: "";
@@ -548,11 +548,11 @@ export component MainWindow inherits Window {
                     font-weight: 600;
                 }
 
-                // 功能分 tab（macOS 风格分段控件，与顶栏同款）
+                // 功能分 tab（macOS 风格分段控件，与顶栏同款）：数据源 / 通用 / LLM 预评审
                 HorizontalLayout {
                     Rectangle { horizontal-stretch: 1; }
                     Rectangle {
-                        width: 232px;
+                        width: 340px;
                         height: 26px;
                         border-radius: Theme.r_md;
                         border-width: 1px;
@@ -577,7 +577,7 @@ export component MainWindow inherits Window {
                         }
                         Text {
                             x: 0; width: 112px; height: 100%;
-                            text: I18n.settings_tab_connection;
+                            text: I18n.settings_tab_source;
                             font-size: Theme.fs_sm;
                             color: root.settings_tab == 0 ? Theme.text : Theme.text_dim;
                             horizontal-alignment: center;
@@ -590,9 +590,22 @@ export component MainWindow inherits Window {
                         }
                         Text {
                             x: 112px; width: 112px; height: 100%;
-                            text: I18n.settings_tab_llm;
+                            text: I18n.settings_tab_general;
                             font-size: Theme.fs_sm;
                             color: root.settings_tab == 1 ? Theme.text : Theme.text_dim;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        stab2 := TouchArea {
+                            x: 224px; width: 112px; height: 100%;
+                            mouse-cursor: pointer;
+                            clicked => { root.settings_tab = 2; }
+                        }
+                        Text {
+                            x: 224px; width: 112px; height: 100%;
+                            text: I18n.settings_tab_llm;
+                            font-size: Theme.fs_sm;
+                            color: root.settings_tab == 2 ? Theme.text : Theme.text_dim;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
@@ -886,30 +899,12 @@ export component MainWindow inherits Window {
                     color: Theme.text_faint;
                     font-size: Theme.fs_xs;
                 }
-
-                // ── 分隔线：以下为全局设置（GitHub token / 仓库列表 / 轮询间隔 / 语言），不随档案切换 ──
-                Rectangle {
-                    height: 13px;
-                    Rectangle {
-                        y: (parent.height - 1px) / 2;
-                        width: 100%;
-                        height: 1px;
-                        background: Theme.hairline;
-                    }
-                    Rectangle {
-                        x: parent.width - global-tag.preferred-width - 10px;
-                        width: global-tag.preferred-width + 10px;
-                        height: 100%;
-                        background: Theme.card;
-                        global-tag := Text {
-                            text: I18n.settings_profile_global;
-                            color: Theme.text_faint;
-                            font-size: Theme.fs_xs;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
                 }
+
+                // ── tab 1：通用（GitHub token / 仓库列表 / 轮询间隔 / 语言，全局不随档案）──
+                if root.settings_tab == 1: VerticalLayout {
+                    spacing: 14px;
+
                 Field {
                     label: root.gh_token_from_env
                         ? I18n.settings_gh_token_env
@@ -995,8 +990,8 @@ export component MainWindow inherits Window {
                 }
                 }
 
-                // ── tab 1：LLM 预评审 ──
-                if root.settings_tab == 1: VerticalLayout {
+                // ── tab 2：LLM 预评审 ──
+                if root.settings_tab == 2: VerticalLayout {
                     spacing: 14px;
 
                 Field {
