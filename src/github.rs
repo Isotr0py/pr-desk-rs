@@ -59,16 +59,6 @@ pub struct Notification {
     pub url: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct OpenPr {
-    pub repo: String,
-    pub number: i64,
-    pub title: String,
-    pub author: String,
-    pub url: String,
-    pub head_sha: String,
-}
-
 impl GitHub {
     pub fn new(token: Option<String>) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -106,61 +96,6 @@ impl GitHub {
         {
             *self.rate_limit.lock().unwrap() = Some(n);
         }
-    }
-
-    /// 拉取仓库的 open PR 列表。
-    pub async fn fetch_open_prs(&self, repo: &str) -> Result<Vec<OpenPr>> {
-        let url = format!("{API}/repos/{repo}/pulls?state=open&per_page=100");
-        let resp = self.client.get(&url).send().await?;
-        self.record_rate_limit(resp.headers());
-        if !resp.status().is_success() {
-            anyhow::bail!("GitHub API {}: {}", resp.status(), repo);
-        }
-        let body: Vec<Value> = resp.json().await?;
-        Ok(body
-            .into_iter()
-            .map(|it| OpenPr {
-                repo: repo.to_string(),
-                number: it["number"].as_i64().unwrap_or(0),
-                title: it["title"].as_str().unwrap_or("").to_string(),
-                author: it["user"]["login"].as_str().unwrap_or("").to_string(),
-                url: it["html_url"].as_str().unwrap_or("").to_string(),
-                head_sha: it["head"]["sha"].as_str().unwrap_or("").to_string(),
-            })
-            .collect())
-    }
-
-    /// 拉取仓库里「与我相关」的 open PR（我提的 + 请求我评审的 + 指派给我的）。
-    /// 用 search/issues（限额独立于 core API：30 次/分钟）；head_sha 该接口不返回，
-    /// 打开面板时经 fetch_pr_meta 自愈补齐。
-    pub async fn fetch_relevant_prs(&self, repo: &str) -> Result<Vec<OpenPr>> {
-        let mut out: Vec<OpenPr> = Vec::new();
-        for qualifier in ["author:@me", "review-requested:@me", "assignee:@me"] {
-            let url = format!(
-                "{API}/search/issues?q=is:pr+is:open+repo:{repo}+{qualifier}&per_page=100"
-            );
-            let resp = self.client.get(&url).send().await?;
-            self.record_rate_limit(resp.headers());
-            if !resp.status().is_success() {
-                anyhow::bail!("GitHub search {}: {}", resp.status(), repo);
-            }
-            let body: Value = resp.json().await?;
-            for it in body["items"].as_array().cloned().unwrap_or_default() {
-                let number = it["number"].as_i64().unwrap_or(0);
-                if out.iter().any(|p: &OpenPr| p.number == number) {
-                    continue; // 多条件命中同一 PR 去重
-                }
-                out.push(OpenPr {
-                    repo: repo.to_string(),
-                    number,
-                    title: it["title"].as_str().unwrap_or("").to_string(),
-                    author: it["user"]["login"].as_str().unwrap_or("").to_string(),
-                    url: it["html_url"].as_str().unwrap_or("").to_string(),
-                    head_sha: String::new(),
-                });
-            }
-        }
-        Ok(out)
     }
 
     /// 拉取 PR 的 diff 文本（Accept: application/vnd.github.diff）。

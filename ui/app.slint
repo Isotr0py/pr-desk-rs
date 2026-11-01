@@ -217,11 +217,6 @@ export component MainWindow inherits Window {
         root.language_changed(root.language);
     }
 
-    // ── 本地模式拉取范围（即时生效并持久化，仿 language）──
-    in-out property <string> local_scope: "mine";   // "mine" | "all"
-    callback local_scope_changed(string);
-    changed local_scope => { root.local_scope_changed(root.local_scope); }
-
     // ── 列表 ──
     in property <[PrListRow]> rows: [];
     // 选中行身份（repo#number）：Rust 侧重建列表后回写，高亮跟随 PR 而非下标
@@ -986,60 +981,6 @@ export component MainWindow inherits Window {
                                 text: I18n.lang_name_en;
                                 font-size: Theme.fs_sm;
                                 color: root.language == "en" ? Theme.text : Theme.text_dim;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                        }
-                        Rectangle { horizontal-stretch: 1; }
-                    }
-                }
-                Field {
-                    label: I18n.settings_local_scope;
-                    HorizontalLayout {
-                        spacing: 8px;
-                        // 分段控件（与语言切换同款）；切换即时生效并持久化
-                        Rectangle {
-                            width: 216px;
-                            height: 26px;
-                            border-radius: Theme.r_md;
-                            border-width: 1px;
-                            border-color: Theme.border;
-                            background: Theme.surface2;
-
-                            Rectangle {
-                                x: 2px + (root.local_scope == "all" ? 1 : 0) * 106px;
-                                y: 2px;
-                                width: 106px;
-                                height: parent.height - 4px;
-                                border-radius: Theme.r_sm;
-                                background: Theme.card;
-                                border-width: 1px;
-                                border-color: Theme.border;
-                                animate x { duration: 150ms; easing: ease-out; }
-                            }
-                            scope-mine := TouchArea {
-                                x: 0; width: 106px; height: 100%;
-                                mouse-cursor: pointer;
-                                clicked => { root.local_scope = "mine"; }
-                            }
-                            Text {
-                                x: 0; width: 106px; height: 100%;
-                                text: I18n.local_scope_mine;
-                                font-size: Theme.fs_sm;
-                                color: root.local_scope == "mine" ? Theme.text : Theme.text_dim;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-                            scope-all := TouchArea {
-                                x: 106px; width: 106px; height: 100%;
-                                mouse-cursor: pointer;
-                                clicked => { root.local_scope = "all"; }
-                            }
-                            Text {
-                                x: 106px; width: 106px; height: 100%;
-                                text: I18n.local_scope_all;
-                                font-size: Theme.fs_sm;
-                                color: root.local_scope == "all" ? Theme.text : Theme.text_dim;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }

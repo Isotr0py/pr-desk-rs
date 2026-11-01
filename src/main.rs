@@ -522,7 +522,6 @@ fn main() -> anyhow::Result<()> {
     ui.set_dark_mode(cfg.is_dark());
     // 启动时把配置的语言应用到 UI（Slint 侧 I18n 单例由 app.slint 的 changed language 回调处理）
     ui.set_language(cfg.language.clone().into());
-    ui.set_local_scope(cfg.local_scope.clone().into());
     // 数据源档案回填：名单（local 恒首位）+ 当前选中
     ui.set_profile_names(ModelRc::new(VecModel::from(
         cfg.profile_names().iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
@@ -560,27 +559,6 @@ fn main() -> anyhow::Result<()> {
             }
             reload_rows_global(&app);
             send_msg(Msg::StatusBarRefresh);
-        });
-    }
-
-    // 本地模式拉取范围切换：持久化并立即按新范围刷新列表
-    {
-        let app = app.clone();
-        let cfg_path = cfg_path.clone();
-        let cmd_tx = cmd_tx.clone();
-        ui.on_local_scope_changed(move |scope| {
-            let scope = if scope.as_str() == "all" { "all" } else { "mine" }.to_string();
-            {
-                let mut a = app.lock().unwrap();
-                if a.cfg.local_scope == scope {
-                    return; // 启动回填的同值回调：不落盘不刷新
-                }
-                a.cfg.local_scope = scope;
-                if let Err(e) = a.cfg.save(&cfg_path) {
-                    tracing::warn!("拉取范围写入 config.toml 失败: {e}");
-                }
-            }
-            let _ = cmd_tx.send(Cmd::RefreshGithub);
         });
     }
 
@@ -995,13 +973,12 @@ fn main() -> anyhow::Result<()> {
                 .upgrade()
                 .map(|u| u.get_settings_profile().to_string())
                 .unwrap_or_else(|| "default".into());
-            let (theme, language, local_scope, mut profiles, active_profile, mut server_url, mut sync_token, mut ak_s) = {
+            let (theme, language, mut profiles, active_profile, mut server_url, mut sync_token, mut ak_s) = {
                 let a = app.lock().unwrap();
-                // 主题/语言/拉取范围/数据源档案/活跃档不在设置页表单里，保留当前值
+                // 主题/语言/数据源档案/活跃档不在设置页表单里，保留当前值
                 (
                     a.cfg.theme.clone(),
                     a.cfg.language.clone(),
-                    a.cfg.local_scope.clone(),
                     a.cfg.profiles.clone(),
                     a.cfg.active_profile.clone(),
                     a.cfg.server_url.clone(),
@@ -1043,7 +1020,6 @@ fn main() -> anyhow::Result<()> {
                 poll_interval_min: poll,
                 theme,
                 language,
-                local_scope,
                 llm_base_url: llm_base.trim().to_string(),
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),
@@ -1727,42 +1703,11 @@ fn profile_fields(cfg: &Config, name: &str) -> (String, String, String) {
     }
 }
 
-/// 本地模式刷新：按 local_scope 拉取——"mine"（默认）只拉与我相关的 open PR
-///（我提的/请求我评审的/指派我的，search API），"all" 拉仓库全部 open PR。
+/// 本地模式刷新：本地库是手动策展的（只有 Inbox「+ 预评审」加入的 PR），
+/// 不从 GitHub 自动拉任何 PR 列表——这里只刷新通知收件箱。
 /// sync 启用时不走这条路——列表以服务器插件数据库为准。
 async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
-    let (repos, scope) = {
-        let a = app.lock().unwrap();
-        (a.cfg.repos.clone(), a.cfg.local_scope.clone())
-    };
-    let mut total = 0;
-    for repo in &repos {
-        let result = if scope == "all" {
-            gh.fetch_open_prs(repo).await
-        } else {
-            gh.fetch_relevant_prs(repo).await
-        };
-        match result {
-            Ok(prs) => {
-                total += prs.len();
-                let a = app.lock().unwrap();
-                for p in prs {
-                    let _ = a.db.upsert_pr(&serde_json::json!({
-                        "repo": p.repo, "number": p.number, "title": p.title,
-                        "author": p.author, "url": p.url, "head_sha": p.head_sha,
-                        "status": "pending", "updated_at": db::now(),
-                    }));
-                }
-            }
-            Err(e) => {
-                let lang = lang_of(app);
-                let _ = msg_tx.send(Msg::Status(trf(&lang, "repo_fetch_failed", &[repo, &e.to_string()])));
-            }
-        }
-    }
-    reload_rows(app, msg_tx);
-    let lang = lang_of(app);
-    let _ = msg_tx.send(Msg::Status(trf(&lang, "gh_refresh_done", &[&total.to_string()])));
+    fetch_inbox(gh, app, msg_tx).await;
 }
 
 /// 一次 sync_pull → 本地应用 → outbox/reviews push 流程（Cmd::Sync 与 sync 模式下的
