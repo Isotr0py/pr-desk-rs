@@ -35,9 +35,7 @@ component KindBadge inherits Rectangle {
     width: 82px;   // 固定宽度，保证 PullRequest/Issue 等徽章对齐
     height: 18px;
     border-radius: 9px;
-    border-width: 1px;
-    border-color: root.tone.with-alpha(0.35);
-    background: root.tone.with-alpha(0.14);
+    background: root.tone.with-alpha(0.12);
 
     Text {
         width: 100%;
@@ -59,8 +57,6 @@ component ToolButton inherits Rectangle {
     height: 22px;
     width: layout.preferred-width;
     border-radius: Theme.r_sm;
-    border-width: 1px;
-    border-color: Theme.border;
     background: ta.has-hover ? Theme.hover : transparent;
     animate background { duration: 100ms; }
 
@@ -70,7 +66,7 @@ component ToolButton inherits Rectangle {
         Text {
             text: root.label;
             font-size: Theme.fs_xs;
-            color: Theme.text_dim;
+            color: ta.has-hover ? Theme.text : Theme.text_dim;
             vertical-alignment: center;
         }
     }
@@ -174,7 +170,7 @@ component InboxHeader inherits Rectangle {
     }
 }
 
-// ── 开关胶囊：开 = accent 描边 + accent 字，关 = 描边 + dim 字（同 TurnChip 风格）──
+// ── 开关胶囊：开 = accent tint 底 + accent 字，关 = 透明底 hover 加深，无描边 ──
 component TogglePill inherits Rectangle {
     in property <string> label;
     in property <bool> on: false;
@@ -183,9 +179,7 @@ component TogglePill inherits Rectangle {
     height: 22px;
     width: layout.preferred-width;
     border-radius: 11px;
-    border-width: 1px;
-    border-color: root.on ? Theme.accent.with-alpha(0.5) : Theme.border;
-    background: root.on ? Theme.accent.with-alpha(0.18) : (ta.has-hover ? Theme.hover : transparent);
+    background: root.on ? Theme.accent.with-alpha(0.12) : (ta.has-hover ? Theme.hover : transparent);
     animate background { duration: 100ms; }
 
     layout := HorizontalLayout {
@@ -251,7 +245,6 @@ component StateDot inherits Rectangle {
 component NotifRowItem inherits Rectangle {
     in property <NotifRow> notif;
     in property <bool> selected: false;
-    in property <bool> zebra: false;
     callback clicked();
     callback add_review();
 
@@ -269,8 +262,7 @@ component NotifRowItem inherits Rectangle {
 
     height: 28px;
     background: root.selected ? Theme.sel
-        : (ta.has-hover ? Theme.hover
-        : (root.zebra ? Theme.text.with-alpha(0.03) : transparent));
+        : (ta.has-hover ? Theme.hover : transparent);
     animate background { duration: root.selected ? 150ms : 100ms; }
 
     ta := TouchArea {
@@ -386,8 +378,6 @@ component NotifRowItem inherits Rectangle {
             width: parent.width;
             height: parent.height;
             border-radius: Theme.r_sm;
-            border-width: 1px;
-            border-color: Theme.border;
             background: add-ta.has-hover ? Theme.hover : transparent;
             add-ta := TouchArea {
                 mouse-cursor: pointer;
@@ -503,8 +493,6 @@ export component InboxView inherits FocusScope {
                         height: 22px;
                         width: repo-btn-row.preferred-width;
                         border-radius: Theme.r_sm;
-                        border-width: 1px;
-                        border-color: Theme.border;
                         background: repo-ta.has-hover ? Theme.hover : Theme.surface2;
 
                         repo-ta := TouchArea {
@@ -549,10 +537,10 @@ export component InboxView inherits FocusScope {
                             Rectangle {
                                 width: 100%;
                                 height: 100%;
-                                border-radius: Theme.r_md;
+                                border-radius: Theme.r_lg;
                                 background: Theme.card;
                                 border-width: 1px;
-                                border-color: Theme.border;
+                                border-color: Theme.hairline;
 
                                 VerticalLayout {
                                     x: 0;
@@ -677,7 +665,6 @@ export component InboxView inherits FocusScope {
                         if root.repo_filter == "" || r.repo == root.repo_filter: NotifRowItem {
                             notif: r;
                             selected: i == root.selected_index;
-                            zebra: mod(i, 2) == 1;
                             clicked => {
                                 root.selected_index = i;
                                 root.row_activated(i);
@@ -695,8 +682,6 @@ export component InboxView inherits FocusScope {
                             x: (parent.width - self.width) / 2;
                             y: (parent.height - self.height) / 2;
                             border-radius: 13px;
-                            border-width: 1px;
-                            border-color: root.loading_more ? Theme.hairline : Theme.border;
                             background: !root.loading_more && load-more-ta.has-hover ? Theme.hover : Theme.surface2;
                             animate background { duration: 100ms; }
 
@@ -738,9 +723,7 @@ component StateBadge inherits Rectangle {
     height: 18px;
     width: badge-text.preferred-width + 16px;
     border-radius: 9px;
-    border-width: 1px;
-    border-color: root.tone.with-alpha(0.35);
-    background: root.tone.with-alpha(0.14);
+    background: root.tone.with-alpha(0.12);
 
     badge-text := Text {
         height: 100%;
@@ -753,7 +736,7 @@ component StateBadge inherits Rectangle {
     }
 }
 
-// ── 小号描边按钮（面板操作行用，同 DetailPanel 的 OutlineBtn 风格）──
+// ── 小号幽灵按钮（面板操作行用）：透明底 hover 加深，active 态 accent tint 底 ──
 component OutlineBtn inherits Rectangle {
     in property <string> label;
     in property <bool> active: false;
@@ -763,12 +746,9 @@ component OutlineBtn inherits Rectangle {
     height: 26px;
     width: layout.preferred-width;
     border-radius: Theme.r_md;
-    border-width: 1px;
-    border-color: root.active ? root.tint : Theme.border;
     background: root.active ? root.tint.with-alpha(0.12)
-        : (ta.has-hover ? Theme.hover : transparent);
+        : (ta.has-hover ? Theme.surface2 : transparent);
     animate background { duration: 100ms; }
-    animate border-color { duration: 100ms; }
 
     layout := HorizontalLayout {
         padding-left: 10px;
@@ -921,8 +901,6 @@ export component NotifPreview inherits Rectangle {
                 height: 26px;
                 width: tabs_layout.preferred-width;
                 border-radius: Theme.r_md;
-                border-width: 1px;
-                border-color: Theme.hairline;
                 background: Theme.surface2;
                 clip: true;
 
@@ -935,8 +913,6 @@ export component NotifPreview inherits Rectangle {
                         width: tab_t.preferred-width + 20px;
                         background: self.current ? Theme.card
                             : (tab_ta.has-hover ? Theme.hover : transparent);
-                        border-width: self.current ? 1px : 0;
-                        border-color: Theme.border;
                         animate background { duration: 100ms; }
 
                         tab_ta := TouchArea {

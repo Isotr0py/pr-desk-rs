@@ -59,7 +59,7 @@ component StateBadge inherits Rectangle {
     height: 20px;
     width: badge_layout.preferred-width;
     border-radius: 10px;
-    background: root.tone.with-alpha(0.14);
+    background: root.tone.with-alpha(0.12);
 
     badge_layout := HorizontalLayout {
         padding-left: 8px;
@@ -99,7 +99,7 @@ component CiBadge inherits Rectangle {
     height: 20px;
     width: badge_layout.preferred-width;
     border-radius: 10px;
-    background: root.tone.with-alpha(0.14);
+    background: root.tone.with-alpha(0.12);
 
     badge_layout := HorizontalLayout {
         padding-left: 8px;
@@ -144,7 +144,7 @@ component SeverityBadge inherits Rectangle {
     height: 18px;
     width: badge_layout.preferred-width;
     border-radius: 9px;
-    background: root.tone.with-alpha(0.14);
+    background: root.tone.with-alpha(0.12);
 
     badge_layout := HorizontalLayout {
         padding-left: 7px;
@@ -164,7 +164,7 @@ component SeverityBadge inherits Rectangle {
     }
 }
 
-// 小号描边按钮：hover 淡底，active 时描边与文字着 tint 色
+// 小号无边框按钮：hover 淡底，active 时 tint 浅底 + 文字着 tint 色
 // icon / trailing：前置/后置内嵌 SVG 图标（colorize 随文字色），规避字形缺失豆腐块
 component OutlineBtn inherits Rectangle {
     in property <string> label;
@@ -179,13 +179,10 @@ component OutlineBtn inherits Rectangle {
     height: 26px;
     width: layout.preferred-width;
     border-radius: Theme.r_md;
-    border-width: 1px;
-    border-color: root.active ? root.tint : Theme.border;
     background: root.active ? root.tint.with-alpha(0.12)
         : (ta.has-hover ? Theme.hover : #00000000);
 
     animate background { duration: 100ms; }
-    animate border-color { duration: 100ms; }
 
     layout := HorizontalLayout {
         padding-left: 10px;
@@ -346,8 +343,8 @@ export component DetailPanel inherits Rectangle {
             VerticalLayout {
                 padding-left: 16px;
                 padding-right: 12px;
-                padding-top: 12px;
-                padding-bottom: 12px;
+                padding-top: 14px;
+                padding-bottom: 14px;
                 spacing: 10px;
 
                 // 标题（15px/600，最多两行截断）+ 关闭按钮
@@ -447,8 +444,6 @@ export component DetailPanel inherits Rectangle {
                         width: seg.preferred-width;
                         height: 26px;
                         border-radius: Theme.r_md;
-                        border-width: 1px;
-                        border-color: Theme.border;
                         background: Theme.surface2;
                         clip: true;
                         seg := HorizontalLayout {
@@ -483,7 +478,7 @@ export component DetailPanel inherits Rectangle {
                                     y: 5px;
                                     width: 1px;
                                     height: parent.height - 10px;
-                                    background: Theme.border;
+                                    background: Theme.hairline;
                                 }
                             }
                         }
@@ -512,8 +507,6 @@ export component DetailPanel inherits Rectangle {
                 height: 26px;
                 width: tabs_layout.preferred-width;
                 border-radius: Theme.r_md;
-                border-width: 1px;
-                border-color: Theme.hairline;
                 background: Theme.surface2;
                 clip: true;
 
@@ -526,8 +519,6 @@ export component DetailPanel inherits Rectangle {
                         width: tab_t.preferred-width + 20px;
                         background: self.current ? Theme.card
                             : (tab_ta.has-hover ? Theme.hover : #00000000);
-                        border-width: self.current ? 1px : 0;
-                        border-color: Theme.border;
                         animate background { duration: 100ms; }
 
                         tab_ta := TouchArea {
@@ -587,7 +578,7 @@ export component DetailPanel inherits Rectangle {
 
                 review_scroll := ScrollView {
                     VerticalLayout {
-                        padding: 14px;
+                        padding: 16px;
                         spacing: 12px;
                         alignment: start;
 
@@ -671,14 +662,12 @@ export component DetailPanel inherits Rectangle {
 
                         // ── 报告卡片 ──
                         if root.review_has: report_card := Rectangle {
-                            border-radius: Theme.r_md;
-                            border-width: 1px;
-                            border-color: Theme.hairline;
+                            border-radius: Theme.r_lg;
                             background: Theme.card;
                             height: report_col.preferred-height;
 
                             report_col := VerticalLayout {
-                                padding: 14px;
+                                padding: 16px;
                                 spacing: 12px;
                                 alignment: start;
 
@@ -700,7 +689,7 @@ export component DetailPanel inherits Rectangle {
                                             width: pill_layout.preferred-width;
                                             height: 22px;
                                             border-radius: 11px;
-                                            background: score_tone;
+                                            background: score_tone.with-alpha(0.12);
                                             pill_layout := HorizontalLayout {
                                                 padding-left: 10px;
                                                 padding-right: 10px;
@@ -708,7 +697,7 @@ export component DetailPanel inherits Rectangle {
                                                     text: "" + round(root.review_score * 10) / 10;
                                                     font-size: Theme.fs_sm;
                                                     font-weight: 700;
-                                                    color: #ffffff;
+                                                    color: score_tone;
                                                     vertical-alignment: center;
                                                 }
                                             }
@@ -803,11 +792,11 @@ export component DetailPanel inherits Rectangle {
                                         blocks: root.review_summary_blocks;
                                         // 宽度锚定 root.width（绑定 panel_width，与内容布局无关），
                                         // 绑 report_card.width 会形成 layout-cache 绑定循环
-                                        w: max(0px, root.width - 56px);
+                                        w: max(0px, root.width - 64px);
                                     }
                                     if root.review_summary_blocks.length == 0 && root.review_summary != "": Text {
                                         text: root.review_summary;
-                                        width: max(0px, root.width - 56px);
+                                        width: max(0px, root.width - 64px);
                                         font-size: Theme.fs_md;
                                         color: Theme.text;
                                         wrap: word-wrap;
@@ -880,8 +869,6 @@ export component DetailPanel inherits Rectangle {
                                         // 评论卡片：徽章 + 类别 + 位置 + 正文（hover 覆盖层常驻，visible 切换）
                                         comment_card := Rectangle {
                                             border-radius: Theme.r_md;
-                                            border-width: 1px;
-                                            border-color: Theme.hairline;
                                             background: Theme.surface2;
                                             height: card_col.preferred-height;
 
@@ -893,7 +880,7 @@ export component DetailPanel inherits Rectangle {
                                             card_ta := TouchArea {}
 
                                             card_col := VerticalLayout {
-                                                padding: 10px;
+                                                padding: 12px;
                                                 spacing: 4px;
                                                 alignment: start;
                                                 HorizontalLayout {
@@ -1228,8 +1215,6 @@ export component DetailPanel inherits Rectangle {
                     width: 52px;
                     border-radius: Theme.r_md;
                     background: Theme.surface2;
-                    border-width: 1px;
-                    border-color: Theme.border;
                     Text {
                         text: I18n.send;
                         width: 100%;

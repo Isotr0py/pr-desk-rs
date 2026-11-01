@@ -15,7 +15,7 @@ component IconButton inherits Rectangle {
     width: 28px;
     height: 28px;
     border-radius: Theme.r_md;
-    background: ta.has-hover ? Theme.hover : transparent;
+    background: ta.has-hover ? Theme.surface2 : transparent;
     animate background { duration: 120ms; }
 
     ta := TouchArea {
@@ -41,7 +41,7 @@ component IconButton inherits Rectangle {
         border-radius: Theme.r_md;
         background: Theme.card;
         border-width: 1px;
-        border-color: Theme.border;
+        border-color: Theme.hairline;
         tip := Text {
             text: root.tooltip;
             font-size: Theme.fs_xs;
@@ -52,7 +52,7 @@ component IconButton inherits Rectangle {
     }
 }
 
-// ── 搜索框：26px 高，surface2 底，聚焦时 accent 描边，右侧「/」快捷键提示 ──
+// ── 搜索框：26px 高，surface2 底胶囊形（圆角 = 高/2），无描边，右侧「/」快捷键提示 ──
 component SearchBox inherits Rectangle {
     in-out property <string> text;
     callback focus_changed(bool);   // FocusScope 焦点变化（供集成方埋点/联动）
@@ -60,11 +60,8 @@ component SearchBox inherits Rectangle {
 
     height: 26px;
     width: 240px;
-    border-radius: Theme.r_md;
-    border-width: 1px;
-    border-color: fs.has-focus ? Theme.accent : Theme.border;
+    border-radius: self.height / 2;
     background: Theme.surface2;
-    animate border-color { duration: 120ms; }
 
     fs := FocusScope {
         changed has-focus => { root.focus_changed(self.has-focus); }
@@ -108,16 +105,14 @@ component SearchBox inherits Rectangle {
             vertical-alignment: center;
         }
 
-        // 右侧快捷键提示「/」
+        // 右侧快捷键提示「/」（无边框小胶囊，tint 底）
         Rectangle {
             x: parent.width - 30px;
             y: (parent.height - 18px) / 2;
             width: 20px;
             height: 18px;
-            border-radius: Theme.r_sm;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: Theme.card;
+            border-radius: self.height / 2;
+            background: Theme.hover;
             Text {
                 text: "/";
                 font-size: Theme.fs_xs;
@@ -145,8 +140,6 @@ component SourceSwitcher inherits Rectangle {
     // 宽度 = 图标 12 + 文字 + chevron 10 + 间隙/内边距（显式坐标布局，见下）
     width: name-txt.preferred-width + 52px;
     border-radius: Theme.r_md;
-    border-width: 1px;
-    border-color: Theme.border;
     background: ta.has-hover ? Theme.hover : Theme.surface2;
     animate background { duration: 120ms; }
 
@@ -194,10 +187,10 @@ component SourceSwitcher inherits Rectangle {
         Rectangle {
             width: 100%;
             height: 100%;
-            border-radius: Theme.r_md;
+            border-radius: Theme.r_lg;
             background: Theme.card;
             border-width: 1px;
-            border-color: Theme.border;
+            border-color: Theme.hairline;
 
             VerticalLayout {
                 x: 0;
@@ -272,11 +265,11 @@ export component TopBar inherits Rectangle {
     property <length> seg-w: 64px;
 
     HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 12px;
+        padding-left: 14px;
+        padding-right: 14px;
         padding-top: 6px;
         padding-bottom: 6px;
-        spacing: 8px;
+        spacing: 12px;
 
         // 左：应用名
         Text {
@@ -289,16 +282,14 @@ export component TopBar inherits Rectangle {
 
         Rectangle { horizontal-stretch: 1; }
 
-        // 中：列表 / Inbox 分段控件（macOS 风格：surface2 轨道 + card 白块滑块）
+        // 中：列表 / Inbox 分段控件（macOS 风格：surface2 轨道 + card 白块滑块，无描边）
         Rectangle {
             width: root.seg-w * 2 + 4px;
             height: 24px;
             border-radius: Theme.r_md;
-            border-width: 1px;
-            border-color: Theme.border;
             background: Theme.surface2;
 
-            // 滑块：card 色白块 + 1px 描边模拟细微阴影
+            // 滑块：card 色白块，靠底色与轨道区分层次
             Rectangle {
                 x: 2px + root.view_mode * root.seg-w;
                 y: 2px;
@@ -306,8 +297,6 @@ export component TopBar inherits Rectangle {
                 height: parent.height - 4px;
                 border-radius: Theme.r_sm;
                 background: Theme.card;
-                border-width: 1px;
-                border-color: Theme.border;
                 animate x { duration: 150ms; easing: ease-out; }
             }
 

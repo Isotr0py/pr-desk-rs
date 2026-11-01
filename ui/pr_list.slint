@@ -1,5 +1,5 @@
 // PR Desk — 分区 PR 列表组件（GPLv3）
-// GitHub 风格精致列表：11px 表头 + 28px 紧凑行 + 左侧 accent 选中指示条。
+// GitHub 风格精致列表：11px 表头 + 30px 紧凑行 + 左侧 accent 选中指示条。
 // 依赖共享契约：theme.slint 的 global Theme（sel/sel_text/hover/hairline/fs_*/r_*），
 // components.slint 的 Avatar / StatusDot / ScoreChip / SizeBadge / PriorityDot / TagChip。
 import { Theme } from "theme.slint";
@@ -92,7 +92,7 @@ component ColHandle inherits Rectangle {
     }
 }
 
-// ── 表头行：11px / 500 / text_dim，底部 hairline；列分界处有拖拽手柄 ──
+// ── 表头行：11px / 500 / text_faint，底部 hairline；列分界处有拖拽手柄 ──
 // 与 PrRowItem 共用同一套列坐标公式（绝对定位），保证任何宽度下逐像素对齐
 component ListHeader inherits Rectangle {
     height: 26px;
@@ -112,17 +112,17 @@ component ListHeader inherits Rectangle {
     property <length> x-age: x-diff + DiffCol.width + 6px;
     property <length> x-upd: x-age + Cols.age + 6px;
 
-    Text { x: root.x-p; width: Cols.priority; height: 100%; text: "P"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-num; width: Cols.number; height: 100%; text: "#"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-title; width: root.title-w; height: 100%; text: "Title"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-author; width: Cols.author; height: 100%; text: "Author"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-turn; width: Cols.turn; height: 100%; text: "Turn"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-rev; width: Cols.review; height: 100%; text: "Rev"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-ci; width: Cols.ci; height: 100%; text: "CI"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-size; width: Cols.size; height: 100%; text: "Size"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-diff; width: DiffCol.width; height: 100%; text: "+/-"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-age; width: Cols.age; height: 100%; text: "Age"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-upd; width: Cols.updated; height: 100%; text: "Upd"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_dim; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-p; width: Cols.priority; height: 100%; text: "P"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-num; width: Cols.number; height: 100%; text: "#"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-title; width: root.title-w; height: 100%; text: "Title"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-author; width: Cols.author; height: 100%; text: "Author"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-turn; width: Cols.turn; height: 100%; text: "Turn"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-rev; width: Cols.review; height: 100%; text: "Rev"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-ci; width: Cols.ci; height: 100%; text: "CI"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-size; width: Cols.size; height: 100%; text: "Size"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-diff; width: DiffCol.width; height: 100%; text: "+/-"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-age; width: Cols.age; height: 100%; text: "Age"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    Text { x: root.x-upd; width: Cols.updated; height: 100%; text: "Upd"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
 
     // 列宽拖拽手柄：拖分界线 = 相邻两列宽度互转（左列 + 右列 = 常量），
     // 其它列位置/宽度完全不动。手柄中心 = 间隙中心（右列左缘 - 3px）。
@@ -320,7 +320,7 @@ component QuickAction inherits Rectangle {
     width: 24px;
     height: 22px;
     border-radius: Theme.r_sm;
-    background: qa-ta.has-hover ? Theme.border.with-alpha(0.8) : transparent;
+    background: qa-ta.has-hover ? Theme.hover : transparent;
 
     qa-ta := TouchArea {
         mouse-cursor: pointer;
@@ -353,9 +353,7 @@ component TurnChip inherits Rectangle {
     height: 16px;
     width: layout.preferred-width;
     border-radius: 8px;
-    border-width: 1px;
-    border-color: root.mine ? Theme.accent.with-alpha(0.5) : Theme.border;
-    background: root.mine ? Theme.accent.with-alpha(0.18) : transparent;
+    background: root.mine ? Theme.accent.with-alpha(0.12) : Theme.text_dim.with-alpha(0.12);
 
     layout := HorizontalLayout {
         padding-left: 6px;
@@ -370,12 +368,11 @@ component TurnChip inherits Rectangle {
     }
 }
 
-// ── 紧凑数据行（28px）──
+// ── 紧凑数据行（30px）──
 // 选中：sel 底 + sel_text 字 + 左侧 2px accent 竖条；hover：Theme.hover。
 component PrRowItem inherits Rectangle {
     in property <PrListRow> pr;
     in property <bool> selected: false;
-    in property <bool> zebra: false;   // 偶数行斑马纹
     callback clicked();
     callback pin();
     callback board();
@@ -388,10 +385,9 @@ component PrRowItem inherits Rectangle {
     // 高优先级行提升视觉层级
     property <bool> hot: root.pr.priority == 1;
 
-    height: 28px;
+    height: 30px;
     background: root.selected ? Theme.sel
-        : (row-ta.has-hover ? Theme.hover
-        : (root.zebra ? Theme.text.with-alpha(0.03) : transparent));
+        : (row-ta.has-hover ? Theme.hover : transparent);
 
     animate background { duration: root.selected ? 150ms : 100ms; }
 
@@ -534,8 +530,6 @@ component PrRowItem inherits Rectangle {
             x: 0;
             y: (parent.height - 16px) / 2;
             border-radius: 4px;
-            border-width: 1px;
-            border-color: Theme.border;
             background: Theme.surface2;
             Image {
                 source: @image-url("icons/org.svg");
@@ -706,7 +700,6 @@ component PrRowItem inherits Rectangle {
 // ── 分区列表 ──
 // rows 为扁平数据行（不含组头），groups 以 start/count 切片；groups 为空时退化为扁平列表。
 // 折叠状态直接写在 groups[i].collapsed（in-out，集成方可用 VecModel 持久化）。
-// 斑马纹下标基于「本组内可见行序」，折叠的组不参与。
 export component PrListView inherits FocusScope {
     in property <[PrListRow]> rows: [];
     in-out property <[PrGroup]> groups: [];
@@ -794,7 +787,6 @@ export component PrListView inherits FocusScope {
                         for r[i] in root.rows: PrRowItem {
                             pr: r;
                             selected: root.selected_key != "" && r.key == root.selected_key;
-                            zebra: mod(i, 2) == 1;
                             clicked => {
                                 root.select_at(i);
                                 root.row_activated(i);
@@ -821,7 +813,6 @@ export component PrListView inherits FocusScope {
                                 private property <int> idx: group.start + ri;
                                 pr: root.rows[self.idx];
                                 selected: root.selected_key != "" && root.rows[self.idx].key == root.selected_key;
-                                zebra: mod(ri, 2) == 1;
                                 clicked => {
                                     root.select_at(self.idx);
                                     root.row_activated(self.idx);

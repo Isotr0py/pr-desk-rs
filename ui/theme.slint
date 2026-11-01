@@ -13,9 +13,9 @@ export global Theme {
     out property <color> bg: dark ? #0d1117 : #f6f8fa;
     out property <color> card: dark ? #161b22 : #ffffff;
     out property <color> surface2: dark ? #21262d : #eaeef2;
-    // 边框与发丝级分隔线
-    out property <color> border: dark ? #30363d : #d0d7de;
-    out property <color> hairline: dark ? #21262d : #d8dee4;
+    // 边框与发丝级分隔线（极简风：边框仅用于输入框等必须圈定区域的地方，其余靠底色/hairline 分层）
+    out property <color> border: dark ? #2d333b : #dfe5eb;
+    out property <color> hairline: dark ? #21262d : #e6ebf0;
     // 文字三级层次：正文 / 次要 / 更弱
     out property <color> text: dark ? #e6edf3 : #1f2328;
     out property <color> text_dim: dark ? #8b949e : #59636e;
@@ -26,9 +26,9 @@ export global Theme {
     out property <color> mid: dark ? #d29922 : #9a6700;
     out property <color> bad: dark ? #f85149 : #d1242f;
     out property <color> purple: dark ? #bc8cff : #8250df;
-    // 选中 / 悬停
-    out property <color> sel: dark ? #1f6feb : #0969da;
-    out property <color> sel_text: #ffffff;
+    // 选中 / 悬停（极简选中 = accent 浅底 + accent 字；实心 accent 仅留给主按钮）
+    out property <color> sel: dark ? #58a6ff24 : #0969da17;
+    out property <color> sel_text: dark ? #58a6ff : #0969da;
     out property <color> hover: dark ? #ffffff10 : #00000008;
     // 语义底色（成功 / 失败 / 警告，用于徽章、行底）
     out property <color> green_bg: dark ? #3fb95026 : #1a7f3726;
@@ -42,8 +42,8 @@ export global Theme {
     out property <length> fs_lg: 15px;
     out property <length> fs_xl: 18px;
 
-    // ── 圆角 ─────────────────────────────────────────────
-    out property <length> r_sm: 4px;
-    out property <length> r_md: 6px;
-    out property <length> r_lg: 10px;
+    // ── 圆角（极简风整体更圆润）─────────────────────────────
+    out property <length> r_sm: 6px;
+    out property <length> r_md: 8px;
+    out property <length> r_lg: 12px;
 }

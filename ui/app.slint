@@ -13,7 +13,7 @@ import { MdBlock } from "components.slint";
 // 类型再导出：slint-build 从本文件生成 Rust 绑定
 export { PrListRow, PrGroup, ConvoEntry, CheckRun, FileChange, DiffFile, DiffLine, NotifRow, OcrComment, DimScore, MdBlock }
 
-// ── 表单输入框：30px 高、6px 圆角、1px 描边，聚焦时 accent 描边 ──
+// ── 表单输入框：30px 高、surface2 底无边框，聚焦时 accent 描边 ──
 component FormField inherits Rectangle {
     in-out property <string> text <=> input.text;
     in property <string> placeholder: "";
@@ -24,10 +24,10 @@ component FormField inherits Rectangle {
 
     height: 30px;
     border-radius: Theme.r_md;
-    border-width: 1px;
-    border-color: input.has-focus ? Theme.accent : Theme.border;
-    background: root.enabled ? Theme.bg : Theme.surface2;
-    animate border-color { duration: 120ms; }
+    border-width: input.has-focus ? 1px : 0px;
+    border-color: Theme.accent;
+    background: root.enabled ? Theme.surface2 : Theme.surface2.with-alpha(0.5);
+    animate border-width { duration: 120ms; }
 
     input := TextInput {
         x: 10px;
@@ -60,11 +60,11 @@ component FormArea inherits Rectangle {
 
     height: 88px;
     border-radius: Theme.r_md;
-    border-width: 1px;
-    border-color: input.has-focus ? Theme.accent : Theme.border;
-    background: Theme.bg;
+    border-width: input.has-focus ? 1px : 0px;
+    border-color: Theme.accent;
+    background: Theme.surface2;
     clip: true;
-    animate border-color { duration: 120ms; }
+    animate border-width { duration: 120ms; }
 
     Flickable {
         x: 10px;
@@ -92,19 +92,19 @@ component FormArea inherits Rectangle {
     }
 }
 
-// ── 表单分组：12px dim 标签在上，控件在下，间距 4px ──
+// ── 表单分组：11px faint 小字标签在上，控件在下，间距 4px ──
 component Field inherits VerticalLayout {
     in property <string> label;
     spacing: 4px;
     Text {
         text: root.label;
-        color: Theme.text_dim;
-        font-size: Theme.fs_sm;
+        color: Theme.text_faint;
+        font-size: Theme.fs_xs;
     }
     @children
 }
 
-// ── 对话框按钮：primary = accent 实心白字，否则描边按钮 ──
+// ── 对话框按钮：primary = accent 实心白字（主按钮唯一例外），否则幽灵按钮（透明底、无描边、hover surface2）──
 component DialogButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
@@ -114,11 +114,9 @@ component DialogButton inherits Rectangle {
     width: root.button-width;
     height: 30px;
     border-radius: Theme.r_md;
-    border-width: root.primary ? 0px : 1px;
-    border-color: Theme.border;
     background: root.primary
         ? (ta.has-hover ? Theme.accent.darker(1.08) : Theme.accent)
-        : (ta.has-hover ? Theme.hover : transparent);
+        : (ta.has-hover ? Theme.surface2 : transparent);
     animate background { duration: 120ms; }
 
     ta := TouchArea {
@@ -143,8 +141,6 @@ component NumStepper inherits Rectangle {
     width: 108px;
     height: 30px;
     border-radius: Theme.r_md;
-    border-width: 1px;
-    border-color: Theme.border;
     background: Theme.surface2;
     clip: true;
 
@@ -502,7 +498,7 @@ export component MainWindow inherits Window {
             background: Theme.card;
             border-radius: Theme.r_lg;
             border-width: 1px;
-            border-color: Theme.border;
+            border-color: Theme.hairline;
 
             welcome-col := VerticalLayout {
                 padding: 28px;
@@ -552,7 +548,7 @@ export component MainWindow inherits Window {
             background: Theme.card;
             border-radius: Theme.r_lg;
             border-width: 1px;
-            border-color: Theme.border;
+            border-color: Theme.hairline;
             clip: true;
 
             VerticalLayout {
@@ -573,8 +569,6 @@ export component MainWindow inherits Window {
                         width: 340px;
                         height: 26px;
                         border-radius: Theme.r_md;
-                        border-width: 1px;
-                        border-color: Theme.border;
                         background: Theme.surface2;
 
                         Rectangle {
@@ -584,8 +578,6 @@ export component MainWindow inherits Window {
                             height: parent.height - 4px;
                             border-radius: Theme.r_sm;
                             background: Theme.card;
-                            border-width: 1px;
-                            border-color: Theme.border;
                             animate x { duration: 150ms; easing: ease-out; }
                         }
                         stab0 := TouchArea {
@@ -657,8 +649,6 @@ export component MainWindow inherits Window {
                             width: 160px;
                             height: 30px;
                             border-radius: Theme.r_md;
-                            border-width: 1px;
-                            border-color: Theme.border;
                             background: profile-ta.has-hover ? Theme.hover : Theme.surface2;
                             animate background { duration: 120ms; }
 
@@ -705,10 +695,10 @@ export component MainWindow inherits Window {
                                 Rectangle {
                                     width: 100%;
                                     height: 100%;
-                                    border-radius: Theme.r_md;
+                                    border-radius: Theme.r_lg;
                                     background: Theme.card;
                                     border-width: 1px;
-                                    border-color: Theme.border;
+                                    border-color: Theme.hairline;
 
                                     VerticalLayout {
                                         x: 0;
@@ -776,8 +766,6 @@ export component MainWindow inherits Window {
                             width: 30px;
                             height: 30px;
                             border-radius: Theme.r_md;
-                            border-width: 1px;
-                            border-color: Theme.border;
                             background: add-ta.has-hover ? Theme.hover : transparent;
                             animate background { duration: 120ms; }
 
@@ -806,7 +794,7 @@ export component MainWindow inherits Window {
                                 border-radius: Theme.r_sm;
                                 background: Theme.card;
                                 border-width: 1px;
-                                border-color: Theme.border;
+                                border-color: Theme.hairline;
                                 add-tip := Text {
                                     text: I18n.profile_add_tooltip;
                                     font-size: Theme.fs_xs;
@@ -821,8 +809,6 @@ export component MainWindow inherits Window {
                             width: 30px;
                             height: 30px;
                             border-radius: Theme.r_md;
-                            border-width: 1px;
-                            border-color: Theme.border;
                             background: cancel-ta.has-hover ? Theme.hover : transparent;
                             animate background { duration: 120ms; }
 
@@ -846,8 +832,6 @@ export component MainWindow inherits Window {
                             width: 30px;
                             height: 30px;
                             border-radius: Theme.r_md;
-                            border-width: 1px;
-                            border-color: Theme.border;
                             background: del-ta.has-hover ? Theme.hover : transparent;
                             animate background { duration: 120ms; }
 
@@ -872,7 +856,7 @@ export component MainWindow inherits Window {
                                 border-radius: Theme.r_sm;
                                 background: Theme.card;
                                 border-width: 1px;
-                                border-color: Theme.border;
+                                border-color: Theme.hairline;
                                 del-tip := Text {
                                     text: I18n.profile_delete_tooltip;
                                     font-size: Theme.fs_xs;
@@ -961,8 +945,6 @@ export component MainWindow inherits Window {
                             width: 152px;
                             height: 26px;
                             border-radius: Theme.r_md;
-                            border-width: 1px;
-                            border-color: Theme.border;
                             background: Theme.surface2;
 
                             Rectangle {
@@ -972,8 +954,6 @@ export component MainWindow inherits Window {
                                 height: parent.height - 4px;
                                 border-radius: Theme.r_sm;
                                 background: Theme.card;
-                                border-width: 1px;
-                                border-color: Theme.border;
                                 animate x { duration: 150ms; easing: ease-out; }
                             }
                             lang-zh := TouchArea {
@@ -1045,8 +1025,6 @@ export component MainWindow inherits Window {
                     // 选中即填入输入框（输入框仍可手输）；标题行可折叠
                     if root.model_list.length > 0: Rectangle {
                         border-radius: Theme.r_md;
-                        border-width: 1px;
-                        border-color: Theme.border;
                         background: Theme.surface2;
                         clip: true;
                         height: root.model_list_open ? 178px : 30px;

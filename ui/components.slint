@@ -13,8 +13,6 @@ export component Avatar inherits Rectangle {
     width: root.size;
     height: root.size;
     border-radius: root.size / 2;
-    border-width: 1px;
-    border-color: Theme.hairline;
     clip: true;
 
     property <bool> has-img: root.img.width > 0 && root.img.height > 0;
@@ -75,9 +73,7 @@ export component ScoreChip inherits Rectangle {
     height: 18px;
     width: layout.preferred-width;
     border-radius: 9px;
-    background: root.tone.with-alpha(0.14);
-    border-width: 1px;
-    border-color: root.tone.with-alpha(0.35);
+    background: root.tone.with-alpha(0.12);
 
     layout := HorizontalLayout {
         padding-left: 8px;
@@ -99,8 +95,6 @@ export component TagChip inherits Rectangle {
     height: 18px;
     width: layout.preferred-width;
     border-radius: 9px;
-    border-width: 1px;
-    border-color: Theme.hairline;
     background: Theme.surface2;
 
     layout := HorizontalLayout {
@@ -128,9 +122,7 @@ export component SizeBadge inherits Rectangle {
     height: 18px;
     width: layout.preferred-width;
     border-radius: 9px;
-    background: root.tone.with-alpha(0.14);
-    border-width: 1px;
-    border-color: root.tone.with-alpha(0.35);
+    background: root.tone.with-alpha(0.12);
 
     layout := HorizontalLayout {
         padding-left: 8px;
@@ -206,7 +198,7 @@ export component IconButton inherits Rectangle {
         border-radius: Theme.r_sm;
         background: Theme.card;
         border-width: 1px;
-        border-color: Theme.border;
+        border-color: Theme.hairline;
         tip := HorizontalLayout {
             padding-left: 8px;
             padding-right: 8px;
@@ -382,8 +374,6 @@ export component MarkdownBlocks inherits VerticalLayout {
             property <int> trows: b.cells.length / tcols;
 
             border-radius: Theme.r_md;
-            border-width: 1px;
-            border-color: Theme.hairline;
             background: Theme.card;
             clip: true;
             height: tbl.preferred-height;
@@ -484,13 +474,13 @@ export component EmptyState inherits Rectangle {
                 height: 28px;
                 x: (parent.width - self.width) / 2;
                 image-fit: contain;
-                colorize: Theme.text_dim;
+                colorize: Theme.text_faint;
             }
         }
         if root.icon_img.width == 0: Text {
             text: root.icon;
             font-size: 28px;
-            color: Theme.text_dim;
+            color: Theme.text_faint;
             horizontal-alignment: center;
         }
         Text {
