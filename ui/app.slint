@@ -274,6 +274,7 @@ export component MainWindow inherits Window {
     in property <bool> inbox_detail_open: false;
     in property <string> nd_title: "";
     in property <string> nd_kind: "";
+    in property <string> nd_state: "";
     in property <bool> nd_added: false;
     in property <bool> nd_loading: false;
     in property <[ConvoEntry]> nd_convo: [];
@@ -456,6 +457,7 @@ export component MainWindow inherits Window {
                     visible: root.inbox_detail_open;
                     title: root.nd_title;
                     kind: root.nd_kind;
+                    state: root.nd_state;
                     added: root.nd_added;
                     loading: root.nd_loading;
                     convo_entries: root.nd_convo;

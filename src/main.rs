@@ -827,6 +827,7 @@ fn main() -> anyhow::Result<()> {
             let kind = n["kind"].as_str().unwrap_or("").to_string();
             let title = n["title"].as_str().unwrap_or("").to_string();
             let url = n["url"].as_str().unwrap_or("").to_string();
+            let state = n["state"].as_str().unwrap_or("").to_string();
             let Some(number) = notif_url_number(&url) else { return };
             app.lock().unwrap().inbox_detail = Some((repo.clone(), number, kind.clone(), url));
             // 立即开面板并进加载态（数据由 worker 回送）
@@ -837,6 +838,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(ui) = weak.upgrade() {
                 ui.set_nd_title(title.into());
                 ui.set_nd_kind(kind.clone().into());
+                ui.set_nd_state(state.into());
                 ui.set_nd_added(added);
                 ui.set_nd_loading(true);
                 ui.set_inbox_detail_open(true);
@@ -1600,6 +1602,54 @@ fn notif_url_number(html_url: &str) -> Option<i64> {
     html_url.rsplit('/').next()?.parse().ok()
 }
 
+/// 批量补 PR/Issue 的 open/closed/merged 状态（GraphQL 一次请求）。
+/// 失败降级为空表——状态只是行装饰，不拖垮通知拉取本身。
+async fn fetch_notif_states(
+    gh: &github::GitHub,
+    ns: &[github::Notification],
+) -> std::collections::HashMap<String, String> {
+    let mut seen = std::collections::HashSet::new();
+    let items: Vec<(String, i64, bool)> = ns
+        .iter()
+        .filter_map(|n| {
+            let is_pr = match n.kind.as_str() {
+                "PullRequest" => true,
+                "Issue" => false,
+                _ => return None,
+            };
+            let number = notif_url_number(&notif_html_url(&n.url))?;
+            if seen.insert((n.repo.clone(), number)) {
+                Some((n.repo.clone(), number, is_pr))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if items.is_empty() {
+        return Default::default();
+    }
+    match gh.fetch_subject_states(&items).await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!("通知状态批量查询失败: {e}");
+            Default::default()
+        }
+    }
+}
+
+/// 通知 → 行 JSON（state 取自批量查询结果，查不到为空串）。
+fn notif_row_json(n: &github::Notification, states: &std::collections::HashMap<String, String>) -> serde_json::Value {
+    let url = notif_html_url(&n.url);
+    let state = notif_url_number(&url)
+        .and_then(|num| states.get(&format!("{}#{num}", n.repo)).cloned())
+        .unwrap_or_default();
+    serde_json::json!({
+        "id": n.id, "repo": n.repo, "title": n.title, "kind": n.kind,
+        "reason": n.reason, "updated_at": n.updated_at, "unread": n.unread,
+        "url": url, "state": state,
+    })
+}
+
 /// 拉取 GitHub 通知并回送 UI（无 token 时静默跳过：通知接口必须鉴权）。
 /// 刷新语义：重拉已加载的全部页（1..=inbox_page），保序拼接 + 按 thread id 去重，
 /// 这样用户「加载更多」后定时刷新不会把多页数据塌回第一页。
@@ -1637,20 +1687,12 @@ async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::
         }
     }
     tracing::info!("fetch_inbox: got {} notifications ({} pages)", all_ns.len(), pages);
+    let states = fetch_notif_states(gh, &all_ns).await;
     {
         let mut a = app.lock().unwrap();
         a.inbox_has_more = has_more;
     }
-    let rows: Vec<serde_json::Value> = all_ns
-        .into_iter()
-        .map(|n| {
-            serde_json::json!({
-                "id": n.id, "repo": n.repo, "title": n.title, "kind": n.kind,
-                "reason": n.reason, "updated_at": n.updated_at, "unread": n.unread,
-                "url": notif_html_url(&n.url),
-            })
-        })
-        .collect();
+    let rows: Vec<serde_json::Value> = all_ns.iter().map(|n| notif_row_json(n, &states)).collect();
     let _ = msg_tx.send(Msg::InboxRows(rows));
 }
 
@@ -1669,6 +1711,11 @@ async fn fetch_inbox_more(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &m
         return;
     }
     let result = gh.fetch_notifications_page(all, next_page).await;
+    // 新页的状态在持锁前查好（GraphQL 一次请求；失败降级为空表）
+    let new_states = match &result {
+        Ok((ns, _)) => fetch_notif_states(gh, ns).await,
+        Err(_) => Default::default(),
+    };
     let merged: Vec<serde_json::Value>;
     {
         let mut a = app.lock().unwrap();
@@ -1680,13 +1727,11 @@ async fn fetch_inbox_more(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &m
                     .iter()
                     .filter_map(|r| r["id"].as_str().map(|s| s.to_string()))
                     .collect();
-                a.inbox.extend(ns.into_iter().filter(|n| seen.insert(n.id.clone())).map(|n| {
-                    serde_json::json!({
-                        "id": n.id, "repo": n.repo, "title": n.title, "kind": n.kind,
-                        "reason": n.reason, "updated_at": n.updated_at, "unread": n.unread,
-                        "url": notif_html_url(&n.url),
-                    })
-                }));
+                a.inbox.extend(
+                    ns.iter()
+                        .filter(|n| seen.insert(n.id.clone()))
+                        .map(|n| notif_row_json(n, &new_states)),
+                );
                 a.inbox_page = next_page;
                 a.inbox_has_more = more;
                 merged = a.inbox.clone();
@@ -2792,6 +2837,7 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
                             unread: n["unread"].as_bool().unwrap_or(false),
                             url: url.into(),
                             added,
+                            state: n["state"].as_str().unwrap_or("").into(),
                         }
                     })
                     .collect()

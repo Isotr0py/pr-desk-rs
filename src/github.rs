@@ -211,6 +211,36 @@ impl GitHub {
         Ok((items, has_more))
     }
 
+    /// 批量查询 PR/Issue 的 open/closed/merged 状态（GraphQL，每 100 块一次请求）。
+    /// items: (repo "owner/name", number, is_pr)；返回 "owner/name#number" → "open"/"closed"/"merged"。
+    /// 查不到的条目（已删除/无权限）不出现在结果里，调用方按「无状态」处理。
+    pub async fn fetch_subject_states(
+        &self,
+        items: &[(String, i64, bool)],
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in items.chunks(100) {
+            let query = build_states_query(chunk);
+            let resp = self
+                .client
+                .post(format!("{API}/graphql"))
+                .json(&serde_json::json!({ "query": query }))
+                .send()
+                .await?;
+            self.record_rate_limit(resp.headers());
+            if !resp.status().is_success() {
+                anyhow::bail!("GitHub graphql: {}", resp.status());
+            }
+            let body: Value = resp.json().await?;
+            // GraphQL 允许部分字段报错；只有 data 整体缺失才算失败
+            if body["data"].is_null() {
+                anyhow::bail!("GitHub graphql errors: {}", body["errors"]);
+            }
+            parse_states_response(&body, chunk, &mut out);
+        }
+        Ok(out)
+    }
+
     /// 把一条通知线程标记为已读（PATCH /notifications/threads/{id}，无 body）。
     pub async fn mark_notification_read(&self, thread_id: &str) -> Result<()> {
         let url = format!("{API}/notifications/threads/{thread_id}");
@@ -331,6 +361,38 @@ impl GitHub {
     }
 }
 
+/// 构造批量状态查询的 GraphQL：每个条目一个 repository 别名块（r{i}），
+/// 内嵌 pullRequest/issue 字段（n{i}）。owner/name 只含 GitHub 合法字符，直接内联安全。
+fn build_states_query(items: &[(String, i64, bool)]) -> String {
+    let mut q = String::from("query {");
+    for (i, (repo, number, is_pr)) in items.iter().enumerate() {
+        let (owner, name) = repo.split_once('/').unwrap_or(("", repo.as_str()));
+        let field = if *is_pr { "pullRequest" } else { "issue" };
+        q.push_str(&format!(
+            "r{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ n{i}: {field}(number: {number}) {{ state }} }}"
+        ));
+    }
+    q.push('}');
+    q
+}
+
+/// 解析 GraphQL 响应：按条目下标回读 r{i}/n{i}.state，小写化后写入 "repo#number"。
+/// PR 的 MERGED 原样保留为 "merged"；条目为 null（已删除）时跳过。
+fn parse_states_response(
+    body: &Value,
+    items: &[(String, i64, bool)],
+    out: &mut std::collections::HashMap<String, String>,
+) {
+    for (i, (repo, number, _)) in items.iter().enumerate() {
+        let state = body["data"][format!("r{i}")][format!("n{i}")]["state"]
+            .as_str()
+            .map(|s| s.to_ascii_lowercase());
+        if let Some(s) = state {
+            out.insert(format!("{repo}#{number}"), s);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,5 +441,39 @@ mod tests {
     fn aggregate_ci_failure_beats_pending() {
         let runs = vec![run("in_progress", None), run("completed", Some("failure"))];
         assert_eq!(aggregate_ci(&runs), "failure");
+    }
+
+    #[test]
+    fn states_query_embeds_repo_and_number() {
+        let items = vec![
+            ("vllm-project/vllm".to_string(), 123, true),
+            ("o/r".to_string(), 7, false),
+        ];
+        let q = build_states_query(&items);
+        assert!(q.contains("r0: repository(owner: \"vllm-project\", name: \"vllm\")"));
+        assert!(q.contains("n0: pullRequest(number: 123)"));
+        assert!(q.contains("n1: issue(number: 7)"));
+        assert!(q.starts_with("query {") && q.ends_with('}'));
+    }
+
+    #[test]
+    fn states_response_maps_and_skips_null() {
+        let items = vec![
+            ("o/r".to_string(), 1, true),
+            ("o/r".to_string(), 2, true),
+            ("o/r".to_string(), 3, false),
+        ];
+        let body = serde_json::json!({
+            "data": {
+                "r0": { "n0": { "state": "MERGED" } },
+                "r1": { "n1": null },
+                "r2": { "n2": { "state": "CLOSED" } }
+            }
+        });
+        let mut out = std::collections::HashMap::new();
+        parse_states_response(&body, &items, &mut out);
+        assert_eq!(out.get("o/r#1").map(String::as_str), Some("merged"));
+        assert_eq!(out.get("o/r#3").map(String::as_str), Some("closed"));
+        assert!(!out.contains_key("o/r#2"));
     }
 }

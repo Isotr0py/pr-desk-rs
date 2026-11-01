@@ -20,6 +20,7 @@ export struct NotifRow {
     unread: bool,
     url: string,        // HTML URL（subject.url 由 Rust 侧转换）
     added: bool,        // PR 已在本地库（「+ 预评审」→「已加入」反馈）
+    state: string,      // open / closed / merged（GraphQL 批量补的；空 = 未知/非 PR·Issue）
 }
 
 // ── kind 徽章：固定宽度 + 按类型着色（PullRequest 蓝 / Issue 紫 / 其他黄）──
@@ -118,7 +119,8 @@ component InboxHeader inherits Rectangle {
     // 列 x 坐标（与 NotifRowItem 相同）
     property <length> x-dot: InboxCols.pad-l;
     property <length> x-repo: x-dot + InboxCols.dot + 8px;
-    property <length> x-title: x-repo + InboxCols.repo + 8px;
+    property <length> x-state: x-repo + InboxCols.repo + 8px;
+    property <length> x-title: x-state + InboxCols.state + 4px;
     property <length> x-kind: root.width - InboxCols.pad-r - InboxCols.time - 8px - InboxCols.reason - 8px - InboxCols.kind;
     property <length> x-reason: x-kind + InboxCols.kind + 8px;
     property <length> x-time: x-reason + InboxCols.reason + 8px;
@@ -217,15 +219,31 @@ component TogglePill inherits Rectangle {
 }
 
 // Inbox 列宽契约（表头与数据行共用）。in-out：表头拖拽手柄可改列宽。
-//   dot 8px / repo 180px / title 弹性 / kind 82px / reason 110px / time 40px
+//   dot 8px / repo 180px / state 12px / title 弹性 / kind 82px / reason 110px / time 40px
 global InboxCols {
     in-out property <length> dot: 8px;
     in-out property <length> repo: 180px;
+    out property <length> state: 12px;
     in-out property <length> kind: 82px;
     in-out property <length> reason: 110px;
     in-out property <length> time: 40px;
     out property <length> pad-l: 10px;
     out property <length> pad-r: 10px;
+}
+
+// ── 状态点（GitHub 配色：open 绿 / merged 紫 / closed 红）──
+component StateDot inherits Rectangle {
+    in property <string> state;
+
+    property <color> tone: root.state == "open" ? Theme.good
+        : root.state == "merged" ? Theme.purple
+        : Theme.bad;   // closed
+
+    width: 8px;
+    height: 8px;
+    border-radius: 4px;
+    background: root.tone;
+    visible: root.state != "";
 }
 
 // ── 单行通知（28px）：选中 sel 底 + 左侧 accent 竖条；hover 用 Theme.hover；行底 hairline ──
@@ -243,7 +261,8 @@ component NotifRowItem inherits Rectangle {
     // 列 x 坐标（与 InboxHeader 共用同一套公式）
     property <length> x-dot: InboxCols.pad-l;
     property <length> x-repo: x-dot + InboxCols.dot + 8px;
-    property <length> x-title: x-repo + InboxCols.repo + 8px;
+    property <length> x-state: x-repo + InboxCols.repo + 8px;
+    property <length> x-title: x-state + InboxCols.state + 4px;
     property <length> x-kind: root.width - InboxCols.pad-r - InboxCols.time - 8px - InboxCols.reason - 8px - InboxCols.kind;
     property <length> x-reason: x-kind + InboxCols.kind + 8px;
     property <length> x-time: x-reason + InboxCols.reason + 8px;
@@ -290,14 +309,23 @@ component NotifRowItem inherits Rectangle {
         vertical-alignment: center;
     }
 
+    // PR/Issue 状态点（open/closed/merged；未知不显示）
+    StateDot {
+        x: root.x-state + 2px;
+        y: (parent.height - self.height) / 2;
+        state: root.notif.state;
+    }
+
     Text {
         x: root.x-title;
         width: root.x-kind - 8px - root.x-title;
         height: parent.height;
         text: root.notif.title;
-        color: root.fg;
+        // closed/merged 的行整体压暗（同 GitHub 通知的已完结视觉）
+        property <bool> done: root.notif.state == "closed" || root.notif.state == "merged";
+        color: self.done ? root.fg-dim : root.fg;
         font-size: Theme.fs_sm;
-        font-weight: root.notif.unread ? 700 : 400;
+        font-weight: root.notif.unread && !self.done ? 700 : 400;
         overflow: elide;
         vertical-alignment: center;
     }
@@ -696,6 +724,35 @@ export component InboxView inherits FocusScope {
     }
 }
 
+// ── 状态徽章（open 绿 / merged 紫 / closed 红；预览面板用）──
+component StateBadge inherits Rectangle {
+    in property <string> state;
+
+    property <color> tone: root.state == "open" ? Theme.good
+        : root.state == "merged" ? Theme.purple
+        : Theme.bad;
+    property <string> label: root.state == "open" ? I18n.inbox_state_open
+        : root.state == "merged" ? I18n.inbox_state_merged
+        : I18n.inbox_state_closed;
+
+    height: 18px;
+    width: badge-text.preferred-width + 16px;
+    border-radius: 9px;
+    border-width: 1px;
+    border-color: root.tone.with-alpha(0.35);
+    background: root.tone.with-alpha(0.14);
+
+    badge-text := Text {
+        height: 100%;
+        text: root.label;
+        font-size: Theme.fs_xs;
+        font-weight: 500;
+        color: root.tone;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
 // ── 小号描边按钮（面板操作行用，同 DetailPanel 的 OutlineBtn 风格）──
 component OutlineBtn inherits Rectangle {
     in property <string> label;
@@ -738,6 +795,7 @@ export component NotifPreview inherits Rectangle {
 
     in property <string> title: "";
     in property <string> kind: "";        // PullRequest / Issue / …（决定标签页）
+    in property <string> state: "";       // open / closed / merged（空 = 未知/不适用）
     in property <bool> added: false;      // 已在本地库（按钮变「已加入」）
     in property <bool> loading: false;    // 详情拉取中
 
@@ -823,6 +881,10 @@ export component NotifPreview inherits Rectangle {
                     alignment: start;
                     if root.kind != "": KindBadge {
                         label: root.kind;
+                        y: (parent.height - self.height) / 2;
+                    }
+                    if root.state != "": StateBadge {
+                        state: root.state;
                         y: (parent.height - self.height) / 2;
                     }
                     Rectangle { horizontal-stretch: 1; }
