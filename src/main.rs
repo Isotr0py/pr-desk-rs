@@ -26,6 +26,7 @@ enum Cmd {
     Sync,
     FetchDiff { repo: String, number: i64 },
     FetchInbox,                 // 拉取 GitHub 通知（RefreshGithub/Sync 也会顺带触发）
+    FetchInboxMore,             // Inbox「加载更多」：拉下一页追加
     MarkNotifRead(String),      // 标记通知线程已读，完成后重新拉取
     MarkAllNotifsRead,          // PUT /notifications 全部已读，完成后重新拉取
     AddNotifReview { repo: String, number: i64, title: String, url: String },  // Inbox「+ 预评审」入库
@@ -385,6 +386,9 @@ struct App {
     status_msg: String,                     // 状态栏临时消息（最近一条 Status）
     inbox: Vec<serde_json::Value>,          // 最近一批通知行（inbox_activated 按下标取 thread id）
     inbox_all: bool,                        // 通知拉取范围：true = 含已读（&all=true），false = 只看未读
+    inbox_page: u32,                        // 已加载到的页码（每页 50 条；「加载更多」追加下一页）
+    inbox_has_more: bool,                   // 是否还有下一页可加载
+    inbox_loading_more: bool,               // 「加载更多」进行中（防重入）
     inbox_detail: Option<(String, i64, String, String)>,  // 预览面板当前行（repo, number, kind, url）
     total: usize,                           // 全部行数（状态栏「共 N 个 PR」）
     rate_limit: Arc<Mutex<Option<u64>>>,    // GitHub X-RateLimit-Remaining 共享状态
@@ -490,6 +494,9 @@ fn main() -> anyhow::Result<()> {
         status_msg: config_status(&cfg),
         inbox: Vec::new(),
         inbox_all: true,
+        inbox_page: 1,
+        inbox_has_more: false,
+        inbox_loading_more: false,
         inbox_detail: None,
         total: 0,
         rate_limit: Arc::new(Mutex::new(None)),
@@ -635,17 +642,32 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        // 「加载更多」：按钮按下立刻给 UI 加载态（回调跑在 UI 线程），worker 拉下一页追加
+        let ui2 = ui.as_weak();
+        let cmd_tx = cmd_tx.clone();
+        ui.on_inbox_load_more(move || {
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_inbox_loading_more(true);
+            }
+            let _ = cmd_tx.send(Cmd::FetchInboxMore);
+        });
+    }
+    {
         let cmd_tx = cmd_tx.clone();
         ui.on_inbox_mark_all_read(move || {
             let _ = cmd_tx.send(Cmd::MarkAllNotifsRead);
         });
     }
     {
-        // 「只看未读」开关：状态存 App（worker 拉取时读取），切完立即重拉
+        // 「只看未读」开关：状态存 App（worker 拉取时读取），切完立即重拉；分页重置回第一页
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         ui.on_inbox_filter_toggled(move |unread_only| {
-            app.lock().unwrap().inbox_all = !unread_only;
+            let mut a = app.lock().unwrap();
+            a.inbox_all = !unread_only;
+            a.inbox_page = 1;
+            a.inbox_has_more = false;
+            drop(a);
             let _ = cmd_tx.send(Cmd::FetchInbox);
         });
     }
@@ -1579,35 +1601,106 @@ fn notif_url_number(html_url: &str) -> Option<i64> {
 }
 
 /// 拉取 GitHub 通知并回送 UI（无 token 时静默跳过：通知接口必须鉴权）。
+/// 刷新语义：重拉已加载的全部页（1..=inbox_page），保序拼接 + 按 thread id 去重，
+/// 这样用户「加载更多」后定时刷新不会把多页数据塌回第一页。
 async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
-    let (has_token, all) = {
+    let (has_token, all, pages) = {
         let a = app.lock().unwrap();
-        (a.cfg.token().is_some(), a.inbox_all)
+        (a.cfg.token().is_some(), a.inbox_all, a.inbox_page.max(1))
     };
-    tracing::info!("fetch_inbox: has_token={} all={}", has_token, all);
+    tracing::info!("fetch_inbox: has_token={} all={} pages={}", has_token, all, pages);
     if !has_token {
         return;
     }
-    match gh.fetch_notifications(all).await {
-        Ok(ns) => {
-            tracing::info!("fetch_inbox: got {} notifications", ns.len());
-            let rows: Vec<serde_json::Value> = ns
-                .into_iter()
-                .map(|n| {
+    let mut all_ns: Vec<github::Notification> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut has_more = false;
+    for page in 1..=pages {
+        match gh.fetch_notifications_page(all, page).await {
+            Ok((ns, more)) => {
+                has_more = more;
+                for n in ns {
+                    if seen.insert(n.id.clone()) {
+                        all_ns.push(n);
+                    }
+                }
+                // 本页未满或没有下一页：后面的页码必然也是空的，提前收工
+                if !more {
+                    break;
+                }
+            }
+            Err(e) => {
+                let lang = lang_of(app);
+                let _ = msg_tx.send(Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])));
+                return;
+            }
+        }
+    }
+    tracing::info!("fetch_inbox: got {} notifications ({} pages)", all_ns.len(), pages);
+    {
+        let mut a = app.lock().unwrap();
+        a.inbox_has_more = has_more;
+    }
+    let rows: Vec<serde_json::Value> = all_ns
+        .into_iter()
+        .map(|n| {
+            serde_json::json!({
+                "id": n.id, "repo": n.repo, "title": n.title, "kind": n.kind,
+                "reason": n.reason, "updated_at": n.updated_at, "unread": n.unread,
+                "url": notif_html_url(&n.url),
+            })
+        })
+        .collect();
+    let _ = msg_tx.send(Msg::InboxRows(rows));
+}
+
+/// 「加载更多」：拉下一页追加到现有列表（去重）。进行中或无下一页时忽略。
+async fn fetch_inbox_more(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
+    let (has_token, all, next_page) = {
+        let mut a = app.lock().unwrap();
+        if a.inbox_loading_more || !a.inbox_has_more {
+            return;
+        }
+        a.inbox_loading_more = true;
+        (a.cfg.token().is_some(), a.inbox_all, a.inbox_page + 1)
+    };
+    if !has_token {
+        app.lock().unwrap().inbox_loading_more = false;
+        return;
+    }
+    let result = gh.fetch_notifications_page(all, next_page).await;
+    let merged: Vec<serde_json::Value>;
+    {
+        let mut a = app.lock().unwrap();
+        a.inbox_loading_more = false;
+        match result {
+            Ok((ns, more)) => {
+                let mut seen: std::collections::HashSet<String> = a
+                    .inbox
+                    .iter()
+                    .filter_map(|r| r["id"].as_str().map(|s| s.to_string()))
+                    .collect();
+                a.inbox.extend(ns.into_iter().filter(|n| seen.insert(n.id.clone())).map(|n| {
                     serde_json::json!({
                         "id": n.id, "repo": n.repo, "title": n.title, "kind": n.kind,
                         "reason": n.reason, "updated_at": n.updated_at, "unread": n.unread,
                         "url": notif_html_url(&n.url),
                     })
-                })
-                .collect();
-            let _ = msg_tx.send(Msg::InboxRows(rows));
-        }
-        Err(e) => {
-            let lang = lang_of(app);
-            let _ = msg_tx.send(Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])));
+                }));
+                a.inbox_page = next_page;
+                a.inbox_has_more = more;
+                merged = a.inbox.clone();
+            }
+            Err(e) => {
+                let lang = a.cfg.language.clone();
+                drop(a);
+                let _ = msg_tx.send(Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])));
+                return;
+            }
         }
     }
+    tracing::info!("fetch_inbox_more: page {} loaded, total {} rows", next_page, merged.len());
+    let _ = msg_tx.send(Msg::InboxRows(merged));
 }
 
 /// 单个预评审任务体：评分 + OCR 行级评论两段式流程，结果入库并回送消息。
@@ -1888,6 +1981,11 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             Cmd::FetchInbox => {
                 if let Some(gh) = &gh {
                     fetch_inbox(gh, &app, &msg_tx).await;
+                }
+            }
+            Cmd::FetchInboxMore => {
+                if let Some(gh) = &gh {
+                    fetch_inbox_more(gh, &app, &msg_tx).await;
                 }
             }
             Cmd::MarkNotifRead(thread_id) => {
@@ -2716,6 +2814,12 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
                 ui.set_inbox_repos(ModelRc::new(VecModel::from(repos)));
             }
             ui.set_inbox_rows(ModelRc::new(VecModel::from(rows)));
+            // 分页状态：供「加载更多」按钮显隐与加载态
+            {
+                let a = app.lock().unwrap();
+                ui.set_inbox_has_more(a.inbox_has_more);
+                ui.set_inbox_loading_more(a.inbox_loading_more);
+            }
             // 预览面板开着时同步刷新「已加入」状态（+ 预评审后重发 InboxRows 会走到这里）
             let detail_added = {
                 let a = app.lock().unwrap();
@@ -2863,6 +2967,9 @@ mod tests {
             status_msg: String::new(),
             inbox: Vec::new(),
             inbox_all: true,
+            inbox_page: 1,
+            inbox_has_more: false,
+            inbox_loading_more: false,
             inbox_detail: None,
             total: 0,
             rate_limit: Arc::new(Mutex::new(None)),

@@ -394,6 +394,8 @@ export component InboxView inherits FocusScope {
     // 仓库过滤：repos 由 Rust 侧按当前通知去重给出；"" = 全部
     in property <[string]> repos: [];
     in-out property <string> repo_filter: "";
+    in property <bool> has_more: false;        // 还有下一页通知可加载
+    in property <bool> loading_more: false;    // 「加载更多」进行中
     in property <bool> needs_token: false;
     in property <bool> detail_open: false;  // 右侧预览面板是否展开（Enter/Esc 语义依赖它）
     in-out property <bool> unread_only: false;  // 只看未读（false = 连已读一起拉）
@@ -405,6 +407,7 @@ export component InboxView inherits FocusScope {
     callback close_detail();        // 预览已开时按 Esc：关预览
     callback mark_all_read();       // 「全部已读」：PUT /notifications 后刷新
     callback filter_toggled(bool);  // 「只看未读」开关变化（传新值）
+    callback load_more();           // 「加载更多」：拉下一页通知追加
 
     function move_selection(delta: int) {
         if (root.rows.length == 0) { return; }
@@ -652,6 +655,36 @@ export component InboxView inherits FocusScope {
                                 root.row_activated(i);
                             }
                             add_review => { root.row_add_review(i); }
+                        }
+                    }
+
+                    // 分页：「加载更多」（GitHub 通知每页 50 条；没有下一页时隐藏）
+                    if root.has_more: Rectangle {
+                        height: 40px;
+                        Rectangle {
+                            width: load-more-row.preferred-width + 24px;
+                            height: 26px;
+                            x: (parent.width - self.width) / 2;
+                            y: (parent.height - self.height) / 2;
+                            border-radius: 13px;
+                            border-width: 1px;
+                            border-color: root.loading_more ? Theme.hairline : Theme.border;
+                            background: !root.loading_more && load-more-ta.has-hover ? Theme.hover : Theme.surface2;
+                            animate background { duration: 100ms; }
+
+                            load-more-ta := TouchArea {
+                                mouse-cursor: root.loading_more ? default : pointer;
+                                clicked => { if (!root.loading_more) { root.load_more(); } }
+                            }
+                            load-more-row := HorizontalLayout {
+                                spacing: 6px;
+                                Text {
+                                    text: root.loading_more ? I18n.inbox_loading : I18n.inbox_load_more;
+                                    font-size: Theme.fs_sm;
+                                    color: root.loading_more ? Theme.text_faint : Theme.text_dim;
+                                    vertical-alignment: center;
+                                }
+                            }
                         }
                     }
 

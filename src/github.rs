@@ -171,18 +171,31 @@ impl GitHub {
 
     /// 拉取通知列表（all=true 连已读也拉，否则只返回未读；需要 token，匿名调用会 401）。
     pub async fn fetch_notifications(&self, all: bool) -> Result<Vec<Notification>> {
+        Ok(self.fetch_notifications_page(all, 1).await?.0)
+    }
+
+    /// 分页拉取通知：page 从 1 开始；返回 (本页通知, 是否还有下一页)。
+    /// has_more 优先看 Link 头的 rel="next"，缺头时退化为「本页满 50 条」。
+    pub async fn fetch_notifications_page(&self, all: bool, page: u32) -> Result<(Vec<Notification>, bool)> {
         let url = if all {
-            format!("{API}/notifications?per_page=50&all=true")
+            format!("{API}/notifications?per_page=50&all=true&page={page}")
         } else {
-            format!("{API}/notifications?per_page=50")
+            format!("{API}/notifications?per_page=50&page={page}")
         };
         let resp = self.client.get(&url).send().await?;
         self.record_rate_limit(resp.headers());
         if !resp.status().is_success() {
             anyhow::bail!("GitHub notifications: {}", resp.status());
         }
+        let link_next = resp
+            .headers()
+            .get(reqwest::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.contains("rel=\"next\""))
+            .unwrap_or(false);
         let body: Vec<Value> = resp.json().await?;
-        Ok(body
+        let has_more = link_next || body.len() == 50;
+        let items = body
             .into_iter()
             .map(|it| Notification {
                 id: it["id"].as_str().unwrap_or("").to_string(),
@@ -194,7 +207,8 @@ impl GitHub {
                 unread: it["unread"].as_bool().unwrap_or(false),
                 url: it["subject"]["url"].as_str().unwrap_or("").to_string(),
             })
-            .collect())
+            .collect();
+        Ok((items, has_more))
     }
 
     /// 把一条通知线程标记为已读（PATCH /notifications/threads/{id}，无 body）。

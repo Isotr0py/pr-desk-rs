@@ -267,6 +267,9 @@ export component MainWindow inherits Window {
     // 仓库过滤：repos 由 Rust 侧按当前通知去重给出；repo_filter "" = 全部
     in property <[string]> inbox_repos: [];
     in-out property <string> inbox_repo_filter: "";
+    // 分页：还有下一页 / 下一页加载中
+    in property <bool> inbox_has_more: false;
+    in property <bool> inbox_loading_more: false;
     // ── Inbox 预览面板 ──
     in property <bool> inbox_detail_open: false;
     in property <string> nd_title: "";
@@ -301,6 +304,7 @@ export component MainWindow inherits Window {
     callback inbox_open_browser();
     callback inbox_close_detail();
     callback inbox_diff_toggled(int);
+    callback inbox_load_more();         // 「加载更多」：拉下一页通知追加
     callback fetch_inbox();             // 切到 Inbox 分段时拉取通知
     callback key_pin();
     callback key_priority(int);
@@ -438,12 +442,15 @@ export component MainWindow inherits Window {
                     unread_only <=> root.inbox_unread_only;
                     repos: root.inbox_repos;
                     repo_filter <=> root.inbox_repo_filter;
+                    has_more: root.inbox_has_more;
+                    loading_more: root.inbox_loading_more;
                     row_activated(i) => { root.inbox_activated(i); }
                     row_add_review(i) => { root.inbox_add_review(i); }
                     open_browser => { root.inbox_open_browser(); }
                     close_detail => { root.inbox_close_detail(); }
                     mark_all_read => { root.inbox_mark_all_read(); }
                     filter_toggled(v) => { root.inbox_filter_toggled(v); }
+                    load_more => { root.inbox_load_more(); }
                 }
                 NotifPreview {
                     visible: root.inbox_detail_open;
