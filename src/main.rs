@@ -1708,6 +1708,8 @@ fn profile_fields(cfg: &Config, name: &str) -> (String, String, String) {
 /// sync 启用时不走这条路——列表以服务器插件数据库为准。
 async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     fetch_inbox(gh, app, msg_tx).await;
+    // 本地库是手动策展的：不从 GitHub 拉列表，但必须把库里的现有行装进 UI
+    reload_rows(app, msg_tx);
 }
 
 /// 一次 sync_pull → 本地应用 → outbox/reviews push 流程（Cmd::Sync 与 sync 模式下的
@@ -1815,6 +1817,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
         let lang = lang_of(&app);
         match cmd {
             Cmd::RefreshGithub => {
+                // 先把本地库现有内容装进列表（本地模式手动策展的 PR 启动/刷新时立刻可见，
+                // 不能等网络；sync 模式下这是 sync_pull 前的缓存快照）
+                reload_rows(&app, &msg_tx);
                 if let Some(gh) = &gh {
                     if sync_client.enabled() {
                         // sync 模式：列表来自服务器插件数据库（sync_pull）+ 手动预评审，
