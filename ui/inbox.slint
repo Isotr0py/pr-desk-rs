@@ -391,6 +391,9 @@ component NotifRowItem inherits Rectangle {
 // Esc：预览开着 → 关预览，否则取消选中。
 export component InboxView inherits FocusScope {
     in property <[NotifRow]> rows: [];
+    // 仓库过滤：repos 由 Rust 侧按当前通知去重给出；"" = 全部
+    in property <[string]> repos: [];
+    in-out property <string> repo_filter: "";
     in property <bool> needs_token: false;
     in property <bool> detail_open: false;  // 右侧预览面板是否展开（Enter/Esc 语义依赖它）
     in-out property <bool> unread_only: false;  // 只看未读（false = 连已读一起拉）
@@ -464,6 +467,130 @@ export component InboxView inherits FocusScope {
                         vertical-alignment: center;
                     }
                     Rectangle { horizontal-stretch: 1; }
+                    // 仓库过滤下拉（vllm-omni 刷屏救星；行按 repo_filter 条件显示）
+                    repo-btn := Rectangle {
+                        height: 22px;
+                        width: repo-btn-row.preferred-width;
+                        border-radius: Theme.r_sm;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: repo-ta.has-hover ? Theme.hover : Theme.surface2;
+
+                        repo-ta := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { repo-popup.show(); }
+                        }
+                        repo-btn-row := HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 6px;
+                            spacing: 5px;
+                            Image {
+                                source: @image-url("icons/filter.svg");
+                                width: 11px;
+                                height: 11px;
+                                y: (parent.height - self.height) / 2;
+                                image-fit: contain;
+                                colorize: root.repo_filter != "" ? Theme.accent : Theme.text_dim;
+                            }
+                            Text {
+                                text: root.repo_filter == "" ? I18n.inbox_filter_all : root.repo_filter;
+                                font-size: Theme.fs_xs;
+                                color: root.repo_filter != "" ? Theme.accent : Theme.text_dim;
+                                vertical-alignment: center;
+                            }
+                            Image {
+                                source: @image-url("icons/chevron-down.svg");
+                                width: 9px;
+                                height: 9px;
+                                y: (parent.height - self.height) / 2;
+                                image-fit: contain;
+                                colorize: Theme.text_faint;
+                            }
+                        }
+
+                        repo-popup := PopupWindow {
+                            x: 0;
+                            y: parent.height + 4px;
+                            width: max(200px, repo-btn.width);
+                            height: (root.repos.length + 1) * 26px + 8px;
+                            close-policy: close-on-click-outside;
+
+                            Rectangle {
+                                width: 100%;
+                                height: 100%;
+                                border-radius: Theme.r_md;
+                                background: Theme.card;
+                                border-width: 1px;
+                                border-color: Theme.border;
+
+                                VerticalLayout {
+                                    x: 0;
+                                    y: 4px;
+                                    width: 100%;
+                                    spacing: 0;
+
+                                    // 「全部仓库」置顶项
+                                    Rectangle {
+                                        height: 26px;
+                                        background: root.repo_filter == "" ? Theme.sel
+                                            : (all-ta.has-hover ? Theme.hover : Theme.card);
+                                        all-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.repo_filter = ""; repo-popup.close(); }
+                                        }
+                                        Text {
+                                            x: 24px;
+                                            width: parent.width - 32px;
+                                            height: 100%;
+                                            text: I18n.inbox_filter_all;
+                                            font-size: Theme.fs_sm;
+                                            color: root.repo_filter == "" ? Theme.sel_text : Theme.text;
+                                            vertical-alignment: center;
+                                        }
+                                        Image {
+                                            visible: root.repo_filter == "";
+                                            x: 8px;
+                                            y: (parent.height - 10px) / 2;
+                                            width: 10px;
+                                            height: 10px;
+                                            source: @image-url("icons/check.svg");
+                                            image-fit: contain;
+                                            colorize: Theme.sel_text;
+                                        }
+                                    }
+                                    for p in root.repos: Rectangle {
+                                        height: 26px;
+                                        background: p == root.repo_filter ? Theme.sel
+                                            : (rp-ta.has-hover ? Theme.hover : Theme.card);
+                                        rp-ta := TouchArea {
+                                            mouse-cursor: pointer;
+                                            clicked => { root.repo_filter = p; repo-popup.close(); }
+                                        }
+                                        Text {
+                                            x: 24px;
+                                            width: parent.width - 32px;
+                                            height: 100%;
+                                            text: p;
+                                            font-size: Theme.fs_sm;
+                                            color: p == root.repo_filter ? Theme.sel_text : Theme.text;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+                                        Image {
+                                            visible: p == root.repo_filter;
+                                            x: 8px;
+                                            y: (parent.height - 10px) / 2;
+                                            width: 10px;
+                                            height: 10px;
+                                            source: @image-url("icons/check.svg");
+                                            image-fit: contain;
+                                            colorize: Theme.sel_text;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     ToolButton {
                         label: I18n.inbox_mark_all_read;
                         clicked => { root.mark_all_read(); }
@@ -512,15 +639,20 @@ export component InboxView inherits FocusScope {
                     width: parent.width;
                     alignment: start;
 
-                    for r[i] in root.rows: NotifRowItem {
-                        notif: r;
-                        selected: i == root.selected_index;
-                        zebra: mod(i, 2) == 1;
-                        clicked => {
-                            root.selected_index = i;
-                            root.row_activated(i);
+                    for r[i] in root.rows: VerticalLayout {
+                        // 仓库过滤：不匹配的行整个跳过（VerticalLayout 空则高度为 0；
+                        // 用布局而非裸 Rectangle 包裹，高度才能跟随条件子元素）
+                        alignment: start;
+                        if root.repo_filter == "" || r.repo == root.repo_filter: NotifRowItem {
+                            notif: r;
+                            selected: i == root.selected_index;
+                            zebra: mod(i, 2) == 1;
+                            clicked => {
+                                root.selected_index = i;
+                                root.row_activated(i);
+                            }
+                            add_review => { root.row_add_review(i); }
                         }
-                        add_review => { root.row_add_review(i); }
                     }
 
                     // 列表末尾呼吸空间

@@ -580,9 +580,10 @@ export component DetailPanel inherits Rectangle {
                 property <color> score_tone: root.review_score >= 8 ? Theme.good
                     : root.review_score >= 6 ? Theme.mid : Theme.bad;
 
-                // 切换 PR（标题变化）时滚动位置归零，避免残留旧偏移导致内容看似消失
-                property <string> watched_title: root.title;
-                changed watched_title => { review_scroll.content-y = 0px; }
+                // 切换 PR 或新报告落库（reviewed_at 变化）时滚动位置归零，
+                // 避免残留旧偏移把顶部操作行/评分区滚出视野
+                property <string> watched_key: root.title + "|" + root.review_reviewed_at;
+                changed watched_key => { review_scroll.content-y = 0px; }
 
                 review_scroll := ScrollView {
                     VerticalLayout {

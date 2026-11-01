@@ -195,6 +195,9 @@ export component MainWindow inherits Window {
     title: I18n.app_name;
     // 窗口图标：内嵌 SVG（默认图标在本机字体环境下标题栏显示为豆腐块）
     icon: @image-url("icons/app.svg");
+    // 中英混排字体栈：雅黑 UI 优先（中英都覆盖，CJK 渲染稳定清晰；Segoe 在前的方案
+    // 对缺字形的 CJK 仍要依赖系统兜底，恰好是我们避开的那个发虚字体）
+    default-font-family: "Microsoft YaHei UI, Microsoft YaHei, Segoe UI, PingFang SC, Noto Sans CJK SC, sans-serif";
     preferred-width: 1280px;
     preferred-height: 760px;
     min-width: 900px;
@@ -261,6 +264,9 @@ export component MainWindow inherits Window {
     in property <[NotifRow]> inbox_rows: [];
     in property <bool> inbox_needs_token: false;
     in-out property <bool> inbox_unread_only: false;
+    // 仓库过滤：repos 由 Rust 侧按当前通知去重给出；repo_filter "" = 全部
+    in property <[string]> inbox_repos: [];
+    in-out property <string> inbox_repo_filter: "";
     // ── Inbox 预览面板 ──
     in property <bool> inbox_detail_open: false;
     in property <string> nd_title: "";
@@ -315,6 +321,7 @@ export component MainWindow inherits Window {
     in-out property <string> s_repos: "";
     in-out property <int> s_poll: 5;
     in-out property <int> s_review_concurrency: 3;
+    in-out property <string> s_review_prompt: "";
     in-out property <string> s_llm_base: "";
     in-out property <string> s_llm_key: "";
     in-out property <string> s_llm_model: "";
@@ -429,6 +436,8 @@ export component MainWindow inherits Window {
                     needs_token: root.inbox_needs_token;
                     detail_open: root.inbox_detail_open;
                     unread_only <=> root.inbox_unread_only;
+                    repos: root.inbox_repos;
+                    repo_filter <=> root.inbox_repo_filter;
                     row_activated(i) => { root.inbox_activated(i); }
                     row_add_review(i) => { root.inbox_add_review(i); }
                     open_browser => { root.inbox_open_browser(); }
@@ -1118,6 +1127,13 @@ export component MainWindow inherits Window {
                             wrap: word-wrap;
                             horizontal-stretch: 1;
                         }
+                    }
+                }
+                Field {
+                    label: I18n.settings_review_prompt;
+                    FormArea {
+                        placeholder: I18n.settings_review_prompt_hint;
+                        text <=> root.s_review_prompt;
                     }
                 }
                 }

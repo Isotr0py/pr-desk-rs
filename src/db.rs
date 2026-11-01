@@ -185,6 +185,19 @@ impl Db {
             serde_json::Value::String(s) => Some(s.clone()),
             _ => None,
         };
+        // dimensions/flagged_files 同理：本地评审产出的是对象/数组（需序列化），
+        // 服务器同步来的是字符串（透传）。之前用 as_str() 导致本地评审的这两列存成 NULL。
+        fn json_or_str(v: &serde_json::Value) -> Option<String> {
+            match v {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Object(_) | serde_json::Value::Array(_) => {
+                    serde_json::to_string(v).ok()
+                }
+                _ => None,
+            }
+        }
+        let dimensions = json_or_str(&r["dimensions"]);
+        let flagged_files = json_or_str(&r["flagged_files"]);
         self.conn.execute(
             "INSERT INTO reviews(repo, number, head_sha, score, dimensions, summary,
                 flagged_files, reviewed_at, high_value, oversized, files_changed,
@@ -202,9 +215,9 @@ impl Db {
                 r["number"].as_i64().unwrap_or(0),
                 r["head_sha"].as_str().unwrap_or(""),
                 r["score"].as_f64(),
-                r["dimensions"].as_str(),
+                dimensions,
                 r["summary"].as_str(),
-                r["flagged_files"].as_str(),
+                flagged_files,
                 r["reviewed_at"].as_str(),
                 r["high_value"].as_i64().unwrap_or(0),
                 r["oversized"].as_i64().unwrap_or(0),
@@ -670,6 +683,27 @@ mod tests {
             "comments": [{"path": "src/a.rs", "content": "越界风险", "start_line": 10,
                 "end_line": 12, "category": "bug", "severity": "high"}],
         })
+    }
+
+    #[test]
+    fn upsert_review_object_dimensions_survive() {
+        // 本地评审产出的 dimensions/flagged_files 是 JSON 对象/数组而非字符串，
+        // 落库必须序列化（此前用 as_str() 存成 NULL，本地评审的维度评分和风险文件全丢）
+        let db = Db::open_memory().unwrap();
+        db.upsert_review(&serde_json::json!({
+            "repo": "o/r", "number": 1, "head_sha": "s1", "score": 8.2,
+            "dimensions": {"readability": 8, "security": 9},
+            "summary": "s", "flagged_files": [{"path": "a.rs", "issue": "x"}],
+            "reviewed_at": "t",
+        }))
+        .unwrap();
+        let r = db.get_review("o/r", 1).unwrap().unwrap();
+        // get_review 返回 TEXT 原样（UI 侧 json_field 兼容字符串/内联对象两种形态），
+        // 断言字符串里是序列化后的对象内容而非 NULL
+        let dims = r["dimensions"].as_str().expect("dimensions 不应为 NULL");
+        assert!(dims.contains("\"readability\":8"), "dims={dims}");
+        let flagged = r["flagged_files"].as_str().expect("flagged_files 不应为 NULL");
+        assert!(flagged.contains("a.rs"), "flagged={flagged}");
     }
 
     #[test]

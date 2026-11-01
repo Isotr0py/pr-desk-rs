@@ -252,8 +252,9 @@ pub async fn run_ocr_review(
     }
     git_commit_all(&tmp.0, "head").await?;
 
-    // LLM 配置：写进临时目录的 config.json，OCR_CONFIG_PATH 指向它（不落 ocr 全局配置）。
-    // 未配置 LLM 时不设该变量，ocr 用自家全局配置。
+    // LLM 配置：经环境变量传给 ocr 子进程（OCR_CONFIG_PATH 只对 ocr 的 config 子命令生效，
+    // review 的 LLM resolver 只认 OCR_LLM_* 环境变量和 ~/.opencodereview/config.json——后者不动）。
+    // 未配置 LLM 时不设这些变量，ocr 用自家全局配置。
     let ocr_bin = resolve_ocr_path(cfg);
     let mut cmd = Command::new(&ocr_bin);
     cmd.arg("review")
@@ -274,23 +275,10 @@ pub async fn run_ocr_review(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     if let Some(llm) = LlmSettings::from_config(cfg) {
-        let ocr_cfg = json!({
-            "provider": "prdesk",
-            "model": llm.model,
-            "language": "Chinese",
-            "custom_providers": {
-                "prdesk": {
-                    "protocol": "openai",
-                    "url": llm.base_url,
-                    "api_key": llm.api_key,
-                    "model": llm.model,
-                }
-            }
-        });
-        let cfg_path = tmp.0.join("config.json");
-        std::fs::write(&cfg_path, serde_json::to_string_pretty(&ocr_cfg)?)
-            .context("写入 ocr config.json 失败")?;
-        cmd.env("OCR_CONFIG_PATH", &cfg_path);
+        cmd.env("OCR_LLM_URL", &llm.base_url)
+            .env("OCR_LLM_TOKEN", &llm.api_key)
+            .env("OCR_LLM_MODEL", &llm.model)
+            .env("OCR_LLM_PROTOCOL", "openai");
     }
 
     progress(tr(lang, "prog_ocr_running").into());

@@ -35,6 +35,11 @@ export global I18n {
     out property <string> settings_tab_llm: root.lang == "en" ? "LLM Pre-review" : "LLM 预评审";
     out property <string> settings_tab_source: root.lang == "en" ? "Data Source" : "数据源";
     out property <string> settings_tab_general: root.lang == "en" ? "General" : "通用";
+    out property <string> settings_review_prompt: root.lang == "en" ? "Custom review prompt (optional)" : "自定义评审 Prompt（可选）";
+    out property <string> settings_review_prompt_hint: root.lang == "en"
+        ? "Saved as review_prompt.md next to the exe. Vars: {{repo}} {{number}} {{title}} {{author}} {{url}} {{size_info}} {{diff}} {{note}}. The JSON output contract is appended automatically."
+        : "存到 exe 旁 review_prompt.md。可用变量：{{repo}} {{number}} {{title}} {{author}} {{url}} {{size_info}} {{diff}} {{note}}；输出 JSON 的格式约定会自动附加";
+    out property <string> inbox_filter_all: root.lang == "en" ? "All repos" : "全部仓库";
     out property <string> settings_server_url: root.lang == "en" ? "Server URL" : "服务器地址";
     out property <string> settings_server_placeholder: root.lang == "en" ? "http://127.0.0.1:6185 (AstrBot address)" : "http://127.0.0.1:6185（AstrBot 地址）";
     out property <string> settings_sync_token: root.lang == "en" ? "sync_token (sync token from plugin config)" : "sync_token（插件配置里的同步令牌）";

@@ -42,7 +42,8 @@ pub const DEFAULT_SCORE_RUBRIC: &str = "\
 overall_score 为综合加权总分（0-10），请客观严格打分。
 ";
 
-/// 评审主 Prompt 模板（plugin_metadata.py DEFAULT_REVIEW_PROMPT 原样移植）
+/// 评审主 Prompt 模板（plugin_metadata.py DEFAULT_REVIEW_PROMPT 移植 + 强化：
+/// dimensions 四维必填、summary 强制结构化分点——避免弱模型漏维度/写成长段难读文本）
 /// 变量：{{repo}} {{number}} {{title}} {{author}} {{url}} {{size_info}} {{rubric}} {{diff}} {{note}}
 pub const DEFAULT_REVIEW_PROMPT: &str = "\
 请对以下 GitHub Pull Request 进行代码预评审。
@@ -64,9 +65,12 @@ PR：#{{number}} {{title}}
 请只输出一个严格的 JSON 对象（不要输出任何其他文字、不要使用 markdown 代码块），格式：
 {\"overall_score\": 8.5,
  \"dimensions\": {\"readability\": 8, \"correctness_risk\": 9, \"test_coverage\": 6, \"security\": 9},
- \"summary\": \"一段中文评审摘要（优点、风险点、建议）\",
+ \"summary\": \"……\",
  \"flagged_files\": [{\"path\": \"src/foo.py\", \"issue\": \"具体问题描述\"}]}
-flagged_files 只列出确有问题的文件，没有问题则为空数组。
+硬性要求：
+- dimensions 必须完整包含 readability、correctness_risk、test_coverage、security 四个键，缺一不可；
+- summary 用中文、Markdown 分点格式，两节：「**优点**」逐条列点；「**风险与建议**」逐条列点并指出具体文件/位置（无风险写「无明显风险」）；总共不超过 300 字，禁止写成一整段；
+- flagged_files 只列出确有问题的文件，没有问题则为空数组。
 ";
 
 /// JSON 解析失败后的重试提示词追加（plugin_metadata.py RETRY_SUFFIX 原样移植）
@@ -228,14 +232,30 @@ pub fn filter_diff(
     (diff_text, included.into_iter().map(|(p, _)| p).collect(), omitted)
 }
 
+/// 输出格式约定（自定义 prompt 模板时自动附加，保证 JSON 输出契约不被破坏）。
+pub const OUTPUT_CONTRACT: &str = "\
+请只输出一个严格的 JSON 对象（不要输出任何其他文字、不要使用 markdown 代码块），格式：
+{\"overall_score\": 8.5,
+ \"dimensions\": {\"readability\": 8, \"correctness_risk\": 9, \"test_coverage\": 6, \"security\": 9},
+ \"summary\": \"……\",
+ \"flagged_files\": [{\"path\": \"src/foo.py\", \"issue\": \"具体问题描述\"}]}
+硬性要求：
+- dimensions 必须完整包含 readability、correctness_risk、test_coverage、security 四个键，缺一不可；
+- summary 用中文、Markdown 分点格式，两节：「**优点**」逐条列点；「**风险与建议**」逐条列点并指出具体文件/位置（无风险写「无明显风险」）；
+- flagged_files 只列出确有问题的文件，没有问题则为空数组。
+";
+
 /// 组装评审 prompt；被截断/跳过的文件以注释形式附在末尾。
 /// rubric 为空（或全空白）时使用 DEFAULT_SCORE_RUBRIC。
+/// custom_template 非空时替代 DEFAULT_REVIEW_PROMPT 作为主模板（变量同），
+/// 并自动追加 OUTPUT_CONTRACT（自定义模板只管评审视角，输出契约不可丢）。
 pub fn build_prompt(
     meta: &PrMeta,
     diff_text: &str,
     omitted: &[String],
     rubric: &str,
     size_stats: Option<&SizeStats>,
+    custom_template: Option<&str>,
 ) -> String {
     let mut notes: Vec<String> = Vec::new();
     if !omitted.is_empty() {
@@ -253,7 +273,11 @@ pub fn build_prompt(
     } else {
         rubric.trim()
     };
-    DEFAULT_REVIEW_PROMPT
+    let (template, is_custom) = match custom_template {
+        Some(t) if !t.trim().is_empty() => (t, true),
+        _ => (DEFAULT_REVIEW_PROMPT, false),
+    };
+    let rendered = template
         .replace("{{repo}}", &meta.repo)
         .replace("{{number}}", &meta.number.to_string())
         .replace("{{title}}", &meta.title)
@@ -262,7 +286,12 @@ pub fn build_prompt(
         .replace("{{size_info}}", &build_size_info(size_stats))
         .replace("{{rubric}}", rubric)
         .replace("{{diff}}", diff_text)
-        .replace("{{note}}", &notes.join("\n"))
+        .replace("{{note}}", &notes.join("\n"));
+    if is_custom {
+        format!("{}\n\n{}", rendered.trim_end(), OUTPUT_CONTRACT)
+    } else {
+        rendered
+    }
 }
 
 /// JSON 值转字符串：字符串原样，标量 to_string，其余/缺失为 ""。
@@ -386,6 +415,8 @@ async fn chat_completion(llm: &LlmSettings, user_prompt: &str) -> Result<String>
 /// 本地预评审主流程：拉 PR 元信息 + diff → 过滤 → LLM 评审 → 组装结果 JSON。
 /// 返回的 JSON 可直接传给 Db::upsert_review。
 /// lang："zh"/"en"，进度回调与失败摘要的文案语言（LLM prompt 本身保持中文）。
+/// custom_prompt：用户在设置里自定义的评审模板（None/空 = 用默认模板）；
+/// 自定义模板自动追加输出契约（OUTPUT_CONTRACT），JSON 格式不会被破坏。
 pub async fn run_review(
     llm: &LlmSettings,
     gh: &GitHub,
@@ -393,6 +424,7 @@ pub async fn run_review(
     number: i64,
     progress: &mut (dyn FnMut(String) + Send),
     lang: &str,
+    custom_prompt: Option<&str>,
 ) -> Result<Value> {
     use crate::i18n::{tr, trf};
     progress(tr(lang, "prog_fetch_pr").into());
@@ -454,7 +486,7 @@ pub async fn run_review(
         ));
     }
 
-    let prompt = build_prompt(&meta, &diff_text, &omitted, "", Some(&stats));
+    let prompt = build_prompt(&meta, &diff_text, &omitted, "", Some(&stats), custom_prompt);
 
     progress(tr(lang, "prog_llm_review").into());
     let mut last_raw = String::new();
@@ -631,7 +663,7 @@ index 555..666 100644
             url: "https://github.com/o/r/pull/42".into(),
         };
         let stats = SizeStats { files_changed: 1, additions: 1, deletions: 0 };
-        let p = build_prompt(&meta, "DIFF_BODY", &[], "", Some(&stats));
+        let p = build_prompt(&meta, "DIFF_BODY", &[], "", Some(&stats), None);
         assert!(p.contains("仓库：o/r"));
         assert!(p.contains("PR：#42 标题"));
         assert!(p.contains("作者：alice"));
@@ -641,9 +673,27 @@ index 555..666 100644
         assert!(p.contains("评分标准（每项 0-10 分）：")); // 默认 rubric
         assert!(!p.contains("{{"));
 
-        let custom = build_prompt(&meta, "D", &[], "自定义标准", None);
+        let custom = build_prompt(&meta, "D", &[], "自定义标准", None, None);
         assert!(custom.contains("自定义标准"));
         assert!(!custom.contains("评分标准（每项 0-10 分）："));
+    }
+
+    #[test]
+    fn build_prompt_custom_template_keeps_output_contract() {
+        let meta = PrMeta {
+            repo: "o/r".into(),
+            number: 42,
+            title: "标题".into(),
+            author: "alice".into(),
+            url: "u".into(),
+        };
+        let p = build_prompt(&meta, "DIFF", &[], "", None, Some("自定义视角评审 {{repo}}#{{number}}\n{{diff}}"));
+        assert!(p.contains("自定义视角评审 o/r#42"));
+        assert!(p.contains("DIFF"));
+        // 输出契约自动附加：dimensions 四维硬性要求必须在
+        assert!(p.contains("overall_score"));
+        assert!(p.contains("dimensions 必须完整包含"));
+        assert!(!p.contains("{{")); // 变量已替换
     }
 
     #[test]
@@ -656,7 +706,7 @@ index 555..666 100644
             url: "u".into(),
         };
         let omitted: Vec<String> = (0..25).map(|i| format!("f{i}.rs")).collect();
-        let p = build_prompt(&meta, "D", &omitted, "", None);
+        let p = build_prompt(&meta, "D", &omitted, "", None, None);
         assert!(p.contains("以下 25 个文件未包含在内（含 lock/生成文件），评审时请说明这一点"));
         assert!(p.contains("f0.rs、f1.rs"));
         assert!(p.contains("f19.rs 等")); // 只展示前 20 个

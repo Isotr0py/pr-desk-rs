@@ -522,6 +522,12 @@ fn main() -> anyhow::Result<()> {
     ui.set_dark_mode(cfg.is_dark());
     // 启动时把配置的语言应用到 UI（Slint 侧 I18n 单例由 app.slint 的 changed language 回调处理）
     ui.set_language(cfg.language.clone().into());
+    // 自定义评审模板（exe 旁 review_prompt.md，空/缺失 = 默认模板）
+    ui.set_s_review_prompt(
+        std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
+            .unwrap_or_default()
+            .into(),
+    );
     // 数据源档案回填：名单（local 恒首位）+ 当前选中
     ui.set_profile_names(ModelRc::new(VecModel::from(
         cfg.profile_names().iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
@@ -924,6 +930,12 @@ fn main() -> anyhow::Result<()> {
                 ui.set_s_llm_model(cfg.llm_model.into());
                 ui.set_s_ocr_path(cfg.ocr_path.into());
                 ui.set_s_review_concurrency(cfg.review_concurrency as i32);
+                // 自定义评审模板每次打开重读（可能被外部编辑过）
+                ui.set_s_review_prompt(
+                    std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
+                        .unwrap_or_default()
+                        .into(),
+                );
                 ui.set_settings_open(true);
             }
         });
@@ -1041,6 +1053,14 @@ fn main() -> anyhow::Result<()> {
                 a.review_slots.lock().unwrap().set_capacity(review_concurrency as usize);
             }
             if let Some(ui) = ui2.upgrade() {
+                // 自定义评审模板落盘（exe 旁 review_prompt.md；清空 = 删除文件回到默认模板）
+                let prompt = ui.get_s_review_prompt().to_string();
+                let prompt_path = pr_desk_rs::exe_dir().join("review_prompt.md");
+                if prompt.trim().is_empty() {
+                    let _ = std::fs::remove_file(&prompt_path);
+                } else if let Err(e) = std::fs::write(&prompt_path, prompt) {
+                    tracing::warn!("写入 review_prompt.md 失败: {e}");
+                }
                 ui.set_onboarding(new_cfg.is_unconfigured());
                 ui.set_inbox_needs_token(new_cfg.token().is_none());
                 // 设置页改的是顶层键（= "default" 档）：token 从空变非空时名单要多出 default
@@ -1613,7 +1633,11 @@ async fn run_review_task(
     let mut progress = move |text: String| {
         let _ = tx.send(Msg::ReviewProgress { repo: r2.clone(), number: n2, text });
     };
-    match reviewer::run_review(llm, g, repo, number, &mut progress, lang).await {
+    // 设置页的自定义评审模板（exe 旁 review_prompt.md；空/缺失 = 默认模板）
+    let custom_prompt = std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    match reviewer::run_review(llm, g, repo, number, &mut progress, lang, custom_prompt.as_deref()).await {
         Ok(mut v) => {
             // 第二段：OCR 行级评论（评分已拿到，OCR 失败不拖垮整单）
             match g.fetch_pr_meta(repo, number).await {
@@ -1635,11 +1659,14 @@ async fn run_review_task(
                             v["comments"] = serde_json::Value::Array(outcome.comments);
                         }
                         Err(e) => {
+                            // 状态栏一闪而过很难捉到，同步写日志
+                            tracing::warn!("OCR 明细获取失败 {repo} #{number}: {e}");
                             let _ = msg_tx.send(Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])));
                         }
                     }
                 }
                 Err(e) => {
+                    tracing::warn!("OCR 前置 meta 拉取失败 {repo} #{number}: {e}");
                     let _ = msg_tx.send(Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])));
                 }
             }
@@ -2672,6 +2699,22 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
                     .collect()
             };
             tracing::info!("InboxRows: setting {} rows to UI", rows.len());
+            // 仓库过滤下拉的去重列表（保序去重：按出现顺序）
+            {
+                let mut seen = std::collections::HashSet::new();
+                let repos: Vec<SharedString> = rows
+                    .iter()
+                    .filter_map(|r| {
+                        let s = r.repo.to_string();
+                        if !s.is_empty() && seen.insert(s.clone()) {
+                            Some(s.into())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                ui.set_inbox_repos(ModelRc::new(VecModel::from(repos)));
+            }
             ui.set_inbox_rows(ModelRc::new(VecModel::from(rows)));
             // 预览面板开着时同步刷新「已加入」状态（+ 预评审后重发 InboxRows 会走到这里）
             let detail_added = {
