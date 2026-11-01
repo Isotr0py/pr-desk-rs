@@ -130,6 +130,39 @@ impl GitHub {
             .collect())
     }
 
+    /// 拉取仓库里「与我相关」的 open PR（我提的 + 请求我评审的 + 指派给我的）。
+    /// 用 search/issues（限额独立于 core API：30 次/分钟）；head_sha 该接口不返回，
+    /// 打开面板时经 fetch_pr_meta 自愈补齐。
+    pub async fn fetch_relevant_prs(&self, repo: &str) -> Result<Vec<OpenPr>> {
+        let mut out: Vec<OpenPr> = Vec::new();
+        for qualifier in ["author:@me", "review-requested:@me", "assignee:@me"] {
+            let url = format!(
+                "{API}/search/issues?q=is:pr+is:open+repo:{repo}+{qualifier}&per_page=100"
+            );
+            let resp = self.client.get(&url).send().await?;
+            self.record_rate_limit(resp.headers());
+            if !resp.status().is_success() {
+                anyhow::bail!("GitHub search {}: {}", resp.status(), repo);
+            }
+            let body: Value = resp.json().await?;
+            for it in body["items"].as_array().cloned().unwrap_or_default() {
+                let number = it["number"].as_i64().unwrap_or(0);
+                if out.iter().any(|p: &OpenPr| p.number == number) {
+                    continue; // 多条件命中同一 PR 去重
+                }
+                out.push(OpenPr {
+                    repo: repo.to_string(),
+                    number,
+                    title: it["title"].as_str().unwrap_or("").to_string(),
+                    author: it["user"]["login"].as_str().unwrap_or("").to_string(),
+                    url: it["html_url"].as_str().unwrap_or("").to_string(),
+                    head_sha: String::new(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// 拉取 PR 的 diff 文本（Accept: application/vnd.github.diff）。
     pub async fn fetch_diff(&self, repo: &str, number: i64) -> Result<String> {
         let url = format!("{API}/repos/{repo}/pulls/{number}");
