@@ -9,9 +9,11 @@ default = ["ui"]
 ui = ["dep:slint", "dep:slint-build"]
 
 [dependencies]
-# 关默认特性砍掉 skia（约 30MB）和 software 渲染器，只留 femtovg（OpenGL）
+# 关默认特性砍掉 skia（约 30MB）和 software 渲染器。
+# 注意必须用 femtovg 的 wgpu 后端：OpenGL(glutin) 后端实测会渲染坏部分文本
+# （详情面板标题字形重叠，wgpu 后端正常；且 OpenGL 不支持 DWM 窗口 alpha）
 slint = { version = "1", optional = true, default-features = false, features = [
-    "std", "backend-winit", "renderer-winit-femtovg",
+    "std", "backend-winit", "renderer-femtovg-wgpu",
     "accessibility", "compat-1-2",
 ] }
 rusqlite = { version = "0.32", features = ["bundled"] }

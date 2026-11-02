@@ -1873,6 +1873,34 @@ fn profile_fields(cfg: &Config, name: &str) -> (String, String, String) {
 /// sync 启用时不走这条路——列表以服务器插件数据库为准。
 async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     fetch_inbox(gh, app, msg_tx).await;
+    // 本地模式（手动策展）：顺带刷新每个在库 PR 的 GitHub 状态——merged/closed 写入
+    // status 列后分组会把已完结 PR 移出待评审区；否则合入了列表还显示 Open。
+    // sync 模式跳过：行数据由服务端插件负责保持新鲜。
+    let sync_enabled = { app.lock().unwrap().cfg.active_sync().is_some() };
+    if !sync_enabled {
+        let keys = { app.lock().unwrap().db.list_pr_keys().unwrap_or_default() };
+        for (repo, number) in keys {
+            match gh.fetch_pr_meta(&repo, number).await {
+                Ok(meta) => {
+                    let gh_state = if meta["merged_at"].is_null() {
+                        meta["state"].as_str().unwrap_or("open").to_string()
+                    } else {
+                        "merged".to_string()
+                    };
+                    if gh_state == "merged" || gh_state == "closed" {
+                        let a = app.lock().unwrap();
+                        let _ = a.db.conn.execute(
+                            "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
+                            rusqlite::params![gh_state, repo, number],
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("刷新 PR 状态失败 {repo} #{number}: {e}");
+                }
+            }
+        }
+    }
     // 本地库是手动策展的：不从 GitHub 拉列表，但必须把库里的现有行装进 UI
     reload_rows(app, msg_tx);
 }
@@ -2388,9 +2416,22 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         let title = meta["title"].as_str().unwrap_or("").to_string();
                         let sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
                         let meta_updated = meta["updated_at"].as_str().unwrap_or("").to_string();
+                        // GitHub 终态（merged/closed）覆盖 status：分组靠它把已完结 PR 移出
+                        // 待评审区；open 不回写（避免冲掉 reviewed/failed 等工作流状态）
+                        let gh_state = if meta["merged_at"].is_null() {
+                            meta["state"].as_str().unwrap_or("open").to_string()
+                        } else {
+                            "merged".to_string()
+                        };
                         {
                             let a = app.lock().unwrap();
                             let _ = a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &sha, &title);
+                            if gh_state == "merged" || gh_state == "closed" {
+                                let _ = a.db.conn.execute(
+                                    "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
+                                    rusqlite::params![gh_state, repo, number],
+                                );
+                            }
                             match &checks {
                                 Some((ci, _)) => {
                                     let _ = a.db.conn.execute(
@@ -2415,11 +2456,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                                 }
                             }
                         }
-                        state_out = Some(if meta["merged_at"].is_null() {
-                            meta["state"].as_str().unwrap_or("open").to_string()
-                        } else {
-                            "merged".into()
-                        });
+                        state_out = Some(gh_state.clone());
                         updated_out = Some(model::rel_time(&meta_updated));
                         checks_json_out = checks.map(|(_, items)| {
                             serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())

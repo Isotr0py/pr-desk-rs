@@ -831,7 +831,9 @@ export component NotifPreview inherits Rectangle {
                             color: Theme.text;
                             font-size: Theme.fs_lg;
                             font-weight: 600;
-                            wrap: word-wrap;
+                            // 注意：这里不能用 wrap: word-wrap——femtovg 下大字号加粗的换行文本
+                            // 会出现双份字形叠印的渲染 bug（detail_panel 标题同样因此用 elide）
+                            overflow: elide;
                         }
                     }
                     Rectangle {

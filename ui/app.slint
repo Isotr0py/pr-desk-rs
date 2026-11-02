@@ -191,9 +191,10 @@ export component MainWindow inherits Window {
     title: I18n.app_name;
     // 窗口图标：内嵌 SVG（默认图标在本机字体环境下标题栏显示为豆腐块）
     icon: @image-url("icons/app.svg");
-    // 中英混排字体栈：雅黑 UI 优先（中英都覆盖，CJK 渲染稳定清晰；Segoe 在前的方案
-    // 对缺字形的 CJK 仍要依赖系统兜底，恰好是我们避开的那个发虚字体）
-    default-font-family: "Microsoft YaHei UI, Microsoft YaHei, Segoe UI, PingFang SC, Noto Sans CJK SC, sans-serif";
+    // 中英混排字体：雅黑 UI（中英都覆盖，CJK 渲染稳定清晰）。
+    // 注意 Slint 的 default-font-family 只支持单一字体名（不支持逗号分隔的 fallback 列表，
+    // 写列表会被当成一个字面字体名去查找、查不到就走系统兜底，CJK 字宽全乱）
+    default-font-family: "Microsoft YaHei UI";
     preferred-width: 1280px;
     preferred-height: 760px;
     min-width: 900px;

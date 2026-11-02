@@ -402,6 +402,15 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// 全部 PR 的 (repo, number)（本地模式手动刷新时逐个刷新 GitHub 状态用）。
+    pub fn list_pr_keys(&self) -> Result<Vec<(String, i64)>> {
+        let mut stmt = self.conn.prepare("SELECT repo, number FROM prs")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// 只补空缺字段（Inbox「+ 预评审」入库的行缺 author/head_sha 等）：
     /// 空/NULL 才写入，已有值一律不动；行不存在返回 false。
     pub fn fill_pr_meta_if_empty(
