@@ -7,15 +7,12 @@
 export global Theme {
     // 主题开关：false = 浅色（默认），true = 深色
     in-out property <bool> dark: false;
-    // 毛玻璃开关：Windows 11 DWM acrylic 成功启用后由 Rust 置 true，底色整体变半透明
-    in-out property <bool> glass: false;
 
     // ── 颜色 ──────────────────────────────────────────────
     // 窗口底色 / 卡片面板 / 次级底（表头等）
-    // glass 模式下底色半透明，让 DWM 的模糊背景透出来（卡片保持近不透明保证可读性）
-    out property <color> bg: glass ? (dark ? #0d1117b8 : #f6f8fab8) : (dark ? #0d1117 : #f6f8fa);
-    out property <color> card: glass ? (dark ? #161b22e0 : #ffffffe0) : (dark ? #161b22 : #ffffff);
-    out property <color> surface2: glass ? (dark ? #21262dd0 : #eaeef2d0) : (dark ? #21262d : #eaeef2);
+    out property <color> bg: dark ? #0d1117 : #f6f8fa;
+    out property <color> card: dark ? #161b22 : #ffffff;
+    out property <color> surface2: dark ? #21262d : #eaeef2;
     // 边框与发丝级分隔线（极简风：边框仅用于输入框等必须圈定区域的地方，其余靠底色/hairline 分层）
     out property <color> border: dark ? #2d333b : #dfe5eb;
     out property <color> hairline: dark ? #21262d : #e6ebf0;

@@ -6,15 +6,13 @@ edition = "2024"
 [features]
 default = ["ui"]
 # Slint UI（windows 大 crate 编译吃内存；纯逻辑测试可用 --no-default-features 跳过）
-ui = ["dep:slint", "dep:slint-build", "dep:window-vibrancy"]
+ui = ["dep:slint", "dep:slint-build"]
 
 [dependencies]
-# 关默认特性砍掉 skia（约 30MB）和 software 渲染器；用 femtovg-wgpu（DX12 合成支持
-# 窗口 alpha——OpenGL 路径在 Windows 上 DWM 会忽略 alpha，毛玻璃出不来）；
-# accessibility/compat-1-2 保留原行为，unstable-winit-030 用于拿 winit 窗口句柄（毛玻璃）
+# 关默认特性砍掉 skia（约 30MB）和 software 渲染器，只留 femtovg（OpenGL）
 slint = { version = "1", optional = true, default-features = false, features = [
-    "std", "backend-winit", "renderer-femtovg-wgpu",
-    "accessibility", "compat-1-2", "unstable-winit-030",
+    "std", "backend-winit", "renderer-winit-femtovg",
+    "accessibility", "compat-1-2",
 ] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
@@ -30,10 +28,6 @@ open = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
-
-# 毛玻璃：Windows acrylic/mica + macOS NSVisualEffectView（同一 API）。
-# 钉 0.5：0.6 起 Windows 侧改用完整的 windows crate（编译极慢、体积爆炸）
-window-vibrancy = { version = "0.5.3", optional = true }
 
 [profile.release]
 # 二进制瘦身：瘦 LTO + 单编译单元 + 去符号（panic=abort 会弄坏 cargo test --release，不用）
