@@ -1900,6 +1900,19 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
                 }
             }
         }
+        // 作者公开组织成员关系（org 徽章数据源；本地行没人填这个字段，永远不会有 org 标）
+        let authors = { app.lock().unwrap().db.list_authors().unwrap_or_default() };
+        for author in authors {
+            match gh.fetch_user_orgs(&author).await {
+                Ok(orgs) => {
+                    let a = app.lock().unwrap();
+                    let _ = a.db.set_author_orgs(&author, &orgs);
+                }
+                Err(e) => {
+                    tracing::debug!("拉取作者组织失败 {author}: {e}");
+                }
+            }
+        }
     }
     // 本地库是手动策展的：不从 GitHub 拉列表，但必须把库里的现有行装进 UI
     reload_rows(app, msg_tx);
@@ -2645,8 +2658,13 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     let app2 = app.clone();
     let msg_tx2 = msg_tx.clone();
     tokio::spawn(async move {
-        let fetched = avatars::prefetch(logins).await + avatars::prefetch_orgs(orgs).await;
+        // 用 GitHub::new 的标准客户端（与 fetch_inbox 同款构建方式，已证明稳定）；
+        // 之前 prefetch 自建裸客户端在 worker 运行时下会挂死在 send()，原因未查明
+        let token = app2.lock().unwrap().cfg.token();
+        let Ok(gh) = github::GitHub::new(token) else { return };
+        let fetched = avatars::prefetch(&gh, logins).await + avatars::prefetch_orgs(&gh, orgs).await;
         if fetched > 0 {
+            // 新头像落盘：重建一次让 UI 拿到图（缓存已新鲜，不会递归预取）
             reload_rows(&app2, &msg_tx2);
         }
     });

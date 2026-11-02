@@ -39,6 +39,7 @@ pub fn aggregate_ci(runs: &[Value]) -> String {
     }
 }
 
+#[derive(Clone)]
 pub struct GitHub {
     client: reqwest::Client,
     /// 最近一次响应的 X-RateLimit-Remaining（worker 写入，UI 状态栏读取）。
@@ -239,6 +240,42 @@ impl GitHub {
             parse_states_response(&body, chunk, &mut out);
         }
         Ok(out)
+    }
+
+    /// 拉用户的公开组织成员关系（GET /users/{login}/orgs）→ org login 列表。
+    pub async fn fetch_user_orgs(&self, login: &str) -> Result<Vec<String>> {
+        let url = format!("{API}/users/{login}/orgs");
+        let resp = self.client.get(&url).send().await?;
+        self.record_rate_limit(resp.headers());
+        if !resp.status().is_success() {
+            anyhow::bail!("GitHub user orgs {}: {}", login, resp.status());
+        }
+        let body: Vec<Value> = resp.json().await?;
+        Ok(body
+            .iter()
+            .filter_map(|o| o["login"].as_str().map(|s| s.to_string()))
+            .collect())
+    }
+
+    /// login → avatar_url（GET /users/{login}；org 账号同路径）。
+    pub async fn fetch_avatar_url(&self, login: &str) -> Result<Option<String>> {
+        let url = format!("{API}/users/{login}");
+        let resp = self.client.get(&url).send().await?;
+        self.record_rate_limit(resp.headers());
+        if !resp.status().is_success() {
+            return Ok(None);
+        }
+        let v: Value = resp.json().await?;
+        Ok(v["avatar_url"].as_str().map(|s| format!("{s}&s=64")))
+    }
+
+    /// 下载任意 URL 的原始字节（头像 CDN 用；无鉴权需求）。
+    pub async fn fetch_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        let resp = self.client.get(url).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("GET {}: {}", url, resp.status());
+        }
+        Ok(resp.bytes().await?.to_vec())
     }
 
     /// 把一条通知线程标记为已读（PATCH /notifications/threads/{id}，无 body）。

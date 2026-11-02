@@ -1,6 +1,6 @@
 //! GitHub 头像 / 组织图标拉取与本地磁盘缓存。
-//! - 用户头像：`https://github.com/<login>.png?size=64` → `data/avatars/<login>.png`
-//! - 组织图标：`https://github.com/<org>.png?size=32`   → `data/avatars/orgs/<org>.png`
+//! - 解析：`api.github.com/users/<name>` → `avatar_url`（github.com 被墙的网络下可用）
+//! - 下载：`avatars.githubusercontent.com/...&s=64` → `data/avatars/<login>.png`（orgs/ 子目录存组织）
 //! 文件缺失或超过 7 天由 `prefetch*` 重新拉取；`get_*` 只在缓存新鲜且能解码时返回
 //! `Some(slint::Image)`（像素经 Rgba8 SharedPixelBuffer 落位），否则返回 None，UI 走字母降级。
 
@@ -78,22 +78,47 @@ pub fn get_org_icon(org: &str) -> Option<slint::Image> {
     load(&org_icon_path(org))
 }
 
-async fn fetch_one(client: &reqwest::Client, url: String, path: PathBuf) -> bool {
-    let bytes = match client.get(&url).send().await {
-        Ok(resp) => match resp.bytes().await {
-            Ok(b) => b,
-            Err(_) => return false,
-        },
-        Err(_) => return false,
+/// 经共享 GitHub 客户端解析头像 URL 再下载（github.com/<login>.png 的重定向在
+/// 本机网络下不可用；api.github.com + avatars.githubusercontent.com 可达）。
+/// 复用 GitHub 客户端而不是自建——独立 reqwest 客户端在 worker 运行时下偶发
+/// 请求挂死（原因未查明），共享客户端的连接池已被证明稳定。
+async fn fetch_one(gh: &crate::github::GitHub, name: String, path: PathBuf) -> bool {
+    let Ok(Some(avatar_url)) = gh.fetch_avatar_url(&name).await else {
+        tracing::info!("avatar: {name} 的 /users 解析失败");
+        return false;
+    };
+    let bytes = match gh.fetch_bytes(&avatar_url).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::info!("avatar: {name} 下载失败 {avatar_url}: {e}");
+            return false;
+        }
     };
     // GitHub 对不存在的名字也会 302 到默认头像图；过小的响应视为错误页，不写缓存
     if bytes.len() < 64 {
         return false;
     }
-    // 只写真正的 PNG（网络错误页/代理拦截页不落盘，避免坏缓存反复重拉）
-    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+    // 只写真图片（网络错误页/代理拦截页不落盘）。CDN 对真人照片回 JPEG
+    //（FF D8 FF），默认头像才是 PNG——JPEG 先解码再按 PNG 落盘，
+    // 否则 image::open 按 .png 扩展名解析会解码失败，缓存被反复删了重拉
+    let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+    let is_jpeg = bytes.starts_with(b"\xFF\xD8\xFF");
+    let bytes = if is_png {
+        bytes
+    } else if is_jpeg {
+        let Ok(img) = image::load_from_memory(&bytes) else {
+            tracing::info!("avatar: {name} JPEG 解码失败，丢弃");
+            return false;
+        };
+        let mut buf = Vec::new();
+        if img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).is_err() {
+            return false;
+        }
+        buf
+    } else {
+        tracing::info!("avatar: {name} 下载内容不是 PNG/JPEG，丢弃");
         return false;
-    }
+    };
     if let Some(parent) = path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
             return false;
@@ -107,7 +132,7 @@ async fn fetch_one(client: &reqwest::Client, url: String, path: PathBuf) -> bool
     std::fs::rename(&tmp, &path).is_ok()
 }
 
-async fn prefetch_to(path_of: fn(&str) -> PathBuf, size: u32, names: Vec<String>) -> usize {
+async fn prefetch_to(gh: &crate::github::GitHub, path_of: fn(&str) -> PathBuf, names: Vec<String>) -> usize {
     let names: BTreeSet<String> = names
         .into_iter()
         .filter(|n| !n.trim().is_empty())
@@ -116,20 +141,12 @@ async fn prefetch_to(path_of: fn(&str) -> PathBuf, size: u32, names: Vec<String>
     if names.is_empty() {
         return 0;
     }
-    let client = match reqwest::Client::builder()
-        .user_agent("pr-desk-rs")
-        .timeout(Duration::from_secs(15))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return 0,
-    };
+    tracing::info!("avatar prefetch: {} 个待拉取", names.len());
     let mut set = tokio::task::JoinSet::new();
     for name in names {
-        let client = client.clone();
-        let url = format!("https://github.com/{name}.png?size={size}");
         let path = path_of(&name);
-        set.spawn(async move { fetch_one(&client, url, path).await });
+        let gh = gh.clone();
+        set.spawn(async move { fetch_one(&gh, name, path).await });
     }
     let mut fetched = 0;
     while let Some(res) = set.join_next().await {
@@ -137,17 +154,18 @@ async fn prefetch_to(path_of: fn(&str) -> PathBuf, size: u32, names: Vec<String>
             fetched += 1;
         }
     }
+    tracing::info!("avatar prefetch: 拉取完成 {fetched}");
     fetched
 }
 
 /// 后台预取用户头像；返回实际新拉取的数量（全部为新鲜缓存时返回 0，调用方据此决定是否重绘）。
-pub async fn prefetch(logins: Vec<String>) -> usize {
-    prefetch_to(avatar_path, 64, logins).await
+pub async fn prefetch(gh: &crate::github::GitHub, logins: Vec<String>) -> usize {
+    prefetch_to(gh, avatar_path, logins).await
 }
 
-/// 后台预取组织图标（32px）。
-pub async fn prefetch_orgs(orgs: Vec<String>) -> usize {
-    prefetch_to(org_icon_path, 32, orgs).await
+/// 后台预取组织图标。
+pub async fn prefetch_orgs(gh: &crate::github::GitHub, orgs: Vec<String>) -> usize {
+    prefetch_to(gh, org_icon_path, orgs).await
 }
 
 #[cfg(test)]

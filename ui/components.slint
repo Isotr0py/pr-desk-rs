@@ -27,23 +27,22 @@ export component Avatar inherits Rectangle {
         source: root.img;
         image-fit: cover;
     }
-    if !root.has-img: Rectangle {
+    if !root.has-img: Text {
         property <length> fs: root.size * 0.5;
-        property <length> gw: fs * 0.62;  // 等宽字体单字宽 ≈ 0.6em，裁剪出首字母
-        x: (parent.width - gw) / 2;
-        width: gw;
+        // 首字母居中：文本左缘放在 (size - 字宽)/2，后续字母自然溢出，
+        // 由外层圆形 clip 裁掉。不要再套内层 clip 窗口——femtovg 嵌套 clip
+        // 会把文字画得又小又偏（雅黑/Consolas 均中招）
+        property <length> gw: fs * 0.62;  // 等宽字体单字宽 ≈ 0.6em
+        x: (root.size - gw) / 2;
+        width: root.size * 2;
         height: parent.height;
-        clip: true;
-        Text {
-            height: parent.height;
-            text: root.login.to-uppercase();
-            font-family: "Consolas";
-            font-size: fs;
-            font-weight: 600;
-            color: root.tone;
-            wrap: no-wrap;
-            vertical-alignment: center;
-        }
+        text: root.login.to-uppercase();
+        font-family: "Consolas";
+        font-size: fs;
+        font-weight: 600;
+        color: root.tone;
+        wrap: no-wrap;
+        vertical-alignment: center;
     }
 }
 

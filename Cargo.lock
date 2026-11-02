@@ -3713,6 +3713,7 @@ dependencies = [
  "chrono",
  "hex",
  "hmac",
+ "image",
  "open",
  "pulldown-cmark 0.12.2",
  "reqwest",

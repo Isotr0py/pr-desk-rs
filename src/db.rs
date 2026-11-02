@@ -98,6 +98,11 @@ impl Db {
         if !prs_cols.is_empty() && !prs_cols.iter().any(|c| c == "source") {
             conn.execute_batch("ALTER TABLE prs ADD COLUMN source TEXT NOT NULL DEFAULT 'github'")?;
         }
+        // prs 增加 author_orgs 列（作者公开组织成员关系 JSON 数组；org 徽章数据源。
+        // 本地模式由 refresh 从 /users/{author}/orgs 补齐；sync 行以服务端为准不覆盖）
+        if !prs_cols.is_empty() && !prs_cols.iter().any(|c| c == "author_orgs") {
+            conn.execute_batch("ALTER TABLE prs ADD COLUMN author_orgs TEXT NOT NULL DEFAULT '[]'")?;
+        }
         if version < 2 {
             // v1 → v2：prs 加 extras 缓存列（幂等：列已存在则跳过）
             let cols: Vec<String> = {
@@ -320,7 +325,7 @@ impl Db {
         let sql = format!(
             "SELECT p.repo, p.number, p.title, p.author, p.url, p.status, p.tags, p.role,
                 p.on_board, p.priority, p.pinned, p.ci_status, p.review_decision, p.turn,
-                p.updated_at, p.recent_commits, p.extras_detail, p.source,
+                p.updated_at, p.recent_commits, p.extras_detail, p.source, p.author_orgs,
                 r.score, r.reviewed_at, r.size_label, r.additions, r.deletions
              FROM prs p
              LEFT JOIN reviews r ON r.rowid = (
@@ -352,10 +357,11 @@ impl Db {
                     "recent_commits": row.get::<_, Option<String>>(15)?,
                     "extras_detail": row.get::<_, Option<String>>(16)?,
                     "source": row.get::<_, String>(17)?,
-                    "score": row.get::<_, Option<f64>>(18)?,
-                    "size_label": row.get::<_, Option<String>>(20)?,
-                    "additions": row.get::<_, Option<i64>>(21)?,
-                    "deletions": row.get::<_, Option<i64>>(22)?,
+                    "author_orgs": row.get::<_, String>(18)?,
+                    "score": row.get::<_, Option<f64>>(19)?,
+                    "size_label": row.get::<_, Option<String>>(21)?,
+                    "additions": row.get::<_, Option<i64>>(22)?,
+                    "deletions": row.get::<_, Option<i64>>(23)?,
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -409,6 +415,26 @@ impl Db {
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// 全部非空作者名（去重）：刷新时批量补 author_orgs 用。
+    pub fn list_authors(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT author FROM prs WHERE author != ''")?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// 按作者回写公开组织成员关系（JSON 数组字符串；直改 DB，不进 outbox）。
+    pub fn set_author_orgs(&self, author: &str, orgs: &[String]) -> Result<()> {
+        self.conn.execute(
+            "UPDATE prs SET author_orgs=?1 WHERE author=?2",
+            params![serde_json::to_string(orgs)?, author],
+        )?;
+        Ok(())
     }
 
     /// 只补空缺字段（Inbox「+ 预评审」入库的行缺 author/head_sha 等）：
