@@ -795,7 +795,7 @@ export component NotifPreview inherits Rectangle {
     width: root.visible ? root.panel_width : 0px;
     clip: true;
     background: Theme.card;
-    animate width { duration: 150ms; easing: ease-out-quad; }
+    // 不开宽度动画：动画期间换行文本逐帧重排会触发 femtovg 叠影（同 detail_panel）
 
     // 左缘 hairline
     Rectangle {
@@ -823,17 +823,15 @@ export component NotifPreview inherits Rectangle {
                     alignment: start;
                     Rectangle {
                         horizontal-stretch: 1;
-                        height: 40px;   // 两行 15px 标题的高度
-                        clip: true;
+                        // 不套固定高度+clip：换行超出时 femtovg 会渲染出叠影（同 detail_panel 标题）
                         Text {
                             width: parent.width;
                             text: root.title == "" ? I18n.inbox_not_selected : root.title;
                             color: Theme.text;
                             font-size: Theme.fs_lg;
-                            font-weight: 600;
-                            // 注意：这里不能用 wrap: word-wrap——femtovg 下大字号加粗的换行文本
-                            // 会出现双份字形叠印的渲染 bug（detail_panel 标题同样因此用 elide）
-                            overflow: elide;
+                            // 400：femtovg 对换行加粗的雅黑文本会叠影（detail_panel 标题同款规避）
+                            font-weight: 400;
+                            wrap: word-wrap;
                         }
                     }
                     Rectangle {
