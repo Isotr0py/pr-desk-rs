@@ -522,9 +522,10 @@ component PrRowItem inherits Rectangle {
             x: 0;
             y: (parent.height - 16px) / 2;
         }
-        Text {
+        name-txt := Text {
             x: 20px;
-            width: parent.width - 20px - org-icons.width - 4px;
+            // 名字取自然宽（超长才省略），org 图标紧跟其后
+            width: min(self.preferred-width, parent.width - 20px - org-icons.width - 6px);
             height: parent.height;
             text: root.pr.author;
             color: root.fg-dim;
@@ -532,20 +533,19 @@ component PrRowItem inherits Rectangle {
             overflow: elide;
             vertical-alignment: center;
         }
-        // 组织图标行：org1 最右，org2/org3 依次往左（圆角方形；Image 走外层 clip 安全——
+        // 组织图标行：org1 最左，org2/org3 依次往右（圆角方形；Image 走外层 clip 安全——
         // 嵌套 clip 只坑文字）
         org-icons := Rectangle {
             property <int> n: (root.pr.org1.width > 0 ? 1 : 0) + (root.pr.org2.width > 0 ? 1 : 0) + (root.pr.org3.width > 0 ? 1 : 0);
             width: n > 0 ? n * 17px - 4px : 0px;
             height: parent.height;
-            x: parent.width - self.width;
+            x: name-txt.x + name-txt.width + 6px;
 
             for ic[k] in [root.pr.org1, root.pr.org2, root.pr.org3]: Rectangle {
                 visible: ic.width > 0;
                 width: 13px;
                 height: 13px;
-                // org1(k=0) 贴最右，依次往左排
-                x: org-icons.width - 13px - k * 17px;
+                x: k * 17px;
                 y: (parent.height - 13px) / 2;
                 border-radius: 3px;
                 clip: true;
