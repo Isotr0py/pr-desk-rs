@@ -14,7 +14,9 @@ export struct PrListRow {
     priority: int,      // 0 未排 / 1 高 / 2 中 / 3 低
     author: string,
     avatar: image,      // Rust 侧传入的头像
-    is_org: bool,       // 作者是组织（显示组织图标占位）
+    org1: image,        // 作者公开组织的图标（最多 3 个；无则空 image）
+    org2: image,
+    org3: image,
     turn: string,       // me / them / ""
     review: string,     // approved / changes_requested / commented / review_required / ""
     ci: string,         // success / failure / pending / none / ""
@@ -505,45 +507,24 @@ component PrRowItem inherits Rectangle {
         }
     }
 
-    // 作者：Avatar + 名字 + 组织图标占位（左对齐，与表头一致）
+    // 作者：Avatar + 名字 + 组织图标（右对齐，真实 org 头像，插件 web UI 同款）
     // 纯 Rectangle + 手动居中：HorizontalLayout 设 alignment 后子元素垂直方向不再居中
-    // 组织行：有头像图像就照常显示；无图像时不渲染字母豆腐块，改用组织徽章
-    // （圆角方形 + Theme 描边 + org.svg 多人字形；PrListRow 只有 is_org 标记，无 org 图标字段）
     Rectangle {
         x: root.x-author;
         width: Cols.author;
         height: parent.height;
         clip: true;
 
-        property <bool> has_avatar: root.pr.avatar.width > 0 && root.pr.avatar.height > 0;
-
-        if !root.pr.is_org || has_avatar: Avatar {
+        Avatar {
             img: root.pr.avatar;
             login: root.pr.author;
             size: 16px;
             x: 0;
             y: (parent.height - 16px) / 2;
         }
-        if root.pr.is_org && !has_avatar: Rectangle {
-            width: 16px;
-            height: 16px;
-            x: 0;
-            y: (parent.height - 16px) / 2;
-            border-radius: 4px;
-            background: Theme.surface2;
-            Image {
-                source: @image-url("icons/org.svg");
-                width: 10px;
-                height: 10px;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                image-fit: contain;
-                colorize: root.fg-dim;
-            }
-        }
         Text {
             x: 20px;
-            width: parent.width - 20px - (org-tag.visible ? org-tag.width + 4px : 0px);
+            width: parent.width - 20px - org-icons.width - 4px;
             height: parent.height;
             text: root.pr.author;
             color: root.fg-dim;
@@ -551,11 +532,30 @@ component PrRowItem inherits Rectangle {
             overflow: elide;
             vertical-alignment: center;
         }
-        org-tag := TagChip {
-            visible: root.pr.is_org;
+        // 组织图标行：org1 最右，org2/org3 依次往左（圆角方形；Image 走外层 clip 安全——
+        // 嵌套 clip 只坑文字）
+        org-icons := Rectangle {
+            property <int> n: (root.pr.org1.width > 0 ? 1 : 0) + (root.pr.org2.width > 0 ? 1 : 0) + (root.pr.org3.width > 0 ? 1 : 0);
+            width: n > 0 ? n * 17px - 4px : 0px;
+            height: parent.height;
             x: parent.width - self.width;
-            y: (parent.height - self.height) / 2;
-            label: "org";
+
+            for ic[k] in [root.pr.org1, root.pr.org2, root.pr.org3]: Rectangle {
+                visible: ic.width > 0;
+                width: 13px;
+                height: 13px;
+                // org1(k=0) 贴最右，依次往左排
+                x: org-icons.width - 13px - k * 17px;
+                y: (parent.height - 13px) / 2;
+                border-radius: 3px;
+                clip: true;
+                Image {
+                    width: 100%;
+                    height: 100%;
+                    source: ic;
+                    image-fit: cover;
+                }
+            }
         }
     }
 

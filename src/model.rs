@@ -176,6 +176,14 @@ pub fn build_models(rows: &[serde_json::Value], lang: &str) -> (Vec<PrListRow>, 
 
 pub fn to_row(r: &serde_json::Value, lang: &str) -> PrListRow {
     let author = r["author"].as_str().unwrap_or("");
+    // 作者公开组织的图标（最多 3 个，右对齐展示；图标由 prefetch_orgs 预取到磁盘缓存）
+    let org_list = author_orgs(r);
+    let org_icon = |i: usize| {
+        org_list
+            .get(i)
+            .and_then(|o| avatars::get_org_icon(o))
+            .unwrap_or_default()
+    };
     PrListRow {
         key: format!("{}#{}", r["repo"].as_str().unwrap_or(""), r["number"].as_i64().unwrap_or(0)).into(),
         number: r["number"].as_i64().unwrap_or(0) as i32,
@@ -183,7 +191,9 @@ pub fn to_row(r: &serde_json::Value, lang: &str) -> PrListRow {
         priority: r["priority"].as_i64().unwrap_or(0) as i32,
         author: author.into(),
         avatar: avatars::get_avatar(author).unwrap_or_default(),
-        is_org: !author_orgs(r).is_empty(),
+        org1: org_icon(0),
+        org2: org_icon(1),
+        org3: org_icon(2),
         turn: r["turn"].as_str().unwrap_or("").into(),
         review: r["review_decision"].as_str().unwrap_or("").into(),
         ci: r["ci_status"].as_str().unwrap_or("").into(),

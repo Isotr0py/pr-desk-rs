@@ -72,8 +72,7 @@ pub fn get_avatar(login: &str) -> Option<slint::Image> {
     load(&avatar_path(login))
 }
 
-// 同上：组织图标入口
-#[allow(dead_code)]
+/// 组织图标入口
 pub fn get_org_icon(org: &str) -> Option<slint::Image> {
     load(&org_icon_path(org))
 }
