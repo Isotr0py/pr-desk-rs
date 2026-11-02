@@ -446,6 +446,39 @@ fn resolve_view(app: &Arc<Mutex<App>>, view_idx: usize) -> Option<(String, i64)>
     a.view_keys.get(view_idx).cloned()
 }
 
+/// 毛玻璃：Windows 用 acrylic（真背景模糊，失败退 mica），macOS 用 NSVisualEffectView。
+/// winit 窗口要等事件循环起来才存在，所以 spawn_local 等它 ready；
+/// 材质应用成功才把 glass_mode 置位（失败保持不透明，界面完全不受影响）。
+#[cfg(any(windows, target_os = "macos"))]
+fn enable_glass(ui: &MainWindow) {
+    use slint::winit_030::WinitWindowAccessor;
+    let weak = ui.as_weak();
+    let _ = slint::spawn_local(async move {
+        let Some(ui) = weak.upgrade() else { return };
+        let Ok(winit_win) = ui.window().winit_window().await else { return };
+        #[cfg(windows)]
+        let ok = window_vibrancy::apply_acrylic(&*winit_win, None)
+            .or_else(|_| window_vibrancy::apply_mica(&*winit_win, None))
+            .is_ok();
+        #[cfg(target_os = "macos")]
+        let ok = window_vibrancy::apply_vibrancy(
+            &*winit_win,
+            window_vibrancy::NSVisualEffectMaterial::UnderWindowBackground,
+            Some(window_vibrancy::NSVisualEffectState::Active),
+            None,
+        )
+        .is_ok();
+        if ok {
+            ui.set_glass_mode(true);
+            tracing::info!("毛玻璃效果已启用");
+        } else {
+            tracing::info!("系统不支持窗口材质，保持不透明背景");
+        }
+    });
+}
+#[cfg(not(any(windows, target_os = "macos")))]
+fn enable_glass(_ui: &MainWindow) {}
+
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -480,6 +513,7 @@ fn main() -> anyhow::Result<()> {
     let cfg = Config { active_profile: active_name, ..cfg };
 
     let ui = MainWindow::new()?;
+    enable_glass(&ui);
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
 

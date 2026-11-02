@@ -208,6 +208,10 @@ export component MainWindow inherits Window {
         root.theme_toggled(root.dark_mode);
     }
 
+    // ── 毛玻璃（Windows 11 DWM acrylic 成功启用后由 Rust 置位；单向 Rust→UI）──
+    in-out property <bool> glass_mode: false;
+    changed glass_mode => { Theme.glass = root.glass_mode; }
+
     // ── 语言（language 写回 I18n 并通知 Rust 持久化，仿 dark_mode）──
     in-out property <string> language: "zh";   // "zh" | "en"
     callback language_changed(string);
