@@ -17,6 +17,9 @@ export struct PrListRow {
     org1: image,        // 作者公开组织的图标（最多 3 个；无则空 image）
     org2: image,
     org3: image,
+    org1_name: string,  // 对应的 org 名（hover tooltip 用）
+    org2_name: string,
+    org3_name: string,
     turn: string,       // me / them / ""
     review: string,     // approved / changes_requested / commented / review_required / ""
     ci: string,         // success / failure / pending / none / ""
@@ -60,6 +63,50 @@ global Cols {
 // 增删行数列宽（表头拖拽手柄可调）
 global DiffCol {
     in-out property <length> width: 72px;
+}
+
+// ── org 图标（13px 圆角方形）+ hover tooltip 显示组织名 ──
+// 注意层次：tooltip 不能放在带 clip 的图标壳里（会被裁掉），挂在无 clip 的外层
+component OrgIcon inherits Rectangle {
+    in property <image> icon;
+    in property <string> name;
+
+    visible: root.icon.width > 0;
+    width: 13px;
+    height: 13px;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 3px;
+        clip: true;
+        Image {
+            width: 100%;
+            height: 100%;
+            source: root.icon;
+            image-fit: cover;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+    }
+    if ta.has-hover: Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height + 6px;
+        width: tip.preferred-width + 14px;
+        height: 22px;
+        border-radius: Theme.r_md;
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.hairline;
+        tip := Text {
+            text: root.name;
+            font-size: Theme.fs_xs;
+            color: Theme.text;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
 }
 
 // ── 表头列宽拖拽手柄：8px 宽热区，拖动列分界线调整该列（弹性标题列吸收余量）──
@@ -387,7 +434,7 @@ component PrRowItem inherits Rectangle {
     // 高优先级行提升视觉层级
     property <bool> hot: root.pr.priority == 1;
 
-    height: 30px;
+    height: 30px * Theme.fs_scale;
     background: root.selected ? Theme.sel
         : (row-ta.has-hover ? Theme.hover : transparent);
 
@@ -509,11 +556,11 @@ component PrRowItem inherits Rectangle {
 
     // 作者：Avatar + 名字 + 组织图标（右对齐，真实 org 头像，插件 web UI 同款）
     // 纯 Rectangle + 手动居中：HorizontalLayout 设 alignment 后子元素垂直方向不再居中
+    // 注意：作者单元格不开 clip（名字有 elide 兜底），org 图标的 hover tooltip 需要溢出单元格
     Rectangle {
         x: root.x-author;
         width: Cols.author;
         height: parent.height;
-        clip: true;
 
         Avatar {
             img: root.pr.avatar;
@@ -533,29 +580,16 @@ component PrRowItem inherits Rectangle {
             overflow: elide;
             vertical-alignment: center;
         }
-        // 组织图标行：org1 最左，org2/org3 依次往右（圆角方形；Image 走外层 clip 安全——
-        // 嵌套 clip 只坑文字）
+        // 组织图标行：org1 最左，org2/org3 依次往右
         org-icons := Rectangle {
             property <int> n: (root.pr.org1.width > 0 ? 1 : 0) + (root.pr.org2.width > 0 ? 1 : 0) + (root.pr.org3.width > 0 ? 1 : 0);
             width: n > 0 ? n * 17px - 4px : 0px;
             height: parent.height;
             x: name-txt.x + name-txt.width + 6px;
 
-            for ic[k] in [root.pr.org1, root.pr.org2, root.pr.org3]: Rectangle {
-                visible: ic.width > 0;
-                width: 13px;
-                height: 13px;
-                x: k * 17px;
-                y: (parent.height - 13px) / 2;
-                border-radius: 3px;
-                clip: true;
-                Image {
-                    width: 100%;
-                    height: 100%;
-                    source: ic;
-                    image-fit: cover;
-                }
-            }
+            OrgIcon { x: 0px; y: (parent.height - 13px) / 2; icon: root.pr.org1; name: root.pr.org1_name; }
+            OrgIcon { x: 17px; y: (parent.height - 13px) / 2; icon: root.pr.org2; name: root.pr.org2_name; }
+            OrgIcon { x: 34px; y: (parent.height - 13px) / 2; icon: root.pr.org3; name: root.pr.org3_name; }
         }
     }
 

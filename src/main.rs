@@ -529,6 +529,7 @@ fn main() -> anyhow::Result<()> {
     ui.set_dark_mode(cfg.is_dark());
     // 启动时把配置的语言应用到 UI（Slint 侧 I18n 单例由 app.slint 的 changed language 回调处理）
     ui.set_language(cfg.language.clone().into());
+    ui.set_font_scale(cfg.font_scale);
     // 自定义评审模板（exe 旁 review_prompt.md，空/缺失 = 默认模板）
     ui.set_s_review_prompt(
         std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
@@ -572,6 +573,23 @@ fn main() -> anyhow::Result<()> {
             }
             reload_rows_global(&app);
             send_msg(Msg::StatusBarRefresh);
+        });
+    }
+
+    // 字号档位切换：即时生效（changed 回调已写 Theme.fs_scale），持久化到 config.toml
+    {
+        let app = app.clone();
+        let cfg_path = cfg_path.clone();
+        ui.on_font_scale_changed(move |s| {
+            let snapped = if s < 0.95 { 0.9 } else if s > 1.07 { 1.15 } else { 1.0 };
+            let mut a = app.lock().unwrap();
+            if (a.cfg.font_scale - snapped).abs() < 0.001 {
+                return; // 启动 set_font_scale 的同值回调：不落盘
+            }
+            a.cfg.font_scale = snapped;
+            if let Err(e) = a.cfg.save(&cfg_path) {
+                tracing::warn!("字号写入 config.toml 失败: {e}");
+            }
         });
     }
 
@@ -1056,6 +1074,8 @@ fn main() -> anyhow::Result<()> {
                 poll_interval_min: poll,
                 theme,
                 language,
+                // 字号档位是即时生效项（不走设置表单），保存设置时保留现值
+                font_scale: app.lock().unwrap().cfg.font_scale,
                 llm_base_url: llm_base.trim().to_string(),
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),

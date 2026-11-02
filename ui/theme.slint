@@ -35,12 +35,13 @@ export global Theme {
     out property <color> red_bg: dark ? #f8514926 : #d1242f1a;
     out property <color> yellow_bg: dark ? #d2992226 : #9a670026;
 
-    // ── 字号 ─────────────────────────────────────────────
-    out property <length> fs_xs: 11px;
-    out property <length> fs_sm: 12px;
-    out property <length> fs_md: 13px;
-    out property <length> fs_lg: 15px;
-    out property <length> fs_xl: 18px;
+    // ── 字号（fs_scale 档位系数：设置里 小=0.9 / 标准=1.0 / 大=1.15）────────────
+    in-out property <float> fs_scale: 1.0;
+    out property <length> fs_xs: 11px * fs_scale;
+    out property <length> fs_sm: 12px * fs_scale;
+    out property <length> fs_md: 13px * fs_scale;
+    out property <length> fs_lg: 15px * fs_scale;
+    out property <length> fs_xl: 18px * fs_scale;
 
     // ── 圆角（极简风整体更圆润）─────────────────────────────
     out property <length> r_sm: 6px;

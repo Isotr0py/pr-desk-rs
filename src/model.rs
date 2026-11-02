@@ -184,6 +184,7 @@ pub fn to_row(r: &serde_json::Value, lang: &str) -> PrListRow {
             .and_then(|o| avatars::get_org_icon(o))
             .unwrap_or_default()
     };
+    let org_name = |i: usize| org_list.get(i).cloned().unwrap_or_default();
     PrListRow {
         key: format!("{}#{}", r["repo"].as_str().unwrap_or(""), r["number"].as_i64().unwrap_or(0)).into(),
         number: r["number"].as_i64().unwrap_or(0) as i32,
@@ -194,6 +195,9 @@ pub fn to_row(r: &serde_json::Value, lang: &str) -> PrListRow {
         org1: org_icon(0),
         org2: org_icon(1),
         org3: org_icon(2),
+        org1_name: org_name(0).into(),
+        org2_name: org_name(1).into(),
+        org3_name: org_name(2).into(),
         turn: r["turn"].as_str().unwrap_or("").into(),
         review: r["review_decision"].as_str().unwrap_or("").into(),
         ci: r["ci_status"].as_str().unwrap_or("").into(),

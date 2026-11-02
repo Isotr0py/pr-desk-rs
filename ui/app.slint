@@ -217,6 +217,14 @@ export component MainWindow inherits Window {
         root.language_changed(root.language);
     }
 
+    // ── 字号档位（写回 Theme.fs_scale 并通知 Rust 持久化，仿 language）──
+    in-out property <float> font_scale: 1.0;   // 0.9 小 / 1.0 标准 / 1.15 大
+    callback font_scale_changed(float);
+    changed font_scale => {
+        Theme.fs_scale = root.font_scale;
+        root.font_scale_changed(root.font_scale);
+    }
+
     // ── 列表 ──
     in property <[PrListRow]> rows: [];
     // 选中行身份（repo#number）：Rust 侧重建列表后回写，高亮跟随 PR 而非下标
@@ -980,6 +988,69 @@ export component MainWindow inherits Window {
                                 text: I18n.lang_name_en;
                                 font-size: Theme.fs_sm;
                                 color: root.language == "en" ? Theme.text : Theme.text_dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                        }
+                        Rectangle { horizontal-stretch: 1; }
+                    }
+                }
+                Field {
+                    label: I18n.settings_font_size;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        // 三档分段控件（小/标准/大，与语言切换同款样式）；切换即时生效并持久化
+                        Rectangle {
+                            width: 176px;
+                            height: 26px;
+                            border-radius: Theme.r_md;
+                            background: Theme.surface2;
+
+                            Rectangle {
+                                x: 2px + (root.font_scale < 0.95 ? 0 : (root.font_scale > 1.07 ? 2 : 1)) * 58px;
+                                y: 2px;
+                                width: 56px;
+                                height: parent.height - 4px;
+                                border-radius: Theme.r_sm;
+                                background: Theme.card;
+                                animate x { duration: 150ms; easing: ease-out; }
+                            }
+                            fs-s := TouchArea {
+                                x: 0; width: 58px; height: 100%;
+                                mouse-cursor: pointer;
+                                clicked => { root.font_scale = 0.9; }
+                            }
+                            Text {
+                                x: 0; width: 58px; height: 100%;
+                                text: I18n.font_size_small;
+                                font-size: Theme.fs_sm;
+                                color: root.font_scale < 0.95 ? Theme.text : Theme.text_dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            fs-m := TouchArea {
+                                x: 58px; width: 58px; height: 100%;
+                                mouse-cursor: pointer;
+                                clicked => { root.font_scale = 1.0; }
+                            }
+                            Text {
+                                x: 58px; width: 58px; height: 100%;
+                                text: I18n.font_size_normal;
+                                font-size: Theme.fs_sm;
+                                color: root.font_scale >= 0.95 && root.font_scale <= 1.07 ? Theme.text : Theme.text_dim;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
+                            fs-l := TouchArea {
+                                x: 116px; width: 58px; height: 100%;
+                                mouse-cursor: pointer;
+                                clicked => { root.font_scale = 1.15; }
+                            }
+                            Text {
+                                x: 116px; width: 58px; height: 100%;
+                                text: I18n.font_size_large;
+                                font-size: Theme.fs_sm;
+                                color: root.font_scale > 1.07 ? Theme.text : Theme.text_dim;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }

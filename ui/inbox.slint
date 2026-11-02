@@ -260,7 +260,7 @@ component NotifRowItem inherits Rectangle {
     property <length> x-reason: x-kind + InboxCols.kind + 8px;
     property <length> x-time: x-reason + InboxCols.reason + 8px;
 
-    height: 28px;
+    height: 28px * Theme.fs_scale;
     background: root.selected ? Theme.sel
         : (ta.has-hover ? Theme.hover : transparent);
     animate background { duration: root.selected ? 150ms : 100ms; }
