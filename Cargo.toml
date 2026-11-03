@@ -32,6 +32,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
 # 头像 JPEG→PNG 归一化（i-slint-core 已拉入 image 0.25，无额外编译开销）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# 系统剪贴板（复制评审报告到剪贴板）
+arboard = "3"
 
 [profile.release]
 # 二进制瘦身：瘦 LTO + 单编译单元 + 去符号（panic=abort 会弄坏 cargo test --release，不用）

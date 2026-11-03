@@ -194,9 +194,69 @@ fn severity_rank(s: &str) -> u8 {
     }
 }
 
+/// 评审 JSON → 可粘贴到 GitHub 评论的 Markdown 全文（评分/维度/摘要/风险文件/行级评论）。
+fn build_review_markdown(repo: &str, number: i64, rv: &serde_json::Value, lang: &str) -> String {
+    let mut s = format!("## Review: {repo}#{number}\n\n");
+    if let Some(score) = rv["score"].as_f64() {
+        s.push_str(&format!("**Score: {score:.1}/10**"));
+        if let Some(sz) = rv["size_label"].as_str().filter(|x| !x.is_empty()) {
+            s.push_str(&format!(" · {sz}"));
+            if let (Some(a), Some(d), Some(f)) =
+                (rv["additions"].as_i64(), rv["deletions"].as_i64(), rv["files_changed"].as_i64())
+            {
+                s.push_str(&format!(" (+{a}/-{d}, {f} files)"));
+            }
+        }
+        s.push_str("\n\n");
+    }
+    // dimensions 在库里是 JSON 字符串（尺寸小，解析失败就跳过整节）
+    if let Some(dims) = rv["dimensions"]
+        .as_str()
+        .and_then(|d| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(d).ok())
+        .filter(|d| !d.is_empty())
+    {
+        for (k, v) in &dims {
+            let val = v.as_f64().map(|x| format!("{x}")).unwrap_or_default();
+            s.push_str(&format!("- {}: {val}\n", dim_label(k, lang)));
+        }
+        s.push('\n');
+    }
+    if let Some(sum) = rv["summary"].as_str().filter(|x| !x.is_empty()) {
+        s.push_str("### Summary\n\n");
+        s.push_str(sum);
+        s.push_str("\n\n");
+    }
+    if let Some(fl) = rv["flagged_files"]
+        .as_str()
+        .and_then(|f| serde_json::from_str::<Vec<serde_json::Value>>(f).ok())
+        .filter(|v| !v.is_empty())
+    {
+        s.push_str("### Flagged files\n\n");
+        for f in fl {
+            s.push_str(&format!(
+                "- `{}` — {}\n",
+                f["path"].as_str().unwrap_or("?"),
+                f["issue"].as_str().unwrap_or("")
+            ));
+        }
+        s.push('\n');
+    }
+    if let Some(comments) = rv["comments"].as_array().filter(|c| !c.is_empty()) {
+        s.push_str("### Line comments\n\n");
+        for c in comments {
+            s.push_str(&format!(
+                "- **[{}]** `{}`: {}\n",
+                c["severity"].as_str().unwrap_or("other"),
+                ocr_comment_location(c),
+                c["content"].as_str().unwrap_or("")
+            ));
+        }
+    }
+    s.trim_end().to_string() + "\n"
+}
+
 /// OCR 评论位置格式化：path:start-end；start=end 只一个行号；都是 0 只留 path。
-fn ocr_comment_location(c: &serde_json::Value) -> String {
-    let path = c["path"].as_str().unwrap_or("");
+fn ocr_comment_location(c: &serde_json::Value) -> String {    let path = c["path"].as_str().unwrap_or("");
     let start = c["start_line"].as_i64().unwrap_or(0);
     let end = c["end_line"].as_i64().unwrap_or(0);
     if start == 0 && end == 0 {
@@ -814,6 +874,31 @@ fn main() -> anyhow::Result<()> {
             let target = app.lock().unwrap().selected.clone();
             if let Some((repo, number)) = target {
                 let _ = cmd_tx.send(Cmd::RunReview { repo, number });
+            }
+        });
+    }
+    {
+        // 详情面板「复制评审」：把整份报告渲染成 Markdown 进剪贴板（可直接粘到 GitHub 评论）
+        let app = app.clone();
+        ui.on_action_copy_review(move || {
+            let lang = lang_of(&app);
+            let (sel, review) = {
+                let a = app.lock().unwrap();
+                let sel = a.selected.clone();
+                let rv = sel
+                    .as_ref()
+                    .and_then(|(repo, number)| a.db.get_review(repo, *number).ok().flatten());
+                (sel, rv)
+            };
+            match (sel, review) {
+                (Some((repo, number)), Some(rv)) => {
+                    let md = build_review_markdown(&repo, number, &rv, &lang);
+                    match arboard::Clipboard::new().and_then(|mut c| c.set_text(&md)) {
+                        Ok(()) => send_msg(Msg::Status(tr(&lang, "review_copied").into())),
+                        Err(e) => send_msg(Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()]))),
+                    }
+                }
+                _ => {}
             }
         });
     }

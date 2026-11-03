@@ -302,6 +302,7 @@ export component MainWindow inherits Window {
     callback panel_set_priority(int);
     callback panel_toggle_pin();
     callback action_run_review();
+    callback action_copy_review();
     callback diff_file_toggled(int);
     callback inbox_activated(int);
     callback inbox_add_review(int);
@@ -435,6 +436,7 @@ export component MainWindow inherits Window {
                     action_set_priority(p) => { root.panel_set_priority(p); }
                     action_toggle_pin => { root.panel_toggle_pin(); }
                     action_run_review => { root.action_run_review(); }
+                    action_copy_review => { root.action_copy_review(); }
                     diff_file_toggled(i) => { root.diff_file_toggled(i); }
                     tab_changed(t) => { root.panel_tab_changed(t); }
                 }

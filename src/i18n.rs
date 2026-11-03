@@ -55,6 +55,8 @@ const ZH: &[(&str, &str)] = &[
     ("llm_not_configured", "请先在设置里配置 LLM API Key 和模型"),
     ("ocr_done_status", "OCR 完成：{0} 条评论（{1} 个文件）"),
     ("ocr_detail_failed", "OCR 明细获取失败：{0}"),
+    ("review_copied", "评审报告已复制到剪贴板"),
+    ("review_copy_failed", "复制失败：{0}"),
     // ── 后台 worker 状态消息 ──
     ("inbox_fetch_failed", "通知拉取失败: {0}"),
     ("gh_client_init_failed", "GitHub 客户端初始化失败: {0}"),
@@ -160,6 +162,8 @@ const EN: &[(&str, &str)] = &[
     ("llm_not_configured", "Configure LLM API key and model in Settings first"),
     ("ocr_done_status", "OCR done: {0} comments ({1} files)"),
     ("ocr_detail_failed", "Failed to fetch OCR details: {0}"),
+    ("review_copied", "Review copied to clipboard"),
+    ("review_copy_failed", "Copy failed: {0}"),
     ("inbox_fetch_failed", "Failed to fetch notifications: {0}"),
     ("gh_client_init_failed", "Failed to init GitHub client: {0}"),
     ("gh_client_rebuild_failed", "Failed to rebuild GitHub client: {0}"),

@@ -302,6 +302,7 @@ export component DetailPanel inherits Rectangle {
 
     // ── 评审标签页（LLM 预评审）──
     callback action_run_review();           // 点击「开始预评审 / 重试评审」
+    callback action_copy_review();          // 复制评审报告（Markdown 进剪贴板）
     in property <string> review_status: "";        // "" 未评审 / "running" / "done" / "failed"
     in property <string> review_progress: "";      // running 时的进度文本
     in property <bool> review_has: false;          // 是否已有评审报告
@@ -614,6 +615,48 @@ export component DetailPanel inherits Rectangle {
                                     mouse-cursor: root.review_status == "running" ? default : pointer;
                                     clicked => {
                                         if (root.review_status != "running") { root.action_run_review(); }
+                                    }
+                                }
+                            }
+
+                            // 复制评审报告（Markdown 全文进剪贴板，可直接粘到 GitHub 评论）
+                            if root.review_has: Rectangle {
+                                x: parent.width - 32px;
+                                y: 0;
+                                width: 32px;
+                                height: 30px;
+                                border-radius: Theme.r_md;
+                                background: copy_ta.has-hover ? Theme.hover : transparent;
+                                animate background { duration: 100ms; }
+                                copy_ta := TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.action_copy_review(); }
+                                }
+                                Image {
+                                    source: @image-url("icons/copy.svg");
+                                    width: 15px;
+                                    height: 15px;
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    image-fit: contain;
+                                    colorize: copy_ta.has-hover ? Theme.text : Theme.text_dim;
+                                }
+                                // hover tooltip（该操作行无 clip，可直接溢出）
+                                if copy_ta.has-hover: Rectangle {
+                                    x: parent.width - self.width;
+                                    y: parent.height + 6px;
+                                    width: tip.preferred-width + 14px;
+                                    height: 22px;
+                                    border-radius: Theme.r_md;
+                                    background: Theme.card;
+                                    border-width: 1px;
+                                    border-color: Theme.hairline;
+                                    tip := Text {
+                                        text: I18n.review_copy_tip;
+                                        font-size: Theme.fs_xs;
+                                        color: Theme.text;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
                                     }
                                 }
                             }
