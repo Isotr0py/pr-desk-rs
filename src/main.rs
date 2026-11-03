@@ -2035,7 +2035,7 @@ fn profile_fields(cfg: &Config, name: &str) -> (String, String, String) {
 /// 本地模式刷新：本地库是手动策展的（只有 Inbox「+ 预评审」加入的 PR），
 /// 不从 GitHub 自动拉任何 PR 列表——这里只刷新通知收件箱。
 /// sync 启用时不走这条路——列表以服务器插件数据库为准。
-async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
+async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, for_profile: &str) {
     fetch_inbox(gh, app, msg_tx).await;
     // 本地模式（手动策展）：顺带刷新每个在库 PR 的 GitHub 状态——merged/closed 写入
     // status 列后分组会把已完结 PR 移出待评审区；否则合入了列表还显示 Open。
@@ -2066,9 +2066,11 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
                 })
                 .collect();
             {
-                let a = app.lock().unwrap();
-                for (repo, number, adds, dels) in sums {
-                    let _ = a.db.fill_diff_sums_if_empty(&repo, number, adds, dels);
+                // 写回前校验档案未切换（在途数据不写进切后的库）
+                if let Some(a) = lock_for_profile(app, for_profile) {
+                    for (repo, number, adds, dels) in sums {
+                        let _ = a.db.fill_diff_sums_if_empty(&repo, number, adds, dels);
+                    }
                 }
             }
         }
@@ -2094,11 +2096,13 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
                             "merged".to_string()
                         };
                         if gh_state == "merged" || gh_state == "closed" {
-                            let a = app.lock().unwrap();
-                            let _ = a.db.conn.execute(
-                                "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
-                                rusqlite::params![gh_state, repo, number],
-                            );
+                            // 档案已切走则丢弃这条在途结果，不写进新档案的库
+                            if let Some(a) = lock_for_profile(app, for_profile) {
+                                let _ = a.db.conn.execute(
+                                    "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
+                                    rusqlite::params![gh_state, repo, number],
+                                );
+                            }
                         }
                     }
                     Err(e) => {
@@ -2122,8 +2126,10 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
             while let Some(Ok((author, res))) = set.join_next().await {
                 match res {
                     Ok(orgs) => {
-                        let a = app.lock().unwrap();
-                        let _ = a.db.set_author_orgs(&author, &orgs);
+                        // 同上：档案切走则丢弃
+                        if let Some(a) = lock_for_profile(app, for_profile) {
+                            let _ = a.db.set_author_orgs(&author, &orgs);
+                        }
                     }
                     Err(e) => {
                         tracing::debug!("拉取作者组织失败 {author}: {e}");
@@ -2136,24 +2142,50 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
     reload_rows(app, msg_tx);
 }
 
+/// 当前生效档案仍是 for_profile 时返回持有的锁守卫，否则 None。
+/// 后台任务（sync 拉取 / GitHub 状态刷新）的网络请求要几秒，其间用户可能已切走档案；
+/// 在途结果若写回「当前」库就会把 A 档案的数据灌进 B 档案（曾致服务器列表串进本地库）。
+/// 检查与写入在同一把锁内完成：SwitchProfile 换库也要这把锁，无法插进来。
+fn lock_for_profile<'a>(app: &'a Mutex<App>, for_profile: &str) -> Option<std::sync::MutexGuard<'a, App>> {
+    let a = app.lock().unwrap();
+    if a.cfg.active_profile == for_profile {
+        Some(a)
+    } else {
+        None
+    }
+}
+
 /// 一次 sync_pull → 本地应用 → outbox/reviews push 流程（Cmd::Sync 与 sync 模式下的
 /// RefreshGithub/ReloadConfig 共用）。sync 未启用时静默跳过。
-async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: &mpsc::Sender<Msg>) {
+/// for_profile：发起时的档案名——任何写库阶段发现当前档案已切换则中止（防串库）。
+async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: &mpsc::Sender<Msg>, for_profile: &str) {
     if !sync_client.enabled() {
         // 本地模式：静默跳过，状态栏由 update_status_bar 显示「本地模式」
         return;
     }
-    // 不跨 await 持有 DB 锁：HTTP 与 DB 应用分步，各自短时加锁
-    let result: anyhow::Result<((usize, usize, usize), sync::PushSummary)> = async {
-        let since = { app.lock().unwrap().db.get_cursor()? };
+    // 不跨 await 持有 DB 锁：HTTP 与 DB 应用分步，各自短时加锁。
+    // 每次加锁都经 lock_for_profile 校验档案未切换——网络在途期间用户切走档案则
+    // 中止写库（Ok(None)），否则在途结果会灌进切后的库（曾把服务器列表写进本地库）。
+    // 被丢弃的拉取不丢数据：该档案的游标未前进，下次同步会重新拉。
+    let result: anyhow::Result<Option<((usize, usize, usize), sync::PushSummary)>> = async {
+        let since = {
+            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
+            a.db.get_cursor()?
+        };
         let body = sync_client.pull_body(since).await?;
         let pulled = {
-            let a = app.lock().unwrap();
+            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
             sync::apply_pull(&a.db, &body)?
         };
-        let outbox = { app.lock().unwrap().db.outbox_drain()? };
+        let outbox = {
+            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
+            a.db.outbox_drain()?
+        };
         let (updates, ids) = sync::merge_outbox(&outbox);
-        let reviews_new = { app.lock().unwrap().db.unpushed_reviews()? };
+        let reviews_new = {
+            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
+            a.db.unpushed_reviews()?
+        };
         let mut pushed = sync::PushSummary::default();
         if !updates.is_empty() || !reviews_new.is_empty() {
             // 推送成功后才标记 reviews 已推（失败则下轮重推）
@@ -2168,18 +2200,18 @@ async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: 
                 })
                 .collect();
             let resp = sync_client.push_body(updates, reviews_new).await?;
-            let a = app.lock().unwrap();
+            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
             pushed = sync::apply_push_result(&a.db, &resp)?;
             for id in ids {
                 a.db.outbox_remove(id)?;
             }
             a.db.mark_reviews_pushed(&review_keys)?;
         }
-        Ok((pulled, pushed))
+        Ok(Some((pulled, pushed)))
     }
     .await;
     match result {
-        Ok(((p, r, t), push)) => {
+        Ok(Some(((p, r, t), push))) => {
             // 记入「已同步 X 前」共享状态（状态栏组合读取）
             let (last_sync, lang) = {
                 let a = app.lock().unwrap();
@@ -2198,6 +2230,10 @@ async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: 
                 ],
             )));
             reload_rows(app, msg_tx);
+        }
+        Ok(None) => {
+            // 档案中途切换：在途结果已丢弃（未写任何库），状态栏不用打扰用户
+            tracing::info!("do_sync: 档案已从 {for_profile} 切走，在途结果丢弃");
         }
         Err(e) => {
             let lang = lang_of(app);
@@ -2244,14 +2280,16 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 // 先把本地库现有内容装进列表（本地模式手动策展的 PR 启动/刷新时立刻可见，
                 // 不能等网络；sync 模式下这是 sync_pull 前的缓存快照）
                 reload_rows(&app, &msg_tx);
+                // 档案名随任务走：网络在途期间切档案时，在途结果不得写进切后的库
+                let for_profile = app.lock().unwrap().cfg.active_profile.clone();
                 if let Some(gh) = &gh {
                     if sync_client.enabled() {
                         // sync 模式：列表来自服务器插件数据库（sync_pull）+ 手动预评审，
                         // 不再把配置仓库的全部 open PR 灌进列表库；通知仍从 GitHub 拉
                         fetch_inbox(gh, &app, &msg_tx).await;
-                        do_sync(&app, &sync_client, &msg_tx).await;
+                        do_sync(&app, &sync_client, &msg_tx, &for_profile).await;
                     } else {
-                        refresh_from_github(gh, &app, &msg_tx).await;
+                        refresh_from_github(gh, &app, &msg_tx, &for_profile).await;
                         // 顺便拉一次通知
                         fetch_inbox(gh, &app, &msg_tx).await;
                     }
@@ -2259,10 +2297,11 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             }
             Cmd::Sync => {
                 // 通知与同步服务器无关，先顺手拉一次
+                let for_profile = app.lock().unwrap().cfg.active_profile.clone();
                 if let Some(g) = &gh {
                     fetch_inbox(g, &app, &msg_tx).await;
                 }
-                do_sync(&app, &sync_client, &msg_tx).await;
+                do_sync(&app, &sync_client, &msg_tx, &for_profile).await;
             }
             Cmd::FetchDiff { repo, number } => {
                 if let Some(gh) = &gh {
@@ -2836,12 +2875,13 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     let sc = sync_client.clone();
                     let app2 = app.clone();
                     let msg_tx2 = msg_tx.clone();
+                    let prof = name.clone(); // 任务归属档案：在途结果只许写回该档案的库
                     tokio::spawn(async move {
                         if sc.enabled() {
                             fetch_inbox(&g, &app2, &msg_tx2).await;
-                            do_sync(&app2, &sc, &msg_tx2).await;
+                            do_sync(&app2, &sc, &msg_tx2, &prof).await;
                         } else {
-                            refresh_from_github(&g, &app2, &msg_tx2).await;
+                            refresh_from_github(&g, &app2, &msg_tx2, &prof).await;
                             fetch_inbox(&g, &app2, &msg_tx2).await;
                         }
                     });
@@ -2863,12 +2903,13 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 sync_client = sync::SyncClient::new(&cfg);
                 let _ = msg_tx.send(Msg::Status(tr(&lang, "cfg_reloaded").into()));
                 // 复用现有流程：sync 模式同步服务器列表；本地模式拉全部 open PR
+                let for_profile = cfg.active_profile.clone();
                 if let Some(g) = &gh {
                     if sync_client.enabled() {
                         fetch_inbox(g, &app, &msg_tx).await;
-                        do_sync(&app, &sync_client, &msg_tx).await;
+                        do_sync(&app, &sync_client, &msg_tx, &for_profile).await;
                     } else {
-                        refresh_from_github(g, &app, &msg_tx).await;
+                        refresh_from_github(g, &app, &msg_tx, &for_profile).await;
                         fetch_inbox(g, &app, &msg_tx).await;
                     }
                 }
@@ -3477,5 +3518,85 @@ mod tests {
             derive_review_decision(&[review("dismissed", "2026-01-01T00:00:00Z")]),
             None
         );
+    }
+
+    // ── 串库竞态回归：在途 sync 不得写进切换后的档案库 ──
+
+    /// 微型 sync 服务器：收到一次请求后延迟 delay 再返回 body（模拟网络在途）。
+    fn fake_sync_server(delay: std::time::Duration, body: String) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let mut got: Vec<u8> = Vec::new();
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            got.extend_from_slice(&buf[..n]);
+                            if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                std::thread::sleep(delay);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[test]
+    fn inflight_sync_must_not_write_into_switched_profile_db() {
+        // do_sync 以 default 档案发起；拉取在途（假服务器 sleep 中）时模拟
+        // SwitchProfile 切到 local（换库）。断言切后的 local 库不出现
+        // server 行与同步游标——用户实测 local 库被灌入 108 个服务器 PR。
+        let body = serde_json::json!({
+            "prs": [{"repo": "o/r", "number": 999, "title": "leaked"}],
+            "reviews": [],
+            "todos": [],
+            "server_time": "2026-11-03T16:00:00",
+        })
+        .to_string();
+        let url = fake_sync_server(std::time::Duration::from_millis(400), body);
+
+        let app = test_app(Vec::new());
+        {
+            let mut a = app.lock().unwrap();
+            a.cfg.server_url = url;
+            a.cfg.sync_token = "tok".into();
+            a.cfg.active_profile = "default".into();
+        }
+        let sc = sync::SyncClient::new(&app.lock().unwrap().cfg);
+        assert!(sc.enabled());
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let app2 = app.clone();
+            let (msg_tx, _rx) = mpsc::channel::<Msg>();
+            let h = tokio::spawn(async move { do_sync(&app2, &sc, &msg_tx, "default").await });
+            // 拉取在途：用户切回 local —— 换库
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            {
+                let mut a = app.lock().unwrap();
+                a.cfg.active_profile = "local".into();
+                a.db = Db::open_memory().unwrap();
+            }
+            h.await.unwrap();
+        });
+        let a = app.lock().unwrap();
+        assert!(
+            a.db.list_pr_keys().unwrap().is_empty(),
+            "在途 sync 把服务器数据写进了切换后的 local 库（串库）"
+        );
+        assert!(a.db.get_cursor().unwrap().is_none(), "sync 游标泄漏进了 local 库");
     }
 }
