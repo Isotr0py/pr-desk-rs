@@ -66,8 +66,10 @@ global DiffCol {
 }
 
 // ── org 图标（13px 圆角方形）+ hover tooltip 显示组织名 ──
-// tooltip 用 PopupWindow：行内条件渲染会被后绘制的下一行盖住（分层问题），
-// PopupWindow 走窗口覆盖层，永远在最上。图标壳的 clip 只裁图像、碰不到弹层。
+// tooltip 画在图标上方（y 负值）：Slint 按声明顺序绘制，本行在上行之后绘制，
+// 所以向上的 tooltip 能盖住上一行；不要用 PopupWindow（show 会抢走 hover 状态导致抖动），
+// 也不要画在图标下方（会被下一行盖住）。
+// 边界情况：第一行的 tooltip 顶部会被列表视口裁掉一点，可接受。
 component OrgIcon inherits Rectangle {
     in property <image> icon;
     in property <string> name;
@@ -90,30 +92,22 @@ component OrgIcon inherits Rectangle {
     }
     ta := TouchArea {
         mouse-cursor: pointer;
-        changed has-hover => {
-            if (self.has-hover) { tip_popup.show(); } else { tip_popup.close(); }
-        }
     }
-    tip_popup := PopupWindow {
+    if ta.has-hover: Rectangle {
         x: (parent.width - (tip.preferred-width + 14px)) / 2;
-        y: -30px;
+        y: -28px;
         width: tip.preferred-width + 14px;
         height: 22px;
-        close-policy: no-auto-close;
-        Rectangle {
-            width: 100%;
-            height: 100%;
-            border-radius: Theme.r_md;
-            background: Theme.card;
-            border-width: 1px;
-            border-color: Theme.hairline;
-            tip := Text {
-                text: root.name;
-                font-size: Theme.fs_xs;
-                color: Theme.text;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
+        border-radius: Theme.r_md;
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.hairline;
+        tip := Text {
+            text: root.name;
+            font-size: Theme.fs_xs;
+            color: Theme.text;
+            horizontal-alignment: center;
+            vertical-alignment: center;
         }
     }
 }
