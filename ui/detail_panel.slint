@@ -631,6 +631,9 @@ export component DetailPanel inherits Rectangle {
                                 copy_ta := TouchArea {
                                     mouse-cursor: pointer;
                                     clicked => { root.action_copy_review(); }
+                                    changed has-hover => {
+                                        if (self.has-hover) { copy_tip_popup.show(); } else { copy_tip_popup.close(); }
+                                    }
                                 }
                                 Image {
                                     source: @image-url("icons/copy.svg");
@@ -641,22 +644,27 @@ export component DetailPanel inherits Rectangle {
                                     image-fit: contain;
                                     colorize: copy_ta.has-hover ? Theme.text : Theme.text_dim;
                                 }
-                                // hover tooltip（该操作行无 clip，可直接溢出）
-                                if copy_ta.has-hover: Rectangle {
-                                    x: parent.width - self.width;
+                                // hover tooltip 用 PopupWindow（覆盖层），行内渲染会被后绘制的内容盖住
+                                copy_tip_popup := PopupWindow {
+                                    x: parent.width - (tip.preferred-width + 14px);
                                     y: parent.height + 6px;
                                     width: tip.preferred-width + 14px;
                                     height: 22px;
-                                    border-radius: Theme.r_md;
-                                    background: Theme.card;
-                                    border-width: 1px;
-                                    border-color: Theme.hairline;
-                                    tip := Text {
-                                        text: I18n.review_copy_tip;
-                                        font-size: Theme.fs_xs;
-                                        color: Theme.text;
-                                        horizontal-alignment: center;
-                                        vertical-alignment: center;
+                                    close-policy: no-auto-close;
+                                    Rectangle {
+                                        width: 100%;
+                                        height: 100%;
+                                        border-radius: Theme.r_md;
+                                        background: Theme.card;
+                                        border-width: 1px;
+                                        border-color: Theme.hairline;
+                                        tip := Text {
+                                            text: I18n.review_copy_tip;
+                                            font-size: Theme.fs_xs;
+                                            color: Theme.text;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
                                     }
                                 }
                             }
