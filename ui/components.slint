@@ -78,7 +78,10 @@ export component ScoreChip inherits Rectangle {
         padding-left: 8px;
         padding-right: 8px;
         Text {
-            text: root.oversized ? I18n.score_oversized : "" + (Math.round(root.score * 10) / 10);
+            // 一位小数固定格式：8 → "8.0"，7.9 → "7.9"
+            property <int> d10: Math.round(root.score * 10);
+            text: root.oversized ? I18n.score_oversized
+                : "" + Math.floor(d10 / 10) + "." + Math.round(mod(d10, 10));
             font-size: Theme.fs_xs;
             font-weight: 500;
             color: root.tone;

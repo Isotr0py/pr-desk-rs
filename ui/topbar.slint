@@ -240,6 +240,95 @@ component SourceSwitcher inherits Rectangle {
     }
 }
 
+// ── 排序切换器：图标 + 下拉（更新时间 / 评分 / 改动量），结构与 SourceSwitcher 一致 ──
+component SortSwitcher inherits Rectangle {
+    in-out property <string> sort_mode: "updated";
+    callback sort_changed(string);
+
+    height: 26px;
+    width: 28px;
+    border-radius: Theme.r_md;
+    background: ta.has-hover ? Theme.hover : (root.sort_mode != "updated" ? Theme.sel : transparent);
+    animate background { duration: 120ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { popup.show(); }
+    }
+    Image {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 15px;
+        height: 15px;
+        source: @image-url("icons/sort.svg");
+        image-fit: contain;
+        colorize: root.sort_mode != "updated" ? Theme.sel_text
+            : (ta.has-hover ? Theme.text : Theme.text_dim);
+    }
+
+    popup := PopupWindow {
+        x: -120px;
+        y: root.height + 4px;
+        width: 148px;
+        height: 3 * 26px + 8px;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: Theme.r_lg;
+            background: Theme.card;
+            border-width: 1px;
+            border-color: Theme.hairline;
+
+            VerticalLayout {
+                x: 0;
+                y: 4px;
+                width: 100%;
+                spacing: 0;
+
+                for item in [
+                    { k: "updated", label: I18n.sort_updated },
+                    { k: "score", label: I18n.sort_score },
+                    { k: "changes", label: I18n.sort_changes },
+                ]: Rectangle {
+                    height: 26px;
+                    // 当前项优先给 sel 底（hover 不得盖掉），非当前项给显式 card 底
+                    background: item.k == root.sort_mode ? Theme.sel
+                        : item-ta.has-hover ? Theme.hover : Theme.card;
+                    item-ta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => {
+                            root.sort_mode = item.k;
+                            root.sort_changed(item.k);
+                            popup.close();
+                        }
+                    }
+                    Image {
+                        visible: item.k == root.sort_mode;
+                        x: 8px;
+                        y: (parent.height - 10px) / 2;
+                        width: 10px;
+                        height: 10px;
+                        source: @image-url("icons/check.svg");
+                        image-fit: contain;
+                        colorize: Theme.sel_text;
+                    }
+                    Text {
+                        x: 24px;
+                        width: parent.width - 32px;
+                        height: 100%;
+                        text: item.label;
+                        font-size: Theme.fs_sm;
+                        color: item.k == root.sort_mode ? Theme.sel_text : Theme.text;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // ── 顶栏 ──
 // view_mode: 0 = 列表，1 = Inbox。回调：refresh / sync / open_settings。
 export component TopBar inherits Rectangle {
@@ -252,6 +341,11 @@ export component TopBar inherits Rectangle {
     in property <[string]> profile_names: [];
     in-out property <string> active_profile: "local";
     callback switch_profile(string);
+    // ── 排序 + 高分快筛（列表视图）──
+    in-out property <string> sort_mode: "updated";   // updated / score / changes
+    in-out property <bool> high_score_only: false;   // true = 只看 ≥8.0
+    callback sort_changed(string);
+    callback high_score_toggled(bool);
     // 图标按钮 tooltip 文案（可覆盖）
     in property <string> refresh_tooltip: I18n.refresh_tooltip;
     in property <string> sync_tooltip: I18n.sync_tooltip;
@@ -340,9 +434,54 @@ export component TopBar inherits Rectangle {
 
         Rectangle { horizontal-stretch: 1; }
 
-        // 右：搜索 + 刷新 / 同步 / 主题 / 设置
+        // 右：搜索 + 高分快筛 + 排序 + 刷新 / 同步 / 主题 / 设置
         search := SearchBox {
             text <=> root.filter_text;
+        }
+        // 高分快筛：只看评分 ≥8.0（文本胶囊，选中态 accent 底）
+        Rectangle {
+            height: 26px;
+            width: hs-txt.preferred-width + 18px;
+            border-radius: 13px;
+            background: root.high_score_only ? Theme.sel : (hs-ta.has-hover ? Theme.hover : transparent);
+            animate background { duration: 120ms; }
+            hs-ta := TouchArea {
+                mouse-cursor: pointer;
+                clicked => {
+                    root.high_score_only = !root.high_score_only;
+                    root.high_score_toggled(root.high_score_only);
+                }
+            }
+            hs-txt := Text {
+                height: 100%;
+                text: "8+";
+                font-size: Theme.fs_sm;
+                font-weight: 600;
+                color: root.high_score_only ? Theme.sel_text : Theme.text_dim;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            if hs-ta.has-hover: Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: parent.height + 6px;
+                width: hs-tip.preferred-width + 14px;
+                height: 22px;
+                border-radius: Theme.r_md;
+                background: Theme.card;
+                border-width: 1px;
+                border-color: Theme.hairline;
+                hs-tip := Text {
+                    text: I18n.high_score_tooltip;
+                    font-size: Theme.fs_xs;
+                    color: Theme.text;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+        SortSwitcher {
+            sort_mode <=> root.sort_mode;
+            sort_changed(m) => { root.sort_changed(m); }
         }
         IconButton {
             icon: @image-url("icons/refresh.svg");

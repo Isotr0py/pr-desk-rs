@@ -738,7 +738,9 @@ export component DetailPanel inherits Rectangle {
                                                 padding-left: 10px;
                                                 padding-right: 10px;
                                                 Text {
-                                                    text: "" + round(root.review_score * 10) / 10;
+                                                    // 一位小数固定格式：8 → "8.0"
+                                                    property <int> d10: round(root.review_score * 10);
+                                                    text: "" + Math.floor(d10 / 10) + "." + Math.round(mod(d10, 10));
                                                     font-size: Theme.fs_sm;
                                                     font-weight: 700;
                                                     color: score_tone;
@@ -805,7 +807,9 @@ export component DetailPanel inherits Rectangle {
                                             y: 0;
                                             width: 48px;
                                             height: 100%;
-                                            text: "" + round(d.score * 10) / 10;
+                                            // 一位小数固定格式：8 → "8.0"
+                                            property <int> d10: round(d.score * 10);
+                                            text: "" + Math.floor(d10 / 10) + "." + Math.round(mod(d10, 10));
                                             font-size: Theme.fs_sm;
                                             font-weight: 600;
                                             color: Theme.text;

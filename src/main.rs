@@ -71,6 +71,7 @@ enum Msg {
     Rows(Vec<serde_json::Value>),
     // 搜索框过滤词变化（UI 回调 send_msg 进来，apply_msg 里重建行模型）
     FilterChanged(String),
+    ViewPrefsChanged,  // 排序方式 / 高分快筛变化（重算过滤视图并重建行模型）
     // 只重组状态栏（配额 / 同步时间变化，不改临时消息）
     StatusBarRefresh,
     // 详情面板：文本/JSON 字符串过界；ConvoEntry/CheckRun/FileChange 模型在 UI 线程装配
@@ -442,6 +443,8 @@ struct App {
     view: Vec<usize>,                       // 过滤后可见行 → rows 下标（UI 下标经它换算）
     view_keys: Vec<(String, i64)>,          // UI 实际展示顺序（build_models 分组后）→ 身份；点击映射以此为准
     filter: String,                         // 当前过滤词（空 = 全量）
+    sort_mode: String,                      // 组内排序："updated"（默认）/ "score" / "changes"
+    min_score: f32,                         // 高分快筛阈值（0 = 关；8 = 只看 ≥8.0）
     selected: Option<(String, i64)>,        // 选中 PR 身份（repo, number）；刷新后行序变化也不漂移
     status_msg: String,                     // 状态栏临时消息（最近一条 Status）
     inbox: Vec<serde_json::Value>,          // 最近一批通知行（inbox_activated 按下标取 thread id）
@@ -478,14 +481,17 @@ fn update_status_bar(ui: &MainWindow, app: &Arc<Mutex<App>>) {
 }
 
 /// 当前过滤词下可见行的原始下标。
-fn filtered_view(rows: &[serde_json::Value], filter: &str) -> Vec<usize> {
+fn filtered_view(rows: &[serde_json::Value], filter: &str, min_score: f32) -> Vec<usize> {
     let q = filter.trim().to_lowercase();
-    if q.is_empty() {
-        return (0..rows.len()).collect();
-    }
     rows.iter()
         .enumerate()
-        .filter(|(_, r)| model::row_matches(r, &q))
+        .filter(|(_, r)| {
+            // 高分快筛：min_score > 0 时只保留达到阈值的行（未评审 score=0 被滤掉）
+            if min_score > 0.0 && (r["score"].as_f64().unwrap_or(0.0) as f32) < min_score {
+                return false;
+            }
+            q.is_empty() || model::row_matches(r, &q)
+        })
         .map(|(i, _)| i)
         .collect()
 }
@@ -550,6 +556,8 @@ fn main() -> anyhow::Result<()> {
         view: Vec::new(),
         view_keys: Vec::new(),
         filter: String::new(),
+        sort_mode: "updated".into(),
+        min_score: 0.0,
         selected: None,
         status_msg: config_status(&cfg),
         inbox: Vec::new(),
@@ -768,6 +776,22 @@ fn main() -> anyhow::Result<()> {
     {
         // 顶栏搜索框过滤词 → 重建行模型（view 下标映射在 resolve_view）
         ui.on_filter_changed(|q| send_msg(Msg::FilterChanged(q.to_string())));
+    }
+    {
+        // 排序方式变化（组内排序键存 App，重建时按它排）
+        let app = app.clone();
+        ui.on_sort_changed(move |mode| {
+            app.lock().unwrap().sort_mode = mode.to_string();
+            send_msg(Msg::ViewPrefsChanged);
+        });
+    }
+    {
+        // 高分快筛开关（只看评分 ≥8.0 的 PR）
+        let app = app.clone();
+        ui.on_high_score_toggled(move |on| {
+            app.lock().unwrap().min_score = if on { 8.0 } else { 0.0 };
+            send_msg(Msg::ViewPrefsChanged);
+        });
     }
     {
         let app = app.clone();
@@ -2866,14 +2890,15 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
 /// 用当前 filter 过滤 app.rows 并重建 rows/groups 模型（折叠状态按组 key 从旧模型带回）。
 fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     // 在 UI 线程装配 Slint 模型（SharedString/Image 是 Rc，不跨线程）
-    let (rows_json, lang) = {
+    let (rows_json, lang, sort_by) = {
         let a = app.lock().unwrap();
         (
             a.view.iter().map(|&i| a.rows[i].clone()).collect::<Vec<serde_json::Value>>(),
             a.cfg.language.clone(),
+            a.sort_mode.clone(),
         )
     };
-    let (rows, mut groups) = model::build_models(&rows_json, &lang);
+    let (rows, mut groups) = model::build_models(&rows_json, &lang, &sort_by);
     // UI 展示顺序（分组重排后）的身份序列——resolve_view 的点击映射以此为准，
     // 不能用 a.view（数据库排序），两者在分组重排后不是一个序。
     let keys: Vec<(String, i64)> = rows
@@ -2990,7 +3015,15 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
             {
                 let mut a = app.lock().unwrap();
                 a.filter = q;
-                a.view = filtered_view(&a.rows, &a.filter);
+                a.view = filtered_view(&a.rows, &a.filter, a.min_score);
+            }
+            rebuild_rows_ui(ui, app);
+        }
+        Msg::ViewPrefsChanged => {
+            // 排序 / 高分快筛变化：重算过滤视图并重建行模型
+            {
+                let mut a = app.lock().unwrap();
+                a.view = filtered_view(&a.rows, &a.filter, a.min_score);
             }
             rebuild_rows_ui(ui, app);
         }
@@ -2998,7 +3031,7 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
             {
                 let mut a = app.lock().unwrap();
                 a.total = rows_json.len();
-                a.view = filtered_view(&a.rows, &a.filter);
+                a.view = filtered_view(&a.rows, &a.filter, a.min_score);
             }
             rebuild_rows_ui(ui, app);
             update_status_bar(ui, app);
@@ -3255,6 +3288,8 @@ mod tests {
             view,
             view_keys: Vec::new(),
             filter: String::new(),
+        sort_mode: "updated".into(),
+        min_score: 0.0,
             selected: None,
             status_msg: String::new(),
             inbox: Vec::new(),

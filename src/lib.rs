@@ -33,15 +33,36 @@ pub fn exe_data_dir() -> std::path::PathBuf {
 /// 分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
 /// 行只出现在一个组里；pinned 独立成组（不再出现在其状态组）。空组不返回。
 /// lang："zh"/"en"，组标题文案经 i18n::tr 取对应语言。
-pub fn build_sections(rows: &[serde_json::Value], lang: &str) -> Vec<(String, Vec<usize>)> {
+/// 行数据 → 分组：（组标题, 该组内数据行的索引列表）。
+/// 分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
+/// 行只出现在一个组里；pinned 独立成组（不再出现在其状态组）。空组不返回。
+/// sort_by：组内排序——"updated"（默认，保持输入序=updated_at DESC）/ "score"（评分降序）/
+/// "changes"（增删行数降序）。
+/// lang："zh"/"en"，组标题文案经 i18n::tr 取对应语言。
+pub fn build_sections(rows: &[serde_json::Value], lang: &str, sort_by: &str) -> Vec<(String, Vec<usize>)> {
     let mut out: Vec<(String, Vec<usize>)> = Vec::new();
     let mut emit = |title_key: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
-        let idx: Vec<usize> = rows
+        let mut idx: Vec<usize> = rows
             .iter()
             .enumerate()
             .filter(|(_, r)| pred(r))
             .map(|(i, _)| i)
             .collect();
+        match sort_by {
+            "score" => idx.sort_by(|&a, &b| {
+                let sa = rows[a]["score"].as_f64().unwrap_or(0.0);
+                let sb = rows[b]["score"].as_f64().unwrap_or(0.0);
+                sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+            }),
+            "changes" => idx.sort_by(|&a, &b| {
+                let ca = rows[a]["additions"].as_i64().unwrap_or(0)
+                    + rows[a]["deletions"].as_i64().unwrap_or(0);
+                let cb = rows[b]["additions"].as_i64().unwrap_or(0)
+                    + rows[b]["deletions"].as_i64().unwrap_or(0);
+                cb.cmp(&ca)
+            }),
+            _ => {} // "updated"：输入序即 updated_at DESC（SQL 排好），不动
+        }
         if !idx.is_empty() {
             let title = i18n::tr(lang, title_key);
             out.push((i18n::trf(lang, "section_title_fmt", &[title, &idx.len().to_string()]), idx));
@@ -106,14 +127,14 @@ mod tests {
             row(3, 0, 0, "pending"),  // 待评审
             row(4, 0, 0, "reviewed"), // 已评审
         ];
-        let sections = build_sections(&rows, "zh");
+        let sections = build_sections(&rows, "zh", "updated");
         assert_eq!(sections.len(), 4);
         assert!(sections[0].0.contains("Pinned") && sections[0].1 == vec![0]);
         assert!(sections[1].0.contains("看板") && sections[1].1 == vec![1]);
         assert!(sections[2].0.contains("待评审") && sections[2].1 == vec![2]);
         assert!(sections[3].0.contains("已评审") && sections[3].1 == vec![3]);
         // 英文：组标题与计数格式切换
-        let sections = build_sections(&rows, "en");
+        let sections = build_sections(&rows, "en", "updated");
         assert_eq!(sections.len(), 4);
         assert_eq!(sections[1].0, "Board (1)");
         assert_eq!(sections[2].0, "To Review (1)");
@@ -122,7 +143,7 @@ mod tests {
     #[test]
     fn sections_empty_hidden() {
         let rows = vec![row(1, 0, 0, "pending")];
-        let sections = build_sections(&rows, "zh");
+        let sections = build_sections(&rows, "zh", "updated");
         assert_eq!(sections.len(), 1);
         assert!(sections[0].0.contains("待评审"));
     }
@@ -131,7 +152,7 @@ mod tests {
     fn sections_pinned_exclusive() {
         // pinned 的行不再出现在其状态组
         let rows = vec![row(1, 1, 1, "pending")];
-        let sections = build_sections(&rows, "zh");
+        let sections = build_sections(&rows, "zh", "updated");
         assert_eq!(sections.len(), 1);
         assert!(sections[0].0.contains("Pinned"));
     }

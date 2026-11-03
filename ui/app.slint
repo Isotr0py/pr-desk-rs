@@ -232,6 +232,8 @@ export component MainWindow inherits Window {
     in-out property <[PrGroup]> groups: [];
     in-out property <string> filter_text: "";
     in-out property <int> view_mode: 0;      // 0=列表 1=Inbox（TopBar 分段控件，唯一一套视图切换）
+    in-out property <string> sort_mode: "updated";   // 组内排序：updated / score / changes
+    in-out property <bool> high_score_only: false;   // true = 只看评分 ≥8.0
     // ── 状态栏 ──
     in property <string> sb_sync: "";
     in property <string> sb_quota: "";
@@ -290,6 +292,8 @@ export component MainWindow inherits Window {
     callback sync_now();
     callback open_settings();
     callback filter_changed(string);
+    callback sort_changed(string);          // 组内排序方式变化（updated/score/changes）
+    callback high_score_toggled(bool);      // 高分快筛开关（只看 ≥8.0）
     callback row_activated(int);
     callback row_pin(int);
     callback row_reject(int);
@@ -370,6 +374,10 @@ export component MainWindow inherits Window {
             profile_names: root.profile_names;
             active_profile <=> root.active_profile;
             switch_profile(n) => { root.switch_profile(n); }
+            sort_mode <=> root.sort_mode;
+            high_score_only <=> root.high_score_only;
+            sort_changed(m) => { root.sort_changed(m); }
+            high_score_toggled(on) => { root.high_score_toggled(on); }
             refresh => { root.refresh(); }
             sync => { root.sync_now(); }
             open_settings => { root.open_settings(); }

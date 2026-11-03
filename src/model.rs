@@ -155,10 +155,11 @@ fn group_key(title: &str) -> &'static str {
 /// 行数据 → (扁平 PrListRow 模型, PrGroup 切片元数据)。
 /// PrListView 的 rows 不含组头，groups 以 start/count 切片；selected_index 直接是 rows 下标。
 /// lang："zh"/"en"（组标题与 activity_text 的文案语言）。
-pub fn build_models(rows: &[serde_json::Value], lang: &str) -> (Vec<PrListRow>, Vec<PrGroup>) {
+/// sort_by：组内排序键，见 build_sections。
+pub fn build_models(rows: &[serde_json::Value], lang: &str, sort_by: &str) -> (Vec<PrListRow>, Vec<PrGroup>) {
     let mut out_rows: Vec<PrListRow> = Vec::new();
     let mut groups: Vec<PrGroup> = Vec::new();
-    for (title, idxs) in build_sections(rows, lang) {
+    for (title, idxs) in build_sections(rows, lang, sort_by) {
         let start = out_rows.len() as i32;
         for i in &idxs {
             out_rows.push(to_row(&rows[*i], lang));
