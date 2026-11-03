@@ -112,6 +112,42 @@ component OrgIcon inherits Rectangle {
     }
 }
 
+// ── 可排序表头单元格：点击排序（同列再点反向），当前列高亮 + 方向箭头 ──
+component HeaderCell inherits Rectangle {
+    in property <string> label;
+    in property <string> sort_key;
+    in property <bool> active: false;
+    in property <bool> asc: true;
+    callback clicked();
+
+    background: ta.has-hover ? Theme.hover : transparent;
+    animate background { duration: 100ms; }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.label;
+        font-size: Theme.fs_xs;
+        font-weight: root.active ? 700 : 500;
+        color: root.active ? Theme.text : Theme.text_faint;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    if root.active: Image {
+        x: parent.width - 12px;
+        y: (parent.height - 8px) / 2;
+        width: 8px;
+        height: 8px;
+        source: root.asc ? @image-url("icons/chevron-up.svg") : @image-url("icons/chevron-down.svg");
+        image-fit: contain;
+        colorize: Theme.text_dim;
+    }
+}
+
 // ── 表头列宽拖拽手柄：8px 宽热区，拖动列分界线调整该列（弹性标题列吸收余量）──
 // dragged 回调收到的是鼠标在表头坐标系下的绝对 x——用手柄自身 x + 相对位移算出，
 // 与列宽解耦，避免「手柄跟随列宽移动导致相对位移漂移」的反馈回路。
@@ -147,6 +183,11 @@ component ColHandle inherits Rectangle {
 // ── 表头行：11px / 500 / text_faint，底部 hairline；列分界处有拖拽手柄 ──
 // 与 PrRowItem 共用同一套列坐标公式（绝对定位），保证任何宽度下逐像素对齐
 component ListHeader inherits Rectangle {
+    // 排序状态（当前列 + 方向）+ 点击回调（Excel 式点列标题排序）
+    in property <string> sort_col: "upd";
+    in property <bool> sort_asc: false;
+    callback col_clicked(string);
+
     height: 26px;
 
     // 列 x 坐标：左锚定链式计算，Title 弹性吸收剩余宽度（PrRowItem 里有一套相同的）
@@ -164,17 +205,17 @@ component ListHeader inherits Rectangle {
     property <length> x-age: x-diff + DiffCol.width + 6px;
     property <length> x-upd: x-age + Cols.age + 6px;
 
-    Text { x: root.x-p; width: Cols.priority; height: 100%; text: "P"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-num; width: Cols.number; height: 100%; text: "#"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-title; width: root.title-w; height: 100%; text: "Title"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-author; width: Cols.author; height: 100%; text: "Author"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-turn; width: Cols.turn; height: 100%; text: "Turn"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-rev; width: Cols.review; height: 100%; text: "Rev"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-ci; width: Cols.ci; height: 100%; text: "CI"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-size; width: Cols.size; height: 100%; text: "Size"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-diff; width: DiffCol.width; height: 100%; text: "+/-"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-age; width: Cols.age; height: 100%; text: "Age"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
-    Text { x: root.x-upd; width: Cols.updated; height: 100%; text: "Upd"; font-size: Theme.fs_xs; font-weight: 500; color: Theme.text_faint; horizontal-alignment: center; vertical-alignment: center; }
+    HeaderCell { x: root.x-p; width: Cols.priority; label: "P"; sort_key: "priority"; active: root.sort_col == "priority"; asc: root.sort_asc; clicked => { root.col_clicked("priority"); } }
+    HeaderCell { x: root.x-num; width: Cols.number; label: "#"; sort_key: "num"; active: root.sort_col == "num"; asc: root.sort_asc; clicked => { root.col_clicked("num"); } }
+    HeaderCell { x: root.x-title; width: root.title-w; label: "Title"; sort_key: "title"; active: root.sort_col == "title"; asc: root.sort_asc; clicked => { root.col_clicked("title"); } }
+    HeaderCell { x: root.x-author; width: Cols.author; label: "Author"; sort_key: "author"; active: root.sort_col == "author"; asc: root.sort_asc; clicked => { root.col_clicked("author"); } }
+    HeaderCell { x: root.x-turn; width: Cols.turn; label: "Turn"; sort_key: "turn"; active: root.sort_col == "turn"; asc: root.sort_asc; clicked => { root.col_clicked("turn"); } }
+    HeaderCell { x: root.x-rev; width: Cols.review; label: "Rev"; sort_key: "review"; active: root.sort_col == "review"; asc: root.sort_asc; clicked => { root.col_clicked("review"); } }
+    HeaderCell { x: root.x-ci; width: Cols.ci; label: "CI"; sort_key: "ci"; active: root.sort_col == "ci"; asc: root.sort_asc; clicked => { root.col_clicked("ci"); } }
+    HeaderCell { x: root.x-size; width: Cols.size; label: "Size"; sort_key: "size"; active: root.sort_col == "size"; asc: root.sort_asc; clicked => { root.col_clicked("size"); } }
+    HeaderCell { x: root.x-diff; width: DiffCol.width; label: "+/-"; sort_key: "changes"; active: root.sort_col == "changes"; asc: root.sort_asc; clicked => { root.col_clicked("changes"); } }
+    HeaderCell { x: root.x-age; width: Cols.age; label: "Age"; sort_key: "age"; active: root.sort_col == "age"; asc: root.sort_asc; clicked => { root.col_clicked("age"); } }
+    HeaderCell { x: root.x-upd; width: Cols.updated; label: "Upd"; sort_key: "upd"; active: root.sort_col == "upd"; asc: root.sort_asc; clicked => { root.col_clicked("upd"); } }
 
     // 列宽拖拽手柄：拖分界线 = 相邻两列宽度互转（左列 + 右列 = 常量），
     // 其它列位置/宽度完全不动。手柄中心 = 间隙中心（右列左缘 - 3px）。
@@ -741,6 +782,10 @@ export component PrListView inherits FocusScope {
     in property <[PrListRow]> rows: [];
     in-out property <[PrGroup]> groups: [];
     in-out property <int> selected_index: -1;   // in-out：集成方 Esc 取消选中时需要写
+    // 排序状态（表头高亮用；点击排序逻辑在集成方）
+    in property <string> sort_col: "upd";
+    in property <bool> sort_asc: false;
+    callback header_clicked(string);
     // 选中行的身份（PrListRow.key = repo#number）。高亮以它为准——刷新重建行后
     // 下标会漂移，身份不会。由点击/键盘/Rust 侧（rebuild 后回写）共同维护。
     in-out property <string> selected_key: "";
@@ -805,7 +850,11 @@ export component PrListView inherits FocusScope {
         VerticalLayout {
             alignment: start;
 
-            ListHeader {}
+            ListHeader {
+                sort_col: root.sort_col;
+                sort_asc: root.sort_asc;
+                col_clicked(c) => { root.header_clicked(c); }
+            }
 
             flick := Flickable {
                 vertical-stretch: 1;

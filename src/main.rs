@@ -443,7 +443,8 @@ struct App {
     view: Vec<usize>,                       // 过滤后可见行 → rows 下标（UI 下标经它换算）
     view_keys: Vec<(String, i64)>,          // UI 实际展示顺序（build_models 分组后）→ 身份；点击映射以此为准
     filter: String,                         // 当前过滤词（空 = 全量）
-    sort_mode: String,                      // 组内排序："updated"（默认）/ "score" / "changes"
+    sort_col: String,                       // 组内排序列（默认 "upd" = 更新时间降序，即 SQL 输入序）
+    sort_asc: bool,                         // 排序方向（false = 降序）
     min_score: f32,                         // 高分快筛阈值（0 = 关；8 = 只看 ≥8.0）
     selected: Option<(String, i64)>,        // 选中 PR 身份（repo, number）；刷新后行序变化也不漂移
     status_msg: String,                     // 状态栏临时消息（最近一条 Status）
@@ -563,7 +564,8 @@ fn main() -> anyhow::Result<()> {
         view: Vec::new(),
         view_keys: Vec::new(),
         filter: String::new(),
-        sort_mode: "updated".into(),
+        sort_col: "upd".into(),
+        sort_asc: false,
         min_score: 0.0,
         selected: None,
         status_msg: config_status(&cfg),
@@ -785,10 +787,18 @@ fn main() -> anyhow::Result<()> {
         ui.on_filter_changed(|q| send_msg(Msg::FilterChanged(q.to_string())));
     }
     {
-        // 排序方式变化（组内排序键存 App，重建时按它排）
+        // 列表头点击排序（Excel 式）：同列再点反向；新列按该列的默认方向
+        //（数值/时间列先降序——最新/最大在前；文本列先升序）
         let app = app.clone();
-        ui.on_sort_changed(move |mode| {
-            app.lock().unwrap().sort_mode = mode.to_string();
+        ui.on_header_clicked(move |col| {
+            let mut a = app.lock().unwrap();
+            if a.sort_col == col.as_str() {
+                a.sort_asc = !a.sort_asc;
+            } else {
+                a.sort_col = col.to_string();
+                a.sort_asc = matches!(col.as_str(), "num" | "title" | "author" | "turn" | "review" | "ci" | "size");
+            }
+            drop(a);
             send_msg(Msg::ViewPrefsChanged);
         });
     }
@@ -2897,15 +2907,16 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
 /// 用当前 filter 过滤 app.rows 并重建 rows/groups 模型（折叠状态按组 key 从旧模型带回）。
 fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     // 在 UI 线程装配 Slint 模型（SharedString/Image 是 Rc，不跨线程）
-    let (rows_json, lang, sort_by) = {
+    let (rows_json, lang, sort_col, sort_asc) = {
         let a = app.lock().unwrap();
         (
             a.view.iter().map(|&i| a.rows[i].clone()).collect::<Vec<serde_json::Value>>(),
             a.cfg.language.clone(),
-            a.sort_mode.clone(),
+            a.sort_col.clone(),
+            a.sort_asc,
         )
     };
-    let (rows, mut groups) = model::build_models(&rows_json, &lang, &sort_by);
+    let (rows, mut groups) = model::build_models(&rows_json, &lang, &sort_col, sort_asc);
     // UI 展示顺序（分组重排后）的身份序列——resolve_view 的点击映射以此为准，
     // 不能用 a.view（数据库排序），两者在分组重排后不是一个序。
     let keys: Vec<(String, i64)> = rows
@@ -3295,7 +3306,8 @@ mod tests {
             view,
             view_keys: Vec::new(),
             filter: String::new(),
-        sort_mode: "updated".into(),
+        sort_col: "upd".into(),
+        sort_asc: false,
         min_score: 0.0,
             selected: None,
             status_msg: String::new(),

@@ -232,7 +232,8 @@ export component MainWindow inherits Window {
     in-out property <[PrGroup]> groups: [];
     in-out property <string> filter_text: "";
     in-out property <int> view_mode: 0;      // 0=列表 1=Inbox（TopBar 分段控件，唯一一套视图切换）
-    in-out property <string> sort_mode: "updated";   // 组内排序：updated / score / changes
+    in-out property <string> sort_col: "upd";   // 列表排序列（Excel 式点表头）
+    in-out property <bool> sort_asc: false;     // 排序方向（false = 降序）
     in-out property <bool> high_score_only: false;   // true = 只看评分 ≥8.0
     // PageUp/PageDown 桥接：keys FocusScope 在视图的 if 作用域之外，够不到
     // list/panel/inbox 的 id——计数器累加（有符号），各 if 作用域里的 changed 消费
@@ -295,7 +296,7 @@ export component MainWindow inherits Window {
     callback sync_now();
     callback open_settings();
     callback filter_changed(string);
-    callback sort_changed(string);          // 组内排序方式变化（updated/score/changes）
+    callback header_clicked(string);        // 列表头点击排序（同列再点反向）
     callback high_score_toggled(bool);      // 高分快筛开关（只看 ≥8.0）
     callback row_activated(int);
     callback row_pin(int);
@@ -377,9 +378,7 @@ export component MainWindow inherits Window {
             profile_names: root.profile_names;
             active_profile <=> root.active_profile;
             switch_profile(n) => { root.switch_profile(n); }
-            sort_mode <=> root.sort_mode;
             high_score_only <=> root.high_score_only;
-            sort_changed(m) => { root.sort_changed(m); }
             high_score_toggled(on) => { root.high_score_toggled(on); }
             refresh => { root.refresh(); }
             sync => { root.sync_now(); }
@@ -417,6 +416,9 @@ export component MainWindow inherits Window {
                     rows: root.rows;
                     groups: root.groups;
                     selected_key <=> root.selected_key;
+                    sort_col: root.sort_col;
+                    sort_asc: root.sort_asc;
+                    header_clicked(c) => { root.header_clicked(c); }
                     row_activated(i) => { root.row_activated(i); }
                     row_pin(i) => { root.row_pin(i); }
                     row_reject(i) => { root.row_reject(i); }
