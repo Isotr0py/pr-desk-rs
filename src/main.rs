@@ -513,6 +513,13 @@ fn resolve_view(app: &Arc<Mutex<App>>, view_idx: usize) -> Option<(String, i64)>
 }
 
 fn main() -> anyhow::Result<()> {
+    // Windows 上 wgpu 默认可能挑 Vulkan；远控/抓屏（Parsec、OBS 等）对 Vulkan 呈现
+    // 的支持很差（卡顿/黑屏），DX12 走 DXGI 是它们支持最好的路径。环境变量可覆盖。
+    #[cfg(windows)]
+    if std::env::var_os("WGPU_BACKEND").is_none() {
+        unsafe { std::env::set_var("WGPU_BACKEND", "dx12") };
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
