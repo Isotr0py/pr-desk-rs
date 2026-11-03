@@ -103,6 +103,14 @@ impl Db {
         if !prs_cols.is_empty() && !prs_cols.iter().any(|c| c == "author_orgs") {
             conn.execute_batch("ALTER TABLE prs ADD COLUMN author_orgs TEXT NOT NULL DEFAULT '[]'")?;
         }
+        // prs 增加 additions/deletions 列：Files 标签页拉到文件清单时把增删行数落库，
+        // 列表 +/- 列用它兜底（评审记录的 r.additions 优先，见 list_prs 的 COALESCE）
+        if !prs_cols.is_empty() && !prs_cols.iter().any(|c| c == "additions") {
+            conn.execute_batch(
+                "ALTER TABLE prs ADD COLUMN additions INTEGER;
+                 ALTER TABLE prs ADD COLUMN deletions INTEGER;",
+            )?;
+        }
         if version < 2 {
             // v1 → v2：prs 加 extras 缓存列（幂等：列已存在则跳过）
             let cols: Vec<String> = {
@@ -326,7 +334,8 @@ impl Db {
             "SELECT p.repo, p.number, p.title, p.author, p.url, p.status, p.tags, p.role,
                 p.on_board, p.priority, p.pinned, p.ci_status, p.review_decision, p.turn,
                 p.updated_at, p.recent_commits, p.extras_detail, p.source, p.author_orgs,
-                r.score, r.reviewed_at, r.size_label, r.additions, r.deletions
+                r.score, r.reviewed_at, r.size_label, r.additions, r.deletions,
+                p.additions, p.deletions
              FROM prs p
              LEFT JOIN reviews r ON r.rowid = (
                 SELECT r2.rowid FROM reviews r2
@@ -360,8 +369,9 @@ impl Db {
                     "author_orgs": row.get::<_, String>(18)?,
                     "score": row.get::<_, Option<f64>>(19)?,
                     "size_label": row.get::<_, Option<String>>(21)?,
-                    "additions": row.get::<_, Option<i64>>(22)?,
-                    "deletions": row.get::<_, Option<i64>>(23)?,
+                    // +/- 列：评审记录的优先，否则用 Files 拉取落库的 PR 级增删（没评审过不再是 0）
+                    "additions": row.get::<_, Option<i64>>(22)?.or(row.get::<_, Option<i64>>(24)?),
+                    "deletions": row.get::<_, Option<i64>>(23)?.or(row.get::<_, Option<i64>>(25)?),
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -415,6 +425,31 @@ impl Db {
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// 全部 diff 缓存（repo, number, diff 文本）：回填 prs.additions/deletions 用。
+    pub fn list_diff_cache(&self) -> Result<Vec<(String, i64, String)>> {
+        let mut stmt = self.conn.prepare("SELECT repo, number, diff FROM diff_cache")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// 回填 PR 的增删行数（只填空值，已有值不动——GitHub files API 的真值优先）。
+    pub fn fill_diff_sums_if_empty(&self, repo: &str, number: i64, adds: i64, dels: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE prs SET additions=?1, deletions=?2
+             WHERE repo=?3 AND number=?4 AND additions IS NULL",
+            params![adds, dels, repo, number],
+        )?;
+        Ok(())
     }
 
     /// 全部非空作者名（去重）：刷新时批量补 author_orgs 用。

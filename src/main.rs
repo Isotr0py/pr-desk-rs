@@ -1425,7 +1425,25 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
         .map(|r| drawer_extras_json(r))
         .unwrap_or_default();
     let files_json = match &diff_cached {
-        Some(d) => files_json_from_diff(d),
+        Some(d) => {
+            let j = files_json_from_diff(d);
+            // diff 缓存的增删行数顺手落库（列表 +/- 列的兜底数据源，GitHub files API 的
+            // 真值拉到时会覆盖，见 FetchPrLive 的文件分支）
+            if let Ok(files) = serde_json::from_str::<Vec<serde_json::Value>>(&j) {
+                let (adds, dels) = files.iter().fold((0i64, 0i64), |(a, dd), f| {
+                    (
+                        a + f["adds"].as_i64().unwrap_or(0),
+                        dd + f["dels"].as_i64().unwrap_or(0),
+                    )
+                });
+                let a = app.lock().unwrap();
+                let _ = a.db.conn.execute(
+                    "UPDATE prs SET additions=?1, deletions=?2 WHERE repo=?3 AND number=?4",
+                    rusqlite::params![adds, dels, repo, number],
+                );
+            }
+            j
+        }
         None => "[]".into(),
     };
     let state = row
@@ -1983,6 +2001,24 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
     // sync 模式跳过：行数据由服务端插件负责保持新鲜。
     let sync_enabled = { app.lock().unwrap().cfg.active_sync().is_some() };
     if !sync_enabled {
+        // 先用 diff 缓存回填增删行数（纯本地计算；打开过 Files/Diff 的 PR 立即有数，
+        // 列表 +/- 列不再 +0/-0；只填空值，GitHub files API 的真值优先）
+        {
+            let a = app.lock().unwrap();
+            if let Ok(cached) = a.db.list_diff_cache() {
+                for (repo, number, diff) in cached {
+                    let (adds, dels) = diffview::split_files(&diff)
+                        .iter()
+                        .fold((0i64, 0i64), |(a, d), (_p, text)| {
+                            (
+                                a + text.lines().filter(|l| l.starts_with('+')).count() as i64,
+                                d + text.lines().filter(|l| l.starts_with('-')).count() as i64,
+                            )
+                        });
+                    let _ = a.db.fill_diff_sums_if_empty(&repo, number, adds, dels);
+                }
+            }
+        }
         let keys = { app.lock().unwrap().db.list_pr_keys().unwrap_or_default() };
         for (repo, number) in keys {
             match gh.fetch_pr_meta(&repo, number).await {
@@ -2608,9 +2644,24 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             Some(serde_json::to_string(&convo_items).unwrap_or_else(|_| "[]".into()));
                         dirty = true;
                     }
-                    if let Some(files) = files {
+                    if let Some(files) = &files {
+                        // 增删行数落库：列表 +/- 列之前只来自评审记录，没评审过的 PR 永远 +0/-0
+                        let (adds, dels) = files.iter().fold((0i64, 0i64), |(a, d), f| {
+                            (
+                                a + f["adds"].as_i64().unwrap_or(0),
+                                d + f["dels"].as_i64().unwrap_or(0),
+                            )
+                        });
+                        {
+                            let a = app.lock().unwrap();
+                            let _ = a.db.conn.execute(
+                                "UPDATE prs SET additions=?1, deletions=?2 WHERE repo=?3 AND number=?4",
+                                rusqlite::params![adds, dels, repo, number],
+                            );
+                        }
                         files_json_out =
-                            Some(serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()));
+                            Some(serde_json::to_string(files).unwrap_or_else(|_| "[]".into()));
+                        dirty = true;
                     }
                     if dirty {
                         reload_rows(&app, &msg_tx);
