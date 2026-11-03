@@ -4,7 +4,9 @@
 //! 文件缺失或超过 7 天由 `prefetch*` 重新拉取；`get_*` 只在缓存新鲜且能解码时返回
 //! `Some(slint::Image)`（像素经 Rgba8 SharedPixelBuffer 落位），否则返回 None，UI 走字母降级。
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -69,12 +71,39 @@ fn load(path: &Path) -> Option<slint::Image> {
 // 集成方在 PrRow 增加 image 字段后由 model::to_row 调用
 #[allow(dead_code)]
 pub fn get_avatar(login: &str) -> Option<slint::Image> {
-    load(&avatar_path(login))
+    load_cached(&avatar_path(login))
 }
 
 /// 组织图标入口
 pub fn get_org_icon(org: &str) -> Option<slint::Image> {
-    load(&org_icon_path(org))
+    load_cached(&org_icon_path(org))
+}
+
+// 进程内图片缓存：列表每次重建（刷新/过滤/切档案）都会为每行取头像 + 组织图标，
+// 没有它每次重建 = 全量文件读盘 + PNG 解码，全跑在 UI 线程上（实测 108 行 600ms+，
+// 切一次档案重建 3 次，界面直接冻住）。slint::Image 是 Rc，克隆廉价。
+// 以文件 mtime 做一致性校验：prefetch 写入（tmp+rename）或坏缓存被删都会使 mtime
+// 变化/消失，下次访问自动重载，不会用过期图。负缓存（文件缺席 → None）同样成立，
+// prefetch 补拉落盘后 mtime 从 None 变 Some，自动命中新图。
+// 调用点都在 UI 线程（build_models / Msg::Panel），thread_local 即可，无需 Send。
+thread_local! {
+    static IMG_CACHE: RefCell<HashMap<PathBuf, (Option<std::time::SystemTime>, Option<slint::Image>)>> =
+        RefCell::new(HashMap::new());
+}
+
+fn load_cached(path: &Path) -> Option<slint::Image> {
+    let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    IMG_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some((mt, img)) = c.get(path) {
+            if *mt == mtime {
+                return img.clone();
+            }
+        }
+        let img = load(path);
+        c.insert(path.to_path_buf(), (mtime, img.clone()));
+        img
+    })
 }
 
 /// 经共享 GitHub 客户端解析头像 URL 再下载（github.com/<login>.png 的重定向在

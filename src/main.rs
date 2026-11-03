@@ -2045,10 +2045,16 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
         // 先用 diff 缓存回填增删行数（纯本地计算；打开过 Files/Diff 的 PR 立即有数，
         // 列表 +/- 列不再 +0/-0；只填空值，GitHub files API 的真值优先）
         {
-            let a = app.lock().unwrap();
-            if let Ok(cached) = a.db.list_diff_cache() {
-                for (repo, number, diff) in cached {
-                    let (adds, dels) = diffview::split_files(&diff)
+            // 先取数据放锁，解析（逐行扫描 diff）在锁外做，写完再取锁——
+            // 持锁解析会堵住 UI 线程的 app.lock()，表现为界面冻结
+            let cached = {
+                let a = app.lock().unwrap();
+                a.db.list_diff_cache().unwrap_or_default()
+            };
+            let sums: Vec<(String, i64, i64, i64)> = cached
+                .iter()
+                .map(|(repo, number, diff)| {
+                    let (adds, dels) = diffview::split_files(diff)
                         .iter()
                         .fold((0i64, 0i64), |(a, d), (_p, text)| {
                             (
@@ -2056,6 +2062,12 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
                                 d + text.lines().filter(|l| l.starts_with('-')).count() as i64,
                             )
                         });
+                    (repo.clone(), *number, adds, dels)
+                })
+                .collect();
+            {
+                let a = app.lock().unwrap();
+                for (repo, number, adds, dels) in sums {
                     let _ = a.db.fill_diff_sums_if_empty(&repo, number, adds, dels);
                 }
             }
