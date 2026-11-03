@@ -94,6 +94,7 @@ fn rel_short(ts: NaiveDateTime) -> String {
     }
 }
 
+#[derive(Clone)]
 pub struct SyncClient {
     client: reqwest::Client,
     base: String,

@@ -2019,38 +2019,62 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
                 }
             }
         }
+        // 并行拉每个在库 PR 的 GitHub 状态（merged/closed 写入 status 列后分组会把
+        // 已完结 PR 移出待评审区；否则合入了列表还显示 Open）。之前是串行循环，
+        // N 个 PR + M 个作者串行各一次请求，切换档案时要卡十几秒
         let keys = { app.lock().unwrap().db.list_pr_keys().unwrap_or_default() };
-        for (repo, number) in keys {
-            match gh.fetch_pr_meta(&repo, number).await {
-                Ok(meta) => {
-                    let gh_state = if meta["merged_at"].is_null() {
-                        meta["state"].as_str().unwrap_or("open").to_string()
-                    } else {
-                        "merged".to_string()
-                    };
-                    if gh_state == "merged" || gh_state == "closed" {
-                        let a = app.lock().unwrap();
-                        let _ = a.db.conn.execute(
-                            "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
-                            rusqlite::params![gh_state, repo, number],
-                        );
+        {
+            let mut set = tokio::task::JoinSet::new();
+            for (repo, number) in keys {
+                let g = gh.clone();
+                set.spawn(async move {
+                    let meta = g.fetch_pr_meta(&repo, number).await;
+                    (repo, number, meta)
+                });
+            }
+            while let Some(Ok((repo, number, res))) = set.join_next().await {
+                match res {
+                    Ok(meta) => {
+                        let gh_state = if meta["merged_at"].is_null() {
+                            meta["state"].as_str().unwrap_or("open").to_string()
+                        } else {
+                            "merged".to_string()
+                        };
+                        if gh_state == "merged" || gh_state == "closed" {
+                            let a = app.lock().unwrap();
+                            let _ = a.db.conn.execute(
+                                "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
+                                rusqlite::params![gh_state, repo, number],
+                            );
+                        }
                     }
-                }
-                Err(e) => {
-                    tracing::debug!("刷新 PR 状态失败 {repo} #{number}: {e}");
+                    Err(e) => {
+                        tracing::debug!("刷新 PR 状态失败 {repo} #{number}: {e}");
+                    }
                 }
             }
         }
-        // 作者公开组织成员关系（org 徽章数据源；本地行没人填这个字段，永远不会有 org 标）
+        // 作者公开组织成员关系（org 徽章数据源；本地行没人填这个字段，永远不会有 org 标）。
+        // 同样并行
         let authors = { app.lock().unwrap().db.list_authors().unwrap_or_default() };
-        for author in authors {
-            match gh.fetch_user_orgs(&author).await {
-                Ok(orgs) => {
-                    let a = app.lock().unwrap();
-                    let _ = a.db.set_author_orgs(&author, &orgs);
-                }
-                Err(e) => {
-                    tracing::debug!("拉取作者组织失败 {author}: {e}");
+        {
+            let mut set = tokio::task::JoinSet::new();
+            for author in authors {
+                let g = gh.clone();
+                set.spawn(async move {
+                    let orgs = g.fetch_user_orgs(&author).await;
+                    (author, orgs)
+                });
+            }
+            while let Some(Ok((author, res))) = set.join_next().await {
+                match res {
+                    Ok(orgs) => {
+                        let a = app.lock().unwrap();
+                        let _ = a.db.set_author_orgs(&author, &orgs);
+                    }
+                    Err(e) => {
+                        tracing::debug!("拉取作者组织失败 {author}: {e}");
+                    }
                 }
             }
         }
@@ -2746,17 +2770,28 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 let _ = msg_tx.send(Msg::Profiles { names, active: name.clone() });
                 let _ = msg_tx.send(Msg::ClosePanel);
                 let _ = msg_tx.send(Msg::Status(trf(&lang, "profile_switched", &[&name])));
-                // 走现有刷新路径：远程档 do_sync 全量拉；本地档 GitHub 火hose
+                // 走现有刷新路径：远程档 do_sync 全量拉；本地档 GitHub 火hose。
+                // 但先让 UI 立即落地：换库后马上重排行 + 回放上一条通知列表，
+                // 网络刷新 spawn 到后台，切换档案不再卡 worker 队列
+                reload_rows(&app, &msg_tx);
+                {
+                    let cached = app.lock().unwrap().inbox.clone();
+                    let _ = msg_tx.send(Msg::InboxRows(cached));
+                }
                 if let Some(g) = &gh {
-                    if sync_client.enabled() {
-                        fetch_inbox(g, &app, &msg_tx).await;
-                        do_sync(&app, &sync_client, &msg_tx).await;
-                    } else {
-                        refresh_from_github(g, &app, &msg_tx).await;
-                        fetch_inbox(g, &app, &msg_tx).await;
-                    }
-                } else {
-                    reload_rows(&app, &msg_tx);
+                    let g = g.clone();
+                    let sc = sync_client.clone();
+                    let app2 = app.clone();
+                    let msg_tx2 = msg_tx.clone();
+                    tokio::spawn(async move {
+                        if sc.enabled() {
+                            fetch_inbox(&g, &app2, &msg_tx2).await;
+                            do_sync(&app2, &sc, &msg_tx2).await;
+                        } else {
+                            refresh_from_github(&g, &app2, &msg_tx2).await;
+                            fetch_inbox(&g, &app2, &msg_tx2).await;
+                        }
+                    });
                 }
             }
             Cmd::ReloadConfig => {
