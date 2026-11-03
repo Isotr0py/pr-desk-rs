@@ -300,6 +300,30 @@ export component DetailPanel inherits Rectangle {
     in property <[DiffFile]> diff_files: [];
     callback diff_file_toggled(int);
 
+    // PageUp/PageDown：滚动当前标签页的内容区（各 tab 容器类型不同，逐一分派；
+    // Flickable/ScrollView 用 content-y + content-height，ListView 用 viewport-y + viewport-height）
+    public function page_scroll(dir: int) {
+        if (root.current_tab == 0) {
+            review_scroll.content-y = dir > 0
+                ? max(review_scroll.height - review_scroll.content-height, review_scroll.content-y - review_scroll.height * 0.9)
+                : min(0px, review_scroll.content-y + review_scroll.height * 0.9);
+        } else if (root.current_tab == 1) {
+            convo_scroll.content-y = dir > 0
+                ? max(convo_scroll.height - convo_scroll.content-height, convo_scroll.content-y - convo_scroll.height * 0.9)
+                : min(0px, convo_scroll.content-y + convo_scroll.height * 0.9);
+        } else if (root.current_tab == 2) {
+            checks_scroll.viewport-y = dir > 0
+                ? max(checks_scroll.height - checks_scroll.viewport-height, checks_scroll.viewport-y - checks_scroll.height * 0.9)
+                : min(0px, checks_scroll.viewport-y + checks_scroll.height * 0.9);
+        } else if (root.current_tab == 3) {
+            files_scroll.viewport-y = dir > 0
+                ? max(files_scroll.height - files_scroll.viewport-height, files_scroll.viewport-y - files_scroll.height * 0.9)
+                : min(0px, files_scroll.viewport-y + files_scroll.height * 0.9);
+        } else {
+            diff_scroll.page_scroll(dir);
+        }
+    }
+
     // ── 评审标签页（LLM 预评审）──
     callback action_run_review();           // 点击「开始预评审 / 重试评审」
     callback action_copy_review();          // 复制评审报告（Markdown 进剪贴板）
@@ -559,8 +583,11 @@ export component DetailPanel inherits Rectangle {
             background: Theme.bg;
             clip: true;
 
-            // 评审：LLM 预评审报告（分数胶囊 / 维度进度条 / 体量行 / 总结 / 风险文件），整体可滚动
-            if root.current_tab == 0: Rectangle {
+            // 评审：LLM 预评审报告（分数胶囊 / 维度进度条 / 体量行 / 总结 / 风险文件），整体可滚动。
+            // 注意：tab 容器用 visible 切换而非 if 创建——PageUp/PageDown 翻页需要
+            // 跨作用域引用滚动容器的 id（if 块里的 id 外部不可见）；顺带滚动位置跨 tab 保留
+            Rectangle {
+                visible: root.current_tab == 0;
                 // 转圈指示：Timer 驱动逐帧切换 4 帧旋转 SVG（Slint 无元素旋转属性，故用帧切换；仅 running 时转动）
                 property <int> spin_idx: 0;
                 Timer {
@@ -981,8 +1008,10 @@ export component DetailPanel inherits Rectangle {
             // 会话：时间线（24px 圆形头像 + 2px 竖向时间线贯穿）
             // Flickable + VerticalLayout：Markdown 块换行后的高度随宽度变化，
             // ListView 会缓存委托高度导致条目重叠，这里整树重排更可靠
-            if root.current_tab == 1: Rectangle {
-                if root.convo_entries.length > 0: Flickable {
+            Rectangle {
+                visible: root.current_tab == 1;
+                convo_scroll := Flickable {
+                    visible: root.convo_entries.length > 0;
                     content-width: self.width;
                     content-height: convo_layout.preferred-height;
 
@@ -1065,8 +1094,10 @@ export component DetailPanel inherits Rectangle {
             }
 
             // Checks：状态圆点 + 名称 + 结论（失败红字）
-            if root.current_tab == 2: Rectangle {
-                if root.check_runs.length > 0: ListView {
+            Rectangle {
+                visible: root.current_tab == 2;
+                checks_scroll := ListView {
+                    visible: root.check_runs.length > 0;
                     for c[i] in root.check_runs: check_row := Rectangle {
                         property <color> tone: c.conclusion == "success" ? Theme.good
                             : c.conclusion == "failure" ? Theme.bad
@@ -1127,8 +1158,10 @@ export component DetailPanel inherits Rectangle {
             }
 
             // Files：文件名 + 增删数字 + 迷你增删比例条
-            if root.current_tab == 3: Rectangle {
-                if root.files.length > 0: ListView {
+            Rectangle {
+                visible: root.current_tab == 3;
+                files_scroll := ListView {
+                    visible: root.files.length > 0;
                     for f[i] in root.files: file_row := Rectangle {
                         property <float> add_frac: (f.adds + f.dels) > 0
                             ? f.adds * 1.0 / (f.adds + f.dels) : 0;
@@ -1202,7 +1235,8 @@ export component DetailPanel inherits Rectangle {
             }
 
             // Diff：嵌入真实 DiffView（彩色渲染 + 按文件折叠）
-            if root.current_tab == 4: DiffView {
+            diff_scroll := DiffView {
+                visible: root.current_tab == 4;
                 files: root.diff_files;
                 file_toggled(i) => { root.diff_file_toggled(i); }
             }

@@ -234,6 +234,9 @@ export component MainWindow inherits Window {
     in-out property <int> view_mode: 0;      // 0=列表 1=Inbox（TopBar 分段控件，唯一一套视图切换）
     in-out property <string> sort_mode: "updated";   // 组内排序：updated / score / changes
     in-out property <bool> high_score_only: false;   // true = 只看评分 ≥8.0
+    // PageUp/PageDown 桥接：keys FocusScope 在视图的 if 作用域之外，够不到
+    // list/panel/inbox 的 id——计数器累加（有符号），各 if 作用域里的 changed 消费
+    in-out property <int> page_req: 0;
     // ── 状态栏 ──
     in property <string> sb_sync: "";
     in property <string> sb_quota: "";
@@ -392,10 +395,23 @@ export component MainWindow inherits Window {
                 if (event.text == "2") { root.key_priority(2); return accept; }
                 if (event.text == "3") { root.key_priority(3); return accept; }
                 if (event.text == "/") { topbar.focus_search(); return accept; }
+                // PageUp/PageDown：桥接给当前视图的滚动容器（计数器累加，各 if 作用域消费）
+                if (event.text == Key.PageDown || event.text == Key.PageUp) {
+                    root.page_req = root.page_req + (event.text == Key.PageDown ? 1 : -1);
+                    return accept;
+                }
                 reject  // j/k/Enter/Esc 冒泡给 PrListView 内部处理
             }
 
             if root.view_mode == 0: HorizontalLayout {
+                // PageUp/PageDown 消费（mirror 桥接：changed 只能盯本地属性）
+                property <int> last_page_req: 0;
+                property <int> page_req_mirror: root.page_req;
+                changed page_req_mirror => {
+                    let dir = page_req_mirror - last_page_req;
+                    last_page_req = page_req_mirror;
+                    if (root.d_open) { panel.page_scroll(dir); } else { list.page_scroll(dir); }
+                }
                 list := PrListView {
                     horizontal-stretch: 1;
                     rows: root.rows;
@@ -410,7 +426,7 @@ export component MainWindow inherits Window {
                         if (root.d_open) { root.panel_close(); } else { self.selected_index = -1; self.selected_key = ""; }
                     }
                 }
-                DetailPanel {
+                panel := DetailPanel {
                     visible: root.d_open;
                     max_panel_width: root.width * 0.6;
                     title: root.d_title;
@@ -450,6 +466,14 @@ export component MainWindow inherits Window {
                 }
             }
             if root.view_mode == 1: HorizontalLayout {
+                // PageUp/PageDown 消费（mirror 桥接，同列表分支）
+                property <int> last_page_req: 0;
+                property <int> page_req_mirror: root.page_req;
+                changed page_req_mirror => {
+                    let dir = page_req_mirror - last_page_req;
+                    last_page_req = page_req_mirror;
+                    inbox.page_scroll(dir);
+                }
                 inbox := InboxView {
                     horizontal-stretch: 1;
                     rows: root.inbox_rows;

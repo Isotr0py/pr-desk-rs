@@ -436,6 +436,12 @@ export component InboxView inherits FocusScope {
         root.selected_index = Math.min(root.rows.length - 1, Math.max(0, root.selected_index + delta));
     }
 
+    // PageUp/PageDown 翻页滚动（由外层 FocusScope 调用；Flickable 自己不认键盘）。
+    // 注意桥接：Flickable 在 if 作用域里，id 外部不可见——page_scroll 只累加
+    // page_req 计数，真正的滚动在 Flickable 内部的 changed 里（那里看得到 self）。
+    in-out property <int> page_req: 0;
+    public function page_scroll(dir: int) { root.page_req = root.page_req + dir; }
+
     // 键盘导航：j/k 或 ↑/↓ 移动，Enter 展开预览 / 打开浏览器，Esc 关预览 / 取消选中
     key-pressed(event) => {
         if (event.text == "j" || event.text == Key.DownArrow) {
@@ -649,9 +655,23 @@ export component InboxView inherits FocusScope {
 
             if !root.needs_token && root.rows.length > 0: InboxHeader {}
 
-            if !root.needs_token && root.rows.length > 0: Flickable {
+            if !root.needs_token && root.rows.length > 0: flick := Flickable {
                 vertical-stretch: 1;
                 content-height: col.preferred-height;
+
+                // PageUp/PageDown：page_req 计数桥接（if 作用域里 id 外部不可见、
+                // changed 又只能盯本地属性——mirror 绑定把外层计数引进来）
+                property <int> last_page_req: 0;
+                property <int> page_req_mirror: root.page_req;
+                changed page_req_mirror => {
+                    let dir = page_req_mirror - self.last_page_req;
+                    self.last_page_req = page_req_mirror;
+                    if (dir > 0) {
+                        self.content-y = max(self.height - self.content-height, self.content-y - self.height * 0.9);
+                    } else if (dir < 0) {
+                        self.content-y = min(0px, self.content-y + self.height * 0.9);
+                    }
+                }
 
                 // Flickable 子元素需显式铺满视口宽，否则 stretch 列拿不到剩余空间
                 col := VerticalLayout {
