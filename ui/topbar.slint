@@ -259,6 +259,9 @@ export component TopBar inherits Rectangle {
     in property <string> refresh_tooltip: I18n.refresh_tooltip;
     in property <string> sync_tooltip: I18n.sync_tooltip;
     in property <string> settings_tooltip: I18n.settings_tooltip;
+    // 刷新 / 同步进行中（图标换转圈动画；连点去重在 Rust 侧）
+    in property <bool> refresh_busy: false;
+    in property <bool> sync_busy: false;
     // 供全局 / 快捷键调用：聚焦搜索框
     public function focus_search() { search.focus_search(); }
 
@@ -266,6 +269,14 @@ export component TopBar inherits Rectangle {
     background: Theme.card;
 
     property <length> seg-w: 64px;
+
+    // 转圈指示：Timer 驱动逐帧切换 4 帧旋转 SVG（复用 detail_panel 的 spin 模式）
+    property <int> spin_idx: 0;
+    Timer {
+        interval: 130ms;
+        running: root.refresh_busy || root.sync_busy;
+        triggered => { root.spin_idx = root.spin_idx >= 3 ? 0 : root.spin_idx + 1; }
+    }
 
     HorizontalLayout {
         padding-left: 14px;
@@ -389,7 +400,12 @@ export component TopBar inherits Rectangle {
             }
         }
         IconButton {
-            icon: @image-url("icons/refresh.svg");
+            icon: root.refresh_busy
+                ? (root.spin_idx == 0 ? @image-url("icons/spin-0.svg")
+                    : root.spin_idx == 1 ? @image-url("icons/spin-1.svg")
+                    : root.spin_idx == 2 ? @image-url("icons/spin-2.svg")
+                    : @image-url("icons/spin-3.svg"))
+                : @image-url("icons/refresh.svg");
             tooltip: root.refresh_tooltip;
             clicked => { root.refresh(); }
         }
@@ -400,7 +416,12 @@ export component TopBar inherits Rectangle {
             switch_profile(n) => { root.switch_profile(n); }
         }
         IconButton {
-            icon: @image-url("icons/sync.svg");
+            icon: root.sync_busy
+                ? (root.spin_idx == 0 ? @image-url("icons/spin-0.svg")
+                    : root.spin_idx == 1 ? @image-url("icons/spin-1.svg")
+                    : root.spin_idx == 2 ? @image-url("icons/spin-2.svg")
+                    : @image-url("icons/spin-3.svg"))
+                : @image-url("icons/sync.svg");
             tooltip: root.sync_tooltip;
             clicked => { root.sync(); }
         }
@@ -429,6 +450,7 @@ export component StatusBar inherits Rectangle {
     in property <string> sync_text;    // 如「已同步 2m 前」
     in property <string> quota_text;   // 如「API 剩余 4,037」
     in property <int> total_count;     // PR 总数
+    in property <int> view_mode: 0;    // 0=列表 1=Inbox（快捷键提示随视图切换）
 
     height: 24px;
     background: Theme.card;
@@ -444,9 +466,9 @@ export component StatusBar inherits Rectangle {
         padding-right: 12px;
         spacing: 0;
 
-        // 左：快捷键提示（· 分隔）
+        // 左：快捷键提示（· 分隔，随视图切换）
         Text {
-            text: I18n.statusbar_hints;
+            text: root.view_mode == 1 ? I18n.statusbar_hints_inbox : I18n.statusbar_hints;
             font-size: Theme.fs_xs;
             color: Theme.text_faint;
             vertical-alignment: center;
@@ -463,6 +485,9 @@ export component StatusBar inherits Rectangle {
                 font-size: Theme.fs_xs;
                 color: Theme.text_dim;
                 vertical-alignment: center;
+                // 长错误消息截断：避免把右侧配额/总数挤出屏幕
+                max-width: 420px;
+                overflow: elide;
             }
             Text {
                 text: "·";

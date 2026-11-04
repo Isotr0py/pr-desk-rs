@@ -84,10 +84,12 @@ pub const DEFAULT_REVIEWER_PERSONA: &str = "\
 评审请用中文，客观严格，结论必须是指定格式的 JSON。";
 
 /// LLM 连接参数；api_key 或 model 缺失时 from_config 返回 None（预评审不可用）。
+/// client 复用（连接池/TLS 复用），超时 600s——评审生成本来就慢，不用 GitHub 的 30s。
 pub struct LlmSettings {
     pub base_url: String,
     pub api_key: String,
     pub model: String,
+    client: reqwest::Client,
 }
 
 impl LlmSettings {
@@ -97,10 +99,16 @@ impl LlmSettings {
         if model.is_empty() {
             return None;
         }
+        let client = reqwest::Client::builder()
+            .user_agent("pr-desk-rs")
+            .timeout(std::time::Duration::from_secs(600))
+            .build()
+            .unwrap_or_default();
         Some(Self {
             base_url: cfg.llm_base_url.clone(),
             api_key,
             model,
+            client,
         })
     }
 }
@@ -392,8 +400,8 @@ async fn chat_completion(llm: &LlmSettings, user_prompt: &str) -> Result<String>
         ],
         "temperature": 0.2,
     });
-    let client = reqwest::Client::new();
-    let resp = client
+    let resp = llm
+        .client
         .post(&url)
         .header("Authorization", format!("Bearer {}", llm.api_key))
         .json(&body)
@@ -430,6 +438,10 @@ pub async fn run_review(
     progress(tr(lang, "prog_fetch_pr").into());
     let meta_raw = gh.fetch_pr_meta(repo, number).await?;
     let head_sha = meta_raw["head"]["sha"].as_str().unwrap_or("").to_string();
+    if head_sha.is_empty() {
+        // 评审主键含 head_sha，空 sha 入库会互相覆盖——缺 sha 直接不评审
+        anyhow::bail!("{}", tr(lang, "err_missing_sha"));
+    }
     let meta = PrMeta {
         repo: repo.to_string(),
         number,
@@ -451,7 +463,7 @@ pub async fn run_review(
         additions,
         deletions,
     };
-    let reviewed_at = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let reviewed_at = crate::db::now();
     let size_label = size_label(additions, deletions);
 
     let base = json!({

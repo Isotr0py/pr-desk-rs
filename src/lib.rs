@@ -29,30 +29,28 @@ pub fn exe_data_dir() -> std::path::PathBuf {
     data_dir_from(&exe_dir())
 }
 
-/// 行数据 → 分组：（组标题, 该组内数据行的索引列表）。
-/// 分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
-/// 行只出现在一个组里；pinned 独立成组（不再出现在其状态组）。空组不返回。
-/// lang："zh"/"en"，组标题文案经 i18n::tr 取对应语言。
-/// 行数据 → 分组：（组标题, 该组内数据行的索引列表）。
-/// 分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
-/// 行只出现在一个组里；pinned 独立成组（不再出现在其状态组）。空组不返回。
-/// sort_by：组内排序——"updated"（默认，保持输入序=updated_at DESC）/ "score"（评分降序）/
-/// "changes"（增删行数降序）。
-/// lang："zh"/"en"，组标题文案经 i18n::tr 取对应语言。
-/// 行数据 → 分组：（组标题, 该组内数据行的索引列表）。
-/// 分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
+/// 行分组结果。key 是稳定的组标识（"pinned"/"board"/"needs-review"/"reviewed"/
+/// "rejected"/"closed"），不随语言/文案变化——UI 层的折叠状态恢复与图标映射按 key 消费；
+/// title 仅用于显示（经 i18n 随语言切换，不含数量，数量徽章由 UI 层用组头行的 gcount 画）。
+pub struct GroupSection {
+    pub key: &'static str,
+    pub title: String,
+    pub idxs: Vec<usize>,
+}
+
+/// 行数据 → 分组。分区顺序固定：Pinned → 看板 → 待评审 → 已评审 → 不采纳 → 已合入/已关闭；
 /// 行只出现在一个组里；pinned 独立成组（不再出现在其状态组）。空组不返回。
 /// sort_col / sort_asc：组内排序（Excel 式点列标题）。sort_col="upd"（默认）=
 /// updated_at 降序，即 SQL 输入序，不动。
-/// lang："zh"/"en"，组标题文案经 i18n::tr 取对应语言。
+/// lang："zh"/"en"，组标题文案经 i18n::tr 取对应语言（key 不受影响）。
 pub fn build_sections(
     rows: &[serde_json::Value],
     lang: &str,
     sort_col: &str,
     sort_asc: bool,
-) -> Vec<(String, Vec<usize>)> {
-    let mut out: Vec<(String, Vec<usize>)> = Vec::new();
-    let mut emit = |title_key: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
+) -> Vec<GroupSection> {
+    let mut out: Vec<GroupSection> = Vec::new();
+    let mut emit = |key: &'static str, title_key: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
         let mut idx: Vec<usize> = rows
             .iter()
             .enumerate()
@@ -70,31 +68,30 @@ pub fn build_sections(
             idx.reverse();
         }
         if !idx.is_empty() {
-            let title = i18n::tr(lang, title_key);
-            out.push((i18n::trf(lang, "section_title_fmt", &[title, &idx.len().to_string()]), idx));
+            out.push(GroupSection { key, title: i18n::tr(lang, title_key).to_string(), idxs: idx });
         }
     };
     // 组标题纯文本（图标由 UI 层按 PrGroup.key 画 SVG；📌 等字形在部分字体下会豆腐块）
-    emit("section_pinned", &|r| r["pinned"].as_i64() == Some(1));
-    emit("section_board", &|r| {
+    emit("pinned", "section_pinned", &|r| r["pinned"].as_i64() == Some(1));
+    emit("board", "section_board", &|r| {
         r["pinned"].as_i64() != Some(1) && r["on_board"].as_i64() == Some(1)
     });
-    emit("section_pending", &|r| {
+    emit("needs-review", "section_pending", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
             && r["status"].as_str() == Some("pending")
     });
-    emit("section_reviewed", &|r| {
+    emit("reviewed", "section_reviewed", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
             && matches!(r["status"].as_str(), Some("reviewed") | Some("failed"))
     });
-    emit("section_rejected", &|r| {
+    emit("rejected", "section_rejected", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
             && r["status"].as_str() == Some("rejected")
     });
-    emit("section_closed", &|r| {
+    emit("closed", "section_closed", &|r| {
         r["pinned"].as_i64() != Some(1)
             && r["on_board"].as_i64() != Some(1)
             && matches!(r["status"].as_str(), Some("merged") | Some("closed"))
@@ -185,15 +182,22 @@ mod tests {
         ];
         let sections = build_sections(&rows, "zh", "upd", false);
         assert_eq!(sections.len(), 4);
-        assert!(sections[0].0.contains("Pinned") && sections[0].1 == vec![0]);
-        assert!(sections[1].0.contains("看板") && sections[1].1 == vec![1]);
-        assert!(sections[2].0.contains("待评审") && sections[2].1 == vec![2]);
-        assert!(sections[3].0.contains("已评审") && sections[3].1 == vec![3]);
-        // 英文：组标题与计数格式切换
+        // key 稳定不随语言变；title 仅用于显示
+        assert_eq!(sections[0].key, "pinned");
+        assert!(sections[0].title.contains("Pinned") && sections[0].idxs == vec![0]);
+        assert_eq!(sections[1].key, "board");
+        assert!(sections[1].title.contains("看板") && sections[1].idxs == vec![1]);
+        assert_eq!(sections[2].key, "needs-review");
+        assert!(sections[2].title.contains("待评审") && sections[2].idxs == vec![2]);
+        assert_eq!(sections[3].key, "reviewed");
+        assert!(sections[3].title.contains("已评审") && sections[3].idxs == vec![3]);
+        // 英文：组标题随语言切换，key 不变（数量徽章由 UI 层画，标题不含计数）
         let sections = build_sections(&rows, "en", "upd", false);
         assert_eq!(sections.len(), 4);
-        assert_eq!(sections[1].0, "Board (1)");
-        assert_eq!(sections[2].0, "To Review (1)");
+        assert_eq!(sections[1].key, "board");
+        assert_eq!(sections[1].title, "Board");
+        assert_eq!(sections[2].key, "needs-review");
+        assert_eq!(sections[2].title, "To Review");
     }
 
     #[test]
@@ -201,7 +205,8 @@ mod tests {
         let rows = vec![row(1, 0, 0, "pending")];
         let sections = build_sections(&rows, "zh", "upd", false);
         assert_eq!(sections.len(), 1);
-        assert!(sections[0].0.contains("待评审"));
+        assert_eq!(sections[0].key, "needs-review");
+        assert!(sections[0].title.contains("待评审"));
     }
 
     #[test]
@@ -210,6 +215,7 @@ mod tests {
         let rows = vec![row(1, 1, 1, "pending")];
         let sections = build_sections(&rows, "zh", "upd", false);
         assert_eq!(sections.len(), 1);
-        assert!(sections[0].0.contains("Pinned"));
+        assert_eq!(sections[0].key, "pinned");
+        assert!(sections[0].title.contains("Pinned"));
     }
 }

@@ -1,57 +1,67 @@
 // PR Desk — Diff 查看器组件（GitHub 级观感，GPLv3）
 //
 // 设计说明：
-// - 纯 Slint 表达式不支持数组 fold，文件头的增删行数由隐藏的零尺寸计数
-//   repeater 在 init 时累加得到。因此集成方必须用「整体替换 files 模型」
-//   的方式更新（set_files(ModelRc::new(...))），不要原地修改某一行，
-//   否则计数会重复累加。
-// - 折叠状态以数据为准（DiffFile.expanded），点击头部只发 file_toggled(i)，
-//   由 Rust 侧翻转后重建模型。
-// - 每个文件最多渲染 max-render-lines 行，超出显示截断提示。
-// - DiffLine 结构没有真实行号字段，行号列暂以「文件内行序号」代替。
+// - 模型是「摊平」的 DiffRow 列表：每个文件一个 header 行，展开时跟若干内容行
+//   （+ 可能的截断提示行），折叠的文件只有 header 行。外层一个 ListView 纵向
+//   虚拟化（视口外不实例化委托），替代旧的「每文件一块、块内全量行」结构。
+// - 折叠状态以数据为准（header 行 DiffRow.expanded），点击只发 file_toggled(file_idx)，
+//   由 Rust 侧翻转后重建模型（行内容在折叠时不在 UI 模型里，UI 无法自行展开）。
+// - 行号是真行号（Rust 侧 diffview::numbered_lines 解析 hunk 头算出）：
+//   add/ctx 用 new 侧、del 用 old 侧；lineno = 0 的行（meta/hunk）不显示行号。
+// - 横向滚动是单一外层 Flickable 包整个 ListView（GitHub 风格整表横滚，gutter 随内容
+//   滚动）；content-width 由最长行文本（max_text，Rust 侧选出）的测量宽决定。
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { I18n } from "i18n.slint";
 
-export struct DiffLine {
-    kind: string,   // add / del / hunk / meta / ctx
-    text: string,
-}
-
-export struct DiffFile {
+// 摊平后的 diff 行：header（文件头）/ 内容行 / 截断提示行 三态
+export struct DiffRow {
+    is_header: bool,
+    is_trunc: bool,     // 截断提示行（仅显示前 shown 行，共 total 行）
+    file_idx: int,      // 所属文件下标（file_toggled 回传用）
+    // ── header 行字段 ──
     path: string,
-    lines: [DiffLine],
+    adds: int,
+    dels: int,
     expanded: bool,
+    // ── 内容行字段 ──
+    kind: string,       // add / del / hunk / meta / ctx
+    text: string,
+    lineno: int,        // 真实行号；0 = 无行号（meta/hunk）
+    // ── 截断提示行字段 ──
+    shown: int,
+    total: int,
 }
 
 export component DiffView inherits Rectangle {
-    in property <[DiffFile]> files: [];
-    // 前 N 个文件默认展开——供 Rust 侧构建模型时读取（Slint 侧不消费）
-    in-out property <int> expanded_count_init: 3;
+    in property <[DiffRow]> rows: [];
+    callback file_toggled(int);   // 参数为 file_idx（不是模型行下标）
 
     // PageUp/PageDown 翻页（外层 FocusScope 调用；ListView 自己不认键盘）
     public function page_scroll(dir: int) {
         if (dir > 0) {
-            lv.viewport-y = max(lv.height - lv.viewport-height, lv.viewport-y - lv.height * 0.9);
+            lv.content-y = max(lv.height - lv.content-height, lv.content-y - lv.height * 0.9);
         } else {
-            lv.viewport-y = min(0px, lv.viewport-y + lv.height * 0.9);
+            lv.content-y = min(0px, lv.content-y + lv.height * 0.9);
         }
-    }    callback file_toggled(int);
-
-    // 单文件渲染行数上限
-    in property <int> max_render_lines: 2000;
+    }
 
     property <length> header-h: 32px;
     property <length> line-h: 20px;
     property <length> trunc-h: 26px;
     // 行号列宽（GitHub 风格 gutter）
     property <length> gutter-w: 48px;
+    // 最长内容行（Rust 侧按显示宽度挑出传入）：测量其像素宽以决定横向滚动区域
+    in property <string> max_text: "";
+
+    // 换 diff（开新 PR / 重新拉取）时回最左，避免带着上一个 diff 的滚动位置
+    changed rows => { hf.content-x = 0px; }
 
     background: Theme.bg;
     clip: true;
 
     // ── 空状态：居中 SVG 图标 + 提示文案 ──
-    if root.files.length == 0: VerticalLayout {
+    if root.rows.length == 0: VerticalLayout {
         alignment: center;
         spacing: 8px;
         Rectangle {
@@ -79,49 +89,41 @@ export component DiffView inherits Rectangle {
         }
     }
 
-    lv := ListView {
+    // 单一横向 Flickable 包整个 ListView：GitHub 风格整屏同步横滚（gutter 随内容滚动）。
+    // content-width 由最长行文本（root.max_text）的测量宽给出。
+    hf := Flickable {
         width: 100%;
         height: 100%;
+        content-height: self.height;
+        content-width: max(self.width, root.gutter-w + measure.preferred-width + 12px);
 
-        for file[fi] in root.files: file-block := Rectangle {
-            property <int> adds: 0;
-            property <int> dels: 0;
-            property <int> shown: min(file.lines.length, root.max-render-lines);
-            property <bool> truncated: file.lines.length > root.max-render-lines;
-            property <length> body-h: file.expanded
-                ? shown * root.line-h + (truncated ? root.trunc-h : 0px)
-                : 0px;
+        // 测量用文本：不能用 visible: false（不参与布局计量，preferred-width 恒 0），
+        // 用 opacity: 0 保持不可见但正常计量；字号/字体必须与行内 TextInput 完全一致
+        measure := Text {
+            opacity: 0;
+            text: root.max_text;
+            font-family: Theme.mono_font;
+            font-size: Theme.fs_sm;
+        }
 
-            height: root.header-h + body-h;
-            background: Theme.bg;
-            clip: true;
+    lv := ListView {
+        width: hf.content-width;
+        height: hf.height;
 
-            // 折叠/展开高度过渡
-            animate height { duration: 120ms; easing: ease-in-out; }
+        for it in root.rows: row-rect := Rectangle {
+            height: it.is_header ? root.header-h : (it.is_trunc ? root.trunc-h : root.line-h);
+            background: it.is_header ? Theme.surface2
+                : (it.is_trunc ? Theme.surface2
+                : (it.kind == "add" ? Theme.green_bg
+                : (it.kind == "del" ? Theme.red_bg
+                : (it.kind == "hunk" ? Theme.accent.with-alpha(0.08)
+                : transparent))));
 
-            // 隐藏计数器：随委托重建重新累加（前提：模型整体替换）
-            for line in file.lines: Rectangle {
-                width: 0px;
-                height: 0px;
-                visible: false;
-                init => {
-                    if line.kind == "add" {
-                        adds += 1;
-                    }
-                    if line.kind == "del" {
-                        dels += 1;
-                    }
-                }
-            }
-
-            // ── 文件头：surface2 底 + 上下 hairline，左箭头+文件名，右 +N/-N ──
-            header := Rectangle {
-                y: 0px;
+            // ── 文件头：上下 hairline，左箭头+文件名，右 +N/-N ──
+            if it.is_header: Rectangle {
                 width: 100%;
-                height: root.header-h;
-                background: Theme.surface2;
+                height: 100%;
 
-                // 上 / 下发丝分隔线
                 Rectangle { y: 0px; width: 100%; height: 1px; background: Theme.hairline; }
                 Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: Theme.hairline; }
 
@@ -135,7 +137,7 @@ export component DiffView inherits Rectangle {
                 }
 
                 header-touch := TouchArea {
-                    clicked => { root.file_toggled(fi); }
+                    clicked => { root.file_toggled(it.file_idx); }
                 }
 
                 HorizontalLayout {
@@ -146,7 +148,7 @@ export component DiffView inherits Rectangle {
                     Rectangle {
                         width: 14px;
                         Image {
-                            source: file.expanded
+                            source: it.expanded
                                 ? @image-url("icons/chevron-down.svg")
                                 : @image-url("icons/chevron-right.svg");
                             width: 10px;
@@ -158,9 +160,9 @@ export component DiffView inherits Rectangle {
                         }
                     }
                     Text {
-                        text: file.path;
+                        text: it.path;
                         color: Theme.text;
-                        font-family: "Consolas";
+                        font-family: Theme.mono_font;
                         font-size: Theme.fs_md;
                         font-weight: 600;
                         overflow: elide;
@@ -168,23 +170,23 @@ export component DiffView inherits Rectangle {
                         vertical-alignment: center;
                     }
                     Text {
-                        text: "+" + adds;
+                        text: "+" + it.adds;
                         color: Theme.good;
-                        font-family: "Consolas";
+                        font-family: Theme.mono_font;
                         font-size: Theme.fs_xs;
                         font-weight: 700;
                         vertical-alignment: center;
                     }
                     Text {
-                        text: "-" + dels;
+                        text: "-" + it.dels;
                         color: Theme.bad;
-                        font-family: "Consolas";
+                        font-family: Theme.mono_font;
                         font-size: Theme.fs_xs;
                         font-weight: 700;
                         vertical-alignment: center;
                     }
                     Text {
-                        text: file.expanded ? I18n.diff_collapse : I18n.diff_expand;
+                        text: it.expanded ? I18n.diff_collapse : I18n.diff_expand;
                         color: Theme.text_faint;
                         font-size: Theme.fs_xs;
                         vertical-alignment: center;
@@ -192,89 +194,76 @@ export component DiffView inherits Rectangle {
                 }
             }
 
-            // ── 行区（高度随折叠动画，内容裁剪） ──
-            body := Rectangle {
-                y: root.header-h;
+            // ── 截断提示行 ──
+            if it.is_trunc: Rectangle {
                 width: 100%;
-                height: parent.height - root.header-h;
-                clip: true;
-                opacity: file.expanded ? 1 : 0;
-                animate opacity { duration: 120ms; }
+                height: 100%;
+                Rectangle { y: 0px; width: 100%; height: 1px; background: Theme.hairline; }
+                Text {
+                    x: root.gutter-w + 8px;
+                    height: 100%;
+                    text: I18n.diff_truncated_p1 + it.shown
+                        + I18n.diff_truncated_p2 + it.total + I18n.diff_truncated_p3;
+                    color: Theme.text_dim;
+                    font-family: Theme.mono_font;
+                    font-size: Theme.fs_xs;
+                    vertical-alignment: center;
+                }
+            }
 
-                for line[li] in file.lines: Rectangle {
-                    y: li * root.line-h;
-                    width: 100%;
-                    height: root.line-h;
-                    visible: li < root.max-render-lines;
-                    background: line.kind == "add" ? Theme.green_bg
-                        : (line.kind == "del" ? Theme.red_bg
-                        : (line.kind == "hunk" ? Theme.accent.with-alpha(0.08)
-                        : transparent));
+            // ── 内容行：gutter 固定 + 内容区独立横向 Flickable ──
+            if !it.is_header && !it.is_trunc: Rectangle {
+                width: 100%;
+                height: 100%;
 
-                    // 行号列：48px 宽、右对齐、略深底色
-                    Rectangle {
+                // 行号列：48px 宽、右对齐、略深底色
+                Rectangle {
+                    x: 0px;
+                    width: root.gutter-w;
+                    height: 100%;
+                    background: Theme.surface2;
+                    Text {
                         x: 0px;
-                        width: root.gutter-w;
+                        width: parent.width - 8px;
                         height: 100%;
-                        background: Theme.surface2;
-                        Text {
-                            x: 0px;
-                            width: parent.width - 8px;
-                            height: 100%;
-                            text: line.kind == "hunk" ? "..." : "\{li + 1}";
-                            horizontal-alignment: right;
-                            vertical-alignment: center;
-                            color: Theme.text_faint;
-                            font-family: "Consolas";
-                            font-size: Theme.fs_xs;
-                        }
-                        // 行号与代码之间的分隔线
-                        Rectangle {
-                            x: parent.width - 1px;
-                            width: 1px;
-                            height: 100%;
-                            background: Theme.hairline;
-                        }
-                    }
-
-                    // read-only TextInput：行内文本可选中复制
-                    TextInput {
-                        x: root.gutter-w + 8px;
-                        width: parent.width - root.gutter-w - 16px;
-                        height: parent.height;
-                        read-only: true;
-                        single-line: true;
-                        enabled: true;
-                        text: line.text;
-                        font-family: "Consolas";
-                        font-size: Theme.fs_sm;
-                        color: line.kind == "hunk" ? Theme.text_dim
-                            : (line.kind == "meta" ? Theme.text_dim
-                            : Theme.text);
-                        selection-background-color: Theme.accent.with-alpha(0.28);
+                        text: it.kind == "hunk" ? "…" : (it.lineno > 0 ? "\{it.lineno}" : "");
+                        horizontal-alignment: right;
                         vertical-alignment: center;
+                        color: Theme.text_faint;
+                        font-family: Theme.mono_font;
+                        font-size: Theme.fs_xs;
+                    }
+                    // 行号与代码之间的分隔线
+                    Rectangle {
+                        x: parent.width - 1px;
+                        width: 1px;
+                        height: 100%;
+                        background: Theme.hairline;
                     }
                 }
 
-                // 截断提示
-                if truncated: Rectangle {
-                    y: shown * root.line-h;
-                    width: 100%;
-                    height: root.trunc-h;
-                    background: Theme.surface2;
-                    Rectangle { y: 0px; width: 100%; height: 1px; background: Theme.hairline; }
-                    Text {
-                        x: root.gutter-w + 8px;
-                        height: 100%;
-                        text: I18n.diff_truncated_p1 + root.max-render-lines
-                            + I18n.diff_truncated_p2 + file.lines.length + I18n.diff_truncated_p3;
-                        color: Theme.text_dim;
-                        font-family: "Consolas";
-                        font-size: Theme.fs_xs;
-                        vertical-alignment: center;
-                    }
+                // 内容区：行宽 = 内容区全宽（外层 hf 的 content-width ≥ 最长行宽），
+                // 横向滚动由外层统一负责，行内不再需要 Flickable。
+                // read-only TextInput：行内文本可选中复制
+                TextInput {
+                    x: root.gutter-w;
+                    y: 0px;
+                    width: parent.width - root.gutter-w;
+                    height: 100%;
+                    read-only: true;
+                    single-line: true;
+                    enabled: true;
+                    text: it.text;
+                    font-family: Theme.mono_font;
+                    font-size: Theme.fs_sm;
+                    color: it.kind == "hunk" ? Theme.text_dim
+                        : (it.kind == "meta" ? Theme.text_dim
+                        : Theme.text);
+                    selection-background-color: Theme.accent.with-alpha(0.28);
+                    vertical-alignment: center;
                 }
             }
         }
+    }
     }
 }

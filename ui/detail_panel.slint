@@ -9,8 +9,8 @@
 import { ScrollView, ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { I18n } from "i18n.slint";
-import { Avatar, MarkdownBlocks, MdBlock } from "components.slint";
-import { DiffView, DiffFile } from "diff_view.slint";
+import { Avatar, MarkdownBlocks, MdBlock, EmptyState } from "components.slint";
+import { DiffView, DiffRow } from "diff_view.slint";
 
 // 会话时间线条目：kind = "commit" / "review" / "comment"
 export struct ConvoEntry {
@@ -224,51 +224,8 @@ component OutlineBtn inherits Rectangle {
     }
 }
 
-// 空状态占位：图标 + 标题 + 提示，居中
-// icon_img 优先（内嵌 SVG，规避 emoji 字形缺失豆腐块）；未传时回退 icon 文字字形
-component EmptyState inherits Rectangle {
-    in property <string> icon;
-    in property <image> icon_img;
-    in property <string> heading;
-    in property <string> hint;
-
-    VerticalLayout {
-        padding: 24px;
-        spacing: 6px;
-        alignment: center;
-        if root.icon_img.width > 0: Rectangle {
-            height: 26px;
-            Image {
-                source: root.icon_img;
-                width: 26px;
-                height: 26px;
-                x: (parent.width - self.width) / 2;
-                image-fit: contain;
-                colorize: Theme.text_faint;
-            }
-        }
-        if root.icon_img.width == 0: Text {
-            text: root.icon;
-            font-size: 26px;
-            color: Theme.text_faint;
-            horizontal-alignment: center;
-        }
-        Text {
-            text: root.heading;
-            font-size: Theme.fs_md;
-            font-weight: 600;
-            color: Theme.text;
-            horizontal-alignment: center;
-        }
-        Text {
-            text: root.hint;
-            font-size: Theme.fs_sm;
-            color: Theme.text_dim;
-            horizontal-alignment: center;
-            wrap: word-wrap;
-        }
-    }
-}
+// 空状态占位统一用 components.slint 的 EmptyState（title/hint）——
+// 本地曾有一份 heading/hint 的重复实现，已删除避免两套 API 漂移。
 
 export component DetailPanel inherits Rectangle {
     // 显示/隐藏：直接绑定内置 visible；false 时宽度为 0 不占布局
@@ -296,12 +253,14 @@ export component DetailPanel inherits Rectangle {
     in property <[ConvoEntry]> convo_entries: [];
     in property <[CheckRun]> check_runs: [];
     in property <[FileChange]> files: [];
-    // Diff 标签页：嵌入真实 DiffView（模型由集成方提供，整体替换）
-    in property <[DiffFile]> diff_files: [];
+    // Diff 标签页：嵌入真实 DiffView（摊平行模型由集成方提供，整体替换）
+    in property <[DiffRow]> diff_files: [];
+    // diff 最长内容行（DiffView 测量像素宽以定横向滚动区域）
+    in property <string> diff_max_text: "";
     callback diff_file_toggled(int);
 
     // PageUp/PageDown：滚动当前标签页的内容区（各 tab 容器类型不同，逐一分派；
-    // Flickable/ScrollView 用 content-y + content-height，ListView 用 viewport-y + viewport-height）
+    // Flickable/ScrollView 用 content-y + content-height，ListView 同样用 content-y + content-height）
     public function page_scroll(dir: int) {
         if (root.current_tab == 0) {
             review_scroll.content-y = dir > 0
@@ -312,13 +271,13 @@ export component DetailPanel inherits Rectangle {
                 ? max(convo_scroll.height - convo_scroll.content-height, convo_scroll.content-y - convo_scroll.height * 0.9)
                 : min(0px, convo_scroll.content-y + convo_scroll.height * 0.9);
         } else if (root.current_tab == 2) {
-            checks_scroll.viewport-y = dir > 0
-                ? max(checks_scroll.height - checks_scroll.viewport-height, checks_scroll.viewport-y - checks_scroll.height * 0.9)
-                : min(0px, checks_scroll.viewport-y + checks_scroll.height * 0.9);
+            checks_scroll.content-y = dir > 0
+                ? max(checks_scroll.height - checks_scroll.content-height, checks_scroll.content-y - checks_scroll.height * 0.9)
+                : min(0px, checks_scroll.content-y + checks_scroll.height * 0.9);
         } else if (root.current_tab == 3) {
-            files_scroll.viewport-y = dir > 0
-                ? max(files_scroll.height - files_scroll.viewport-height, files_scroll.viewport-y - files_scroll.height * 0.9)
-                : min(0px, files_scroll.viewport-y + files_scroll.height * 0.9);
+            files_scroll.content-y = dir > 0
+                ? max(files_scroll.height - files_scroll.content-height, files_scroll.content-y - files_scroll.height * 0.9)
+                : min(0px, files_scroll.content-y + files_scroll.height * 0.9);
         } else {
             diff_scroll.page_scroll(dir);
         }
@@ -379,14 +338,20 @@ export component DetailPanel inherits Rectangle {
                     alignment: start;
                     Rectangle {
                         horizontal-stretch: 1;
-                        Text {
+                        // read-only TextInput：标题可选中复制；视觉与 Text 一致
+                        //（透明底无边框）。不套固定高度+clip：换行超出时 femtovg 叠影
+                        title-input := TextInput {
                             width: parent.width;
+                            height: self.preferred-height;
+                            read-only: true;
+                            enabled: true;
                             text: root.title == "" ? I18n.detail_no_pr_selected : root.title;
                             color: Theme.text;
                             font-size: Theme.fs_lg;
                             // 400：femtovg 对换行加粗的雅黑文本会叠影
                             font-weight: 400;
                             wrap: word-wrap;
+                            selection-background-color: Theme.accent.with-alpha(0.28);
                         }
                     }
                     Rectangle {
@@ -869,12 +834,17 @@ export component DetailPanel inherits Rectangle {
                                         // 绑 report_card.width 会形成 layout-cache 绑定循环
                                         w: max(0px, root.width - 64px);
                                     }
-                                    if root.review_summary_blocks.length == 0 && root.review_summary != "": Text {
+                                    if root.review_summary_blocks.length == 0 && root.review_summary != "": TextInput {
+                                        // read-only TextInput：摘要可选中复制（视觉同 Text）
+                                        read-only: true;
+                                        enabled: true;
                                         text: root.review_summary;
                                         width: max(0px, root.width - 64px);
+                                        height: self.preferred-height;
                                         font-size: Theme.fs_md;
                                         color: Theme.text;
                                         wrap: word-wrap;
+                                        selection-background-color: Theme.accent.with-alpha(0.28);
                                     }
                                 }
 
@@ -899,15 +869,20 @@ export component DetailPanel inherits Rectangle {
                                             image-fit: contain;
                                             colorize: Theme.mid;
                                         }
-                                        f_txt := Text {
+                                        f_txt := TextInput {
+                                            // read-only TextInput：可选中复制（视觉同 Text）
+                                            read-only: true;
+                                            enabled: true;
                                             x: 18px;
                                             y: 0;
                                             width: parent.width - 18px;
+                                            height: self.preferred-height;
                                             text: f;
                                             font-size: Theme.fs_sm;
                                             font-weight: 500;
                                             color: Theme.text;
                                             wrap: word-wrap;
+                                            selection-background-color: Theme.accent.with-alpha(0.28);
                                         }
                                     }
                                 }
@@ -971,7 +946,7 @@ export component DetailPanel inherits Rectangle {
                                                     }
                                                     Text {
                                                         text: c.location;
-                                                        font-family: "Consolas";
+                                                        font-family: Theme.mono_font;
                                                         font-size: Theme.fs_xs;
                                                         color: Theme.text_faint;
                                                         vertical-alignment: center;
@@ -979,11 +954,16 @@ export component DetailPanel inherits Rectangle {
                                                         horizontal-stretch: 1;
                                                     }
                                                 }
-                                                Text {
+                                                TextInput {
+                                                    // read-only TextInput：评论正文可选中复制
+                                                    read-only: true;
+                                                    enabled: true;
                                                     text: c.content;
+                                                    height: self.preferred-height;
                                                     font-size: Theme.fs_sm;
                                                     color: Theme.text;
                                                     wrap: word-wrap;
+                                                    selection-background-color: Theme.accent.with-alpha(0.28);
                                                 }
                                             }
                                         }
@@ -997,7 +977,7 @@ export component DetailPanel inherits Rectangle {
                             height: 240px;
                             EmptyState {
                                 icon_img: @image-url("icons/diamond.svg");
-                                heading: I18n.review_empty_title;
+                                title: I18n.review_empty_title;
                                 hint: I18n.review_empty_hint;
                             }
                         }
@@ -1067,15 +1047,19 @@ export component DetailPanel inherits Rectangle {
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                 }
-                                // 正文：有解析块 → Markdown 渲染；否则回退纯文本（换行）
+                                // 正文：有解析块 → Markdown 渲染；否则回退纯文本（换行，可选中复制）
                                 // 宽度必须从 entry_box（entry_layout 之外）显式推算，
                                 // 绑 parent.width 会形成 layout-cache 绑定循环
-                                if e.blocks.length == 0: Text {
+                                if e.blocks.length == 0: TextInput {
+                                    read-only: true;
+                                    enabled: true;
                                     text: e.text;
                                     width: entry_box.width - 66px;
+                                    height: self.preferred-height;
                                     font-size: Theme.fs_md;
                                     color: Theme.text_dim;
                                     wrap: word-wrap;
+                                    selection-background-color: Theme.accent.with-alpha(0.28);
                                 }
                                 if e.blocks.length > 0: MarkdownBlocks {
                                     blocks: e.blocks;
@@ -1088,7 +1072,7 @@ export component DetailPanel inherits Rectangle {
                 }
                 if root.convo_entries.length == 0: EmptyState {
                     icon_img: @image-url("icons/comment.svg");
-                    heading: I18n.convo_empty_title;
+                    title: I18n.convo_empty_title;
                     hint: I18n.convo_empty_hint;
                 }
             }
@@ -1152,7 +1136,7 @@ export component DetailPanel inherits Rectangle {
                 }
                 if root.check_runs.length == 0: EmptyState {
                     icon_img: @image-url("icons/check.svg");
-                    heading: I18n.checks_empty_title;
+                    title: I18n.checks_empty_title;
                     hint: I18n.checks_empty_hint;
                 }
             }
@@ -1172,7 +1156,7 @@ export component DetailPanel inherits Rectangle {
                             spacing: 10px;
                             Text {
                                 text: f.path;
-                                font-family: "Consolas";
+                                font-family: Theme.mono_font;
                                 font-size: Theme.fs_xs;
                                 color: Theme.text;
                                 overflow: elide;
@@ -1181,14 +1165,14 @@ export component DetailPanel inherits Rectangle {
                             }
                             Text {
                                 text: "+" + f.adds;
-                                font-family: "Consolas";
+                                font-family: Theme.mono_font;
                                 font-size: Theme.fs_xs;
                                 color: Theme.good;
                                 vertical-alignment: center;
                             }
                             Text {
                                 text: "-" + f.dels;
-                                font-family: "Consolas";
+                                font-family: Theme.mono_font;
                                 font-size: Theme.fs_xs;
                                 color: Theme.bad;
                                 vertical-alignment: center;
@@ -1229,7 +1213,7 @@ export component DetailPanel inherits Rectangle {
                 }
                 if root.files.length == 0: EmptyState {
                     icon_img: @image-url("icons/file.svg");
-                    heading: I18n.files_empty_title;
+                    title: I18n.files_empty_title;
                     hint: I18n.files_empty_hint;
                 }
             }
@@ -1237,13 +1221,14 @@ export component DetailPanel inherits Rectangle {
             // Diff：嵌入真实 DiffView（彩色渲染 + 按文件折叠）
             diff_scroll := DiffView {
                 visible: root.current_tab == 4;
-                files: root.diff_files;
+                rows: root.diff_files;
+                max_text: root.diff_max_text;
                 file_toggled(i) => { root.diff_file_toggled(i); }
             }
 
             if root.current_tab < 0 || root.current_tab > 4: EmptyState {
                 icon_img: @image-url("icons/warning.svg");
-                heading: I18n.coming_soon_title;
+                title: I18n.coming_soon_title;
                 hint: I18n.coming_soon_hint;
             }
         }

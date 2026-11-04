@@ -37,6 +37,10 @@ review_concurrency = 3
 # 多数据源：active_profile 选择当前数据源（"local" = 本地库 / "default" = 顶层键 / 自定义档案名）
 # 自定义远程档案三段式（name 仅允许 a-z0-9_-）：
 # profile.<name>.server_url / profile.<name>.sync_token / profile.<name>.api_key
+# 窗口/面板几何记忆（退出时自动写回；删除 = 下次用默认尺寸）：
+# window_width = 1280
+# window_height = 760
+# panel_width = 420
 "#;
 
 /// 一个远程数据源档案（AstrBot 插件服务器连接参数）。
@@ -91,6 +95,10 @@ pub struct Config {
     pub profiles: Vec<Profile>,
     /// 当前数据源："local" = 本地模式；"default" = 顶层 server_url/sync_token；其它 = profiles 里的档案名
     pub active_profile: String,
+    /// 窗口/详情面板几何记忆（逻辑像素；None = 未记录，用默认尺寸）
+    pub window_width: Option<f64>,
+    pub window_height: Option<f64>,
+    pub panel_width: Option<f64>,
 }
 
 impl Default for Config {
@@ -112,19 +120,64 @@ impl Default for Config {
             review_concurrency: 3,
             profiles: Vec::new(),
             active_profile: "local".into(),
+            window_width: None,
+            window_height: None,
+            panel_width: None,
         }
     }
+}
+
+/// 剥离引号外的行内注释（`key = "abc" # 备注` → `"abc"`；引号内的 # 不算注释）。
+fn strip_inline_comment(s: &str) -> &str {
+    let mut in_quote = false;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if in_quote => escaped = true,
+            '"' => in_quote = !in_quote,
+            '#' if !in_quote => return s[..i].trim_end(),
+            _ => {}
+        }
+    }
+    s
 }
 
 fn parse_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
     let line = line.trim();
     let rest = line.strip_prefix(key)?;
     let rest = rest.trim_start().strip_prefix('=')?.trim_start();
-    Some(rest)
+    Some(strip_inline_comment(rest).trim())
 }
 
+/// 剥引号并反转义（quote() 写入的 \" 和 \\；引号外的值原样返回）。
 fn unquote(s: &str) -> String {
-    s.trim().trim_matches('"').to_string()
+    let t = s.trim();
+    let Some(inner) = t.strip_prefix('"').and_then(|x| x.strip_suffix('"')) else {
+        return t.to_string();
+    };
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                // 未知转义保留原样（宽容解析，不丢字符）
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn quote(s: &str) -> String {
@@ -140,7 +193,7 @@ fn parse_profile_line(rest: &str, profiles: &mut Vec<Profile>) {
         tracing::warn!("忽略非法/保留档案名的配置行: profile.{name}.*");
         return;
     }
-    let value = unquote(value);
+    let value = unquote(strip_inline_comment(value));
     let idx = match profiles.iter().position(|p| p.name == name) {
         Some(i) => i,
         None => {
@@ -320,6 +373,13 @@ impl Config {
                 };
             } else if let Some(v) = parse_value(line, "active_profile") {
                 active = Some(unquote(v)).filter(|s| !s.is_empty());
+            } else if let Some(v) = parse_value(line, "window_width") {
+                // 几何记忆：非法/非正值忽略（None = 未记录）
+                cfg.window_width = v.trim().parse::<f64>().ok().filter(|n| *n > 0.0);
+            } else if let Some(v) = parse_value(line, "window_height") {
+                cfg.window_height = v.trim().parse::<f64>().ok().filter(|n| *n > 0.0);
+            } else if let Some(v) = parse_value(line, "panel_width") {
+                cfg.panel_width = v.trim().parse::<f64>().ok().filter(|n| *n > 0.0);
             }
         }
         // 兼容迁移：顶层 sync_token 非空 = 旧版单服务器配置 → 合成 "default" 档（不落新键，
@@ -352,7 +412,7 @@ impl Config {
             "[{}]",
             self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
         );
-        let kv: [(&str, String); 15] = [
+        let kv: Vec<(&str, String)> = vec![
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
             ("astrbot_api_key", quote(&self.astrbot_api_key)),
@@ -369,6 +429,17 @@ impl Config {
             ("review_concurrency", self.review_concurrency.to_string()),
             ("active_profile", quote(&self.active_profile)),
         ];
+        // 几何记忆：仅在记录过时写（None 不往配置里添键）
+        let mut kv = kv;
+        if let Some(w) = self.window_width {
+            kv.push(("window_width", w.to_string()));
+        }
+        if let Some(h) = self.window_height {
+            kv.push(("window_height", h.to_string()));
+        }
+        if let Some(w) = self.panel_width {
+            kv.push(("panel_width", w.to_string()));
+        }
 
         let mut lines: Vec<String> = match fs::read_to_string(path) {
             Ok(text) => text.lines().map(|l| l.to_string()).collect(),
@@ -411,7 +482,10 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).ok();
         }
-        fs::write(path, lines.join("\n") + "\n").context("写入 config.toml 失败")?;
+        // 先写临时文件再 rename，避免写到一半崩溃留下截断的配置（同 avatars.rs 的范式）
+        let tmp = path.with_extension("part");
+        fs::write(&tmp, lines.join("\n") + "\n").context("写入 config.toml 临时文件失败")?;
+        fs::rename(&tmp, path).context("替换 config.toml 失败")?;
         Ok(())
     }
 }
@@ -464,6 +538,9 @@ mod tests {
             review_concurrency: 5,
             profiles: Vec::new(),
             active_profile: "local".into(),
+            window_width: Some(1440.0),
+            window_height: Some(810.0),
+            panel_width: Some(460.0),
         };
         cfg.save(&path).unwrap();
 
@@ -483,14 +560,89 @@ mod tests {
         assert_eq!(loaded.llm_model, "qwen3-coder");
         assert_eq!(loaded.ocr_path, "D:/tools/ocr.exe");
         assert_eq!(loaded.review_concurrency, 5);
+        assert_eq!(loaded.window_width, Some(1440.0));
+        assert_eq!(loaded.window_height, Some(810.0));
+        assert_eq!(loaded.panel_width, Some(460.0));
         assert!(loaded.is_dark());
         assert!(!loaded.is_unconfigured());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn llm_key_fallback() {
-        // 环境变量 LLM_API_KEY 未设置时回退 config.toml；两者皆空则为 None
+    fn window_geometry_parse_and_none_by_default() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-geom-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            "window_width = 1280\nwindow_height = 760.5\npanel_width = 400\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.window_width, Some(1280.0));
+        assert_eq!(cfg.window_height, Some(760.5));
+        assert_eq!(cfg.panel_width, Some(400.0));
+
+        // 非法/非正值忽略
+        std::fs::write(&path, "window_width = abc\nwindow_height = -5\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.window_width, None);
+        assert_eq!(cfg.window_height, None);
+        assert_eq!(cfg.panel_width, None);
+
+        // None 不往配置里添键（新鲜文件上 save 后仍无几何键）
+        let path2 = dir.join("config2.toml");
+        std::fs::write(&path2, "theme = \"dark\"\n").unwrap();
+        let cfg = Config::load(&path2).unwrap();
+        assert_eq!(cfg.window_width, None);
+        cfg.save(&path2).unwrap();
+        let text = std::fs::read_to_string(&path2).unwrap();
+        assert!(!text.contains("window_width"), "None 不写键");
+        assert!(!text.contains("panel_width"), "None 不写键");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_roundtrip_escapes_and_inline_comments() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-esc-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        // 行内注释（引号外）不应读入值；引号内的 # 不是注释
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            &path,
+            "sync_token = \"abc\" # 备注\n\
+             server_url = \"http://x/#frag\" # 另一个备注\n\
+             poll_interval_min = 7 # 分钟\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&path).unwrap();
+        assert_eq!(cfg.sync_token, "abc");
+        assert_eq!(cfg.server_url, "http://x/#frag");
+        assert_eq!(cfg.poll_interval_min, 7);
+
+        // 含 \ 和 " 的值：保存后再读回必须一致（quote 转义 / unquote 反转义对称）
+        let mut cfg = Config::default();
+        cfg.sync_token = "a\\b\"c".into();
+        cfg.ocr_path = "D:\\tools\\ocr.exe".into();
+        cfg.llm_model = "say \"hi\"\\ok".into();
+        cfg.save(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.sync_token, "a\\b\"c");
+        assert_eq!(loaded.ocr_path, "D:\\tools\\ocr.exe");
+        assert_eq!(loaded.llm_model, "say \"hi\"\\ok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unquote_unescape_pairs() {
+        assert_eq!(unquote(&quote("a\\b\"c")), "a\\b\"c");
+        assert_eq!(unquote(&quote("")), "");
+        assert_eq!(unquote("plain"), "plain"); // 无引号原样
+        assert_eq!(unquote("\"a#b\""), "a#b"); // 引号内 # 保留
+    }
+
+    #[test]
+    fn llm_key_fallback() {        // 环境变量 LLM_API_KEY 未设置时回退 config.toml；两者皆空则为 None
         let mut c = Config::default();
         if std::env::var("LLM_API_KEY").is_err() {
             assert_eq!(c.llm_key(), None);

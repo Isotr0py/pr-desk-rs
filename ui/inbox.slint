@@ -7,15 +7,16 @@ import { I18n } from "i18n.slint";
 import { EmptyState, Avatar, MarkdownBlocks } from "components.slint";
 import { ScrollView, ListView } from "std-widgets.slint";
 import { ConvoEntry, FileChange } from "detail_panel.slint";
-import { DiffView, DiffFile } from "diff_view.slint";
+import { DiffView, DiffRow } from "diff_view.slint";
 
 // 单行通知数据（updated 已是相对时间文本，Rust 侧换算；url 是可直接打开的 HTML URL）
 export struct NotifRow {
     id: string,         // GitHub thread id（标记已读用）
     repo: string,       // repository.full_name
     title: string,
-    kind: string,       // subject.type：PullRequest / Issue / Release / Discussion / CheckSuite…
-    reason: string,     // review_requested / mention / ci_activity…
+    kind: string,       // subject.type 原值：PullRequest / Issue / Release / Discussion / CheckSuite…（逻辑判断用）
+    kind_label: string, // kind 的本地化显示文本（Rust 侧映射，未知值回退原串）
+    reason: string,     // 本地化后的原因文本（review_requested → 审查请求 / Review requested…）
     updated: string,    // 相对时间，如 "2h"
     unread: bool,
     url: string,        // HTML URL（subject.url 由 Rust 侧转换）
@@ -23,13 +24,14 @@ export struct NotifRow {
     state: string,      // open / closed / merged（GraphQL 批量补的；空 = 未知/非 PR·Issue）
 }
 
-// ── kind 徽章：固定宽度 + 按类型着色（PullRequest 蓝 / Issue 紫 / 其他黄）──
+// ── kind 徽章：固定宽度 + 按类型着色（kind=原始类型决定色调，label=本地化显示文本）──
 component KindBadge inherits Rectangle {
+    in property <string> kind;
     in property <string> label;
 
-    property <color> tone: root.label == "PullRequest" ? Theme.accent
-        : root.label == "Issue" ? Theme.purple
-        : root.label == "Release" ? Theme.good
+    property <color> tone: root.kind == "PullRequest" ? Theme.accent
+        : root.kind == "Issue" ? Theme.purple
+        : root.kind == "Release" ? Theme.good
         : Theme.mid;
 
     width: 82px;   // 固定宽度，保证 PullRequest/Issue 等徽章对齐
@@ -52,6 +54,7 @@ component KindBadge inherits Rectangle {
 // ── 工具栏小按钮：22px 高、描边、hover 微亮 ──
 component ToolButton inherits Rectangle {
     in property <string> label;
+    in property <bool> danger: false;   // 确认态红字（两步确认用）
     callback clicked();
 
     height: 22px;
@@ -66,7 +69,7 @@ component ToolButton inherits Rectangle {
         Text {
             text: root.label;
             font-size: Theme.fs_xs;
-            color: ta.has-hover ? Theme.text : Theme.text_dim;
+            color: root.danger ? Theme.bad : (ta.has-hover ? Theme.text : Theme.text_dim);
             vertical-alignment: center;
         }
     }
@@ -325,7 +328,8 @@ component NotifRowItem inherits Rectangle {
     if root.notif.kind != "": KindBadge {
         x: root.x-kind;
         y: (parent.height - self.height) / 2;
-        label: root.notif.kind;
+        kind: root.notif.kind;
+        label: root.notif.kind_label;
     }
 
     Text {
@@ -415,9 +419,17 @@ export component InboxView inherits FocusScope {
     in property <bool> has_more: false;        // 还有下一页通知可加载
     in property <bool> loading_more: false;    // 「加载更多」进行中
     in property <bool> needs_token: false;
+    in property <bool> loading: false;   // 首次/手动拉取进行中（空态只在非 loading 时显示，防闪现误导）
     in property <bool> detail_open: false;  // 右侧预览面板是否展开（Enter/Esc 语义依赖它）
     in-out property <bool> unread_only: false;  // 只看未读（false = 连已读一起拉）
     in-out property <int> selected_index: -1;
+    // 弹窗/首启引导打开时锁键盘：key-pressed 全部 reject 放行给外层（外层负责 Esc 关弹窗）
+    in property <bool> keys_locked: false;
+    // 「全部已读」两步确认：true = 确认态（3s 超时自动还原），确认态再点才真正执行
+    property <bool> mar_confirm: false;
+
+    // 仓库过滤变化（Rust 侧重建行模型）：选中下标随之失效，清掉防止选中错行
+    changed repo_filter => { root.selected_index = -1; }
 
     callback row_activated(int);    // 单击 / Enter：选中 + 展开预览（传 rows 下标）
     callback row_add_review(int);   // 「+ 预评审」：加入本地库（传 rows 下标）
@@ -436,14 +448,15 @@ export component InboxView inherits FocusScope {
         root.selected_index = Math.min(root.rows.length - 1, Math.max(0, root.selected_index + delta));
     }
 
-    // PageUp/PageDown 翻页滚动（由外层 FocusScope 调用；Flickable 自己不认键盘）。
-    // 注意桥接：Flickable 在 if 作用域里，id 外部不可见——page_scroll 只累加
-    // page_req 计数，真正的滚动在 Flickable 内部的 changed 里（那里看得到 self）。
+    // PageUp/PageDown 翻页滚动（由外层 FocusScope 调用；滚动容器自己不认键盘）。
+    // 注意桥接：滚动容器在 if 作用域里，id 外部不可见——page_scroll 只累加
+    // page_req 计数，真正的滚动在容器内部的 changed 里（那里看得到 self）。
     in-out property <int> page_req: 0;
     public function page_scroll(dir: int) { root.page_req = root.page_req + dir; }
 
     // 键盘导航：j/k 或 ↑/↓ 移动，Enter 展开预览 / 打开浏览器，Esc 关预览 / 取消选中
     key-pressed(event) => {
+        if (root.keys_locked) { return reject; }
         if (event.text == "j" || event.text == Key.DownArrow) {
             root.move_selection(1);
             return accept;
@@ -474,8 +487,9 @@ export component InboxView inherits FocusScope {
     Rectangle {
         background: Theme.bg;
 
+        // 注意：这里不能设 alignment: start——非 stretch 对齐会让子元素全部退回
+        // preferred 尺寸，ListView 的 vertical-stretch 失效后只渲染约两行高。
         VerticalLayout {
-            alignment: start;
 
             // ── 工具栏：26px，底部 hairline ──
             Rectangle {
@@ -616,9 +630,23 @@ export component InboxView inherits FocusScope {
                             }
                         }
                     }
+                    // 「全部已读」两步确认：第一次点变确认态（3s 超时还原），确认态再点才真正执行
+                    mar-timer := Timer {
+                        interval: 3s;
+                        running: root.mar_confirm;
+                        triggered => { root.mar_confirm = false; }
+                    }
                     ToolButton {
-                        label: I18n.inbox_mark_all_read;
-                        clicked => { root.mark_all_read(); }
+                        label: root.mar_confirm ? I18n.inbox_mark_all_read_confirm : I18n.inbox_mark_all_read;
+                        danger: root.mar_confirm;
+                        clicked => {
+                            if (root.mar_confirm) {
+                                root.mar_confirm = false;
+                                root.mark_all_read();
+                            } else {
+                                root.mar_confirm = true;
+                            }
+                        }
                     }
                     TogglePill {
                         label: I18n.inbox_unread_only;
@@ -646,7 +674,44 @@ export component InboxView inherits FocusScope {
                 hint: I18n.inbox_needs_token_hint;
             }
 
-            if !root.needs_token && root.rows.length == 0: EmptyState {
+            // 首次加载中：转圈 + 「加载中…」（避免 rows 尚未回送时闪「通知为空」误导空态）
+            if !root.needs_token && root.loading && root.rows.length == 0: Rectangle {
+                vertical-stretch: 1;
+
+                // 转圈指示：Timer 驱动逐帧切换 4 帧旋转 SVG（复用 detail_panel 的 spin 模式）
+                property <int> spin_idx: 0;
+                Timer {
+                    interval: 130ms;
+                    running: true;
+                    triggered => { spin_idx = spin_idx >= 3 ? 0 : spin_idx + 1; }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 10px;
+                    HorizontalLayout {
+                        alignment: center;
+                        Image {
+                            width: 16px;
+                            height: 16px;
+                            source: spin_idx == 0 ? @image-url("icons/spin-0.svg")
+                                : spin_idx == 1 ? @image-url("icons/spin-1.svg")
+                                : spin_idx == 2 ? @image-url("icons/spin-2.svg")
+                                : @image-url("icons/spin-3.svg");
+                            image-fit: contain;
+                            colorize: Theme.text_dim;
+                        }
+                    }
+                    Text {
+                        text: I18n.inbox_loading;
+                        color: Theme.text_dim;
+                        font-size: Theme.fs_md;
+                        horizontal-alignment: center;
+                    }
+                }
+            }
+
+            if !root.needs_token && !root.loading && root.rows.length == 0: EmptyState {
                 vertical-stretch: 1;
                 icon_img: @image-url("icons/inbox.svg");
                 title: I18n.inbox_empty_title;
@@ -655,9 +720,10 @@ export component InboxView inherits FocusScope {
 
             if !root.needs_token && root.rows.length > 0: InboxHeader {}
 
-            if !root.needs_token && root.rows.length > 0: flick := Flickable {
+            // 行列表：ListView 虚拟化（行高固定，视口外不实例化）。
+            // 仓库过滤在 Rust 侧做（模型预过滤），这里拿到的 rows 已是过滤后的。
+            if !root.needs_token && root.rows.length > 0: lv := ListView {
                 vertical-stretch: 1;
-                content-height: col.preferred-height;
 
                 // PageUp/PageDown：page_req 计数桥接（if 作用域里 id 外部不可见、
                 // changed 又只能盯本地属性——mirror 绑定把外层计数引进来）
@@ -673,56 +739,42 @@ export component InboxView inherits FocusScope {
                     }
                 }
 
-                // Flickable 子元素需显式铺满视口宽，否则 stretch 列拿不到剩余空间
-                col := VerticalLayout {
-                    width: parent.width;
-                    alignment: start;
+                for r[i] in root.rows: NotifRowItem {
+                    notif: r;
+                    selected: i == root.selected_index;
+                    clicked => {
+                        root.selected_index = i;
+                        root.row_activated(i);
+                    }
+                    add_review => { root.row_add_review(i); }
+                }
+            }
 
-                    for r[i] in root.rows: VerticalLayout {
-                        // 仓库过滤：不匹配的行整个跳过（VerticalLayout 空则高度为 0；
-                        // 用布局而非裸 Rectangle 包裹，高度才能跟随条件子元素）
-                        alignment: start;
-                        if root.repo_filter == "" || r.repo == root.repo_filter: NotifRowItem {
-                            notif: r;
-                            selected: i == root.selected_index;
-                            clicked => {
-                                root.selected_index = i;
-                                root.row_activated(i);
-                            }
-                            add_review => { root.row_add_review(i); }
+            // 分页：「加载更多」常驻底部（GitHub 通知每页 50 条；没有下一页时隐藏）
+            if !root.needs_token && root.rows.length > 0 && root.has_more: Rectangle {
+                height: 40px;
+                Rectangle {
+                    width: load-more-row.preferred-width + 24px;
+                    height: 26px;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 13px;
+                    background: !root.loading_more && load-more-ta.has-hover ? Theme.hover : Theme.surface2;
+                    animate background { duration: 100ms; }
+
+                    load-more-ta := TouchArea {
+                        mouse-cursor: root.loading_more ? default : pointer;
+                        clicked => { if (!root.loading_more) { root.load_more(); } }
+                    }
+                    load-more-row := HorizontalLayout {
+                        spacing: 6px;
+                        Text {
+                            text: root.loading_more ? I18n.inbox_loading : I18n.inbox_load_more;
+                            font-size: Theme.fs_sm;
+                            color: root.loading_more ? Theme.text_faint : Theme.text_dim;
+                            vertical-alignment: center;
                         }
                     }
-
-                    // 分页：「加载更多」（GitHub 通知每页 50 条；没有下一页时隐藏）
-                    if root.has_more: Rectangle {
-                        height: 40px;
-                        Rectangle {
-                            width: load-more-row.preferred-width + 24px;
-                            height: 26px;
-                            x: (parent.width - self.width) / 2;
-                            y: (parent.height - self.height) / 2;
-                            border-radius: 13px;
-                            background: !root.loading_more && load-more-ta.has-hover ? Theme.hover : Theme.surface2;
-                            animate background { duration: 100ms; }
-
-                            load-more-ta := TouchArea {
-                                mouse-cursor: root.loading_more ? default : pointer;
-                                clicked => { if (!root.loading_more) { root.load_more(); } }
-                            }
-                            load-more-row := HorizontalLayout {
-                                spacing: 6px;
-                                Text {
-                                    text: root.loading_more ? I18n.inbox_loading : I18n.inbox_load_more;
-                                    font-size: Theme.fs_sm;
-                                    color: root.loading_more ? Theme.text_faint : Theme.text_dim;
-                                    vertical-alignment: center;
-                                }
-                            }
-                        }
-                    }
-
-                    // 列表末尾呼吸空间
-                    Rectangle { height: 8px; }
                 }
             }
         }
@@ -794,14 +846,17 @@ export component NotifPreview inherits Rectangle {
     in property <length> panel_width: 420px;
 
     in property <string> title: "";
-    in property <string> kind: "";        // PullRequest / Issue / …（决定标签页）
+    in property <string> kind: "";        // PullRequest / Issue / …（原始值；决定标签页与徽章色调）
+    in property <string> kind_label: "";  // kind 的本地化显示文本（空 = 回退显示 kind 原值）
     in property <string> state: "";       // open / closed / merged（空 = 未知/不适用）
     in property <bool> added: false;      // 已在本地库（按钮变「已加入」）
     in property <bool> loading: false;    // 详情拉取中
 
     in property <[ConvoEntry]> convo_entries: [];
     in property <[FileChange]> files: [];
-    in property <[DiffFile]> diff_files: [];
+    in property <[DiffRow]> diff_files: [];
+    // diff 最长内容行（DiffView 测量像素宽以定横向滚动区域）
+    in property <string> diff_max_text: "";
 
     callback close();
     callback open_browser();
@@ -844,14 +899,19 @@ export component NotifPreview inherits Rectangle {
                     Rectangle {
                         horizontal-stretch: 1;
                         // 不套固定高度+clip：换行超出时 femtovg 会渲染出叠影（同 detail_panel 标题）
-                        Text {
+                        // read-only TextInput：标题可选中复制（视觉同 Text）
+                        TextInput {
                             width: parent.width;
+                            height: self.preferred-height;
+                            read-only: true;
+                            enabled: true;
                             text: root.title == "" ? I18n.inbox_not_selected : root.title;
                             color: Theme.text;
                             font-size: Theme.fs_lg;
                             // 400：femtovg 对换行加粗的雅黑文本会叠影（detail_panel 标题同款规避）
                             font-weight: 400;
                             wrap: word-wrap;
+                            selection-background-color: Theme.accent.with-alpha(0.28);
                         }
                     }
                     Rectangle {
@@ -880,7 +940,8 @@ export component NotifPreview inherits Rectangle {
                     spacing: 8px;
                     alignment: start;
                     if root.kind != "": KindBadge {
-                        label: root.kind;
+                        kind: root.kind;
+                        label: root.kind_label != "" ? root.kind_label : root.kind;
                         y: (parent.height - self.height) / 2;
                     }
                     if root.state != "": StateBadge {
@@ -1027,15 +1088,19 @@ export component NotifPreview inherits Rectangle {
                                     }
                                     Rectangle { horizontal-stretch: 1; }
                                 }
-                                // 正文：有解析块 → Markdown 渲染；否则回退纯文本（换行）
+                                // 正文：有解析块 → Markdown 渲染；否则回退纯文本（换行，可选中复制）
                                 // 宽度必须从 entry_box（entry_layout 之外）显式推算，
                                 // 绑 parent.width 会形成 layout-cache 绑定循环
-                                if e.blocks.length == 0: Text {
+                                if e.blocks.length == 0: TextInput {
+                                    read-only: true;
+                                    enabled: true;
                                     text: e.text;
                                     width: entry_box.width - 66px;
+                                    height: self.preferred-height;
                                     font-size: Theme.fs_md;
                                     color: Theme.text_dim;
                                     wrap: word-wrap;
+                                    selection-background-color: Theme.accent.with-alpha(0.28);
                                 }
                                 if e.blocks.length > 0: MarkdownBlocks {
                                     blocks: e.blocks;
@@ -1064,7 +1129,7 @@ export component NotifPreview inherits Rectangle {
                             spacing: 10px;
                             Text {
                                 text: f.path;
-                                font-family: "Consolas";
+                                font-family: Theme.mono_font;
                                 font-size: Theme.fs_xs;
                                 color: Theme.text;
                                 overflow: elide;
@@ -1073,14 +1138,14 @@ export component NotifPreview inherits Rectangle {
                             }
                             Text {
                                 text: "+" + f.adds;
-                                font-family: "Consolas";
+                                font-family: Theme.mono_font;
                                 font-size: Theme.fs_xs;
                                 color: Theme.good;
                                 vertical-alignment: center;
                             }
                             Text {
                                 text: "-" + f.dels;
-                                font-family: "Consolas";
+                                font-family: Theme.mono_font;
                                 font-size: Theme.fs_xs;
                                 color: Theme.bad;
                                 vertical-alignment: center;
@@ -1104,7 +1169,8 @@ export component NotifPreview inherits Rectangle {
 
             // Diff：嵌入真实 DiffView（彩色渲染 + 按文件折叠）
             if root.current_tab == 2 && root.is_pr: DiffView {
-                files: root.diff_files;
+                rows: root.diff_files;
+                max_text: root.diff_max_text;
                 file_toggled(i) => { root.diff_file_toggled(i); }
             }
 

@@ -25,6 +25,9 @@ const OCR_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// --background 注入的 PR 标题+正文截断长度。
 const BACKGROUND_MAX_CHARS: usize = 2000;
 
+/// 重建临时仓库时拉取文件内容的并发度（GitHub API 友好上限）。
+const FETCH_CONCURRENCY: usize = 8;
+
 /// 单次 ocr 评审结果：行级评论（原样保留 ocr schema）+ 已评审文件数 + 状态。
 #[derive(Debug)]
 pub struct OcrRunOutcome {
@@ -190,6 +193,28 @@ pub fn resolve_ocr_path(cfg: &Config) -> PathBuf {
     resolve_ocr_path_in(&cfg.ocr_path, exe_dir.as_deref(), &cwd)
 }
 
+/// 并发拉取一批文件内容（调用方按 FETCH_CONCURRENCY 分批；任一任务出错整体报错）。
+async fn fetch_files_chunk(
+    gh: &GitHub,
+    repo: &str,
+    git_ref: &str,
+    paths: &[String],
+) -> Result<Vec<(String, Option<Vec<u8>>)>> {
+    let mut set = tokio::task::JoinSet::new();
+    for path in paths {
+        let gh = gh.clone();
+        let repo = repo.to_string();
+        let path = path.clone();
+        let git_ref = git_ref.to_string();
+        set.spawn(async move { gh.fetch_file_content(&repo, &path, &git_ref).await.map(|b| (path, b)) });
+    }
+    let mut out = Vec::with_capacity(paths.len());
+    while let Some(res) = set.join_next().await {
+        out.push(res.context("抓取文件任务 panic")??);
+    }
+    Ok(out)
+}
+
 /// 本地预评审主流程：重建临时 git 仓库 → 跑 ocr → 解析行级评论。
 /// meta 为 GitHub::fetch_pr_meta 的原始返回（取 base.sha / head.sha / title / body）。
 /// lang："zh"/"en"，进度回调与错误文案语言。
@@ -228,26 +253,40 @@ pub async fn run_ocr_review(
     let total = files.len();
 
     // 第一个 commit：base 版本（新增文件在 base 侧 404 → None → 跳过；
-    // 二进制/超大文件两边都跳过，ocr 反正会排除）。
-    for (i, (path, _chunk)) in files.iter().enumerate() {
-        progress(trf(lang, "prog_rebuild_base", &[&(i + 1).to_string(), &total.to_string()]));
-        if let Some(bytes) = gh.fetch_file_content(repo, path, &base_sha).await? {
-            write_file(&tmp.0, path, &bytes)?;
+    // 二进制/超大文件两边都跳过，ocr 反正会排除）。分批并发拉取（批内 8 并发）。
+    let mut done = 0usize;
+    for chunk in files.chunks(FETCH_CONCURRENCY) {
+        let paths: Vec<String> = chunk.iter().map(|(p, _)| p.clone()).collect();
+        for (path, bytes) in fetch_files_chunk(gh, repo, &base_sha, &paths).await? {
+            done += 1;
+            progress(trf(lang, "prog_rebuild_base", &[&done.to_string(), &total.to_string()]));
+            if let Some(bytes) = bytes {
+                write_file(&tmp.0, &path, &bytes)?;
+            }
         }
     }
     git_commit_all(&tmp.0, "base").await?;
 
-    // 第二个 commit：head 版本（新增/修改写 head 内容；被删文件从磁盘移除）。
-    for (i, (path, chunk)) in files.iter().enumerate() {
-        progress(trf(lang, "prog_rebuild_head", &[&(i + 1).to_string(), &total.to_string()]));
+    // 第二个 commit：head 版本（新增/修改写 head 内容；被删文件从磁盘移除，不占并发额度）。
+    let mut to_fetch: Vec<String> = Vec::new();
+    for (path, chunk) in &files {
         if file_status(chunk) == "deleted" {
             if let Some(p) = safe_join(&tmp.0, path) {
                 let _ = std::fs::remove_file(p);
             }
-            continue;
+            done += 1;
+            progress(trf(lang, "prog_rebuild_head", &[&done.to_string(), &total.to_string()]));
+        } else {
+            to_fetch.push(path.clone());
         }
-        if let Some(bytes) = gh.fetch_file_content(repo, path, &head_sha).await? {
-            write_file(&tmp.0, path, &bytes)?;
+    }
+    for batch in to_fetch.chunks(FETCH_CONCURRENCY) {
+        for (path, bytes) in fetch_files_chunk(gh, repo, &head_sha, batch).await? {
+            done += 1;
+            progress(trf(lang, "prog_rebuild_head", &[&done.to_string(), &total.to_string()]));
+            if let Some(bytes) = bytes {
+                write_file(&tmp.0, &path, &bytes)?;
+            }
         }
     }
     git_commit_all(&tmp.0, "head").await?;
@@ -290,10 +329,11 @@ pub async fn run_ocr_review(
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let tail: String = stderr.chars().rev().take(500).collect::<String>().chars().rev().collect();
-        anyhow::bail!(
-            "{}",
-            trf(lang, "err_ocr_exit", &[&format!("{:?}", out.status.code()), tail.trim()])
-        );
+        match out.status.code() {
+            Some(code) => anyhow::bail!("{}", trf(lang, "err_ocr_exit", &[&code.to_string(), tail.trim()])),
+            // 无退出码 = 进程被信号终止（kill 等），不往错误里拼 Some/None
+            None => anyhow::bail!("{}", trf(lang, "err_ocr_terminated", &[tail.trim()])),
+        }
     }
 
     progress(tr(lang, "prog_parse_ocr").into());

@@ -9,6 +9,9 @@ PR Desk 风格的 GitHub PR 预评审桌面客户端（Rust + Slint），与 Ast
 
 - 工具链：**x86_64-pc-windows-gnu**（纯 Rust 链路，无 MSVC/OpenSSL 依赖）
 - 网络栈：reqwest + rustls；数据库：rusqlite(bundled)；UI：Slint
+- **运行时依赖**：
+  - `git` 需在 PATH 上——本地预评审（行级评论）会用它在临时目录重建 PR 的 base/head 两个 commit（见 `src/ocr.rs`）。
+  - `bin/ocr.exe`（open-code-review CLI，随包 sidecar）：行级评论评审引擎。查找顺序：`ocr_path` 配置（非默认时）→ exe 旁 `bin/ocr.exe` → 当前目录 `bin/ocr.exe` → PATH。缺失时仅行级评论功能不可用，评分评审（纯 LLM）不受影响。
 
 ```bash
 cargo run --release

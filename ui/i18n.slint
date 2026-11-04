@@ -18,6 +18,9 @@ export global I18n {
     out property <string> statusbar_hints: root.lang == "en"
         ? "j/k move · Enter details · o open in browser · p pin · 1/2/3 priority · / search · Esc back"
         : "j/k 移动 · Enter 详情 · o 浏览器打开 · p 置顶 · 1/2/3 优先级 · / 搜索 · Esc 返回";
+    out property <string> statusbar_hints_inbox: root.lang == "en"
+        ? "j/k move · Enter preview / open in browser · Esc back · / search"
+        : "j/k 移动 · Enter 预览 / 浏览器打开 · Esc 返回 · / 搜索";
     // 状态栏总数：pre + 数字 + post（zh: 「共 N 个 PR」，en: 「N PRs」）
     out property <string> statusbar_total_pre: root.lang == "en" ? "" : "共 ";
     out property <string> statusbar_total_post: root.lang == "en" ? " PRs" : " 个 PR";
@@ -25,13 +28,13 @@ export global I18n {
     // ── app.slint · 首启引导 ──
     out property <string> welcome_title: root.lang == "en" ? "Welcome to PR Desk" : "欢迎使用 PR Desk";
     out property <string> welcome_hint: root.lang == "en"
-        ? "No server or repositories configured yet.\nOpen Settings and fill in the server URL, token, and repositories to get started."
-        : "还没有配置服务器与仓库。\n打开设置，填入服务器地址、令牌和要关注的仓库即可开始。";
+        ? "No repositories configured yet.\nLocal mode: only a GitHub token and the repos to watch are needed.\nSync mode: additionally needs the server URL and sync_token."
+        : "还没有配置仓库。\n本地模式：只需 GitHub token 和要关注的仓库。\n同步模式：另需服务器地址与 sync_token。";
     out property <string> welcome_open_settings: root.lang == "en" ? "Open Settings" : "打开设置";
+    out property <string> welcome_later: root.lang == "en" ? "Maybe later" : "稍后再说";
 
     // ── app.slint · 设置弹窗 ──
     out property <string> settings_title: root.lang == "en" ? "Settings" : "设置";
-    out property <string> settings_tab_connection: root.lang == "en" ? "Connection & Sync" : "连接与同步";
     out property <string> settings_tab_llm: root.lang == "en" ? "LLM Pre-review" : "LLM 预评审";
     out property <string> settings_tab_source: root.lang == "en" ? "Data Source" : "数据源";
     out property <string> settings_tab_general: root.lang == "en" ? "General" : "通用";
@@ -53,6 +56,8 @@ export global I18n {
     out property <string> settings_repos: root.lang == "en" ? "Repositories (one owner/repo per line)" : "仓库列表（每行一个 owner/repo）";
     out property <string> settings_poll_interval: root.lang == "en" ? "Poll interval (minutes)" : "轮询间隔（分钟）";
     out property <string> settings_model_name: root.lang == "en" ? "Model name" : "模型名";
+    out property <string> settings_llm_base: root.lang == "en" ? "API Base URL" : "API 地址";
+    out property <string> settings_llm_key: root.lang == "en" ? "API Key" : "API 密钥";
     out property <string> settings_fetch_models: root.lang == "en" ? "Fetch" : "获取";
     // 模型列表标题：pre + 数量 + post（zh: 「选择模型（N 个）」，en: 「Select model (N)」）
     out property <string> settings_model_list_pre: root.lang == "en" ? "Select model (" : "选择模型（";
@@ -74,6 +79,7 @@ export global I18n {
     out property <string> profile_add_hint: root.lang == "en" ? "New profile name" : "新档案名";
     out property <string> profile_add_tooltip: root.lang == "en" ? "Add profile" : "添加档案";
     out property <string> profile_delete_tooltip: root.lang == "en" ? "Remove profile" : "删除档案";
+    out property <string> profile_delete_confirm: root.lang == "en" ? "Click again to confirm removal" : "再点一次确认删除";
     out property <string> settings_profile_global: root.lang == "en" ? "Global (applies to all profiles)" : "全局设置（对所有档案生效）";
 
     // ── pr_list.slint ──
@@ -82,13 +88,14 @@ export global I18n {
     // ── inbox.slint ──
     out property <string> inbox_title: root.lang == "en" ? "Notifications" : "通知";
     out property <string> inbox_mark_all_read: root.lang == "en" ? "Mark all read" : "全部已读";
+    out property <string> inbox_mark_all_read_confirm: root.lang == "en" ? "Confirm mark all read?" : "确认全部已读？";
     out property <string> inbox_unread_only: root.lang == "en" ? "Unread only" : "只看未读";
     out property <string> inbox_needs_token_title: root.lang == "en" ? "GitHub token required" : "需要 GitHub token";
     out property <string> inbox_needs_token_hint: root.lang == "en"
         ? "The notifications API requires auth. Open Settings to add a GitHub token, or set the GITHUB_TOKEN environment variable."
         : "通知接口需要鉴权。打开设置填入 GitHub token，或配置 GITHUB_TOKEN 环境变量。";
     out property <string> inbox_empty_title: root.lang == "en" ? "No notifications" : "没有通知";
-    out property <string> inbox_empty_hint: root.lang == "en" ? "Your GitHub inbox is empty. Click the refresh button in the top bar to fetch again." : "GitHub 通知为空。点顶栏刷新按钮重新拉取。";
+    out property <string> inbox_empty_hint: root.lang == "en" ? "Your GitHub inbox is empty." : "GitHub 通知箱为空。";
     out property <string> inbox_added: root.lang == "en" ? "Added" : "已加入";
     out property <string> inbox_add_review: root.lang == "en" ? "+ Review" : "+ 预评审";
     out property <string> inbox_not_selected: root.lang == "en" ? "Nothing selected" : "未选择";
@@ -104,11 +111,21 @@ export global I18n {
     out property <string> font_size_normal: root.lang == "en" ? "Standard" : "标准";
     out property <string> font_size_large: root.lang == "en" ? "Large" : "大";
     out property <string> review_copy_tip: root.lang == "en" ? "Copy review as Markdown" : "复制评审报告（Markdown）";
-    out property <string> sort_updated: root.lang == "en" ? "By updated" : "按更新时间";
-    out property <string> sort_score: root.lang == "en" ? "By score" : "按评分";
-    out property <string> sort_changes: root.lang == "en" ? "By changes" : "按改动量";
-    out property <string> sort_tooltip: root.lang == "en" ? "Sort" : "排序";
     out property <string> high_score_tooltip: root.lang == "en" ? "High scores only (≥8.0)" : "只看高分（≥8.0）";
+    // 行内 hover 快捷操作 tooltip（pr_list.slint QuickAction）
+    out property <string> tip_pin: root.lang == "en" ? "Pin" : "置顶";
+    out property <string> tip_reject: root.lang == "en" ? "Reject" : "不采纳";
+    // PR 列表表头列名（P / # / +/- / CI 是符号或通用缩写，不进 i18n）
+    out property <string> col_title: root.lang == "en" ? "Title" : "标题";
+    out property <string> col_author: root.lang == "en" ? "Author" : "作者";
+    out property <string> col_turn: root.lang == "en" ? "Turn" : "轮次";
+    out property <string> col_review: root.lang == "en" ? "Rev" : "评审";
+    out property <string> col_size: root.lang == "en" ? "Size" : "体量";
+    out property <string> col_age: root.lang == "en" ? "Age" : "创建";
+    out property <string> col_updated: root.lang == "en" ? "Upd" : "更新";
+    // TurnChip（该谁跟进）：me = 我 / them = 对方
+    out property <string> turn_me: root.lang == "en" ? "me" : "我";
+    out property <string> turn_them: root.lang == "en" ? "them" : "对方";
 
     // ── diff_view.slint ──
     out property <string> diff_empty_title: root.lang == "en" ? "No diff content" : "暂无 Diff 内容";

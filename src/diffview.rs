@@ -29,6 +29,67 @@ pub fn classify_line(line: &str) -> LineKind {
     }
 }
 
+/// 解析 hunk 头 `@@ -old_start,old_count +new_start,new_count @@`（count 省略 = 1），
+/// 返回 (old_start, new_start)。畸形头返回 None（调用方保持行号不变，不炸解析）。
+fn parse_hunk_header(line: &str) -> Option<(i32, i32)> {
+    // 形如 "@@ -1,3 +1,4 @@"；section 注释（@@ 之后的文字）忽略
+    let inner = line.strip_prefix("@@")?.split_once("@@")?.0;
+    let mut old_start = None;
+    let mut new_start = None;
+    for tok in inner.split_whitespace() {
+        if let Some(rest) = tok.strip_prefix('-') {
+            old_start = rest.split(',').next()?.trim().parse().ok();
+        } else if let Some(rest) = tok.strip_prefix('+') {
+            new_start = rest.split(',').next()?.trim().parse().ok();
+        }
+    }
+    Some((old_start?, new_start?))
+}
+
+/// 给单文件 diff 文本的每一行配真实行号（gutter 用）：
+/// - add / context 行 → new 侧行号；del 行 → old 侧行号；hunk / meta 行 → 0（无行号）。
+/// - hunk 头重置两侧的计数器；第一个 hunk 之前的 meta 行无行号。
+/// 返回 (LineKind, 原文, 行号)，行号 0 表示「不显示」。
+pub fn numbered_lines(text: &str) -> Vec<(LineKind, String, i32)> {
+    let mut old_ln = 0i32;
+    let mut new_ln = 0i32;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let kind = classify_line(line);
+        let mut no = 0;
+        match kind {
+            LineKind::Hunk => {
+                if let Some((o, n)) = parse_hunk_header(line) {
+                    old_ln = o;
+                    new_ln = n;
+                }
+            }
+            LineKind::Add => {
+                if new_ln > 0 {
+                    no = new_ln;
+                    new_ln += 1;
+                }
+            }
+            LineKind::Del => {
+                if old_ln > 0 {
+                    no = old_ln;
+                    old_ln += 1;
+                }
+            }
+            LineKind::Ctx => {
+                if new_ln > 0 && old_ln > 0 {
+                    no = new_ln;
+                    new_ln += 1;
+                    old_ln += 1;
+                }
+            }
+            LineKind::Meta => {}
+        }
+        out.push((kind, line.to_string(), no));
+    }
+    out
+}
+
 /// 按 `diff --git` 头切分为文件块。
 pub fn split_files(diff: &str) -> Vec<(String, String)> {
     let mut files: Vec<(String, String)> = Vec::new();
@@ -88,5 +149,53 @@ mod tests {
         assert_eq!(files[1].0, "b.py");
         assert!(files[0].1.contains("-x"));
         assert!(files[1].1.contains("+n"));
+    }
+
+    #[test]
+    fn hunk_header_parses_both_forms() {
+        assert_eq!(parse_hunk_header("@@ -1,3 +1,4 @@"), Some((1, 1)));
+        assert_eq!(parse_hunk_header("@@ -10 +20 @@ fn main()"), Some((10, 20)));
+        assert_eq!(parse_hunk_header("@@ -0,0 +5,2 @@"), Some((0, 5)));
+        assert_eq!(parse_hunk_header("@@ garbage"), None);
+        assert_eq!(parse_hunk_header("not a hunk"), None);
+    }
+
+    #[test]
+    fn numbered_lines_multi_hunk_mixed() {
+        let text = "\
+diff --git a/a.py b/a.py
+--- a/a.py
++++ b/a.py
+@@ -1,3 +1,4 @@
+ ctx1
+-del
++add1
++add2
+ ctx2
+@@ -10,2 +11,3 @@
+ ctxA
+-delA
++addA
+";
+        let lines = numbered_lines(text);
+        let no: Vec<i32> = lines.iter().map(|(_, _, n)| *n).collect();
+        let kinds: Vec<LineKind> = lines.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            [
+                LineKind::Meta, LineKind::Meta, LineKind::Meta, LineKind::Hunk,
+                LineKind::Ctx, LineKind::Del, LineKind::Add, LineKind::Add, LineKind::Ctx,
+                LineKind::Hunk,
+                LineKind::Ctx, LineKind::Del, LineKind::Add,
+            ]
+        );
+        // meta/hunk 无行号；ctx/add 用 new 侧，del 用 old 侧
+        assert_eq!(no, [0, 0, 0, 0, 1, 2, 2, 3, 4, 0, 11, 11, 12]);
+    }
+
+    #[test]
+    fn numbered_lines_before_first_hunk_have_no_number() {
+        let lines = numbered_lines("diff --git a/x b/x\nindex 1..2\n--- a/x\n+++ b/x\n");
+        assert!(lines.iter().all(|(_, _, n)| *n == 0));
     }
 }

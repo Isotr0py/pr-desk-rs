@@ -4,14 +4,14 @@
 import { Theme } from "theme.slint";
 import { I18n } from "i18n.slint";
 import { TopBar, StatusBar } from "topbar.slint";
-import { PrListView, PrListRow, PrGroup } from "pr_list.slint";
+import { PrListView, PrListRow, PrListItem } from "pr_list.slint";
 import { DetailPanel, ConvoEntry, CheckRun, FileChange, OcrComment, DimScore } from "detail_panel.slint";
-import { DiffFile, DiffLine } from "diff_view.slint";
+import { DiffRow } from "diff_view.slint";
 import { InboxView, NotifRow, NotifPreview } from "inbox.slint";
 import { MdBlock } from "components.slint";
 
 // 类型再导出：slint-build 从本文件生成 Rust 绑定
-export { PrListRow, PrGroup, ConvoEntry, CheckRun, FileChange, DiffFile, DiffLine, NotifRow, OcrComment, DimScore, MdBlock }
+export { PrListRow, PrListItem, ConvoEntry, CheckRun, FileChange, DiffRow, NotifRow, OcrComment, DimScore, MdBlock }
 
 // ── 表单输入框：30px 高、surface2 底无边框，聚焦时 accent 描边 ──
 component FormField inherits Rectangle {
@@ -57,12 +57,13 @@ component FormField inherits Rectangle {
 component FormArea inherits Rectangle {
     in-out property <string> text <=> input.text;
     in property <string> placeholder: "";
+    in property <bool> enabled: true;   // false = 禁用（评审模板回填中锁定，防竞态覆盖）
 
     height: 88px;
     border-radius: Theme.r_md;
     border-width: input.has-focus ? 1px : 0px;
     border-color: Theme.accent;
-    background: Theme.surface2;
+    background: root.enabled ? Theme.surface2 : Theme.surface2.with-alpha(0.5);
     clip: true;
     animate border-width { duration: 120ms; }
 
@@ -71,13 +72,14 @@ component FormArea inherits Rectangle {
         y: 7px;
         width: parent.width - 20px;
         height: parent.height - 14px;
-        viewport-width: self.width;
-        viewport-height: input.preferred-height;
+        content-width: self.width;
+        content-height: input.preferred-height;
         input := TextInput {
             width: parent.width;
             wrap: word-wrap;
             font-size: Theme.fs_md;
-            color: Theme.text;
+            color: root.enabled ? Theme.text : Theme.text_faint;
+            enabled: root.enabled;
         }
     }
 
@@ -108,24 +110,26 @@ component Field inherits VerticalLayout {
 component DialogButton inherits Rectangle {
     in property <string> text;
     in property <bool> primary: false;
+    in property <bool> enabled: true;   // false = 禁用（灰化且不响应点击）
     in property <length> button-width: 72px;
     callback clicked();
 
     width: root.button-width;
     height: 30px;
     border-radius: Theme.r_md;
-    background: root.primary
+    background: !root.enabled ? Theme.surface2.with-alpha(0.5)
+        : root.primary
         ? (ta.has-hover ? Theme.accent.darker(1.08) : Theme.accent)
         : (ta.has-hover ? Theme.surface2 : transparent);
     animate background { duration: 120ms; }
 
     ta := TouchArea {
-        mouse-cursor: pointer;
-        clicked => { root.clicked(); }
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { if (root.enabled) { root.clicked(); } }
     }
     Text {
         text: root.text;
-        color: root.primary ? #ffffff : Theme.text;
+        color: !root.enabled ? Theme.text_faint : root.primary ? #ffffff : Theme.text;
         font-size: Theme.fs_md;
         horizontal-alignment: center;
         vertical-alignment: center;
@@ -191,10 +195,15 @@ export component MainWindow inherits Window {
     title: I18n.app_name;
     // 窗口图标：内嵌 SVG（默认图标在本机字体环境下标题栏显示为豆腐块）
     icon: @image-url("icons/app.svg");
-    // 中英混排字体：雅黑 UI（中英都覆盖，CJK 渲染稳定清晰）。
+    // 中英混排字体：由 Rust 侧按平台赋值（Windows 雅黑 UI / macOS PingFang SC /
+    // Linux Noto Sans CJK SC；空值时的兜底即本声明的默认值）。
     // 注意 Slint 的 default-font-family 只支持单一字体名（不支持逗号分隔的 fallback 列表，
     // 写列表会被当成一个字面字体名去查找、查不到就走系统兜底，CJK 字宽全乱）
-    default-font-family: "Microsoft YaHei UI";
+    in property <string> ui_font: "Microsoft YaHei UI";
+    // 等宽字体（diff/代码块/文件路径）：Rust 侧按平台赋值，写进 Theme.mono_font 全局
+    in property <string> mono_font: "Consolas";
+    changed mono_font => { Theme.mono_font = root.mono_font; }
+    default-font-family: root.ui_font;
     preferred-width: 1280px;
     preferred-height: 760px;
     min-width: 900px;
@@ -226,10 +235,10 @@ export component MainWindow inherits Window {
     }
 
     // ── 列表 ──
-    in property <[PrListRow]> rows: [];
+    // 摊平的列表模型（组头 + 数据行混排；折叠组的行不在模型里，见 pr_list.slint）
+    in property <[PrListItem]> items: [];
     // 选中行身份（repo#number）：Rust 侧重建列表后回写，高亮跟随 PR 而非下标
     in-out property <string> selected_key: "";
-    in-out property <[PrGroup]> groups: [];
     in-out property <string> filter_text: "";
     in-out property <int> view_mode: 0;      // 0=列表 1=Inbox（TopBar 分段控件，唯一一套视图切换）
     in-out property <string> sort_col: "upd";   // 列表排序列（Excel 式点表头）
@@ -242,6 +251,11 @@ export component MainWindow inherits Window {
     in property <string> sb_sync: "";
     in property <string> sb_quota: "";
     in property <int> sb_total: 0;
+    // ── 顶栏进行中反馈（转圈动画；Rust 侧同时用作连点去重标志）──
+    in property <bool> gh_refreshing: false;
+    in property <bool> syncing: false;
+    // 详情面板宽度（拖拽手柄改；Rust 侧启动回填、退出时持久化到 config.toml）
+    in-out property <length> panel_width: 420px;
     // ── 详情面板 ──
     in property <bool> d_open: false;
     in property <string> d_title: "";
@@ -258,7 +272,9 @@ export component MainWindow inherits Window {
     in property <[ConvoEntry]> d_convo: [];
     in property <[CheckRun]> d_checks: [];
     in property <[FileChange]> d_files: [];
-    in property <[DiffFile]> diff_files: [];
+    in property <[DiffRow]> diff_files: [];
+    // diff 最长内容行（测量像素宽以定横向滚动区域）
+    in property <string> diff_max_text: "";
     // ── 详情面板·评审报告 ──
     in property <string> d_review_status: "";          // "" / running / done / failed
     in property <string> d_review_progress: "";
@@ -274,6 +290,7 @@ export component MainWindow inherits Window {
     // ── Inbox（GitHub 通知）──
     in property <[NotifRow]> inbox_rows: [];
     in property <bool> inbox_needs_token: false;
+    in property <bool> inbox_loading: false;   // 首次/手动拉取进行中（空态只在非 loading 时显示）
     in-out property <bool> inbox_unread_only: false;
     // 仓库过滤：repos 由 Rust 侧按当前通知去重给出；repo_filter "" = 全部
     in property <[string]> inbox_repos: [];
@@ -285,18 +302,24 @@ export component MainWindow inherits Window {
     in property <bool> inbox_detail_open: false;
     in property <string> nd_title: "";
     in property <string> nd_kind: "";
+    in property <string> nd_kind_label: "";   // kind 的本地化显示文本（kind 本体留给逻辑判断）
     in property <string> nd_state: "";
     in property <bool> nd_added: false;
     in property <bool> nd_loading: false;
     in property <[ConvoEntry]> nd_convo: [];
     in property <[FileChange]> nd_files: [];
-    in property <[DiffFile]> nd_diff_files: [];
+    in property <[DiffRow]> nd_diff_files: [];
+    in property <string> nd_diff_max_text: "";
 
     callback refresh();
     callback sync_now();
     callback open_settings();
     callback filter_changed(string);
     callback header_clicked(string);        // 列表头点击排序（同列再点反向）
+    callback group_toggled(string);         // 组头折叠/展开（传组 key，Rust 侧重建行模型）
+    callback key_move(int);                 // j/k/↑/↓ 移动选中（Rust 侧在可见行序上跳组头）
+    callback key_enter();                   // Enter 打开当前选中（Rust 侧按身份解析）
+    callback clear_selection();             // Esc（详情关着时）：清 Rust 侧选中态
     callback high_score_toggled(bool);      // 高分快筛开关（只看 ≥8.0）
     callback row_activated(int);
     callback row_pin(int);
@@ -321,6 +344,7 @@ export component MainWindow inherits Window {
     callback inbox_diff_toggled(int);
     callback inbox_load_more();         // 「加载更多」：拉下一页通知追加
     callback fetch_inbox();             // 切到 Inbox 分段时拉取通知
+    callback inbox_repo_filter_changed(string);  // Inbox 仓库过滤词变化（过滤在 Rust 侧做）
     callback key_pin();
     callback key_priority(int);
     // 设置页（顺序：server_url, sync_token, github_token, repos, poll_interval, llm_base_url, llm_api_key, llm_model, ocr_path, review_concurrency, astrbot_api_key）
@@ -347,6 +371,14 @@ export component MainWindow inherits Window {
     in-out property <string> s_ocr_path: "";
     in property <bool> onboarding: false;   // 未配置（首启引导）
     in property <bool> gh_token_from_env: false;  // GITHUB_TOKEN 环境变量优先提示
+    // 首启引导「稍后再说」：仅本次会话不再弹（不写配置；状态栏的未配置提示保留）
+    property <bool> onboarding_dismissed: false;
+    // 设置弹窗内联错误行（弹窗发起操作的失败反馈——状态栏被遮罩盖住看不见）；
+    // Rust 侧打开弹窗/操作成功时清空
+    in-out property <string> s_dialog_error: "";
+    // 评审模板异步回填中（打开设置页时置 true，Msg::ReviewPromptLoaded 回填后置 false）；
+    // 期间锁定编辑且保存不回写模板（防旧文本覆盖磁盘新模板）
+    in property <bool> s_prompt_loading: false;
 
     // ── 数据源档案（本地 / 多远程服务器）──
     in property <[string]> profile_names: [];    // 第一个恒为 "local"，然后 "default"、自定义名
@@ -363,6 +395,8 @@ export component MainWindow inherits Window {
     property <bool> editing_local: root.settings_profile == "local";
     // 档案选择行的「+」输入模式（内联输入新档案名）
     property <bool> adding_profile: false;
+    // 删除档案两步确认：非空 = 确认态（值为待删档案名，Timer 3s 超时自动还原）
+    property <string> del_confirm_target: "";
 
     // 顶栏搜索框内容变化（双向绑定）→ 通知 Rust 重建过滤视图
     changed filter_text => { root.filter_changed(root.filter_text); }
@@ -370,6 +404,8 @@ export component MainWindow inherits Window {
     changed view_mode => { if (root.view_mode == 1) { root.fetch_inbox(); } }
     // 档案选择器切换 → 通知 Rust 回填该档案的服务器字段
     changed settings_profile => { root.settings_profile_focus(root.settings_profile); }
+    // Inbox 仓库过滤词变化 → 通知 Rust 重建过滤后的行模型
+    changed inbox_repo_filter => { root.inbox_repo_filter_changed(root.inbox_repo_filter); }
 
     VerticalLayout {
         topbar := TopBar {
@@ -380,6 +416,8 @@ export component MainWindow inherits Window {
             switch_profile(n) => { root.switch_profile(n); }
             high_score_only <=> root.high_score_only;
             high_score_toggled(on) => { root.high_score_toggled(on); }
+            refresh_busy: root.gh_refreshing;
+            sync_busy: root.syncing;
             refresh => { root.refresh(); }
             sync => { root.sync_now(); }
             open_settings => { root.open_settings(); }
@@ -388,6 +426,16 @@ export component MainWindow inherits Window {
         keys := FocusScope {
             vertical-stretch: 1;
             key-pressed(event) => {
+                // 设置弹窗 / 首启引导打开时：快捷键不穿透到背后的列表（列表/Inbox 视图
+                // 也挂了 keys_locked 双重拦截）。reject 放行给弹窗内输入框正常收键；
+                // Esc 优先关弹窗本身（onboarding 打开时 Esc 吞掉不穿透）
+                if (root.settings_open || (root.onboarding && !root.onboarding_dismissed)) {
+                    if (event.text == Key.Escape && root.settings_open) {
+                        root.settings_open = false;
+                        return accept;
+                    }
+                    return reject;
+                }
                 if (event.text == "p") { root.key_pin(); return accept; }
                 if (event.text == "o") { root.key_open(); return accept; }
                 if (event.text == "1") { root.key_priority(1); return accept; }
@@ -413,23 +461,28 @@ export component MainWindow inherits Window {
                 }
                 list := PrListView {
                     horizontal-stretch: 1;
-                    rows: root.rows;
-                    groups: root.groups;
+                    items: root.items;
                     selected_key <=> root.selected_key;
                     sort_col: root.sort_col;
                     sort_asc: root.sort_asc;
+                    // 弹窗/引导打开时锁键盘（Esc/j/k 等不得穿透到列表）
+                    keys_locked: root.settings_open || (root.onboarding && !root.onboarding_dismissed);
                     header_clicked(c) => { root.header_clicked(c); }
+                    group_toggled(k) => { root.group_toggled(k); }
                     row_activated(i) => { root.row_activated(i); }
                     row_pin(i) => { root.row_pin(i); }
                     row_reject(i) => { root.row_reject(i); }
                     row_board(i) => { root.row_board(i); }
                     row_open(i) => { root.row_open(i); }
+                    key_move(d) => { root.key_move(d); }
+                    key_enter() => { root.key_enter(); }
                     dismissed => {
-                        if (root.d_open) { root.panel_close(); } else { self.selected_index = -1; self.selected_key = ""; }
+                        if (root.d_open) { root.panel_close(); } else { self.selected_key = ""; root.clear_selection(); }
                     }
                 }
                 panel := DetailPanel {
                     visible: root.d_open;
+                    panel_width <=> root.panel_width;
                     max_panel_width: root.width * 0.6;
                     title: root.d_title;
                     author: root.d_author;
@@ -446,6 +499,7 @@ export component MainWindow inherits Window {
                     check_runs: root.d_checks;
                     files: root.d_files;
                     diff_files: root.diff_files;
+                    diff_max_text: root.diff_max_text;
                     review_status: root.d_review_status;
                     review_progress: root.d_review_progress;
                     review_has: root.d_review_has;
@@ -480,7 +534,9 @@ export component MainWindow inherits Window {
                     horizontal-stretch: 1;
                     rows: root.inbox_rows;
                     needs_token: root.inbox_needs_token;
+                    loading: root.inbox_loading;
                     detail_open: root.inbox_detail_open;
+                    keys_locked: root.settings_open || (root.onboarding && !root.onboarding_dismissed);
                     unread_only <=> root.inbox_unread_only;
                     repos: root.inbox_repos;
                     repo_filter <=> root.inbox_repo_filter;
@@ -498,12 +554,14 @@ export component MainWindow inherits Window {
                     visible: root.inbox_detail_open;
                     title: root.nd_title;
                     kind: root.nd_kind;
+                    kind_label: root.nd_kind_label;
                     state: root.nd_state;
                     added: root.nd_added;
                     loading: root.nd_loading;
                     convo_entries: root.nd_convo;
                     files: root.nd_files;
                     diff_files: root.nd_diff_files;
+                    diff_max_text: root.nd_diff_max_text;
                     close => { root.inbox_close_detail(); }
                     open_browser => { root.inbox_open_browser(); }
                     add_review => { root.inbox_add_review(inbox.selected_index); }
@@ -516,11 +574,12 @@ export component MainWindow inherits Window {
             sync_text: root.sb_sync;
             quota_text: root.sb_quota;
             total_count: root.sb_total;
+            view_mode: root.view_mode;
         }
     }
 
-    // 首启引导：未配置时盖住主区，引导打开设置
-    if root.onboarding && !root.settings_open: Rectangle {
+    // 首启引导：未配置时盖住主区，引导打开设置；「稍后再说」仅本次会话不再弹
+    if root.onboarding && !root.settings_open && !root.onboarding_dismissed: Rectangle {
         width: 100%;
         height: 100%;
         background: Theme.bg.with-alpha(0.96);
@@ -566,6 +625,11 @@ export component MainWindow inherits Window {
                 HorizontalLayout {
                     Rectangle { horizontal-stretch: 1; }
                     DialogButton {
+                        text: I18n.welcome_later;
+                        button-width: 96px;
+                        clicked => { root.onboarding_dismissed = true; }
+                    }
+                    DialogButton {
                         text: I18n.welcome_open_settings;
                         primary: true;
                         button-width: 120px;
@@ -583,6 +647,17 @@ export component MainWindow inherits Window {
         height: 100%;
         background: #00000066;
         TouchArea {}  // 拦截点击穿透
+
+        // Esc 关弹窗：弹窗内输入框聚焦时按键沿祖先链冒泡——外层 keys FocusScope
+        // 不是弹窗的祖先（收不到），必须在弹窗链上自带一级 FocusScope 接住
+        FocusScope {
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.settings_open = false;
+                    return accept;
+                }
+                reject  // 其余键放行（输入框收文本键；外层 keys 在弹窗打开时整体拒快捷键）
+            }
 
         dialog := Rectangle {
             x: (parent.width - self.width) / 2;
@@ -872,7 +947,8 @@ export component MainWindow inherits Window {
                             }
                         }
 
-                        // 删除当前档案（local 不可删；Rust 侧删除后负责回写 settings_profile / profile_names）
+                        // 删除当前档案（local 不可删；Rust 侧删除后负责回写 settings_profile / profile_names）。
+                        // 两步确认：第一次点进入确认态（3s 超时还原），确认态再点才真正删除
                         if !root.adding_profile && root.settings_profile != "local": Rectangle {
                             width: 30px;
                             height: 30px;
@@ -880,9 +956,21 @@ export component MainWindow inherits Window {
                             background: del-ta.has-hover ? Theme.hover : transparent;
                             animate background { duration: 120ms; }
 
+                            del-confirm-timer := Timer {
+                                interval: 3s;
+                                running: root.del_confirm_target != "";
+                                triggered => { root.del_confirm_target = ""; }
+                            }
                             del-ta := TouchArea {
                                 mouse-cursor: pointer;
-                                clicked => { root.profile_remove(root.settings_profile); }
+                                clicked => {
+                                    if (root.del_confirm_target == root.settings_profile) {
+                                        root.del_confirm_target = "";
+                                        root.profile_remove(root.settings_profile);
+                                    } else {
+                                        root.del_confirm_target = root.settings_profile;
+                                    }
+                                }
                             }
                             Image {
                                 x: (parent.width - 12px) / 2;
@@ -891,9 +979,10 @@ export component MainWindow inherits Window {
                                 height: 12px;
                                 source: @image-url("icons/x.svg");
                                 image-fit: contain;
-                                colorize: del-ta.has-hover ? Theme.bad : Theme.text_dim;
+                                colorize: del-ta.has-hover || root.del_confirm_target != "" ? Theme.bad : Theme.text_dim;
                             }
-                            if del-ta.has-hover: Rectangle {
+                            // 确认态常显提示（不只 hover），防止用户没注意到状态变化
+                            if del-ta.has-hover || root.del_confirm_target != "": Rectangle {
                                 x: (parent.width - self.width) / 2;
                                 y: parent.height + 4px;
                                 width: del-tip.preferred-width + 12px;
@@ -903,9 +992,9 @@ export component MainWindow inherits Window {
                                 border-width: 1px;
                                 border-color: Theme.hairline;
                                 del-tip := Text {
-                                    text: I18n.profile_delete_tooltip;
+                                    text: root.del_confirm_target != "" ? I18n.profile_delete_confirm : I18n.profile_delete_tooltip;
                                     font-size: Theme.fs_xs;
-                                    color: Theme.text;
+                                    color: root.del_confirm_target != "" ? Theme.bad : Theme.text;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
                                 }
@@ -1101,14 +1190,14 @@ export component MainWindow inherits Window {
                     spacing: 14px;
 
                 Field {
-                    label: "API Base URL";
+                    label: I18n.settings_llm_base;
                     FormField {
                         placeholder: "https://api.openai.com/v1";
                         text <=> root.s_llm_base;
                     }
                 }
                 Field {
-                    label: "API Key";
+                    label: I18n.settings_llm_key;
                     FormField {
                         password: true;
                         placeholder: "sk-...";
@@ -1229,10 +1318,19 @@ export component MainWindow inherits Window {
                     FormArea {
                         placeholder: I18n.settings_review_prompt_hint;
                         text <=> root.s_review_prompt;
+                        enabled: !root.s_prompt_loading;
                     }
                 }
                 }
                 }
+                }
+
+                // 弹窗内联错误行（弹窗发起的操作失败时由 Rust 回填；状态栏被遮罩盖住看不见）
+                if root.s_dialog_error != "": Text {
+                    text: root.s_dialog_error;
+                    color: Theme.bad;
+                    font-size: Theme.fs_sm;
+                    wrap: word-wrap;
                 }
 
                 // 底部按钮：右对齐，保存为主色实心
@@ -1248,12 +1346,17 @@ export component MainWindow inherits Window {
                         text: I18n.save;
                         primary: true;
                         clicked => {
+                            // 先清内联错误；Rust 保存失败会同步回填 s_dialog_error —— 此时不关弹窗
+                            root.s_dialog_error = "";
                             root.save_settings(root.s_server, root.s_sync_token, root.s_gh_token, root.s_repos, "" + root.s_poll, root.s_llm_base, root.s_llm_key, root.s_llm_model, root.s_ocr_path, "" + root.s_review_concurrency, root.s_ak);
-                            root.settings_open = false;
+                            if (root.s_dialog_error == "") {
+                                root.settings_open = false;
+                            }
                         }
                     }
                 }
             }
+        }
         }
     }
 }

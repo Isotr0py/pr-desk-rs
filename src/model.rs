@@ -1,5 +1,5 @@
-//! 行模型装配：serde_json 行 → PrListRow + PrGroup（Slint 生成类型，经 build_sections 分组），
-//! 以及相对时间（age_text/updated_text）、次级活动行（activity_text）、
+//! 行模型装配：serde_json 行 → 摊平的 PrListItem（Slint 生成类型，经 build_sections 分组、
+//! 组头与数据行混排），以及相对时间（age_text/updated_text）、次级活动行（activity_text）、
 //! 作者组织（author_orgs）与过滤（filter_rows/row_matches）的派生函数。
 //!
 //! 集成注意：PrListRow（pr_list.slint）若新增 `activity_text` 字段，
@@ -10,7 +10,7 @@ use pr_desk_rs::i18n::trf;
 use pr_desk_rs::build_sections;
 
 use crate::avatars;
-use crate::{PrGroup, PrListRow};
+use crate::{PrListItem, PrListRow};
 
 /// 解析 updated_at：兼容 db::now() 的本地 "YYYY-MM-DDTHH:MM:SS"、带小数秒、
 /// 空格分隔以及 RFC3339（带时区）格式。
@@ -135,49 +135,54 @@ pub fn author_orgs(r: &serde_json::Value) -> Vec<String> {
     }
 }
 
-/// 组标题 → PrGroup.key（中/英文标题都识别；build_sections 的标题随 lang 变化）。
-fn group_key(title: &str) -> &'static str {
-    if title.contains("Pinned") {
-        "pinned"
-    } else if title.contains("看板") || title.contains("Board") {
-        "board"
-    } else if title.contains("待评审") || title.contains("To Review") {
-        "needs-review"
-    } else if title.contains("已评审") || title.contains("Reviewed") {
-        "reviewed"
-    } else if title.contains("不采纳") || title.contains("Rejected") {
-        "rejected"
-    } else {
-        "closed"
-    }
-}
-
-/// 行数据 → (扁平 PrListRow 模型, PrGroup 切片元数据)。
-/// PrListView 的 rows 不含组头，groups 以 start/count 切片；selected_index 直接是 rows 下标。
+/// 行数据 → 摊平的 PrListItem 模型（组头与数据行混排，供单个 ListView 虚拟化渲染）。
+/// 折叠组的行不进模型（数据仍在 App 侧，展开时重建模型即可）。
+/// 返回 (items, keys, visible_keys)：
+/// - keys：全部行在展示序下的身份（repo, number），行委托的 ridx 指向它；
+/// - visible_keys：可见行（折叠组除外）的展示序身份，j/k 键盘导航以此为准。
 /// lang："zh"/"en"（组标题与 activity_text 的文案语言）。
-/// sort_col/sort_asc：组内排序，见 build_sections。
-pub fn build_models(
+/// sort_col/sort_asc：组内排序，见 build_sections。collapsed：折叠的组 key 集合。
+pub fn build_items(
     rows: &[serde_json::Value],
     lang: &str,
     sort_col: &str,
     sort_asc: bool,
-) -> (Vec<PrListRow>, Vec<PrGroup>) {
-    let mut out_rows: Vec<PrListRow> = Vec::new();
-    let mut groups: Vec<PrGroup> = Vec::new();
-    for (title, idxs) in build_sections(rows, lang, sort_col, sort_asc) {
-        let start = out_rows.len() as i32;
-        for i in &idxs {
-            out_rows.push(to_row(&rows[*i], lang));
-        }
-        groups.push(PrGroup {
-            key: group_key(&title).into(),
-            name: title.into(),
-            start,
-            count: idxs.len() as i32,
-            collapsed: false,
+    collapsed: &std::collections::HashSet<String>,
+) -> (Vec<PrListItem>, Vec<(String, i64)>, Vec<(String, i64)>) {
+    let mut items: Vec<PrListItem> = Vec::new();
+    let mut keys: Vec<(String, i64)> = Vec::new();
+    let mut visible: Vec<(String, i64)> = Vec::new();
+    for section in build_sections(rows, lang, sort_col, sort_asc) {
+        let is_collapsed = collapsed.contains(section.key);
+        items.push(PrListItem {
+            is_header: true,
+            ridx: 0,
+            gkey: section.key.into(),
+            gname: section.title.clone().into(),
+            gcount: section.idxs.len() as i32,
+            gcollapsed: is_collapsed,
+            ..Default::default()
         });
+        for i in &section.idxs {
+            let r = &rows[*i];
+            let id = (
+                r["repo"].as_str().unwrap_or("").to_string(),
+                r["number"].as_i64().unwrap_or(0),
+            );
+            let ridx = keys.len() as i32;
+            keys.push(id.clone());
+            if !is_collapsed {
+                visible.push(id);
+                items.push(PrListItem {
+                    is_header: false,
+                    ridx,
+                    row: to_row(r, lang),
+                    ..Default::default()
+                });
+            }
+        }
     }
-    (out_rows, groups)
+    (items, keys, visible)
 }
 
 pub fn to_row(r: &serde_json::Value, lang: &str) -> PrListRow {

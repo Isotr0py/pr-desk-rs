@@ -94,6 +94,19 @@ fn rel_short(ts: NaiveDateTime) -> String {
     }
 }
 
+/// 最小 percent-encode（不引 url 依赖）：保留 RFC3986 unreserved 字符，其余按字节 %XX。
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct SyncClient {
     client: reqwest::Client,
@@ -108,7 +121,11 @@ impl SyncClient {
         // 数据源取当前生效档案（多数据源）：local 档 / 空 token → enabled() = false
         let p = cfg.active_sync();
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .user_agent("pr-desk-rs")
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             base: p
                 .as_ref()
                 .map(|p| format!("{}{}", p.server_url.trim_end_matches('/'), API_PATH))
@@ -148,7 +165,7 @@ impl SyncClient {
         let path = format!("{API_PATH}/sync_pull");
         let mut url = format!("{}/sync_pull", self.base);
         if let Some(s) = &since {
-            url = format!("{url}?since={s}");
+            url = format!("{url}?since={}", url_encode(s));
         }
         let mut req = self.with_api_key(self.client.get(&url));
         for (k, v) in self.sign_headers("GET", &path, b"") {
@@ -199,6 +216,42 @@ async fn ensure_success(resp: reqwest::Response) -> Result<reqwest::Response> {
     anyhow::bail!("sync HTTP {status}：{detail}");
 }
 
+/// 服务器时间戳归一化为 UTC RFC3339（带 Z 后缀），与 db::now() / GitHub meta 同格式，
+/// 保证列表排序（字符串字典序）可靠：
+/// - 已带时区的 RFC3339 → 转 UTC；
+/// - 裸 "YYYY-MM-DDTHH:MM:SS[.f]" / 空格分隔 → 按 UTC 处理补 Z
+///   （假设：插件服务器与本机时区一致或本就是 UTC；旧插件写本地时间无时区，偏差由该假设承担）；
+/// - 其它形态原样返回。
+pub fn normalize_server_ts(s: &str) -> String {
+    let s = s.trim();
+    if s.is_empty() {
+        return s.to_string();
+    }
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return dt
+            .with_timezone(&chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    }
+    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f"] {
+        if let Ok(t) = NaiveDateTime::parse_from_str(s, fmt) {
+            return t
+                .and_utc()
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        }
+    }
+    s.to_string()
+}
+
+/// 就地归一化一行 JSON 里的指定时间戳字段。
+fn normalize_row_ts(row: &mut Value, fields: &[&str]) {
+    for f in fields {
+        if let Some(s) = row[*f].as_str() {
+            let n = normalize_server_ts(s);
+            row[*f] = Value::from(n);
+        }
+    }
+}
+
 /// 应用 pull 响应到本地。返回 (prs, reviews, todos) 行数。
 /// prs 行注入 source="server"：标记为服务器插件数据库跟踪的 PR（列表按来源过滤）。
 pub fn apply_pull(db: &Db, body: &Value) -> Result<(usize, usize, usize)> {
@@ -208,14 +261,21 @@ pub fn apply_pull(db: &Db, body: &Value) -> Result<(usize, usize, usize)> {
     for p in &prs {
         let mut p = p.clone();
         p["source"] = Value::from("server");
+        normalize_row_ts(&mut p, &["updated_at", "extras_updated_at"]);
         db.upsert_pr(&p)?;
     }
     for r in &reviews {
-        db.upsert_review(r)?;
+        let mut r = r.clone();
+        normalize_row_ts(&mut r, &["reviewed_at"]);
+        db.upsert_review(&r)?;
     }
     for t in &todos {
-        db.upsert_todo(t)?;
+        let mut t = t.clone();
+        normalize_row_ts(&mut t, &["created_at", "done_at", "updated_at"]);
+        db.upsert_todo(&t)?;
     }
+    // server_time 原样存游标：它会在下次 sync_pull 时作为 since 原样回传服务器，
+    // 服务器按自家格式比较，本地不做归一化以免破坏服务器侧语义。
     if let Some(ts) = body["server_time"].as_str() {
         db.set_cursor(ts)?;
     }
@@ -418,5 +478,49 @@ mod tests {
         assert!(text.starts_with("已同步 0m 前"), "got: {text}");
         let text_en = last_sync_text(&state, "en").unwrap();
         assert!(text_en.starts_with("Synced 0m ago"), "got: {text_en}");
+    }
+
+    #[test]
+    fn url_encode_percent_encodes_non_unreserved() {
+        assert_eq!(url_encode("2026-01-01T00:00:00Z"), "2026-01-01T00%3A00%3A00Z");
+        assert_eq!(url_encode("abc-DEF_019.~"), "abc-DEF_019.~");
+        assert_eq!(url_encode(""), "");
+        assert_eq!(url_encode("a b+c"), "a%20b%2Bc");
+    }
+
+    #[test]
+    fn normalize_server_ts_variants() {
+        // 裸本地时间 → 按 UTC 补 Z
+        assert_eq!(normalize_server_ts("2026-01-01T12:00:00"), "2026-01-01T12:00:00Z");
+        // 带小数秒 / 空格分隔
+        assert_eq!(normalize_server_ts("2026-01-01T12:00:00.123"), "2026-01-01T12:00:00Z");
+        assert_eq!(normalize_server_ts("2026-01-01 12:00:00"), "2026-01-01T12:00:00Z");
+        // 带时区 → 转 UTC
+        assert_eq!(normalize_server_ts("2026-01-01T20:00:00+08:00"), "2026-01-01T12:00:00Z");
+        // 已是 UTC Z → 原样（秒精度）
+        assert_eq!(normalize_server_ts("2026-01-01T12:00:00Z"), "2026-01-01T12:00:00Z");
+        // 垃圾输入原样返回
+        assert_eq!(normalize_server_ts("not-a-time"), "not-a-time");
+        assert_eq!(normalize_server_ts(""), "");
+    }
+
+    #[test]
+    fn apply_pull_normalizes_timestamps() {
+        let db = Db::open_memory().unwrap();
+        let body = serde_json::json!({
+            "prs": [{"repo": "o/r", "number": 1, "title": "t", "status": "pending",
+                     "updated_at": "2026-01-01T12:00:00"}],
+            "reviews": [{"repo": "o/r", "number": 1, "head_sha": "s", "score": 8.5,
+                         "reviewed_at": "2026-01-01T20:00:00+08:00"}],
+            "todos": [{"id": 1, "text": "x", "updated_at": "2026-01-01 12:00:00"}],
+            "server_time": "2026-01-01T12:00:00",
+        });
+        apply_pull(&db, &body).unwrap();
+        let rows = db.list_prs(&[]).unwrap();
+        assert_eq!(rows[0]["updated_at"], "2026-01-01T12:00:00Z");
+        let r = db.get_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(r["reviewed_at"], "2026-01-01T12:00:00Z");
+        // 游标原样保存（回传服务器用，不做归一化）
+        assert_eq!(db.get_cursor().unwrap().as_deref(), Some("2026-01-01T12:00:00"));
     }
 }

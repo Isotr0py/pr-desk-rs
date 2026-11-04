@@ -52,8 +52,10 @@ pub struct Db {
     pub conn: Connection,
 }
 
+/// UTC RFC3339（"YYYY-MM-DDTHH:MM:SSZ"）：与 GitHub meta 落库格式一致，
+/// 字符串字典序即时间序（list_prs / 最新评审靠 ORDER BY 文本排序）。
 pub fn now() -> String {
-    chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string()
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 impl Db {
@@ -69,6 +71,8 @@ impl Db {
     }
 
     fn migrate(conn: Connection) -> Result<Db> {
+        // 外部进程（插件等）持锁时写等 3s，避免直接 SQLITE_BUSY
+        conn.pragma_update(None, "busy_timeout", 3000)?;
         let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version < 1 {
             conn.execute_batch(SCHEMA_V1)?;
@@ -211,6 +215,9 @@ impl Db {
         }
         let dimensions = json_or_str(&r["dimensions"]);
         let flagged_files = json_or_str(&r["flagged_files"]);
+        // comments 用 COALESCE 保留旧值：重复评审时 OCR 失败（comments=NULL）不清空已有行级评论。
+        // 其余字段有意整体覆盖——新一轮评审结果取代旧结果；score 等为空只发生在
+        // 「diff 为空不调 LLM」的合法路径（reviewer.rs run_review），不是数据丢失。
         self.conn.execute(
             "INSERT INTO reviews(repo, number, head_sha, score, dimensions, summary,
                 flagged_files, reviewed_at, high_value, oversized, files_changed,
@@ -222,7 +229,8 @@ impl Db {
                 reviewed_at=excluded.reviewed_at, high_value=excluded.high_value,
                 oversized=excluded.oversized, files_changed=excluded.files_changed,
                 additions=excluded.additions, deletions=excluded.deletions,
-                size_label=excluded.size_label, pushed=0, comments=excluded.comments",
+                size_label=excluded.size_label, pushed=0,
+                comments=COALESCE(excluded.comments, reviews.comments)",
             params![
                 r["repo"].as_str().unwrap_or(""),
                 r["number"].as_i64().unwrap_or(0),
@@ -418,6 +426,41 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// 批量存在性检查（替代 Inbox 的 N+1 逐行 pr_exists）：返回已存在的 (repo, number) 集合。
+    /// 每批 400 键（800 个绑定参数，低于 SQLite 默认 999 上限）。
+    pub fn existing_pr_keys(
+        &self,
+        keys: &[(String, i64)],
+    ) -> rusqlite::Result<std::collections::HashSet<(String, i64)>> {
+        let mut out = std::collections::HashSet::new();
+        for chunk in keys.chunks(400) {
+            let ph = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("(?{},?{})", 2 * i + 1, 2 * i + 2))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT repo, number FROM prs WHERE (repo, number) IN ({ph})");
+            let mut stmt = self.conn.prepare(&sql)?;
+            let flat: Vec<&dyn rusqlite::ToSql> = chunk
+                .iter()
+                .flat_map(|(r, n)| {
+                    [
+                        r as &dyn rusqlite::ToSql,
+                        n as &dyn rusqlite::ToSql,
+                    ]
+                })
+                .collect();
+            let rows = stmt
+                .query_map(&*flat, |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
+
     /// 全部 PR 的 (repo, number)（本地模式手动刷新时逐个刷新 GitHub 状态用）。
     pub fn list_pr_keys(&self) -> Result<Vec<(String, i64)>> {
         let mut stmt = self.conn.prepare("SELECT repo, number FROM prs")?;
@@ -497,30 +540,36 @@ impl Db {
 
     // ── 本地改动（立即生效 + 入队 outbox 待推送） ──
     pub fn local_pr_update(&self, repo: &str, number: i64, field: &str, value: &serde_json::Value) -> Result<()> {
-        // 立即应用到本地
+        // 未知字段在动库之前拒绝（不参与事务）
+        if !matches!(field, "status" | "tags" | "priority" | "on_board" | "pinned") {
+            anyhow::bail!("unknown field {field}");
+        }
+        // UPDATE prs + INSERT outbox 必须同生共死（unchecked_transaction：
+        // &self 语义，本函数内无嵌套事务/无并发借用同一连接的其他事务）
+        let tx = self.conn.unchecked_transaction()?;
         match field {
             "status" => {
-                self.conn.execute(
+                tx.execute(
                     "UPDATE prs SET status=?1, updated_at=?2 WHERE repo=?3 AND number=?4",
                     params![value.as_str().unwrap_or("pending"), now(), repo, number],
                 )?;
             }
             "tags" => {
-                self.conn.execute(
+                tx.execute(
                     "UPDATE prs SET tags=?1, updated_at=?2 WHERE repo=?3 AND number=?4",
                     params![serde_json::to_string(value)?, now(), repo, number],
                 )?;
             }
-            "priority" | "on_board" | "pinned" => {
-                self.conn.execute(
+            _ => {
+                // priority | on_board | pinned（上面已校验白名单，format! 无注入面）
+                tx.execute(
                     &format!("UPDATE prs SET {field}=?1, updated_at=?2 WHERE repo=?3 AND number=?4"),
                     params![value.as_i64().unwrap_or(0), now(), repo, number],
                 )?;
             }
-            _ => anyhow::bail!("unknown field {field}"),
         }
         // 入队待推送
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO outbox(kind, payload, created_at) VALUES ('pr', ?1, ?2)",
             params![
                 serde_json::to_string(&serde_json::json!({
@@ -530,9 +579,12 @@ impl Db {
                 now(),
             ],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
+    /// 读取 outbox 全部待推送条目（id 升序）。损坏的 payload（非合法 JSON）
+    /// 跳过并告警——unwrap_or_default 的 Null 会推送 repo=""/number=0 的垃圾。
     pub fn outbox_drain(&self) -> Result<Vec<(i64, serde_json::Value)>> {
         let mut stmt = self
             .conn
@@ -544,7 +596,13 @@ impl Db {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows
             .into_iter()
-            .map(|(id, p)| (id, serde_json::from_str(&p).unwrap_or_default()))
+            .filter_map(|(id, p)| match serde_json::from_str(&p) {
+                Ok(v) => Some((id, v)),
+                Err(e) => {
+                    tracing::warn!("outbox #{id} payload 损坏，跳过推送：{e}");
+                    None
+                }
+            })
             .collect())
     }
 
@@ -884,8 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn fill_pr_meta_only_fills_empty_fields() {
-        let db = Db::open_memory().unwrap();
+    fn fill_pr_meta_only_fills_empty_fields() {        let db = Db::open_memory().unwrap();
         // Inbox 入库的残缺行：author/head_sha 为空
         db.upsert_pr(&serde_json::json!({
             "repo": "o/r", "number": 1, "title": "t", "author": "", "url": "u1",
@@ -912,5 +969,78 @@ mod tests {
         assert_eq!(sha, "sha1");
         // 不存在的行：false
         assert!(!db.fill_pr_meta_if_empty("o/r", 99, "x", "u", "s", "t").unwrap());
+    }
+
+    #[test]
+    fn now_is_utc_rfc3339() {
+        // 与 GitHub meta 的 RFC3339（带 Z）同一格式，字典序可直接当时间序
+        let ts = now();
+        assert!(ts.ends_with('Z'), "ts={ts}");
+        assert!(chrono::DateTime::parse_from_rfc3339(&ts).is_ok());
+    }
+
+    #[test]
+    fn upsert_review_keeps_old_comments_when_new_is_null() {
+        // 重复评审时 OCR 失败 → 新行 comments=NULL → 不清空已有行级评论
+        let db = Db::open_memory().unwrap();
+        db.upsert_review(&review_json("o/r", 1, "s1", 8.5)).unwrap();
+        let mut bare = review_json("o/r", 1, "s1", 9.0);
+        bare.as_object_mut().unwrap().remove("comments");
+        db.upsert_review(&bare).unwrap();
+        let r = db.get_review("o/r", 1).unwrap().unwrap();
+        let comments = r["comments"].as_array().expect("旧 comments 不应被 NULL 覆盖");
+        assert_eq!(comments[0]["path"], "src/a.rs");
+        assert_eq!(r["score"], 9.0); // 其余字段正常被新评审覆盖
+    }
+
+    #[test]
+    fn local_pr_update_rolls_back_on_outbox_failure() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_pr(&pr_json("o/r", 1, "t")).unwrap();
+        // 拆掉 outbox 表让 INSERT 失败 → 事务整体回滚，prs.status 不变
+        db.conn.execute_batch("DROP TABLE outbox").unwrap();
+        assert!(db.local_pr_update("o/r", 1, "status", &serde_json::json!("reviewed")).is_err());
+        let rows = db.list_prs(&[]).unwrap();
+        assert_eq!(rows[0]["status"], "pending");
+        // 未知字段：动库前拒绝
+        assert!(db.local_pr_update("o/r", 1, "bogus", &serde_json::json!(1)).is_err());
+        assert_eq!(db.list_prs(&[]).unwrap()[0]["status"], "pending");
+    }
+
+    #[test]
+    fn outbox_drain_skips_corrupt_payload() {
+        let db = Db::open_memory().unwrap();
+        db.local_pr_update("o/r", 1, "pinned", &serde_json::json!(1)).unwrap();
+        db.conn
+            .execute("INSERT INTO outbox(kind, payload, created_at) VALUES ('pr', '{bad', 't')", [])
+            .unwrap();
+        db.local_pr_update("o/r", 2, "priority", &serde_json::json!(2)).unwrap();
+        let items = db.outbox_drain().unwrap();
+        // 损坏条目跳过，好条目保留（含顺序）
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].1["pinned"], 1);
+        assert_eq!(items[1].1["priority"], 2);
+    }
+
+    #[test]
+    fn existing_pr_keys_batch() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_pr(&pr_json("o/r", 1, "t")).unwrap();
+        db.upsert_pr(&pr_json("o/r", 3, "t")).unwrap();
+        let keys = vec![
+            ("o/r".to_string(), 1),
+            ("o/r".to_string(), 2),
+            ("o/r".to_string(), 3),
+            ("x/y".to_string(), 1),
+        ];
+        let got = db.existing_pr_keys(&keys).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&("o/r".to_string(), 1)));
+        assert!(got.contains(&("o/r".to_string(), 3)));
+        // 空输入 / 超出一批的分块
+        assert!(db.existing_pr_keys(&[]).unwrap().is_empty());
+        let many: Vec<(String, i64)> = (0..900).map(|i| ("o/r".to_string(), i)).collect();
+        let got = db.existing_pr_keys(&many).unwrap();
+        assert_eq!(got.len(), 2);
     }
 }

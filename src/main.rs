@@ -6,7 +6,8 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use slint::{Model as _, ModelRc, SharedString, VecModel};
+use slint::{ModelRc, SharedString, VecModel};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 slint::include_modules!();
 
@@ -21,6 +22,19 @@ use pr_desk_rs::{diffview, github, ocr, reviewer, sync};
 
 // ── 后台命令 / 回送消息 ──
 
+/// 互斥锁加锁：锁中毒时恢复内层值继续用，不让一次锁内 panic 拖死整个 app。
+/// 恢复语义安全的前提：锁内路径已把可避免的 unwrap/panic 改成 graceful 降级
+///（模型行/远程数据不是不变量），中毒不等于数据损坏。
+trait LockRecover<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for Mutex<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        Mutex::lock(self).unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 enum Cmd {
     RefreshGithub,
     Sync,
@@ -31,6 +45,11 @@ enum Cmd {
     MarkAllNotifsRead,          // PUT /notifications 全部已读，完成后重新拉取
     AddNotifReview { repo: String, number: i64, title: String, url: String },  // Inbox「+ 预评审」入库
     FetchNotifDetail { repo: String, number: i64, kind: String },  // Inbox 预览面板：拉会话/Files/Diff
+    // 详情抽屉装配（原 UI 线程 open_drawer）：DB 读写 + diff 解析全在 worker，
+    // UI 线程只把 Msg::Panel/DiffParsed 装盒。refetch=false 用于 ReopenPanel（防 FetchPrMeta 死循环）
+    OpenDrawer { repo: String, number: i64, refetch: bool },
+    CopyReview,        // 详情面板「复制评审」：get_review SQL + 剪贴板写入都在 worker
+    LoadReviewPrompt,  // 设置页打开时重读 exe 旁 review_prompt.md（可能被外部编辑过）
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
     SwitchProfile(String),  // 切换数据源档案（"local"/"default"/自定义名）：换库 + 重建同步客户端
     RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
@@ -61,13 +80,13 @@ fn config_status(cfg: &Config) -> String {
 
 /// 当前界面语言（"zh"/"en"），从配置读取。
 fn lang_of(app: &Arc<Mutex<App>>) -> String {
-    app.lock().unwrap().cfg.language.clone()
+    app.lock_recover().cfg.language.clone()
 }
 
 enum Msg {
     Status(String),
     // Slint 模型类型（SharedString/Image 基于 Rc）不能跨线程：
-    // 行数据以 serde_json（Send）过界，PrListRow/PrGroup 在 UI 线程装配。
+    // 行数据以 serde_json（Send）过界，PrListItem（摊平模型）在 UI 线程装配。
     Rows(Vec<serde_json::Value>),
     // 搜索框过滤词变化（UI 回调 send_msg 进来，apply_msg 里重建行模型）
     FilterChanged(String),
@@ -99,17 +118,31 @@ enum Msg {
     ReviewDone { repo: String, number: i64 },
     // AI 评审失败：状态栏报错；若面板正打开该 PR，置 failed
     ReviewFailed { repo: String, number: i64, err: String },
-    // 同理：diff 以原始文本过界，DiffFile 模型在 UI 线程的 apply_msg 里构建
-    DiffRaw(String),
+    // diff 的结构化解析结果（worker 解析完成，大 PR 几万行不占 UI 线程；UI 只装盒 VecModel）。
+    // 携带身份：面板已切走则不上屏（diff 缓存已在 worker 落库，下次打开能用）
+    DiffParsed { repo: String, number: i64, files: Vec<DiffFileData> },
     // Inbox 通知行：serde_json 过界，NotifRow 模型在 UI 线程装配
     InboxRows(Vec<serde_json::Value>),
-    // Inbox 预览面板：JSON 字符串过界，ConvoEntry/FileChange/DiffFile 在 UI 线程装配
-    //（标题/类型在点击时已由 on_inbox_activated 设置，这里只回送内容数据）
+    // Inbox 预览面板：JSON 字符串过界，ConvoEntry/FileChange 在 UI 线程装配；diff 已解析
+    //（标题/类型在点击时已由 on_inbox_activated 设置，这里只回送内容数据）。
+    // 携带身份：apply 前与 app.inbox_detail 比对，快速连点两条通知时旧结果丢弃
     NotifDetail {
+        repo: String,
+        number: i64,
         convo_json: String,
         files_json: String,
-        diff: String,
+        diff_files: Vec<DiffFileData>,
     },
+    // Inbox 预览拉取失败：身份匹配时关加载态并给状态栏错误（面板不再永远停在「加载中」）
+    NotifDetailFailed { repo: String, number: i64, err: String },
+    // GitHub 刷新完成：停顶栏转圈 + 复位连点去重标志 + 状态栏结果（open PR 数）
+    RefreshDone(usize),
+    // 同步流程结束（无论成败/跳过）：停顶栏转圈 + 复位去重标志；结果文案由 do_sync 自己的 Status 负责
+    SyncFinished,
+    // 设置弹窗内发起操作的进度/失败：写到弹窗内联错误行（状态栏被弹窗遮罩盖住看不见）
+    DialogMsg(String),
+    // Inbox 首次加载态（发 fetch_inbox 置 true；回 rows / 失败 / 无 token 时置 false）
+    InboxLoading(bool),
     // 设置页模型列表拉取结果（id 已排序去重）
     ModelsLoaded(Vec<String>),
     // 数据源档案回填：名单 + 当前选中（启动/切换/增删档案后）
@@ -119,6 +152,8 @@ enum Msg {
     SettingsProfile(String),
     // 行元数据补齐完成：若面板正开着该 PR，重新装载面板（worker 只在成功补齐后发）
     ReopenPanel,
+    // 设置页评审模板重读结果（worker 读盘，避免 UI 线程阻塞 IO）
+    ReviewPromptLoaded(String),
     // 实时拉取完成：面板正开着该 PR 时覆盖对应区块（None = 该区块本次未拉，不动）；
     // 列表行已随 worker 落库后的 reload_rows 刷新
     PanelLive {
@@ -140,6 +175,19 @@ struct OcrCommentRow {
     location: String,   // 如 "src/foo.rs:42-58"
     content: String,
 }
+
+/// diff 文件的结构化解析结果（纯 Rust 数据可跨线程；Slint DiffRow 在 UI 线程装盒）。
+/// lines 的 i32 是真实行号（0 = 无行号，见 diffview::numbered_lines）。
+/// Clone：UI 侧 diff 模型只装「摊平后的可见行」，折叠状态翻转要由缓存重建。
+#[derive(Clone)]
+struct DiffFileData {
+    path: String,
+    lines: Vec<(diffview::LineKind, String, i32)>,
+    expanded: bool,
+}
+
+/// 单文件渲染行数上限（超出出截断提示行；替代旧 DiffView 的 max_render_lines 属性）
+const DIFF_MAX_RENDER_LINES: usize = 2000;
 
 /// 详情面板「评审」tab 的展示数据（从 db.get_review 的 JSON 格式化而来）。
 struct ReviewProps {
@@ -257,7 +305,8 @@ fn build_review_markdown(repo: &str, number: i64, rv: &serde_json::Value, lang: 
 }
 
 /// OCR 评论位置格式化：path:start-end；start=end 只一个行号；都是 0 只留 path。
-fn ocr_comment_location(c: &serde_json::Value) -> String {    let path = c["path"].as_str().unwrap_or("");
+fn ocr_comment_location(c: &serde_json::Value) -> String {
+    let path = c["path"].as_str().unwrap_or("");
     let start = c["start_line"].as_i64().unwrap_or(0);
     let end = c["end_line"].as_i64().unwrap_or(0);
     if start == 0 && end == 0 {
@@ -371,7 +420,7 @@ fn review_props(review: Option<&serde_json::Value>, lang: &str) -> ReviewProps {
 /// 详情面板当前是否正打开指定 PR（评审进度/结果只刷对应面板）。
 /// 选中态存身份（repo, number），刷新后行序变化/行被移除都不影响匹配。
 fn panel_matches(app: &Arc<Mutex<App>>, repo: &str, number: i64) -> bool {
-    let a = app.lock().unwrap();
+    let a = app.lock_recover();
     a.selected
         .as_ref()
         .map(|(r, n)| r == repo && *n == number)
@@ -432,7 +481,7 @@ struct SlotGuard {
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        self.slots.lock().unwrap().release(&self.repo, self.number);
+        self.slots.lock_recover().release(&self.repo, self.number);
     }
 }
 
@@ -441,19 +490,28 @@ struct App {
     db: Db,
     rows: Vec<serde_json::Value>,           // 扁平数据行（按身份查找，见 find_row）
     view: Vec<usize>,                       // 过滤后可见行 → rows 下标（UI 下标经它换算）
-    view_keys: Vec<(String, i64)>,          // UI 实际展示顺序（build_models 分组后）→ 身份；点击映射以此为准
+    view_keys: Vec<(String, i64)>,          // UI 行序列（build_items 分组后，含折叠组的行）→ 身份；点击映射以此为准
+    view_visible: Vec<(String, i64)>,       // 可见行（折叠组的行除外）的展示序 → 身份；j/k 键盘导航以此为准
+    collapsed: HashSet<String>,             // 折叠的组 key（置顶/看板/…）；跨 rebuild 保留
     filter: String,                         // 当前过滤词（空 = 全量）
     sort_col: String,                       // 组内排序列（默认 "upd" = 更新时间降序，即 SQL 输入序）
     sort_asc: bool,                         // 排序方向（false = 降序）
     min_score: f32,                         // 高分快筛阈值（0 = 关；8 = 只看 ≥8.0）
     selected: Option<(String, i64)>,        // 选中 PR 身份（repo, number）；刷新后行序变化也不漂移
     status_msg: String,                     // 状态栏临时消息（最近一条 Status）
-    inbox: Vec<serde_json::Value>,          // 最近一批通知行（inbox_activated 按下标取 thread id）
+    status_gen: u64,                        // 状态栏临时消息序号（自动清除定时器的竞态守卫）
+    gh_refreshing: bool,                    // GitHub 刷新在途（顶栏转圈 + 连点去重）
+    sync_inflight: bool,                    // 同步在途（顶栏转圈 + 连点/定时去重）
+    inbox: Vec<serde_json::Value>,          // 最近一批通知行（未过滤；inbox_repos 下拉由此去重）
+    inbox_view: Vec<serde_json::Value>,     // 仓库过滤后的通知行（inbox_activated 按下标取 thread id）
+    inbox_filter: String,                   // Inbox 仓库过滤（"" = 全部）
     inbox_all: bool,                        // 通知拉取范围：true = 含已读（&all=true），false = 只看未读
     inbox_page: u32,                        // 已加载到的页码（每页 50 条；「加载更多」追加下一页）
     inbox_has_more: bool,                   // 是否还有下一页可加载
     inbox_loading_more: bool,               // 「加载更多」进行中（防重入）
     inbox_detail: Option<(String, i64, String, String)>,  // 预览面板当前行（repo, number, kind, url）
+    diff_data: Vec<DiffFileData>,           // 详情面板当前 diff 缓存（折叠翻转重建模型用）
+    nd_diff_data: Vec<DiffFileData>,        // Inbox 预览面板当前 diff 缓存（同上）
     total: usize,                           // 全部行数（状态栏「共 N 个 PR」）
     rate_limit: Arc<Mutex<Option<u64>>>,    // GitHub X-RateLimit-Remaining 共享状态
     last_sync: sync::SharedLastSync,        // 最近同步成功时间
@@ -462,23 +520,50 @@ struct App {
 
 /// 状态栏组合逻辑已内联进 update_status_bar（三段：同步/配额/总数）。
 fn update_status_bar(ui: &MainWindow, app: &Arc<Mutex<App>>) {
-    let a = app.lock().unwrap();
+    let a = app.lock_recover();
     let lang = a.cfg.language.as_str();
     // 状态栏三段：同步/临时消息 · API 配额 · PR 总数
     let sync_text = if !a.status_msg.is_empty() {
         a.status_msg.clone()
+    } else if a.cfg.is_unconfigured() {
+        // 未配置：临时消息 6s 自动清除后仍要留住「点右上角设置」的引导提示
+        tr(lang, "cfg_unconfigured").into()
     } else if a.cfg.active_sync().is_none() {
         // 未配置同步：明确提示本地模式，不留空白
         tr(lang, "sb_local_mode").into()
     } else {
         sync::last_sync_text(&a.last_sync, lang).unwrap_or_else(|| tr(lang, "sb_wait_sync").into())
     };
-    let quota = a.rate_limit.lock().unwrap()
+    let quota = a.rate_limit.lock_recover()
         .map(|n| trf(lang, "sb_api_quota", &[&n.to_string()]))
         .unwrap_or_default();
     ui.set_sb_sync(sync_text.into());
     ui.set_sb_quota(quota.into());
     ui.set_sb_total(a.total as i32);
+}
+
+/// 状态栏临时消息：覆盖显示，6 秒后自动清除（恢复「已同步 X 前」等常态文本）。
+/// 竞态守卫：每条消息递增 status_gen，旧定时器到期时序号不匹配则不清（防旧定时器清新消息）。
+fn set_transient_status(ui: &MainWindow, app: &Arc<Mutex<App>>, s: String) {
+    let seq = {
+        let mut a = app.lock_recover();
+        a.status_msg = s;
+        a.status_gen = a.status_gen.wrapping_add(1);
+        a.status_gen
+    };
+    update_status_bar(ui, app);
+    let weak = ui.as_weak();
+    let app = app.clone();
+    slint::Timer::single_shot(std::time::Duration::from_secs(6), move || {
+        let Some(ui) = weak.upgrade() else { return };
+        let mut a = app.lock_recover();
+        if a.status_gen != seq {
+            return; // 期间来了新消息：本定时器已失效
+        }
+        a.status_msg.clear();
+        drop(a);
+        update_status_bar(&ui, &app);
+    });
 }
 
 /// 当前过滤词下可见行的原始下标。
@@ -507,7 +592,7 @@ fn find_row(a: &App, repo: &str, number: i64) -> Option<usize> {
 
 /// UI 传来的可见行下标 → 该行 PR 的身份（repo, number）。
 fn resolve_view(app: &Arc<Mutex<App>>, view_idx: usize) -> Option<(String, i64)> {
-    let a = app.lock().unwrap();
+    let a = app.lock_recover();
     // 注意：必须用「实际发给 UI 的分组后顺序」（view_keys）——build_models 会按
     // Pinned/看板/待评审/已评审重排，与 a.view（数据库排序）不是同一个序。
     a.view_keys.get(view_idx).cloned()
@@ -554,7 +639,10 @@ fn main() -> anyhow::Result<()> {
     let cfg = Config { active_profile: active_name, ..cfg };
 
     let ui = MainWindow::new()?;
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+    // Cmd 走 tokio unbounded：worker 在 async 里 recv().await（std 阻塞 recv 会永久
+    // 占住 tokio 一个工作线程）；发送方是同步的 UI 回调，unbounded 的 send 天然兼容。
+    // Msg 保持 std mpsc：接收方是专用的转发线程（blocking recv 合理），发送是非阻塞的。
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
     let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
 
     let app = Arc::new(Mutex::new(App {
@@ -563,18 +651,27 @@ fn main() -> anyhow::Result<()> {
         rows: Vec::new(),
         view: Vec::new(),
         view_keys: Vec::new(),
+        view_visible: Vec::new(),
+        collapsed: HashSet::new(),
         filter: String::new(),
         sort_col: "upd".into(),
         sort_asc: false,
         min_score: 0.0,
         selected: None,
         status_msg: config_status(&cfg),
+        status_gen: 0,
+        gh_refreshing: false,
+        sync_inflight: false,
         inbox: Vec::new(),
+        inbox_view: Vec::new(),
+        inbox_filter: String::new(),
         inbox_all: true,
         inbox_page: 1,
         inbox_has_more: false,
         inbox_loading_more: false,
         inbox_detail: None,
+        diff_data: Vec::new(),
+        nd_diff_data: Vec::new(),
         total: 0,
         rate_limit: Arc::new(Mutex::new(None)),
         last_sync: sync::shared_last_sync(),
@@ -619,12 +716,63 @@ fn main() -> anyhow::Result<()> {
     )));
     ui.set_active_profile(cfg.active_profile.clone().into());
 
+    // 字体按平台赋值（UI 侧只认 MainWindow.ui_font / Theme.mono_font，不写死字体名）：
+    // Windows 雅黑 UI + Consolas；macOS PingFang SC + Menlo；
+    // Linux 用 Noto CJK + Noto Sans Mono（没装就走 fontconfig 系统兜底，比 CJK 随机兜底可控）
+    #[cfg(target_os = "windows")]
+    let (ui_font, mono_font) = ("Microsoft YaHei UI", "Consolas");
+    #[cfg(target_os = "macos")]
+    let (ui_font, mono_font) = ("PingFang SC", "Menlo");
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let (ui_font, mono_font) = ("Noto Sans CJK SC", "Noto Sans Mono");
+    ui.set_ui_font(ui_font.into());
+    ui.set_mono_font(mono_font.into());
+
+    // 窗口/面板几何记忆：配置里有记录才应用（首启不覆盖默认值；小于最小值视为垃圾忽略）
+    if let (Some(w), Some(h)) = (cfg.window_width, cfg.window_height) {
+        if w >= 900.0 && h >= 480.0 {
+            ui.window().set_size(slint::LogicalSize::new(w as f32, h as f32));
+        }
+    }
+    if let Some(w) = cfg.panel_width {
+        if w >= 320.0 {
+            ui.set_panel_width(w as f32);
+        }
+    }
+    // 退出时把当前窗口尺寸和面板宽度写回 config.toml（原子写在 Config::save 里）
+    {
+        let app = app.clone();
+        let cfg_path = cfg_path.clone();
+        let weak = ui.as_weak();
+        ui.window().on_close_requested(move || {
+            if let Some(ui) = weak.upgrade() {
+                let scale = ui.window().scale_factor() as f64;
+                let size = ui.window().size();
+                let (w, h) = (size.width as f64 / scale, size.height as f64 / scale);
+                let pw = ui.get_panel_width() as f64;
+                let mut a = app.lock_recover();
+                // 小于最小值的尺寸不写（防御垃圾值；首启未配置时也不添键）
+                if w >= 900.0 && h >= 480.0 {
+                    a.cfg.window_width = Some(w);
+                    a.cfg.window_height = Some(h);
+                }
+                if pw >= 320.0 {
+                    a.cfg.panel_width = Some(pw);
+                }
+                if let Err(e) = a.cfg.save(&cfg_path) {
+                    tracing::warn!("窗口尺寸写入 config.toml 失败: {e}");
+                }
+            }
+            slint::CloseRequestResponse::HideWindow
+        });
+    }
+
     // 主题切换：即时持久化到 config.toml
     {
         let app = app.clone();
         let cfg_path = cfg_path.clone();
         ui.on_theme_toggled(move |dark| {
-            let mut a = app.lock().unwrap();
+            let mut a = app.lock_recover();
             a.cfg.theme = if dark { "dark".into() } else { "light".into() };
             if let Err(e) = a.cfg.save(&cfg_path) {
                 tracing::warn!("主题写入 config.toml 失败: {e}");
@@ -639,7 +787,7 @@ fn main() -> anyhow::Result<()> {
         ui.on_language_changed(move |lang| {
             let lang = if lang.as_str() == "en" { "en" } else { "zh" }.to_string();
             {
-                let mut a = app.lock().unwrap();
+                let mut a = app.lock_recover();
                 if a.cfg.language == lang {
                     return; // 启动 set_language 的同值回调：不落盘不重建
                 }
@@ -659,7 +807,7 @@ fn main() -> anyhow::Result<()> {
         let cfg_path = cfg_path.clone();
         ui.on_font_scale_changed(move |s| {
             let snapped = if s < 0.95 { 0.9 } else if s > 1.07 { 1.15 } else { 1.0 };
-            let mut a = app.lock().unwrap();
+            let mut a = app.lock_recover();
             if (a.cfg.font_scale - snapped).abs() < 0.001 {
                 return; // 启动 set_font_scale 的同值回调：不落盘
             }
@@ -687,8 +835,16 @@ fn main() -> anyhow::Result<()> {
         let cmd_tx = cmd_tx.clone();
         let app2 = app.clone();
         std::thread::spawn(move || loop {
-            let interval = app2.lock().unwrap().cfg.poll_interval_min.max(1);
+            let interval = app2.lock_recover().cfg.poll_interval_min.max(1);
             std::thread::sleep(std::time::Duration::from_secs(interval * 60));
+            // 在途去重：上一轮还没跑完就跳过本轮（不排队堆叠全量同步）
+            {
+                let mut a = app2.lock_recover();
+                if a.sync_inflight {
+                    continue;
+                }
+                a.sync_inflight = true;
+            }
             if cmd_tx.send(Cmd::Sync).is_err() {
                 break;
             }
@@ -706,11 +862,14 @@ fn main() -> anyhow::Result<()> {
                     let weak = weak.clone();
                     let app = app.clone();
                     let cmd_tx = cmd_tx.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
+                    if let Err(e) = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = weak.upgrade() {
                             apply_msg(&ui, &app, &cmd_tx, msg);
                         }
-                    });
+                    }) {
+                        // 事件循环已退出（或正在退出）：消息丢失至少要可查
+                        tracing::warn!("消息回投 UI 事件循环失败，消息丢失: {e}");
+                    }
                 }
                 Err(_) => break,
             }
@@ -720,19 +879,50 @@ fn main() -> anyhow::Result<()> {
     // ── UI 回调 ──
     {
         let cmd_tx = cmd_tx.clone();
+        let app = app.clone();
+        let ui2 = ui.as_weak();
         ui.on_refresh(move || {
+            // 连点去重：一轮刷新在途时忽略后续点击（避免排队跑 N 轮全量拉取）
+            {
+                let mut a = app.lock_recover();
+                if a.gh_refreshing {
+                    return;
+                }
+                a.gh_refreshing = true;
+            }
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_gh_refreshing(true); // 顶栏转圈（进行中反馈）
+            }
             let _ = cmd_tx.send(Cmd::RefreshGithub);
         });
     }
     {
         let cmd_tx = cmd_tx.clone();
+        let app = app.clone();
+        let ui2 = ui.as_weak();
         ui.on_sync_now(move || {
+            // 连点去重：同 on_refresh
+            {
+                let mut a = app.lock_recover();
+                if a.sync_inflight {
+                    return;
+                }
+                a.sync_inflight = true;
+            }
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_syncing(true); // 顶栏转圈（进行中反馈）
+            }
             let _ = cmd_tx.send(Cmd::Sync);
         });
     }
     {
         let cmd_tx = cmd_tx.clone();
+        let ui2 = ui.as_weak();
         ui.on_fetch_inbox(move || {
+            // 首次加载态：rows 回送前 UI 显示「加载中…」而非误导空态
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_inbox_loading(true);
+            }
             let _ = cmd_tx.send(Cmd::FetchInbox);
         });
     }
@@ -757,21 +947,25 @@ fn main() -> anyhow::Result<()> {
         // 「只看未读」开关：状态存 App（worker 拉取时读取），切完立即重拉；分页重置回第一页
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
+        let ui2 = ui.as_weak();
         ui.on_inbox_filter_toggled(move |unread_only| {
-            let mut a = app.lock().unwrap();
+            let mut a = app.lock_recover();
             a.inbox_all = !unread_only;
             a.inbox_page = 1;
             a.inbox_has_more = false;
             drop(a);
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_inbox_loading(true);
+            }
             let _ = cmd_tx.send(Cmd::FetchInbox);
         });
     }
     {
-        // 「+ 预评审」：按 UI 下标取 repo/number/title 交给 worker 入库
+        // 「+ 预评审」：按 UI 下标取 repo/number/title 交给 worker 入库（下标对过滤后的视图）
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         ui.on_inbox_add_review(move |i| {
-            let row = app.lock().unwrap().inbox.get(i as usize).cloned();
+            let row = app.lock_recover().inbox_view.get(i as usize).cloned();
             if let Some(n) = row {
                 let repo = n["repo"].as_str().unwrap_or("").to_string();
                 let title = n["title"].as_str().unwrap_or("").to_string();
@@ -787,11 +981,27 @@ fn main() -> anyhow::Result<()> {
         ui.on_filter_changed(|q| send_msg(Msg::FilterChanged(q.to_string())));
     }
     {
+        // Inbox 仓库过滤：过滤在 Rust 侧做（模型预过滤后交给 ListView 虚拟化渲染）
+        let app = app.clone();
+        let ui2 = ui.as_weak();
+        ui.on_inbox_repo_filter_changed(move |f| {
+            let rows = {
+                let mut a = app.lock_recover();
+                a.inbox_filter = f.to_string();
+                a.inbox_view = inbox_filtered(&a);
+                build_inbox_rows(&a, &a.inbox_view)
+            };
+            if let Some(ui) = ui2.upgrade() {
+                ui.set_inbox_rows(ModelRc::new(VecModel::from(rows)));
+            }
+        });
+    }
+    {
         // 列表头点击排序（Excel 式）：同列再点反向；新列按该列的默认方向
         //（数值/时间列先降序——最新/最大在前；文本列先升序）
         let app = app.clone();
         ui.on_header_clicked(move |col| {
-            let mut a = app.lock().unwrap();
+            let mut a = app.lock_recover();
             if a.sort_col == col.as_str() {
                 a.sort_asc = !a.sort_asc;
             } else {
@@ -806,17 +1016,82 @@ fn main() -> anyhow::Result<()> {
         // 高分快筛开关（只看评分 ≥8.0 的 PR）
         let app = app.clone();
         ui.on_high_score_toggled(move |on| {
-            app.lock().unwrap().min_score = if on { 8.0 } else { 0.0 };
+            app.lock_recover().min_score = if on { 8.0 } else { 0.0 };
             send_msg(Msg::ViewPrefsChanged);
+        });
+    }
+    {
+        // 组头折叠/展开：状态存 App.collapsed（跨刷新保留），翻转后直接重建行模型
+        let app = app.clone();
+        let ui2 = ui.as_weak();
+        ui.on_group_toggled(move |key| {
+            {
+                let mut a = app.lock_recover();
+                if !a.collapsed.remove(key.as_str()) {
+                    a.collapsed.insert(key.to_string());
+                }
+            }
+            if let Some(ui) = ui2.upgrade() {
+                rebuild_rows_ui(&ui, &app);
+            }
+        });
+    }
+    {
+        // j/k 键盘导航：在「可见行」展示序上移动（折叠组的行跳过），选中态按身份落地
+        let app = app.clone();
+        let ui2 = ui.as_weak();
+        ui.on_key_move(move |delta| {
+            let sel_key = {
+                let mut a = app.lock_recover();
+                if a.view_visible.is_empty() {
+                    return;
+                }
+                let n = a.view_visible.len();
+                let pos = a
+                    .selected
+                    .as_ref()
+                    .and_then(|s| a.view_visible.iter().position(|k| k == s));
+                let npos = match pos {
+                    None => {
+                        if delta > 0 { 0 } else { n - 1 }
+                    }
+                    Some(p) => (p as i64 + delta as i64).clamp(0, n as i64 - 1) as usize,
+                };
+                a.selected = Some(a.view_visible[npos].clone());
+                a.selected.as_ref().map(|(r, num)| format!("{r}#{num}"))
+            };
+            if let (Some(ui), Some(k)) = (ui2.upgrade(), sel_key) {
+                ui.set_selected_key(k.into());
+            }
+        });
+    }
+    {
+        // Enter：打开当前选中 PR 的详情（身份以 App.selected 为准，与点击路径同一出口）
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        ui.on_key_enter(move || {
+            let sel = app.lock_recover().selected.clone();
+            if let Some((repo, number)) = sel {
+                let _ = cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: true });
+            }
+        });
+    }
+    {
+        // Esc（详情关着时）：取消选中（UI 高亮与 App.selected 一起清）
+        let app = app.clone();
+        ui.on_clear_selection(move || {
+            app.lock_recover().selected = None;
         });
     }
     {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
-        // UI 传视图下标，先经 view 换算为该行的身份（repo, number）
+        // UI 传视图下标，先经 view 换算为该行的身份（repo, number）；
+        // 选中态立即落地（后续 Panel/DiffParsed 的身份守卫以此为准），装配交给 worker
         ui.on_row_activated(move |i| {
             if let Some((repo, number)) = resolve_view(&app, i as usize) {
-                open_drawer(&app, &cmd_tx, repo, number, true);
+                app.lock_recover().selected = Some((repo.clone(), number));
+                let _ = cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: true });
             }
         });
     }
@@ -849,7 +1124,7 @@ fn main() -> anyhow::Result<()> {
                 3 => PART_FILES,
                 _ => return, // 评审/Diff 用本地数据
             };
-            let sel = app.lock().unwrap().selected.clone();
+            let sel = app.lock_recover().selected.clone();
             if let Some((repo, number)) = sel {
                 let _ = cmd_tx.send(Cmd::FetchPrLive { repo, number, parts });
             }
@@ -860,7 +1135,7 @@ fn main() -> anyhow::Result<()> {
         ui.on_row_reject(move |i| {
             let Some((repo, number)) = resolve_view(&app, i as usize) else { return };
             let cur = {
-                let a = app.lock().unwrap();
+                let a = app.lock_recover();
                 find_row(&a, &repo, number)
                     .and_then(|idx| a.rows[idx]["status"].as_str().map(|s| s.to_string()))
                     .unwrap_or_else(|| "pending".into())
@@ -873,7 +1148,7 @@ fn main() -> anyhow::Result<()> {
         // 详情面板：关闭（Esc 语义的第一支在 app.slint 里，这里同时清选中态）
         let app = app.clone();
         ui.on_panel_close(move || {
-            app.lock().unwrap().selected = None;
+            app.lock_recover().selected = None;
             send_msg(Msg::ClosePanel);
         });
     }
@@ -881,7 +1156,7 @@ fn main() -> anyhow::Result<()> {
         // 面板看板按钮：切换当前选中 PR 的 on_board
         let app = app.clone();
         ui.on_panel_board(move || {
-            let sel = app.lock().unwrap().selected.clone();
+            let sel = app.lock_recover().selected.clone();
             if let Some((repo, number)) = sel {
                 let v = toggle_of(&app, &repo, number, "on_board");
                 local_update(&app, &repo, number, "on_board", v);
@@ -891,7 +1166,7 @@ fn main() -> anyhow::Result<()> {
     {
         let app = app.clone();
         ui.on_panel_set_priority(move |p| {
-            let sel = app.lock().unwrap().selected.clone();
+            let sel = app.lock_recover().selected.clone();
             if let Some((repo, number)) = sel {
                 local_update(&app, &repo, number, "priority", p as i64);
             }
@@ -900,7 +1175,7 @@ fn main() -> anyhow::Result<()> {
     {
         let app = app.clone();
         ui.on_panel_toggle_pin(move || {
-            let sel = app.lock().unwrap().selected.clone();
+            let sel = app.lock_recover().selected.clone();
             if let Some((repo, number)) = sel {
                 let v = toggle_of(&app, &repo, number, "pinned");
                 local_update(&app, &repo, number, "pinned", v);
@@ -912,60 +1187,45 @@ fn main() -> anyhow::Result<()> {
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         ui.on_action_run_review(move || {
-            let target = app.lock().unwrap().selected.clone();
+            let target = app.lock_recover().selected.clone();
             if let Some((repo, number)) = target {
                 let _ = cmd_tx.send(Cmd::RunReview { repo, number });
             }
         });
     }
     {
-        // 详情面板「复制评审」：把整份报告渲染成 Markdown 进剪贴板（可直接粘到 GitHub 评论）
-        let app = app.clone();
+        // 详情面板「复制评审」：get_review SQL + 剪贴板写入都挪进 worker
+        //（Windows 剪贴板打开可能重试阻塞，不占 UI 线程）；结果经状态栏消息反馈
+        let cmd_tx = cmd_tx.clone();
         ui.on_action_copy_review(move || {
-            let lang = lang_of(&app);
-            let (sel, review) = {
-                let a = app.lock().unwrap();
-                let sel = a.selected.clone();
-                let rv = sel
-                    .as_ref()
-                    .and_then(|(repo, number)| a.db.get_review(repo, *number).ok().flatten());
-                (sel, rv)
-            };
-            match (sel, review) {
-                (Some((repo, number)), Some(rv)) => {
-                    let md = build_review_markdown(&repo, number, &rv, &lang);
-                    match arboard::Clipboard::new().and_then(|mut c| c.set_text(&md)) {
-                        Ok(()) => send_msg(Msg::Status(tr(&lang, "review_copied").into())),
-                        Err(e) => send_msg(Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()]))),
-                    }
-                }
-                _ => {}
-            }
+            let _ = cmd_tx.send(Cmd::CopyReview);
         });
     }
     {
-        // DiffView 要求整体替换模型（原地改会导致其计数器重复累加）；
-        // 折叠状态以 UI 侧当前模型为准（Slint 数据不过线程边界）。
+        // DiffView 折叠/展开：行内容在折叠时不在 UI 模型里，翻转 Rust 缓存后整体重建
         let weak = ui.as_weak();
+        let app = app.clone();
         ui.on_diff_file_toggled(move |i| {
             let Some(ui) = weak.upgrade() else { return };
-            let old = ui.get_diff_files();
-            let mut files: Vec<DiffFile> = (0..old.row_count())
-                .filter_map(|gi| old.row_data(gi))
-                .collect();
-            if let Some(f) = files.get_mut(i as usize) {
-                f.expanded = !f.expanded;
-            }
-            ui.set_diff_files(ModelRc::new(VecModel::from(files)));
+            let (rows, max_line) = {
+                let mut a = app.lock_recover();
+                if let Some(f) = a.diff_data.get_mut(i as usize) {
+                    f.expanded = !f.expanded;
+                }
+                (diff_row_models(&a.diff_data), diff_max_line(&a.diff_data))
+            };
+            ui.set_diff_files(ModelRc::new(VecModel::from(rows)));
+            ui.set_diff_max_text(max_line);
         });
     }
     {
         // Inbox 行点击 / Enter：选中 + 展开右侧预览面板（发 FetchNotifDetail），并标记已读
+        //（下标对仓库过滤后的视图 inbox_view）
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
         let weak = ui.as_weak();
         ui.on_inbox_activated(move |i| {
-            let row = app.lock().unwrap().inbox.get(i as usize).cloned();
+            let row = app.lock_recover().inbox_view.get(i as usize).cloned();
             let Some(n) = row else { return };
             let repo = n["repo"].as_str().unwrap_or("").to_string();
             let kind = n["kind"].as_str().unwrap_or("").to_string();
@@ -973,15 +1233,20 @@ fn main() -> anyhow::Result<()> {
             let url = n["url"].as_str().unwrap_or("").to_string();
             let state = n["state"].as_str().unwrap_or("").to_string();
             let Some(number) = notif_url_number(&url) else { return };
-            app.lock().unwrap().inbox_detail = Some((repo.clone(), number, kind.clone(), url));
-            // 立即开面板并进加载态（数据由 worker 回送）
+            app.lock_recover().inbox_detail = Some((repo.clone(), number, kind.clone(), url));
+            // 立即开面板并进加载态（数据由 worker 回送）；
+            // 查询失败是错误不是「不存在」：保守按已加入处理（防重复插入）并告警
             let added = kind == "PullRequest" && {
-                let a = app.lock().unwrap();
-                a.db.pr_exists(&repo, number).unwrap_or(false)
+                let a = app.lock_recover();
+                a.db.pr_exists(&repo, number).unwrap_or_else(|e| {
+                    tracing::warn!("查询 PR 是否已加入失败 {repo} #{number}: {e}");
+                    true
+                })
             };
             if let Some(ui) = weak.upgrade() {
                 ui.set_nd_title(title.into());
                 ui.set_nd_kind(kind.clone().into());
+                ui.set_nd_kind_label(notif_kind_label(&lang_of(&app), &kind).into());
                 ui.set_nd_state(state.into());
                 ui.set_nd_added(added);
                 ui.set_nd_loading(true);
@@ -997,7 +1262,7 @@ fn main() -> anyhow::Result<()> {
         // 预览面板「在浏览器打开」/ Enter（面板已开时）
         let app = app.clone();
         ui.on_inbox_open_browser(move || {
-            let detail = app.lock().unwrap().inbox_detail.clone();
+            let detail = app.lock_recover().inbox_detail.clone();
             if let Some((_, _, _, url)) = detail {
                 if !url.is_empty() {
                     if let Err(e) = open::that(&url) {
@@ -1021,7 +1286,7 @@ fn main() -> anyhow::Result<()> {
         // 快捷键 o：浏览器打开当前选中 PR
         let app = app.clone();
         ui.on_key_open(move || {
-            let sel = app.lock().unwrap().selected.clone();
+            let sel = app.lock_recover().selected.clone();
             if let Some((repo, number)) = sel {
                 open_pr_url(&app, &repo, &number);
             }
@@ -1032,31 +1297,33 @@ fn main() -> anyhow::Result<()> {
         let app = app.clone();
         let weak = ui.as_weak();
         ui.on_inbox_close_detail(move || {
-            app.lock().unwrap().inbox_detail = None;
+            app.lock_recover().inbox_detail = None;
             if let Some(ui) = weak.upgrade() {
                 ui.set_inbox_detail_open(false);
             }
         });
     }
     {
-        // 预览面板 Diff 标签页：整体替换模型（同主面板 on_diff_file_toggled 的注释）
+        // 预览面板 Diff 标签页：同主面板（翻转 Rust 缓存后整体重建）
         let weak = ui.as_weak();
+        let app = app.clone();
         ui.on_inbox_diff_toggled(move |i| {
             let Some(ui) = weak.upgrade() else { return };
-            let old = ui.get_nd_diff_files();
-            let mut files: Vec<DiffFile> = (0..old.row_count())
-                .filter_map(|gi| old.row_data(gi))
-                .collect();
-            if let Some(f) = files.get_mut(i as usize) {
-                f.expanded = !f.expanded;
-            }
-            ui.set_nd_diff_files(ModelRc::new(VecModel::from(files)));
+            let (rows, max_line) = {
+                let mut a = app.lock_recover();
+                if let Some(f) = a.nd_diff_data.get_mut(i as usize) {
+                    f.expanded = !f.expanded;
+                }
+                (diff_row_models(&a.nd_diff_data), diff_max_line(&a.nd_diff_data))
+            };
+            ui.set_nd_diff_files(ModelRc::new(VecModel::from(rows)));
+            ui.set_nd_diff_max_text(max_line);
         });
     }
     {
         let app = app.clone();
         ui.on_key_pin(move || {
-            let sel = app.lock().unwrap().selected.clone();
+            let sel = app.lock_recover().selected.clone();
             if let Some((repo, number)) = sel {
                 let v = toggle_of(&app, &repo, number, "pinned");
                 local_update(&app, &repo, number, "pinned", v);
@@ -1066,7 +1333,7 @@ fn main() -> anyhow::Result<()> {
     {
         let app = app.clone();
         ui.on_key_priority(move |p| {
-            let sel = app.lock().unwrap().selected.clone();
+            let sel = app.lock_recover().selected.clone();
             if let Some((repo, number)) = sel {
                 local_update(&app, &repo, number, "priority", p as i64);
             }
@@ -1076,10 +1343,11 @@ fn main() -> anyhow::Result<()> {
     {
         let app = app.clone();
         let ui2 = ui.as_weak();
+        let cmd_tx = cmd_tx.clone();
         ui.on_open_settings(move || {
             if let Some(ui) = ui2.upgrade() {
                 // 每次打开回填当前配置（LLM 字段可能在别处被改动）
-                let cfg = app.lock().unwrap().cfg.clone();
+                let cfg = app.lock_recover().cfg.clone();
                 // 首启兜底：default 档未配置且无自定义档案时，编辑目标停在 local 会把
                 // 服务器三字段锁死、永远填不了服务器地址 → 自动切到 default 编辑
                 if ui.get_settings_profile() == "local"
@@ -1098,12 +1366,15 @@ fn main() -> anyhow::Result<()> {
                 ui.set_s_llm_model(cfg.llm_model.into());
                 ui.set_s_ocr_path(cfg.ocr_path.into());
                 ui.set_s_review_concurrency(cfg.review_concurrency as i32);
-                // 自定义评审模板每次打开重读（可能被外部编辑过）
-                ui.set_s_review_prompt(
-                    std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
-                        .unwrap_or_default()
-                        .into(),
-                );
+                // 弹窗内联错误行清空（上一次失败的残留不带进本次会话）
+                ui.set_s_dialog_error("".into());
+                // 自定义评审模板每次打开重读（可能被外部编辑过）：
+                // 读盘挪进 worker（UI 线程不做阻塞 IO），回来经 Msg::ReviewPromptLoaded 回填。
+                // 回填竞态防护：先清空 + loading——回填完成前编辑框锁定、保存不回写模板，
+                // 防止用户瞬间点保存用旧文本覆盖磁盘新模板
+                ui.set_s_review_prompt("".into());
+                ui.set_s_prompt_loading(true);
+                let _ = cmd_tx.send(Cmd::LoadReviewPrompt);
                 ui.set_settings_open(true);
             }
         });
@@ -1114,7 +1385,7 @@ fn main() -> anyhow::Result<()> {
         let ui2 = ui.as_weak();
         ui.on_settings_profile_focus(move |name| {
             let (server, token, ak) = {
-                let a = app.lock().unwrap();
+                let a = app.lock_recover();
                 profile_fields(&a.cfg, &name)
             };
             if let Some(ui) = ui2.upgrade() {
@@ -1154,7 +1425,7 @@ fn main() -> anyhow::Result<()> {
                 .map(|u| u.get_settings_profile().to_string())
                 .unwrap_or_else(|| "default".into());
             let (theme, language, mut profiles, active_profile, mut server_url, mut sync_token, mut ak_s) = {
-                let a = app.lock().unwrap();
+                let a = app.lock_recover();
                 // 主题/语言/数据源档案/活跃档不在设置页表单里，保留当前值
                 (
                     a.cfg.theme.clone(),
@@ -1201,7 +1472,7 @@ fn main() -> anyhow::Result<()> {
                 theme,
                 language,
                 // 字号档位是即时生效项（不走设置表单），保存设置时保留现值
-                font_scale: app.lock().unwrap().cfg.font_scale,
+                font_scale: app.lock_recover().cfg.font_scale,
                 llm_base_url: llm_base.trim().to_string(),
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),
@@ -1209,27 +1480,42 @@ fn main() -> anyhow::Result<()> {
                 review_concurrency,
                 profiles,
                 active_profile,
+                // 窗口/面板几何记忆不在设置表单里，保留现值
+                window_width: app.lock_recover().cfg.window_width,
+                window_height: app.lock_recover().cfg.window_height,
+                panel_width: app.lock_recover().cfg.panel_width,
             };
             if let Err(e) = new_cfg.save(&cfg_path) {
                 let lang = lang_of(&app);
-                send_msg(Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])));
+                let msg = trf(&lang, "cfg_save_failed", &[&e.to_string()]);
+                // 弹窗内联错误（同步回填：Slint 侧保存成功后才会关弹窗，靠它决定不关闭）；
+                // 状态栏仍发一份（弹窗若被 Esc 关掉后还能看到）
+                if let Some(ui) = ui2.upgrade() {
+                    ui.set_s_dialog_error(msg.clone().into());
+                }
+                send_msg(Msg::Status(msg));
                 return;
             }
             {
-                let mut a = app.lock().unwrap();
+                let mut a = app.lock_recover();
                 a.cfg = new_cfg.clone();
                 a.status_msg = config_status(&new_cfg);
+                // 配置状态是常驻消息：推序号让在途的自动清除定时器失效
+                a.status_gen = a.status_gen.wrapping_add(1);
                 // 并发上限即时生效（不影响已占用的槽位）
-                a.review_slots.lock().unwrap().set_capacity(review_concurrency as usize);
+                a.review_slots.lock_recover().set_capacity(review_concurrency as usize);
             }
             if let Some(ui) = ui2.upgrade() {
-                // 自定义评审模板落盘（exe 旁 review_prompt.md；清空 = 删除文件回到默认模板）
-                let prompt = ui.get_s_review_prompt().to_string();
-                let prompt_path = pr_desk_rs::exe_dir().join("review_prompt.md");
-                if prompt.trim().is_empty() {
-                    let _ = std::fs::remove_file(&prompt_path);
-                } else if let Err(e) = std::fs::write(&prompt_path, prompt) {
-                    tracing::warn!("写入 review_prompt.md 失败: {e}");
+                // 自定义评审模板落盘（exe 旁 review_prompt.md；清空 = 删除文件回到默认模板）。
+                // 回填竞态：异步回填未完成时跳过（此时表单里是空占位，写盘会覆盖磁盘新模板）
+                if !ui.get_s_prompt_loading() {
+                    let prompt = ui.get_s_review_prompt().to_string();
+                    let prompt_path = pr_desk_rs::exe_dir().join("review_prompt.md");
+                    if prompt.trim().is_empty() {
+                        let _ = std::fs::remove_file(&prompt_path);
+                    } else if let Err(e) = std::fs::write(&prompt_path, prompt) {
+                        tracing::warn!("写入 review_prompt.md 失败: {e}");
+                    }
                 }
                 ui.set_onboarding(new_cfg.is_unconfigured());
                 ui.set_inbox_needs_token(new_cfg.token().is_none());
@@ -1260,23 +1546,30 @@ fn main() -> anyhow::Result<()> {
         ui.on_profile_add(move |name| {
             let name = name.trim().to_string();
             let lang = lang_of(&app);
+            // 弹窗内发起的操作：失败除了状态栏还要写弹窗内联错误行（状态栏被遮罩盖住）
+            let dialog_err = |msg: String| {
+                send_msg(Msg::Status(msg.clone()));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_s_dialog_error(msg.into());
+                }
+            };
             // Slint 侧在回调返回后才写 settings_profile = 新名；回调内拿不到之后的值，
             // 这里的 prev 仍是旧值，失败时经 Msg::SettingsProfile 延迟纠正回去
             let prev = weak.upgrade().map(|u| u.get_settings_profile().to_string());
             let names = {
-                let mut a = app.lock().unwrap();
+                let mut a = app.lock_recover();
                 if !pr_desk_rs::config::valid_profile_name(&name) {
-                    send_msg(Msg::Status(tr(&lang, "profile_invalid_name").into()));
+                    dialog_err(tr(&lang, "profile_invalid_name").into());
                     if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
                     return;
                 }
                 if pr_desk_rs::config::is_reserved_profile_name(&name) {
-                    send_msg(Msg::Status(trf(&lang, "profile_reserved", &[&name])));
+                    dialog_err(trf(&lang, "profile_reserved", &[&name]));
                     if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
                     return;
                 }
                 if a.cfg.profiles.iter().any(|p| p.name == name) {
-                    send_msg(Msg::Status(trf(&lang, "profile_exists", &[&name])));
+                    dialog_err(trf(&lang, "profile_exists", &[&name]));
                     if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
                     return;
                 }
@@ -1294,7 +1587,7 @@ fn main() -> anyhow::Result<()> {
                 });
                 if let Err(e) = a.cfg.save(&cfg_path) {
                     a.cfg.profiles.retain(|p| p.name != name);
-                    send_msg(Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])));
+                    dialog_err(trf(&lang, "cfg_save_failed", &[&e.to_string()]));
                     if let Some(p) = prev { send_msg(Msg::SettingsProfile(p)); }
                     return;
                 }
@@ -1304,6 +1597,7 @@ fn main() -> anyhow::Result<()> {
                 ui.set_profile_names(ModelRc::new(VecModel::from(
                     names.iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
                 )));
+                ui.set_s_dialog_error("".into()); // 成功：清掉之前的内联错误
             }
             send_msg(Msg::Status(trf(&lang, "profile_added", &[&name])));
         });
@@ -1316,20 +1610,27 @@ fn main() -> anyhow::Result<()> {
         ui.on_profile_remove(move |name| {
             let name = name.trim().to_string();
             let lang = lang_of(&app);
+            // 弹窗内发起的操作：失败除了状态栏还要写弹窗内联错误行（状态栏被遮罩盖住）
+            let dialog_err = |msg: String| {
+                send_msg(Msg::Status(msg.clone()));
+                if let Some(ui) = weak.upgrade() {
+                    ui.set_s_dialog_error(msg.into());
+                }
+            };
             let names = {
-                let mut a = app.lock().unwrap();
+                let mut a = app.lock_recover();
                 let removable = !pr_desk_rs::config::is_reserved_profile_name(&name)
                     && a.cfg.profiles.iter().any(|p| p.name == name)
                     && a.cfg.active_profile != name;
                 if !removable {
-                    send_msg(Msg::Status(tr(&lang, "profile_remove_denied").into()));
+                    dialog_err(tr(&lang, "profile_remove_denied").into());
                     return;
                 }
                 let backup = a.cfg.profiles.clone();
                 a.cfg.profiles.retain(|p| p.name != name);
                 if let Err(e) = a.cfg.save(&cfg_path) {
                     a.cfg.profiles = backup;
-                    send_msg(Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])));
+                    dialog_err(trf(&lang, "cfg_save_failed", &[&e.to_string()]));
                     return;
                 }
                 a.cfg.profile_names()
@@ -1340,6 +1641,7 @@ fn main() -> anyhow::Result<()> {
                 )));
                 // 被删的正是设置页在编辑的档案：编辑目标回到 local（changed 触发三字段回填）
                 ui.set_settings_profile("local".into());
+                ui.set_s_dialog_error("".into()); // 成功：清掉之前的内联错误
             }
             send_msg(Msg::Status(trf(&lang, "profile_removed", &[&name])));
         });
@@ -1357,13 +1659,19 @@ fn main() -> anyhow::Result<()> {
 static MSG_TX: std::sync::OnceLock<mpsc::Sender<Msg>> = std::sync::OnceLock::new();
 
 fn send_msg(msg: Msg) {
-    if let Some(tx) = MSG_TX.get() {
-        let _ = tx.send(msg);
+    match MSG_TX.get() {
+        Some(tx) => {
+            if tx.send(msg).is_err() {
+                tracing::warn!("消息通道已关闭（事件循环退出中），消息丢失");
+            }
+        }
+        // 启动竞态窗口（worker 尚未注册 MSG_TX）：消息丢失至少要可查
+        None => tracing::warn!("MSG_TX 未注册，消息丢失（启动竞态窗口）"),
     }
 }
 
 fn toggle_of(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str) -> i64 {
-    let a = app.lock().unwrap();
+    let a = app.lock_recover();
     find_row(&a, repo, number)
         .and_then(|idx| a.rows[idx][field].as_i64())
         .map(|v| if v == 0 { 1 } else { 0 })
@@ -1373,48 +1681,78 @@ fn toggle_of(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str) -> i64
 /// 本地字段更新（pinned/on_board/priority/status）：按身份直改 DB，
 /// 不依赖行是否还在当前列表里（面板开着但行被刷新滤掉时操作仍生效）。
 fn local_update<V: Into<serde_json::Value>>(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str, value: V) {
-    let a = app.lock().unwrap();
+    let a = app.lock_recover();
     if a.db.local_pr_update(repo, number, field, &value.into()).is_ok() {
         let lang = a.cfg.language.clone();
         drop(a);
         reload_rows_global(app);
-        send_msg(Msg::Status(trf(&lang, "field_updated", &[field])));
+        // 内部字段名不直接抛给用户：经 i18n 映射成界面文案（未知字段回退原名）
+        let label = match field {
+            "pinned" => tr(&lang, "field_pinned"),
+            "on_board" => tr(&lang, "field_on_board"),
+            "priority" => tr(&lang, "field_priority"),
+            "status" => tr(&lang, "field_status"),
+            other => other,
+        };
+        send_msg(Msg::Status(trf(&lang, "field_updated", &[label])));
     }
 }
 
 fn reload_rows_global(app: &Arc<Mutex<App>>) {
     let rows = {
-        let a = app.lock().unwrap();
-        a.db.list_prs(list_sources(&a.cfg)).unwrap_or_default()
+        let a = app.lock_recover();
+        match a.db.list_prs(list_sources(&a.cfg)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                // 失败时保留旧行并提示——清空成空列表会让用户以为数据全没了
+                tracing::warn!("列表加载失败: {e}");
+                let lang = a.cfg.language.clone();
+                drop(a);
+                send_msg(Msg::Status(trf(&lang, "list_load_failed", &[&e.to_string()])));
+                return;
+            }
+        }
     };
-    app.lock().unwrap().rows = rows.clone();
+    app.lock_recover().rows = rows.clone();
     // serde_json 行可跨线程；Slint 模型在 UI 线程（apply_msg）装配
     send_msg(Msg::Rows(rows));
 }
 
 // ── 详情抽屉 ──
 
-fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, number: i64, refetch: bool) {
+/// 打开详情抽屉（worker 侧，Cmd::OpenDrawer 的处理体）：
+/// 全部 DB 读写 + diff 解析在这里完成，UI 线程只负责把回送的 Msg 装盒。
+/// 选中态（a.selected）由调用方先行设置（UI 回调点行时立即落地，
+/// 后续 Panel/DiffParsed 的身份守卫以此为准）。
+fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &UnboundedSender<Cmd>, repo: String, number: i64, refetch: bool) {
     let lang = lang_of(app);
-    // 选中态存身份而非下标：刷新后行序变化，面板仍指向同一个 PR；
-    // 行被刷新滤掉时面板也保持打开（数据来自 DB/快照，row 允许为 None）
-    let (priority, row_idx) = {
-        let mut a = app.lock().unwrap();
-        a.selected = Some((repo.clone(), number));
+    // 行数据是快照（row 允许为 None：行被刷新滤掉时面板也保持打开，数据来自 DB）
+    let (priority, row) = {
+        let a = app.lock_recover();
         let idx = find_row(&a, &repo, number);
         let priority = idx
             .and_then(|i| a.rows[i]["priority"].as_i64())
             .unwrap_or(0) as i32;
-        (priority, idx)
+        (priority, idx.and_then(|i| a.rows.get(i).cloned()))
     };
 
-    let (review, diff_cached, row) = {
-        let a = app.lock().unwrap();
-        (
-            a.db.get_review(&repo, number).ok().flatten(),
-            a.db.get_diff(&repo, number).ok().flatten(),
-            row_idx.and_then(|i| a.rows.get(i).cloned()),
-        )
+    let (review, diff_cached) = {
+        let a = app.lock_recover();
+        let review = match a.db.get_review(&repo, number) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!("读取评审失败 {repo} #{number}: {e}");
+                None
+            }
+        };
+        let diff = match a.db.get_diff(&repo, number) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("读取 diff 缓存失败 {repo} #{number}: {e}");
+                None
+            }
+        };
+        (review, diff)
     };
 
     // tab0 评审文本：评分 + 分项 + 摘要 + flagged
@@ -1460,7 +1798,7 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
         }
     }
 
-    // 会话 / Checks / Files：JSON 过界（Slint 模型不跨线程），UI 线程装配
+    // 会话 / Checks / Files：JSON 过界（Slint 模型不跨线程），UI 线程装盒
     let (convo_json, checks_json) = row
         .as_ref()
         .map(|r| drawer_extras_json(r))
@@ -1477,11 +1815,13 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
                         dd + f["dels"].as_i64().unwrap_or(0),
                     )
                 });
-                let a = app.lock().unwrap();
-                let _ = a.db.conn.execute(
+                let a = app.lock_recover();
+                if let Err(e) = a.db.conn.execute(
                     "UPDATE prs SET additions=?1, deletions=?2 WHERE repo=?3 AND number=?4",
                     rusqlite::params![adds, dels, repo, number],
-                );
+                ) {
+                    tracing::warn!("diff 增删行数落库失败 {repo} #{number}: {e}");
+                }
             }
             j
         }
@@ -1500,7 +1840,7 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
     let pinned = row.as_ref().map(|r| r["pinned"].as_i64() == Some(1)).unwrap_or(false);
     let on_board = row.as_ref().map(|r| r["on_board"].as_i64() == Some(1)).unwrap_or(false);
 
-    send_msg(Msg::Panel {
+    let _ = msg_tx.send(Msg::Panel {
         title: row
             .as_ref()
             .and_then(|r| r["title"].as_str().map(|s| s.to_string()))
@@ -1526,13 +1866,18 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
 
     // 评审进行中打开该 PR 面板：紧随 Panel 之后把面板置 running
     //（apply_msg 顺序处理，ReviewProgress 在 Panel 重置状态后生效）
-    let running = app.lock().unwrap().review_slots.lock().unwrap().is_running(&repo, number);
+    let running = app.lock_recover().review_slots.lock_recover().is_running(&repo, number);
     if running {
-        send_msg(Msg::ReviewProgress { repo: repo.clone(), number, text: tr(&lang, "review_running").into() });
+        let _ = msg_tx.send(Msg::ReviewProgress { repo: repo.clone(), number, text: tr(&lang, "review_running").into() });
     }
 
+    // diff 解析在 worker 完成（大 PR 几万行逐行解析不占 UI 线程），
+    // DiffParsed 带身份：面板已切走时 apply 丢弃上屏（缓存可用）
     match diff_cached {
-        Some(d) => send_msg(Msg::DiffRaw(d)),
+        Some(d) => {
+            let files = parse_diff(&d);
+            let _ = msg_tx.send(Msg::DiffParsed { repo: repo.clone(), number, files });
+        }
         None => {
             let _ = cmd_tx.send(Cmd::FetchDiff { repo: repo.clone(), number });
         }
@@ -1541,7 +1886,7 @@ fn open_drawer(app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, repo: String, 
     // 行数据残缺（Inbox「+ 预评审」入库只带 title/url）：后台补齐 author/head_sha，
     // 成功后 worker 发 Msg::ReopenPanel 重新装载面板。
     // 注意：只能看 author——head_sha 不在 list_prs 的返回列里，看它会造成「永远残缺」
-    // → FetchPrMeta → ReopenPanel → open_drawer 的死循环（烧穿 API 限额的教训）。
+    // → FetchPrMeta → ReopenPanel → OpenDrawer 的死循环（烧穿 API 限额的教训）。
     let damaged = match &row {
         Some(r) => r["author"].as_str().unwrap_or("").is_empty(),
         None => false,
@@ -1681,18 +2026,55 @@ fn md_blocks(md: &str) -> ModelRc<MdBlock> {
     md_blocks_of(pr_desk_rs::markdown::parse_markdown(md))
 }
 
-/// diff 文本 → DiffFile 模型（前 3 个文件展开）。
-/// 在 UI 线程调用（Slint 模型不跨线程）；DiffView 依赖模型整体替换。
-fn build_diff_files(diff: &str) -> Vec<DiffFile> {
+/// diff 文本 → 结构化数据（前 3 个文件展开）。
+/// 在 worker 调用：大 PR 几万行逐行解析是重活，UI 线程只做 VecModel 装盒。
+fn parse_diff(diff: &str) -> Vec<DiffFileData> {
     diffview::split_files(diff)
         .into_iter()
         .enumerate()
-        .map(|(i, (path, text))| DiffFile {
-            path: path.into(),
-            lines: text
-                .lines()
-                .map(|l| DiffLine {
-                    kind: match diffview::classify_line(l) {
+        .map(|(i, (path, text))| DiffFileData {
+            path,
+            lines: diffview::numbered_lines(&text),
+            expanded: i < 3,
+        })
+        .collect()
+}
+
+/// 最长内容行（按显示宽度：ASCII 计 1、其余计 2），供 UI 侧测量其像素宽，
+/// 以决定 diff 横向滚动区域（Slint 无法对虚拟化/未实例化的行求最大文本宽）。
+fn diff_max_line(files: &[DiffFileData]) -> slint::SharedString {
+    files
+        .iter()
+        .flat_map(|f| f.lines.iter().map(|(_, t, _)| t.as_str()))
+        .max_by_key(|t| t.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum::<usize>())
+        .unwrap_or("")
+        .into()
+}
+
+/// 结构化 diff → 摊平的 Slint DiffRow 模型（仅装盒，O(n)）。
+/// 每个文件一个 header 行；展开的文件跟内容行（超 DIFF_MAX_RENDER_LINES 出截断提示行）。
+/// 折叠的文件只有 header 行——展开重建依赖 Rust 侧缓存（App::diff_data / nd_diff_data）。
+/// 增删行数在这里统计（替代旧 UI 侧的隐藏计数器 trick）。
+fn diff_row_models(files: &[DiffFileData]) -> Vec<DiffRow> {
+    let mut out = Vec::new();
+    for (fi, f) in files.iter().enumerate() {
+        let adds = f.lines.iter().filter(|(k, _, _)| *k == diffview::LineKind::Add).count() as i32;
+        let dels = f.lines.iter().filter(|(k, _, _)| *k == diffview::LineKind::Del).count() as i32;
+        out.push(DiffRow {
+            is_header: true,
+            file_idx: fi as i32,
+            path: f.path.as_str().into(),
+            adds,
+            dels,
+            expanded: f.expanded,
+            ..Default::default()
+        });
+        if f.expanded {
+            for (kind, text, lineno) in f.lines.iter().take(DIFF_MAX_RENDER_LINES) {
+                out.push(DiffRow {
+                    is_header: false,
+                    file_idx: fi as i32,
+                    kind: match kind {
                         diffview::LineKind::Add => "add",
                         diffview::LineKind::Del => "del",
                         diffview::LineKind::Hunk => "hunk",
@@ -1700,14 +2082,24 @@ fn build_diff_files(diff: &str) -> Vec<DiffFile> {
                         diffview::LineKind::Ctx => "ctx",
                     }
                     .into(),
-                    text: l.into(),
-                })
-                .collect::<Vec<_>>()
-                .as_slice()
-                .into(),
-            expanded: i < 3,
-        })
-        .collect()
+                    text: text.as_str().into(),
+                    lineno: *lineno,
+                    ..Default::default()
+                });
+            }
+            if f.lines.len() > DIFF_MAX_RENDER_LINES {
+                out.push(DiffRow {
+                    is_header: false,
+                    is_trunc: true,
+                    file_idx: fi as i32,
+                    shown: DIFF_MAX_RENDER_LINES as i32,
+                    total: f.lines.len() as i32,
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    out
 }
 
 // ── 后台 worker ──
@@ -1814,16 +2206,114 @@ fn notif_row_json(n: &github::Notification, states: &std::collections::HashMap<S
     })
 }
 
+/// GitHub 通知 subject.type（PullRequest/CheckSuite/…）→ 界面文案；未知值回退原串。
+/// 注意：行的逻辑判断（是否 PR、徽章配色）仍用原始 kind 字段，本函数只产出显示文本。
+fn notif_kind_label(lang: &str, kind: &str) -> String {
+    let key = match kind {
+        "PullRequest" => "kind_pull_request",
+        "Issue" => "kind_issue",
+        "Release" => "kind_release",
+        "Discussion" => "kind_discussion",
+        "CheckSuite" => "kind_check_suite",
+        "Commit" => "kind_commit",
+        _ => return kind.to_string(),
+    };
+    tr(lang, key).to_string()
+}
+
+/// GitHub 通知 reason（review_requested/mention/…）→ 界面文案；未知值回退原串。
+fn notif_reason_label(lang: &str, reason: &str) -> String {
+    let key = match reason {
+        "review_requested" => "reason_review_requested",
+        "assign" => "reason_assign",
+        "mention" => "reason_mention",
+        "comment" => "reason_comment",
+        "ci_activity" => "reason_ci_activity",
+        "author" => "reason_author",
+        "subscribed" => "reason_subscribed",
+        "team_mention" => "reason_team_mention",
+        "security_alert" => "reason_security_alert",
+        "state_change" => "reason_state_change",
+        "invitation" => "reason_invitation",
+        "manual" => "reason_manual",
+        _ => return reason.to_string(),
+    };
+    tr(lang, key).to_string()
+}
+
+/// 当前仓库过滤词下的通知行（"" = 全部）。
+fn inbox_filtered(a: &App) -> Vec<serde_json::Value> {
+    a.inbox
+        .iter()
+        .filter(|n| a.inbox_filter.is_empty() || n["repo"].as_str() == Some(a.inbox_filter.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Inbox JSON 行 → NotifRow 模型：updated_at 换算相对时间、kind/reason 本地化、
+/// PullRequest 行的「已加入」标记批量一次查完（替代逐行 pr_exists 的 N+1）；
+/// 查询失败是错误不是「不存在」：保守按全部已加入处理（防重复插入）。
+fn build_inbox_rows(a: &App, jsons: &[serde_json::Value]) -> Vec<NotifRow> {
+    let lang = a.cfg.language.as_str();
+    let keys: Vec<(String, i64)> = jsons
+        .iter()
+        .filter(|n| n["kind"].as_str() == Some("PullRequest"))
+        .filter_map(|n| {
+            notif_url_number(n["url"].as_str().unwrap_or(""))
+                .map(|num| (n["repo"].as_str().unwrap_or("").to_string(), num))
+        })
+        .collect();
+    let existing = match a.db.existing_pr_keys(&keys) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            tracing::warn!("批量查询 PR 是否已加入失败: {e}");
+            None
+        }
+    };
+    jsons
+        .iter()
+        .map(|n| {
+            let url = n["url"].as_str().unwrap_or("");
+            let number = notif_url_number(url);
+            let kind = n["kind"].as_str().unwrap_or("");
+            let added = kind == "PullRequest"
+                && number.is_some()
+                && match &existing {
+                    Some(s) => s.contains(&(
+                        n["repo"].as_str().unwrap_or("").to_string(),
+                        number.unwrap_or(0),
+                    )),
+                    None => true,
+                };
+            NotifRow {
+                id: n["id"].as_str().unwrap_or("").into(),
+                repo: n["repo"].as_str().unwrap_or("").into(),
+                title: n["title"].as_str().unwrap_or("").into(),
+                kind: kind.into(),
+                kind_label: notif_kind_label(lang, kind).into(),
+                reason: notif_reason_label(lang, n["reason"].as_str().unwrap_or("")).into(),
+                updated: model::rel_time(n["updated_at"].as_str().unwrap_or("")).into(),
+                unread: n["unread"].as_bool().unwrap_or(false),
+                url: url.into(),
+                added,
+                state: n["state"].as_str().unwrap_or("").into(),
+            }
+        })
+        .collect()
+}
+
 /// 拉取 GitHub 通知并回送 UI（无 token 时静默跳过：通知接口必须鉴权）。
 /// 刷新语义：重拉已加载的全部页（1..=inbox_page），保序拼接 + 按 thread id 去重，
 /// 这样用户「加载更多」后定时刷新不会把多页数据塌回第一页。
 async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     let (has_token, all, pages) = {
-        let a = app.lock().unwrap();
+        let a = app.lock_recover();
         (a.cfg.token().is_some(), a.inbox_all, a.inbox_page.max(1))
     };
     tracing::info!("fetch_inbox: has_token={} all={} pages={}", has_token, all, pages);
     if !has_token {
+        // 无 token：关掉可能存在的 UI 加载态（首次进 Inbox 时置过 true）
+        let _ = msg_tx.send(Msg::InboxLoading(false));
         return;
     }
     let mut all_ns: Vec<github::Notification> = Vec::new();
@@ -1846,6 +2336,8 @@ async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::
             Err(e) => {
                 let lang = lang_of(app);
                 let _ = msg_tx.send(Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])));
+                // 失败也要关首次加载态（否则 Inbox 永远停在「加载中」）
+                let _ = msg_tx.send(Msg::InboxLoading(false));
                 return;
             }
         }
@@ -1853,7 +2345,7 @@ async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::
     tracing::info!("fetch_inbox: got {} notifications ({} pages)", all_ns.len(), pages);
     let states = fetch_notif_states(gh, &all_ns).await;
     {
-        let mut a = app.lock().unwrap();
+        let mut a = app.lock_recover();
         a.inbox_has_more = has_more;
     }
     let rows: Vec<serde_json::Value> = all_ns.iter().map(|n| notif_row_json(n, &states)).collect();
@@ -1863,7 +2355,7 @@ async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::
 /// 「加载更多」：拉下一页追加到现有列表（去重）。进行中或无下一页时忽略。
 async fn fetch_inbox_more(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     let (has_token, all, next_page) = {
-        let mut a = app.lock().unwrap();
+        let mut a = app.lock_recover();
         if a.inbox_loading_more || !a.inbox_has_more {
             return;
         }
@@ -1871,7 +2363,7 @@ async fn fetch_inbox_more(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &m
         (a.cfg.token().is_some(), a.inbox_all, a.inbox_page + 1)
     };
     if !has_token {
-        app.lock().unwrap().inbox_loading_more = false;
+        app.lock_recover().inbox_loading_more = false;
         return;
     }
     let result = gh.fetch_notifications_page(all, next_page).await;
@@ -1882,7 +2374,7 @@ async fn fetch_inbox_more(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &m
     };
     let merged: Vec<serde_json::Value>;
     {
-        let mut a = app.lock().unwrap();
+        let mut a = app.lock_recover();
         a.inbox_loading_more = false;
         match result {
             Ok((ns, more)) => {
@@ -1972,7 +2464,7 @@ async fn run_review_task(
                     let _ = msg_tx.send(Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])));
                 }
             }
-            let ok = { app.lock().unwrap().db.upsert_review(&v).is_ok() };
+            let ok = { app.lock_recover().db.upsert_review(&v).is_ok() };
             if ok {
                 let _ = msg_tx.send(Msg::ReviewDone { repo: repo.to_string(), number });
             } else {
@@ -2040,7 +2532,7 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
     // 本地模式（手动策展）：顺带刷新每个在库 PR 的 GitHub 状态——merged/closed 写入
     // status 列后分组会把已完结 PR 移出待评审区；否则合入了列表还显示 Open。
     // sync 模式跳过：行数据由服务端插件负责保持新鲜。
-    let sync_enabled = { app.lock().unwrap().cfg.active_sync().is_some() };
+    let sync_enabled = { app.lock_recover().cfg.active_sync().is_some() };
     if !sync_enabled {
         // 先用 diff 缓存回填增删行数（纯本地计算；打开过 Files/Diff 的 PR 立即有数，
         // 列表 +/- 列不再 +0/-0；只填空值，GitHub files API 的真值优先）
@@ -2048,8 +2540,14 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
             // 先取数据放锁，解析（逐行扫描 diff）在锁外做，写完再取锁——
             // 持锁解析会堵住 UI 线程的 app.lock()，表现为界面冻结
             let cached = {
-                let a = app.lock().unwrap();
-                a.db.list_diff_cache().unwrap_or_default()
+                let a = app.lock_recover();
+                match a.db.list_diff_cache() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("读取 diff 缓存列表失败: {e}");
+                        Vec::new()
+                    }
+                }
             };
             let sums: Vec<(String, i64, i64, i64)> = cached
                 .iter()
@@ -2077,7 +2575,16 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
         // 并行拉每个在库 PR 的 GitHub 状态（merged/closed 写入 status 列后分组会把
         // 已完结 PR 移出待评审区；否则合入了列表还显示 Open）。之前是串行循环，
         // N 个 PR + M 个作者串行各一次请求，切换档案时要卡十几秒
-        let keys = { app.lock().unwrap().db.list_pr_keys().unwrap_or_default() };
+        let keys = {
+            let a = app.lock_recover();
+            match a.db.list_pr_keys() {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::warn!("列出 PR 键失败，跳过 GitHub 状态刷新: {e}");
+                    Vec::new()
+                }
+            }
+        };
         {
             let mut set = tokio::task::JoinSet::new();
             for (repo, number) in keys {
@@ -2113,7 +2620,16 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
         }
         // 作者公开组织成员关系（org 徽章数据源；本地行没人填这个字段，永远不会有 org 标）。
         // 同样并行
-        let authors = { app.lock().unwrap().db.list_authors().unwrap_or_default() };
+        let authors = {
+            let a = app.lock_recover();
+            match a.db.list_authors() {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("列出作者失败，跳过组织关系刷新: {e}");
+                    Vec::new()
+                }
+            }
+        };
         {
             let mut set = tokio::task::JoinSet::new();
             for author in authors {
@@ -2147,7 +2663,7 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
 /// 在途结果若写回「当前」库就会把 A 档案的数据灌进 B 档案（曾致服务器列表串进本地库）。
 /// 检查与写入在同一把锁内完成：SwitchProfile 换库也要这把锁，无法插进来。
 fn lock_for_profile<'a>(app: &'a Mutex<App>, for_profile: &str) -> Option<std::sync::MutexGuard<'a, App>> {
-    let a = app.lock().unwrap();
+    let a = app.lock_recover();
     if a.cfg.active_profile == for_profile {
         Some(a)
     } else {
@@ -2214,7 +2730,7 @@ async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: 
         Ok(Some(((p, r, t), push))) => {
             // 记入「已同步 X 前」共享状态（状态栏组合读取）
             let (last_sync, lang) = {
-                let a = app.lock().unwrap();
+                let a = app.lock_recover();
                 (a.last_sync.clone(), a.cfg.language.clone())
             };
             sync::mark_synced(&last_sync);
@@ -2242,11 +2758,11 @@ async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: 
     }
 }
 
-async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sender<Msg>, cmd_tx: mpsc::Sender<Cmd>, cfg_path: PathBuf) {
+async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mpsc::Sender<Msg>, cmd_tx: UnboundedSender<Cmd>, cfg_path: PathBuf) {
     let _ = MSG_TX.set(msg_tx.clone());
 
     let token = {
-        let cfg = app.lock().unwrap().cfg.clone();
+        let cfg = app.lock_recover().cfg.clone();
         cfg.token()
     };
     let mut gh = match github::GitHub::new(token) {
@@ -2259,10 +2775,10 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
     };
     // 配额共享句柄交给 App（UI 状态栏读取 X-RateLimit-Remaining）
     if let Some(g) = &gh {
-        app.lock().unwrap().rate_limit = g.rate_limit_handle();
+        app.lock_recover().rate_limit = g.rate_limit_handle();
     }
     let mut sync_client = {
-        let cfg = app.lock().unwrap().cfg.clone();
+        let cfg = app.lock_recover().cfg.clone();
         sync::SyncClient::new(&cfg)
     };
     // 实时刷新节流：同一 PR 同一部分（parts 位标志）的上次拉取时间（120s 内不重复拉）
@@ -2272,7 +2788,8 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
     let mut meta_healed: std::collections::HashMap<(String, i64), std::time::Instant> =
         Default::default();
 
-    while let Ok(cmd) = rx.recv() {
+    // unbounded channel + recv().await：不在 tokio 工作线程上做 std 阻塞 recv
+    while let Some(cmd) = rx.recv().await {
         // 每条命令开始时取一次界面语言（设置页切换语言后下条命令即生效）
         let lang = lang_of(&app);
         match cmd {
@@ -2281,7 +2798,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 // 不能等网络；sync 模式下这是 sync_pull 前的缓存快照）
                 reload_rows(&app, &msg_tx);
                 // 档案名随任务走：网络在途期间切档案时，在途结果不得写进切后的库
-                let for_profile = app.lock().unwrap().cfg.active_profile.clone();
+                let for_profile = app.lock_recover().cfg.active_profile.clone();
                 if let Some(gh) = &gh {
                     if sync_client.enabled() {
                         // sync 模式：列表来自服务器插件数据库（sync_pull）+ 手动预评审，
@@ -2294,24 +2811,42 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         fetch_inbox(gh, &app, &msg_tx).await;
                     }
                 }
+                // 收尾：复位连点去重标志 + 停顶栏转圈 + 状态栏报结果（open PR 数）
+                let open_count = {
+                    let mut a = app.lock_recover();
+                    a.gh_refreshing = false;
+                    a.rows
+                        .iter()
+                        .filter(|r| !matches!(r["status"].as_str(), Some("merged") | Some("closed")))
+                        .count()
+                };
+                let _ = msg_tx.send(Msg::RefreshDone(open_count));
             }
             Cmd::Sync => {
                 // 通知与同步服务器无关，先顺手拉一次
-                let for_profile = app.lock().unwrap().cfg.active_profile.clone();
+                let for_profile = app.lock_recover().cfg.active_profile.clone();
                 if let Some(g) = &gh {
                     fetch_inbox(g, &app, &msg_tx).await;
                 }
                 do_sync(&app, &sync_client, &msg_tx, &for_profile).await;
+                // 收尾：复位去重标志 + 停顶栏转圈（结果文案由 do_sync 自己的 Status 负责；
+                // 本地模式 sync 未启用时 do_sync 静默跳过，这里也不打扰状态栏）
+                app.lock_recover().sync_inflight = false;
+                let _ = msg_tx.send(Msg::SyncFinished);
             }
             Cmd::FetchDiff { repo, number } => {
                 if let Some(gh) = &gh {
                     match gh.fetch_diff(&repo, number).await {
                         Ok(diff) => {
                             {
-                                let a = app.lock().unwrap();
-                                let _ = a.db.put_diff(&repo, number, &diff);
+                                let a = app.lock_recover();
+                                if let Err(e) = a.db.put_diff(&repo, number, &diff) {
+                                    tracing::warn!("diff 缓存写入失败 {repo} #{number}: {e}");
+                                }
                             }
-                            let _ = msg_tx.send(Msg::DiffRaw(diff));
+                            // 解析在 worker 完成；消息带身份，面板已切走时 apply 丢弃上屏
+                            let files = parse_diff(&diff);
+                            let _ = msg_tx.send(Msg::DiffParsed { repo, number, files });
                             // diff 响应也带配额头，状态栏重组刷新配额
                             let _ = msg_tx.send(Msg::StatusBarRefresh);
                         }
@@ -2324,6 +2859,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             Cmd::FetchInbox => {
                 if let Some(gh) = &gh {
                     fetch_inbox(gh, &app, &msg_tx).await;
+                } else {
+                    // 客户端初始化失败：也要关掉 UI 的「加载中…」（否则永远转圈）
+                    let _ = msg_tx.send(Msg::InboxLoading(false));
                 }
             }
             Cmd::FetchInboxMore => {
@@ -2343,43 +2881,92 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 }
             }
             Cmd::FetchNotifDetail { repo, number, kind } => {
-                if let Some(gh) = &gh {
-                    // 会话对 PR/Issue 都有；Files/Diff 仅 PullRequest
-                    let convo = match gh.fetch_pr_convo(&repo, number).await {
-                        Ok(c) => c,
+                // 每个出口都必须回送消息：失败也要把预览面板的 nd_loading 置 false，
+                // 否则面板永远停在「加载中」。消息带身份，快速连点两条通知时旧结果不上屏。
+                let Some(gh) = &gh else {
+                    let _ = msg_tx.send(Msg::NotifDetailFailed {
+                        repo,
+                        number,
+                        err: tr(&lang, "cfg_unconfigured").into(),
+                    });
+                    continue;
+                };
+                // 会话对 PR/Issue 都有；Files/Diff 仅 PullRequest
+                let convo = match gh.fetch_pr_convo(&repo, number).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = msg_tx.send(Msg::Status(trf(&lang, "convo_fetch_failed", &[&e.to_string()])));
+                        Vec::new()
+                    }
+                };
+                let (files, diff) = if kind == "PullRequest" {
+                    let files = match gh.fetch_pr_files(&repo, number).await {
+                        Ok(f) => f,
                         Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(trf(&lang, "convo_fetch_failed", &[&e.to_string()])));
+                            let _ = msg_tx.send(Msg::Status(trf(&lang, "files_fetch_failed", &[&e.to_string()])));
                             Vec::new()
                         }
                     };
-                    let (files, diff) = if kind == "PullRequest" {
-                        let files = match gh.fetch_pr_files(&repo, number).await {
-                            Ok(f) => f,
-                            Err(e) => {
-                                let _ = msg_tx.send(Msg::Status(trf(&lang, "files_fetch_failed", &[&e.to_string()])));
-                                Vec::new()
-                            }
-                        };
-                        let diff = match gh.fetch_diff(&repo, number).await {
-                            Ok(d) => d,
-                            Err(e) => {
-                                let _ = msg_tx.send(Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
-                                String::new()
-                            }
-                        };
-                        (files, diff)
-                    } else {
-                        (Vec::new(), String::new())
+                    let diff = match gh.fetch_diff(&repo, number).await {
+                        Ok(d) => d,
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
+                            String::new()
+                        }
                     };
-                    let _ = msg_tx.send(Msg::NotifDetail {
-                        convo_json: serde_json::to_string(&convo).unwrap_or_else(|_| "[]".into()),
-                        files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
-                        diff,
+                    (files, diff)
+                } else {
+                    (Vec::new(), String::new())
+                };
+                let _ = msg_tx.send(Msg::NotifDetail {
+                    repo,
+                    number,
+                    convo_json: serde_json::to_string(&convo).unwrap_or_else(|_| "[]".into()),
+                    files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
+                    diff_files: parse_diff(&diff),
+                });
+                let _ = msg_tx.send(Msg::StatusBarRefresh);
+            }
+            Cmd::OpenDrawer { repo, number, refetch } => {
+                open_drawer_work(&app, &msg_tx, &cmd_tx, repo, number, refetch);
+            }
+            Cmd::CopyReview => {
+                // 「复制评审」：get_review SQL + arboard 剪贴板写入都在 worker
+                //（Windows 剪贴板打开可能重试阻塞，不占 UI 线程）
+                let (sel, review) = {
+                    let a = app.lock_recover();
+                    let sel = a.selected.clone();
+                    let rv = sel.as_ref().and_then(|(repo, number)| {
+                        match a.db.get_review(repo, *number) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                tracing::warn!("读取评审失败 {repo} #{number}: {e}");
+                                None
+                            }
+                        }
                     });
-                    let _ = msg_tx.send(Msg::StatusBarRefresh);
+                    (sel, rv)
+                };
+                if let (Some((repo, number)), Some(rv)) = (sel, review) {
+                    let md = build_review_markdown(&repo, number, &rv, &lang);
+                    match arboard::Clipboard::new().and_then(|mut c| c.set_text(&md)) {
+                        Ok(()) => {
+                            let _ = msg_tx.send(Msg::Status(tr(&lang, "review_copied").into()));
+                        }
+                        Err(e) => {
+                            let _ = msg_tx.send(Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()])));
+                        }
+                    }
                 }
             }
-            Cmd::MarkAllNotifsRead => {                if let Some(gh) = &gh {
+            Cmd::LoadReviewPrompt => {
+                // 设置页打开时重读自定义评审模板（可能被外部编辑过）；空/缺失 = 默认模板
+                let text = std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
+                    .unwrap_or_default();
+                let _ = msg_tx.send(Msg::ReviewPromptLoaded(text));
+            }
+            Cmd::MarkAllNotifsRead => {
+                if let Some(gh) = &gh {
                     match gh.mark_all_notifications_read().await {
                         Ok(()) => {
                             let _ = msg_tx.send(Msg::Status(tr(&lang, "all_marked_read").into()));
@@ -2393,16 +2980,20 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 }
             }
             Cmd::AddNotifReview { repo, number, title, url } => {
-                // 已存在则跳过（upsert 会把已有行的 author/head_sha 等覆盖成空）
+                // 已存在则跳过（upsert 会把已有行的 author/head_sha 等覆盖成空）；
+                // 查询失败是错误不是「不存在」：保守按已存在处理（防重复插入）并告警
                 let exists = {
-                    let a = app.lock().unwrap();
-                    a.db.pr_exists(&repo, number).unwrap_or(false)
+                    let a = app.lock_recover();
+                    a.db.pr_exists(&repo, number).unwrap_or_else(|e| {
+                        tracing::warn!("查询 PR 是否存在失败 {repo} #{number}: {e}");
+                        true
+                    })
                 };
                 if exists {
                     let _ = msg_tx.send(Msg::Status(trf(&lang, "already_in_list", &[&repo, &number.to_string()])));
                 } else {
                     let ok = {
-                        let a = app.lock().unwrap();
+                        let a = app.lock_recover();
                         a.db.upsert_pr(&serde_json::json!({
                             "repo": repo, "number": number, "title": title,
                             "author": "", "url": url, "head_sha": "",
@@ -2422,12 +3013,12 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                 }
                 // 重发当前通知行：apply_msg 重新计算「已加入」标记
-                let rows = app.lock().unwrap().inbox.clone();
+                let rows = app.lock_recover().inbox.clone();
                 let _ = msg_tx.send(Msg::InboxRows(rows));
             }
             Cmd::RunReview { repo, number } => {
                 let (cfg, slots) = {
-                    let a = app.lock().unwrap();
+                    let a = app.lock_recover();
                     (a.cfg.clone(), a.review_slots.clone())
                 };
                 // LLM 配置缺失：立即提示，不占并发槽
@@ -2437,7 +3028,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 };
                 // 并发槽：同一 PR 重入 / 超额都立即拒绝（槽位由任务内 SlotGuard 释放）
                 // 注意：try_acquire 的锁守卫随 let 语句结束即释放，match 臂内可再次加锁
-                let acquired = slots.lock().unwrap().try_acquire(&repo, number);
+                let acquired = slots.lock_recover().try_acquire(&repo, number);
                 match acquired {
                     Ok(()) => {}
                     Err(SlotError::AlreadyRunning) => {
@@ -2445,7 +3036,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         continue;
                     }
                     Err(SlotError::AtCapacity) => {
-                        let cap = slots.lock().unwrap().capacity.to_string();
+                        let cap = slots.lock_recover().capacity.to_string();
                         let _ = msg_tx.send(Msg::Status(trf(&lang, "review_slots_full", &[&cap])));
                         continue;
                     }
@@ -2472,8 +3063,8 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         }
                     };
                     if let Some(h) = rl {
-                        if let Some(n) = *h.lock().unwrap() {
-                            *app2.lock().unwrap().rate_limit.lock().unwrap() = Some(n);
+                        if let Some(n) = *h.lock_recover() {
+                            *app2.lock_recover().rate_limit.lock_recover() = Some(n);
                         }
                     }
                 });
@@ -2481,12 +3072,12 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             Cmd::FetchModels { base, key } => {
                 // 设置页「获取」：拉 OpenAI 兼容端点的模型列表（base/key 是弹窗里正在编辑的值）
                 let base = if base.trim().is_empty() {
-                    app.lock().unwrap().cfg.llm_base_url.clone()
+                    app.lock_recover().cfg.llm_base_url.clone()
                 } else {
                     base.trim().trim_end_matches('/').to_string()
                 };
                 let key = if key.trim().is_empty() {
-                    app.lock().unwrap().cfg.llm_key().unwrap_or_default()
+                    app.lock_recover().cfg.llm_key().unwrap_or_default()
                 } else {
                     key.trim().to_string()
                 };
@@ -2494,6 +3085,8 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 let lang2 = lang.clone();
                 tokio::spawn(async move {
                     let _ = tx.send(Msg::Status(tr(&lang2, "models_fetching").into()));
+                    // 弹窗内联反馈：状态栏被设置弹窗遮罩盖住，拉取进度/失败要落到弹窗里
+                    let _ = tx.send(Msg::DialogMsg(tr(&lang2, "models_fetching").into()));
                     let url = format!("{base}/models");
                     let result = async {
                         let resp = reqwest::Client::new()
@@ -2526,7 +3119,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             let _ = tx.send(Msg::Status(trf(&lang2, "models_fetched", &[&n.to_string()])));
                         }
                         Err(e) => {
-                            let _ = tx.send(Msg::Status(trf(&lang2, "models_fetch_failed", &[&e.to_string()])));
+                            let msg = trf(&lang2, "models_fetch_failed", &[&e.to_string()]);
+                            let _ = tx.send(Msg::Status(msg.clone()));
+                            let _ = tx.send(Msg::DialogMsg(msg));
                         }
                     }
                 });
@@ -2542,18 +3137,24 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 if recently {
                     continue;
                 }
-                meta_healed.insert((repo.clone(), number), std::time::Instant::now());
                 if let Some(g) = &gh {
                     match g.fetch_pr_meta(&repo, number).await {
                         Ok(meta) => {
+                            // 成功后才记录节流时间戳：拉取失败不该吃满 300s 惩罚窗口
+                            meta_healed.insert((repo.clone(), number), std::time::Instant::now());
                             let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
                             let url = meta["html_url"].as_str().unwrap_or("").to_string();
                             let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
                             let title = meta["title"].as_str().unwrap_or("").to_string();
                             let filled = {
-                                let a = app.lock().unwrap();
-                                a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &head_sha, &title)
-                                    .unwrap_or(false)
+                                let a = app.lock_recover();
+                                match a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &head_sha, &title) {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        tracing::warn!("补齐 PR 元数据落库失败 {repo} #{number}: {e}");
+                                        false
+                                    }
+                                }
                             };
                             if filled {
                                 reload_rows(&app, &msg_tx);
@@ -2587,11 +3188,9 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     parts & PART_CHECKS != 0 && !fresh(PART_CHECKS),
                 );
                 let quota_low = app
-                    .lock()
-                    .unwrap()
+                    .lock_recover()
                     .rate_limit
-                    .lock()
-                    .unwrap()
+                    .lock_recover()
                     .map(|r| r < 50)
                     .unwrap_or(false);
                 if (!want_convo && !want_files && !want_checks) || quota_low {
@@ -2599,12 +3198,6 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         let _ = msg_tx.send(Msg::Status(tr(&lang, "quota_low_skip").into()));
                     }
                     continue;
-                }
-                let now = std::time::Instant::now();
-                for (bit, w) in [(PART_CONVO, want_convo), (PART_FILES, want_files), (PART_CHECKS, want_checks)] {
-                    if w {
-                        live_fetched.insert((repo.clone(), number, bit), now);
-                    }
                 }
                 if let Some(g) = &gh {
                     // meta 只在 checks 部分需要（head.sha → check runs；state/updated → 面板头部）
@@ -2617,6 +3210,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                                     "live_refresh_failed",
                                     &[&repo, &number.to_string(), &e.to_string()],
                                 )));
+                                // 拉取失败不记录节流时间戳（失败不该吃满 120s 惩罚窗口）
                                 continue;
                             }
                         }
@@ -2671,6 +3265,19 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         },
                     );
 
+                    // 节流时间戳在拉取成功后才记入（失败不吃满 120s 惩罚窗口）；
+                    // checks 部分的代价在 meta 请求上，meta 成功即算 checks 已拉
+                    let now = std::time::Instant::now();
+                    if meta.is_some() {
+                        live_fetched.insert((repo.clone(), number, PART_CHECKS), now);
+                    }
+                    if convo_pair.is_some() {
+                        live_fetched.insert((repo.clone(), number, PART_CONVO), now);
+                    }
+                    if files.is_some() {
+                        live_fetched.insert((repo.clone(), number, PART_FILES), now);
+                    }
+
                     let mut ci_out: Option<String> = None;
                     let mut state_out: Option<String> = None;
                     let mut updated_out: Option<String> = None;
@@ -2694,7 +3301,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             "merged".to_string()
                         };
                         {
-                            let a = app.lock().unwrap();
+                            let a = app.lock_recover();
                             let _ = a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &sha, &title);
                             if gh_state == "merged" || gh_state == "closed" {
                                 let _ = a.db.conn.execute(
@@ -2735,7 +3342,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                     if let Some((convo, reviews)) = convo_pair {
                         if let Some(rd) = derive_review_decision(&reviews) {
-                            let a = app.lock().unwrap();
+                            let a = app.lock_recover();
                             let _ = a.db.conn.execute(
                                 "UPDATE prs SET review_decision=?1 WHERE repo=?2 AND number=?3",
                                 rusqlite::params![rd, repo, number],
@@ -2769,7 +3376,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                             )
                         });
                         {
-                            let a = app.lock().unwrap();
+                            let a = app.lock_recover();
                             let _ = a.db.conn.execute(
                                 "UPDATE prs SET additions=?1, deletions=?2 WHERE repo=?3 AND number=?4",
                                 rusqlite::params![adds, dels, repo, number],
@@ -2798,20 +3405,20 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             Cmd::SwitchProfile(name) => {
                 // 校验：档案必须存在且名字合法（防路径穿越）；非法则回填纠正 UI 选中
                 let valid = {
-                    let a = app.lock().unwrap();
+                    let a = app.lock_recover();
                     a.cfg.has_profile(&name)
                         && (name == "local" || pr_desk_rs::config::valid_profile_name(&name))
                 };
                 if !valid {
                     let _ = msg_tx.send(Msg::Status(trf(&lang, "profile_unknown", &[&name])));
                     let (names, active) = {
-                        let a = app.lock().unwrap();
+                        let a = app.lock_recover();
                         (a.cfg.profile_names(), a.cfg.active_profile.clone())
                     };
                     let _ = msg_tx.send(Msg::Profiles { names, active });
                     continue;
                 }
-                if app.lock().unwrap().cfg.active_profile == name {
+                if app.lock_recover().cfg.active_profile == name {
                     continue; // 同档重选：无操作
                 }
                 // 换库：local → pr-desk.db；其它档 → profiles/<name>.db
@@ -2830,7 +3437,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                         )));
                         // 换库失败：回填纠正 UI 选中（顶栏是乐观切换）
                         let (names, active) = {
-                            let a = app.lock().unwrap();
+                            let a = app.lock_recover();
                             (a.cfg.profile_names(), a.cfg.active_profile.clone())
                         };
                         let _ = msg_tx.send(Msg::Profiles { names, active });
@@ -2838,7 +3445,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     }
                 };
                 {
-                    let mut a = app.lock().unwrap();
+                    let mut a = app.lock_recover();
                     a.cfg.active_profile = name.clone();
                     if let Err(e) = a.cfg.save(&cfg_path) {
                         // 落盘失败不阻断切换（内存态已切），仅提示
@@ -2850,15 +3457,16 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                     a.rows.clear();
                     a.view.clear();
                     a.view_keys.clear();
+                    a.view_visible.clear();
                     a.total = 0;
-                    *a.last_sync.lock().unwrap() = None; // 「已同步 X 前」不跨档案沿用
+                    *a.last_sync.lock_recover() = None; // 「已同步 X 前」不跨档案沿用
                 }
                 // SyncClient 按新档案重建（local → enabled()=false）
                 sync_client = {
-                    let a = app.lock().unwrap();
+                    let a = app.lock_recover();
                     sync::SyncClient::new(&a.cfg)
                 };
-                let names = app.lock().unwrap().cfg.profile_names();
+                let names = app.lock_recover().cfg.profile_names();
                 let _ = msg_tx.send(Msg::Profiles { names, active: name.clone() });
                 let _ = msg_tx.send(Msg::ClosePanel);
                 let _ = msg_tx.send(Msg::Status(trf(&lang, "profile_switched", &[&name])));
@@ -2867,7 +3475,7 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
                 // 网络刷新 spawn 到后台，切换档案不再卡 worker 队列
                 reload_rows(&app, &msg_tx);
                 {
-                    let cached = app.lock().unwrap().inbox.clone();
+                    let cached = app.lock_recover().inbox.clone();
                     let _ = msg_tx.send(Msg::InboxRows(cached));
                 }
                 if let Some(g) = &gh {
@@ -2889,11 +3497,11 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
             }
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
-                let cfg = app.lock().unwrap().cfg.clone();
+                let cfg = app.lock_recover().cfg.clone();
                 match github::GitHub::new(cfg.token()) {
                     Ok(g) => {
                         // 重建客户端后替换配额共享句柄
-                        app.lock().unwrap().rate_limit = g.rate_limit_handle();
+                        app.lock_recover().rate_limit = g.rate_limit_handle();
                         gh = Some(g);
                     }
                     Err(e) => {
@@ -2923,8 +3531,18 @@ async fn worker(app: Arc<Mutex<App>>, rx: mpsc::Receiver<Cmd>, msg_tx: mpsc::Sen
 /// 不是 Send，async fn 会在 await 点持有它们导致 future 非 Send。
 fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     let rows = {
-        let a = app.lock().unwrap();
-        a.db.list_prs(list_sources(&a.cfg)).unwrap_or_default()
+        let a = app.lock_recover();
+        match a.db.list_prs(list_sources(&a.cfg)) {
+            Ok(rows) => rows,
+            Err(e) => {
+                // 失败时保留旧行并发状态栏错误——清空成空列表会让用户以为数据全没了
+                tracing::warn!("列表加载失败: {e}");
+                let lang = a.cfg.language.clone();
+                drop(a);
+                let _ = msg_tx.send(Msg::Status(trf(&lang, "list_load_failed", &[&e.to_string()])));
+                return;
+            }
+        }
     };
     // 头像 / 组织图标预取名单
     let mut logins = Vec::new();
@@ -2937,7 +3555,7 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
         }
         orgs.extend(model::author_orgs(r));
     }
-    app.lock().unwrap().rows = rows.clone();
+    app.lock_recover().rows = rows.clone();
     // serde_json 行可跨线程；Slint 模型在 UI 线程（apply_msg）装配
     let _ = msg_tx.send(Msg::Rows(rows));
     let app2 = app.clone();
@@ -2945,7 +3563,7 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     tokio::spawn(async move {
         // 用 GitHub::new 的标准客户端（与 fetch_inbox 同款构建方式，已证明稳定）；
         // 之前 prefetch 自建裸客户端在 worker 运行时下会挂死在 send()，原因未查明
-        let token = app2.lock().unwrap().cfg.token();
+        let token = app2.lock_recover().cfg.token();
         let Ok(gh) = github::GitHub::new(token) else { return };
         let fetched = avatars::prefetch(&gh, logins).await + avatars::prefetch_orgs(&gh, orgs).await;
         if fetched > 0 {
@@ -2957,45 +3575,32 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
 
 // ── UI 消息应用 ──
 
-/// 用当前 filter 过滤 app.rows 并重建 rows/groups 模型（折叠状态按组 key 从旧模型带回）。
+/// 用当前 filter 过滤 app.rows 并重建摊平 items 模型（折叠状态存 App.collapsed，跨重建保留）。
 fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     // 在 UI 线程装配 Slint 模型（SharedString/Image 是 Rc，不跨线程）
-    let (rows_json, lang, sort_col, sort_asc) = {
-        let a = app.lock().unwrap();
+    let (rows_json, lang, sort_col, sort_asc, collapsed) = {
+        let a = app.lock_recover();
         (
             a.view.iter().map(|&i| a.rows[i].clone()).collect::<Vec<serde_json::Value>>(),
             a.cfg.language.clone(),
             a.sort_col.clone(),
             a.sort_asc,
+            a.collapsed.clone(),
         )
     };
-    let (rows, mut groups) = model::build_models(&rows_json, &lang, &sort_col, sort_asc);
-    // UI 展示顺序（分组重排后）的身份序列——resolve_view 的点击映射以此为准，
-    // 不能用 a.view（数据库排序），两者在分组重排后不是一个序。
-    let keys: Vec<(String, i64)> = rows
-        .iter()
-        .filter_map(|r| {
-            let (repo, num) = r.key.rsplit_once('#')?;
-            Some((repo.to_string(), num.parse().ok()?))
-        })
-        .collect();
-    app.lock().unwrap().view_keys = keys;
-    let old = ui.get_groups();
-    for g in groups.iter_mut() {
-        for gi in 0..old.row_count() {
-            let og = old.row_data(gi).unwrap();
-            if og.key == g.key {
-                g.collapsed = og.collapsed;
-                break;
-            }
-        }
+    // view_keys：全部行（含折叠组）的展示序身份——行委托的 ridx 点击映射以此为准；
+    // view_visible：可见行的展示序身份——j/k 键盘导航以它为准（与扁平化后的视觉顺序一致）。
+    // 都不能用 a.view（数据库排序）代替：分组重排后不是一个序。
+    let (items, keys, visible) = model::build_items(&rows_json, &lang, &sort_col, sort_asc, &collapsed);
+    {
+        let mut a = app.lock_recover();
+        a.view_keys = keys;
+        a.view_visible = visible;
     }
-    ui.set_rows(ModelRc::new(VecModel::from(rows)));
-    ui.set_groups(ModelRc::new(VecModel::from(groups)));
-    // 重建后高亮跟随选中 PR 的身份（下标已漂移，UI 侧 selected_index 由 key 反查）
+    ui.set_items(ModelRc::new(VecModel::from(items)));
+    // 重建后高亮跟随选中 PR 的身份（下标已漂移，UI 侧以 selected_key 反查高亮）
     let sel_key = app
-        .lock()
-        .unwrap()
+        .lock_recover()
         .selected
         .as_ref()
         .map(|(r, n)| format!("{r}#{n}"))
@@ -3006,7 +3611,7 @@ fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
 /// 浏览器打开 PR：优先用行数据里的 url，缺失时按 repo/number 拼 GitHub 链接兜底。
 fn open_pr_url(app: &Arc<Mutex<App>>, repo: &str, number: &i64) {
     let url = {
-        let a = app.lock().unwrap();
+        let a = app.lock_recover();
         find_row(&a, repo, *number)
             .and_then(|i| a.rows[i]["url"].as_str().map(|s| s.to_string()))
             .filter(|u| !u.is_empty())
@@ -3053,16 +3658,30 @@ fn apply_review_props(ui: &MainWindow, p: &ReviewProps) {
     )));
 }
 
-fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>, msg: Msg) {
+fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cmd>, msg: Msg) {
     match msg {
-        Msg::Status(s) => {
-            app.lock().unwrap().status_msg = s;
-            update_status_bar(ui, app);
+        Msg::Status(s) => set_transient_status(ui, app, s),
+        Msg::RefreshDone(open_count) => {
+            // 刷新完成：停顶栏转圈（去重标志已在 worker 复位）+ 状态栏结果（走 6s 自动清）
+            ui.set_gh_refreshing(false);
+            let lang = lang_of(app);
+            set_transient_status(ui, app, trf(&lang, "gh_refresh_done", &[&open_count.to_string()]));
         }
+        Msg::SyncFinished => {
+            // 同步结束（成败与否）：只负责停转圈；结果文案由 do_sync 自己的 Status 负责
+            ui.set_syncing(false);
+        }
+        Msg::DialogMsg(s) => {
+            // 设置弹窗内联反馈（模型拉取进度/失败等弹窗内发起的操作）
+            ui.set_s_dialog_error(s.into());
+        }
+        Msg::InboxLoading(v) => ui.set_inbox_loading(v),
         Msg::StatusBarRefresh => update_status_bar(ui, app),
         Msg::ModelsLoaded(models) => {
             let v: Vec<SharedString> = models.iter().map(|m| m.as_str().into()).collect();
             ui.set_model_list(ModelRc::new(slint::VecModel::from(v)));
+            // 拉取成功：清掉「正在拉取模型列表…」内联提示
+            ui.set_s_dialog_error("".into());
         }
         Msg::Profiles { names, active } => {
             ui.set_profile_names(ModelRc::new(VecModel::from(
@@ -3076,15 +3695,16 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
         }
         Msg::ReopenPanel => {
             // 元数据补齐后重开面板（内容已变，身份不变）；
-            // refetch=false：这是刷新重载，不许再派发拉取命令（防 FetchPrMeta 死循环）
-            let sel = app.lock().unwrap().selected.clone();
+            // refetch=false：这是刷新重载，不许再派发拉取命令（防 FetchPrMeta 死循环）。
+            // 装配在 worker（Cmd::OpenDrawer），UI 线程不做 DB/解析
+            let sel = app.lock_recover().selected.clone();
             if let Some((repo, number)) = sel {
-                open_drawer(app, cmd_tx, repo, number, false);
+                let _ = cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: false });
             }
         }
         Msg::FilterChanged(q) => {
             {
-                let mut a = app.lock().unwrap();
+                let mut a = app.lock_recover();
                 a.filter = q;
                 a.view = filtered_view(&a.rows, &a.filter, a.min_score);
             }
@@ -3093,14 +3713,14 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
         Msg::ViewPrefsChanged => {
             // 排序 / 高分快筛变化：重算过滤视图并重建行模型
             {
-                let mut a = app.lock().unwrap();
+                let mut a = app.lock_recover();
                 a.view = filtered_view(&a.rows, &a.filter, a.min_score);
             }
             rebuild_rows_ui(ui, app);
         }
         Msg::Rows(rows_json) => {
             {
-                let mut a = app.lock().unwrap();
+                let mut a = app.lock_recover();
                 a.total = rows_json.len();
                 a.view = filtered_view(&a.rows, &a.filter, a.min_score);
             }
@@ -3132,7 +3752,12 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
         }
         Msg::ClosePanel => ui.set_d_open(false),
         Msg::ReviewProgress { repo, number, text } => {
-            app.lock().unwrap().status_msg = text.clone();
+            {
+                // 直写 status_msg 也要推序号，否则在途的 6s 自动清除定时器会误清这条
+                let mut a = app.lock_recover();
+                a.status_msg = text.clone();
+                a.status_gen = a.status_gen.wrapping_add(1);
+            }
             update_status_bar(ui, app);
             if panel_matches(app, &repo, number) {
                 ui.set_d_review_status("running".into());
@@ -3141,12 +3766,16 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
         }
         Msg::ReviewDone { repo, number } => {
             let lang = lang_of(app);
-            app.lock().unwrap().status_msg = trf(&lang, "review_done", &[&repo, &number.to_string()]);
+            {
+                let mut a = app.lock_recover();
+                a.status_msg = trf(&lang, "review_done", &[&repo, &number.to_string()]);
+                a.status_gen = a.status_gen.wrapping_add(1);
+            }
             update_status_bar(ui, app);
             // 评审分数进列表 Rev 列：重建行模型
             reload_rows_global(app);
             if panel_matches(app, &repo, number) {
-                let rv = { app.lock().unwrap().db.get_review(&repo, number).ok().flatten() };
+                let rv = { app.lock_recover().db.get_review(&repo, number).ok().flatten() };
                 apply_review_props(ui, &review_props(rv.as_ref(), &lang));
                 ui.set_d_review_status("done".into());
                 ui.set_d_review_progress("".into());
@@ -3154,52 +3783,32 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
         }
         Msg::ReviewFailed { repo, number, err } => {
             let lang = lang_of(app);
-            app.lock().unwrap().status_msg = trf(&lang, "review_failed", &[&repo, &number.to_string(), &err]);
+            {
+                let mut a = app.lock_recover();
+                a.status_msg = trf(&lang, "review_failed", &[&repo, &number.to_string(), &err]);
+                a.status_gen = a.status_gen.wrapping_add(1);
+            }
             update_status_bar(ui, app);
             if panel_matches(app, &repo, number) {
                 ui.set_d_review_status("failed".into());
             }
         }
         Msg::InboxRows(rows_json) => {
-            // 存一份原始 JSON（inbox_activated 按下标取 thread id）
-            app.lock().unwrap().inbox = rows_json.clone();
-            // JSON → NotifRow 模型（UI 线程装配）；updated_at 换算成相对时间；
-            // PullRequest 行查库计算「已加入」标记
-            let rows: Vec<NotifRow> = {
-                let a = app.lock().unwrap();
-                rows_json
-                    .iter()
-                    .map(|n| {
-                        let url = n["url"].as_str().unwrap_or("");
-                        let number = notif_url_number(url);
-                        let added = n["kind"].as_str() == Some("PullRequest")
-                            && number.is_some()
-                            && a.db
-                                .pr_exists(n["repo"].as_str().unwrap_or(""), number.unwrap_or(0))
-                                .unwrap_or(false);
-                        NotifRow {
-                            id: n["id"].as_str().unwrap_or("").into(),
-                            repo: n["repo"].as_str().unwrap_or("").into(),
-                            title: n["title"].as_str().unwrap_or("").into(),
-                            kind: n["kind"].as_str().unwrap_or("").into(),
-                            reason: n["reason"].as_str().unwrap_or("").into(),
-                            updated: model::rel_time(n["updated_at"].as_str().unwrap_or("")).into(),
-                            unread: n["unread"].as_bool().unwrap_or(false),
-                            url: url.into(),
-                            added,
-                            state: n["state"].as_str().unwrap_or("").into(),
-                        }
-                    })
-                    .collect()
-            };
-            tracing::info!("InboxRows: setting {} rows to UI", rows.len());
-            // 仓库过滤下拉的去重列表（保序去重：按出现顺序）
-            {
+            // 首次加载完成（成功路径）：关「加载中…」
+            ui.set_inbox_loading(false);
+            // 存原始 JSON + 仓库过滤视图（inbox_activated 按下标取 thread id，以过滤视图为准）
+            let (rows, repos) = {
+                let mut a = app.lock_recover();
+                a.inbox = rows_json;
+                a.inbox_view = inbox_filtered(&a);
+                let rows = build_inbox_rows(&a, &a.inbox_view);
+                // 仓库过滤下拉的去重列表（保序去重：按出现顺序；取未过滤全量）
                 let mut seen = std::collections::HashSet::new();
-                let repos: Vec<SharedString> = rows
+                let repos: Vec<SharedString> = a
+                    .inbox
                     .iter()
-                    .filter_map(|r| {
-                        let s = r.repo.to_string();
+                    .filter_map(|n| {
+                        let s = n["repo"].as_str().unwrap_or("").to_string();
                         if !s.is_empty() && seen.insert(s.clone()) {
                             Some(s.into())
                         } else {
@@ -3207,32 +3816,73 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
                         }
                     })
                     .collect();
-                ui.set_inbox_repos(ModelRc::new(VecModel::from(repos)));
-            }
+                (rows, repos)
+            };
+            tracing::info!("InboxRows: setting {} rows to UI", rows.len());
+            ui.set_inbox_repos(ModelRc::new(VecModel::from(repos)));
             ui.set_inbox_rows(ModelRc::new(VecModel::from(rows)));
             // 分页状态：供「加载更多」按钮显隐与加载态
             {
-                let a = app.lock().unwrap();
+                let a = app.lock_recover();
                 ui.set_inbox_has_more(a.inbox_has_more);
                 ui.set_inbox_loading_more(a.inbox_loading_more);
             }
-            // 预览面板开着时同步刷新「已加入」状态（+ 预评审后重发 InboxRows 会走到这里）
+            // 预览面板开着时同步刷新「已加入」状态（+ 预评审后重发 InboxRows 会走到这里）；
+            // 查询失败保守按已加入处理（防重复插入）并告警
             let detail_added = {
-                let a = app.lock().unwrap();
+                let a = app.lock_recover();
                 a.inbox_detail.as_ref().map(|(repo, number, kind, _)| {
-                    kind == "PullRequest" && a.db.pr_exists(repo, *number).unwrap_or(false)
+                    kind == "PullRequest"
+                        && a.db.pr_exists(repo, *number).unwrap_or_else(|e| {
+                            tracing::warn!("查询 PR 是否已加入失败 {repo} #{number}: {e}");
+                            true
+                        })
                 })
             };
             if let Some(added) = detail_added {
                 ui.set_nd_added(added);
             }
         }
-        Msg::NotifDetail { convo_json, files_json, diff } => {
-            // JSON → Slint 模型（UI 线程装配，同 Msg::Panel 的模式）
+        Msg::NotifDetail { repo, number, convo_json, files_json, diff_files } => {
+            // 身份守卫：快速连点两条通知时，旧通知的内容不得覆盖正在看的那条
+            let current = app
+                .lock_recover()
+                .inbox_detail
+                .as_ref()
+                .map(|(r, n, _, _)| (r.clone(), *n));
+            if current.as_ref() != Some(&(repo, number)) {
+                return;
+            }
+            // JSON → Slint 模型（UI 线程装盒，同 Msg::Panel 的模式）；diff 已在 worker 解析
             ui.set_nd_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
             ui.set_nd_files(ModelRc::new(VecModel::from(file_change_models(&files_json))));
-            ui.set_nd_diff_files(ModelRc::new(VecModel::from(build_diff_files(&diff))));
+            app.lock_recover().nd_diff_data = diff_files.clone();
+            ui.set_nd_diff_files(ModelRc::new(VecModel::from(diff_row_models(&diff_files))));
+            ui.set_nd_diff_max_text(diff_max_line(&diff_files));
             ui.set_nd_loading(false);
+        }
+        Msg::NotifDetailFailed { repo, number, err } => {
+            // 拉取失败：身份匹配时关加载态并给状态栏错误（面板不再永远停在「加载中」）
+            let current = app
+                .lock_recover()
+                .inbox_detail
+                .as_ref()
+                .map(|(r, n, _, _)| (r.clone(), *n));
+            if current.as_ref() != Some(&(repo, number)) {
+                return;
+            }
+            ui.set_nd_loading(false);
+            {
+                let mut a = app.lock_recover();
+                a.status_msg = err;
+                a.status_gen = a.status_gen.wrapping_add(1);
+            }
+            update_status_bar(ui, app);
+        }
+        Msg::ReviewPromptLoaded(text) => {
+            // 回填完成：解除编辑锁定（打开设置页时置的 loading 到此结束）
+            ui.set_s_review_prompt(text.into());
+            ui.set_s_prompt_loading(false);
         }
         Msg::PanelLive { repo, number, ci, state, updated, convo_json, checks_json, files_json } => {
             // 实时数据只刷当前打开的面板；None 的区块本次未拉取，保持不动。
@@ -3258,9 +3908,15 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &mpsc::Sender<Cmd>,
                 }
             }
         }
-        Msg::DiffRaw(diff) => {
-            // 在 UI 线程构建 Slint 模型（DiffView 依赖整体替换）
-            ui.set_diff_files(ModelRc::new(VecModel::from(build_diff_files(&diff))));
+        Msg::DiffParsed { repo, number, files } => {
+            // 身份守卫：快速切换 PR 时，A 的 diff 不得覆盖正在看的 B；
+            // 不匹配时不上屏（diff 缓存已在 worker 落库，下次打开能用）。
+            // UI 线程只做 VecModel 装盒（解析在 worker 完成）
+            if panel_matches(app, &repo, number) {
+                app.lock_recover().diff_data = files.clone();
+                ui.set_diff_files(ModelRc::new(VecModel::from(diff_row_models(&files))));
+                ui.set_diff_max_text(diff_max_line(&files));
+            }
         }
     }
 }
@@ -3340,12 +3996,12 @@ mod tests {
     #[test]
     fn slot_guard_releases_on_drop() {
         let slots = Arc::new(Mutex::new(ReviewSlots::new(1)));
-        slots.lock().unwrap().try_acquire("o/r", 1).unwrap();
+        slots.lock_recover().try_acquire("o/r", 1).unwrap();
         {
             let _g = SlotGuard { slots: slots.clone(), repo: "o/r".into(), number: 1 };
         }
-        assert!(!slots.lock().unwrap().is_running("o/r", 1));
-        assert!(slots.lock().unwrap().try_acquire("o/r", 1).is_ok());
+        assert!(!slots.lock_recover().is_running("o/r", 1));
+        assert!(slots.lock_recover().try_acquire("o/r", 1).is_ok());
     }
 
     // ── 选中态按身份（repo, number）查找 ──
@@ -3358,18 +4014,27 @@ mod tests {
             rows,
             view,
             view_keys: Vec::new(),
+            view_visible: Vec::new(),
+            collapsed: HashSet::new(),
             filter: String::new(),
         sort_col: "upd".into(),
         sort_asc: false,
         min_score: 0.0,
             selected: None,
             status_msg: String::new(),
+            status_gen: 0,
+            gh_refreshing: false,
+            sync_inflight: false,
             inbox: Vec::new(),
+            inbox_view: Vec::new(),
+            inbox_filter: String::new(),
             inbox_all: true,
             inbox_page: 1,
             inbox_has_more: false,
             inbox_loading_more: false,
             inbox_detail: None,
+            diff_data: Vec::new(),
+            nd_diff_data: Vec::new(),
             total: 0,
             rate_limit: Arc::new(Mutex::new(None)),
             last_sync: sync::shared_last_sync(),
@@ -3384,17 +4049,17 @@ mod tests {
             serde_json::json!({"repo": "o/r", "number": 2}),
         ]);
         {
-            let a = app.lock().unwrap();
+            let a = app.lock_recover();
             assert_eq!(find_row(&a, "o/r", 2), Some(1));
             assert_eq!(find_row(&a, "o/r", 99), None);
             assert_eq!(find_row(&a, "x/y", 1), None);
         }
         // 模拟刷新后行序颠倒：身份查找仍命中同一个 PR，不会货不对板
-        app.lock().unwrap().rows = vec![
+        app.lock_recover().rows = vec![
             serde_json::json!({"repo": "o/r", "number": 2}),
             serde_json::json!({"repo": "o/r", "number": 1}),
         ];
-        let a = app.lock().unwrap();
+        let a = app.lock_recover();
         assert_eq!(find_row(&a, "o/r", 2), Some(0));
         assert_eq!(find_row(&a, "o/r", 1), Some(1));
     }
@@ -3402,15 +4067,15 @@ mod tests {
     #[test]
     fn panel_matches_identity_surviving_row_removal() {
         let app = test_app(vec![serde_json::json!({"repo": "o/r", "number": 1})]);
-        app.lock().unwrap().selected = Some(("o/r".into(), 1));
+        app.lock_recover().selected = Some(("o/r".into(), 1));
         assert!(panel_matches(&app, "o/r", 1));
         assert!(!panel_matches(&app, "o/r", 2));
         assert!(!panel_matches(&app, "x/y", 1));
         // 刷新后该行不在列表里：面板保持打开，身份保留，匹配继续工作
-        app.lock().unwrap().rows = Vec::new();
+        app.lock_recover().rows = Vec::new();
         assert!(panel_matches(&app, "o/r", 1));
         // 关闭面板后不再匹配
-        app.lock().unwrap().selected = None;
+        app.lock_recover().selected = None;
         assert!(!panel_matches(&app, "o/r", 1));
     }
 
@@ -3421,7 +4086,7 @@ mod tests {
             serde_json::json!({"repo": "o/r", "number": 2, "title": "bbb"}),
         ]);
         // UI 实际展示顺序（分组重排后）与数据库序不同：点击映射必须以 view_keys 为准
-        app.lock().unwrap().view_keys = vec![("o/r".into(), 2), ("o/r".into(), 1)];
+        app.lock_recover().view_keys = vec![("o/r".into(), 2), ("o/r".into(), 1)];
         assert_eq!(resolve_view(&app, 0), Some(("o/r".to_string(), 2)));
         assert_eq!(resolve_view(&app, 1), Some(("o/r".to_string(), 1)));
         assert_eq!(resolve_view(&app, 2), None);
@@ -3570,12 +4235,12 @@ mod tests {
 
         let app = test_app(Vec::new());
         {
-            let mut a = app.lock().unwrap();
+            let mut a = app.lock_recover();
             a.cfg.server_url = url;
             a.cfg.sync_token = "tok".into();
             a.cfg.active_profile = "default".into();
         }
-        let sc = sync::SyncClient::new(&app.lock().unwrap().cfg);
+        let sc = sync::SyncClient::new(&app.lock_recover().cfg);
         assert!(sc.enabled());
 
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -3586,13 +4251,13 @@ mod tests {
             // 拉取在途：用户切回 local —— 换库
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             {
-                let mut a = app.lock().unwrap();
+                let mut a = app.lock_recover();
                 a.cfg.active_profile = "local".into();
                 a.db = Db::open_memory().unwrap();
             }
             h.await.unwrap();
         });
-        let a = app.lock().unwrap();
+        let a = app.lock_recover();
         assert!(
             a.db.list_pr_keys().unwrap().is_empty(),
             "在途 sync 把服务器数据写进了切换后的 local 库（串库）"

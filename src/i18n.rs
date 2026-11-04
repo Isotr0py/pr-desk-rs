@@ -3,14 +3,13 @@
 
 /// 中文表（现状文案，key 的最终来源）。
 const ZH: &[(&str, &str)] = &[
-    // ── 列表分组标题（lib.rs build_sections）──
+    // ── 列表分组标题（lib.rs build_sections；数量徽章由 UI 层画，标题不再拼计数）──
     ("section_pinned", "Pinned"),
     ("section_board", "看板"),
     ("section_pending", "待评审"),
     ("section_reviewed", "已评审"),
     ("section_rejected", "不采纳"),
     ("section_closed", "已合入 / 已关闭"),
-    ("section_title_fmt", "{0}（{1}）"),
     // ── 行内次级活动行（model.rs activity_text）──
     ("reviews_count", "{0} 条评审"),
     // ── 同步状态（sync.rs last_sync_text）──
@@ -29,6 +28,30 @@ const ZH: &[(&str, &str)] = &[
     ("cfg_saved", "配置已保存并生效"),
     ("cfg_reloaded", "配置已重载"),
     ("field_updated", "已更新 {0}（待同步）"),
+    // field_updated 的字段名映射（内部字段名不直接抛给用户）
+    ("field_pinned", "置顶"),
+    ("field_on_board", "看板"),
+    ("field_priority", "优先级"),
+    ("field_status", "状态"),
+    // ── Inbox 通知类型 / 原因（GitHub 原始枚举值 → 界面文案；未知值回退原串）──
+    ("kind_pull_request", "拉取请求"),
+    ("kind_issue", "议题"),
+    ("kind_release", "发布"),
+    ("kind_discussion", "讨论"),
+    ("kind_check_suite", "检查套件"),
+    ("kind_commit", "提交"),
+    ("reason_review_requested", "审查请求"),
+    ("reason_assign", "被指派"),
+    ("reason_mention", "提及了你"),
+    ("reason_comment", "新评论"),
+    ("reason_ci_activity", "CI 动态"),
+    ("reason_author", "作者更新"),
+    ("reason_subscribed", "订阅更新"),
+    ("reason_team_mention", "团队提及"),
+    ("reason_security_alert", "安全警报"),
+    ("reason_state_change", "状态变更"),
+    ("reason_invitation", "仓库邀请"),
+    ("reason_manual", "手动订阅"),
     // ── 详情面板评审文本 ──
     ("body_score", "综合评分：{0}/10"),
     ("body_score_failed", "评审解析失败（分数为空）"),
@@ -62,6 +85,7 @@ const ZH: &[(&str, &str)] = &[
     ("gh_client_init_failed", "GitHub 客户端初始化失败: {0}"),
     ("gh_client_rebuild_failed", "GitHub 客户端重建失败: {0}"),
     ("repo_fetch_failed", "拉取 {0} 失败: {1}"),
+    ("list_load_failed", "列表加载失败: {0}"),
     ("gh_refresh_done", "GitHub 刷新完成：{0} 个 open PR"),
     ("sync_done", "已同步服务器列表：拉取 {0} PR/{1} 评审/{2} 待办；推送 {3} 条（冲突 {4}）"),
     ("sync_failed", "同步失败: {0}"),
@@ -112,6 +136,7 @@ const ZH: &[(&str, &str)] = &[
     ("err_ocr_spawn", "启动 ocr 失败（检查 ocr_path 配置：{0}）"),
     ("err_ocr_no_result", "ocr 未生成 result.json"),
     ("err_ocr_exit", "ocr 退出码 {0}：{1}"),
+    ("err_ocr_terminated", "ocr 异常终止（无退出码，可能被信号杀死）：{0}"),
     ("err_ocr_failed_status", "ocr 评审失败（status=failed）：{0}"),
 ];
 
@@ -123,7 +148,6 @@ const EN: &[(&str, &str)] = &[
     ("section_reviewed", "Reviewed"),
     ("section_rejected", "Rejected"),
     ("section_closed", "Merged / Closed"),
-    ("section_title_fmt", "{0} ({1})"),
     ("reviews_count", "{0} reviews"),
     ("sync_last", "Synced {0} ago"),
     ("cfg_unconfigured", "Not configured (click Settings at top right)"),
@@ -138,6 +162,28 @@ const EN: &[(&str, &str)] = &[
     ("cfg_saved", "Settings saved and applied"),
     ("cfg_reloaded", "Config reloaded"),
     ("field_updated", "Updated {0} (pending sync)"),
+    ("field_pinned", "pin"),
+    ("field_on_board", "board"),
+    ("field_priority", "priority"),
+    ("field_status", "status"),
+    ("kind_pull_request", "Pull Request"),
+    ("kind_issue", "Issue"),
+    ("kind_release", "Release"),
+    ("kind_discussion", "Discussion"),
+    ("kind_check_suite", "Check Suite"),
+    ("kind_commit", "Commit"),
+    ("reason_review_requested", "Review requested"),
+    ("reason_assign", "Assigned"),
+    ("reason_mention", "Mentioned"),
+    ("reason_comment", "New comment"),
+    ("reason_ci_activity", "CI activity"),
+    ("reason_author", "Author update"),
+    ("reason_subscribed", "Subscribed"),
+    ("reason_team_mention", "Team mention"),
+    ("reason_security_alert", "Security alert"),
+    ("reason_state_change", "State change"),
+    ("reason_invitation", "Repo invitation"),
+    ("reason_manual", "Manual subscription"),
     ("body_score", "Overall score: {0}/10"),
     ("body_score_failed", "Failed to parse review (no score)"),
     ("body_dimensions", "Dimensions: {0}"),
@@ -168,6 +214,7 @@ const EN: &[(&str, &str)] = &[
     ("gh_client_init_failed", "Failed to init GitHub client: {0}"),
     ("gh_client_rebuild_failed", "Failed to rebuild GitHub client: {0}"),
     ("repo_fetch_failed", "Failed to fetch {0}: {1}"),
+    ("list_load_failed", "Failed to load the list: {0}"),
     ("gh_refresh_done", "GitHub refresh done: {0} open PRs"),
     ("sync_done", "Synced server list: pulled {0} PRs / {1} reviews / {2} todos; pushed {3} ({4} conflicts)"),
     ("sync_failed", "Sync failed: {0}"),
@@ -215,6 +262,7 @@ const EN: &[(&str, &str)] = &[
     ("err_ocr_spawn", "Failed to start ocr (check ocr_path config: {0})"),
     ("err_ocr_no_result", "ocr did not produce result.json"),
     ("err_ocr_exit", "ocr exit code {0}: {1}"),
+    ("err_ocr_terminated", "ocr terminated abnormally (no exit code, possibly killed by signal): {0}"),
     ("err_ocr_failed_status", "ocr review failed (status=failed): {0}"),
 ];
 
@@ -223,14 +271,27 @@ fn lookup(table: &'static [(&'static str, &'static str)], key: &str) -> Option<&
 }
 
 /// 取文案：lang=="en" 走英文表（缺 key 回退中文），其它一律中文。
-/// key 在两张表都不存在时返回空串（调用方 key 拼写错误的兜底，靠测试覆盖防呆）。
-pub fn tr(lang: &str, key: &str) -> &'static str {
+/// key 在两张表都不存在时返回 key 本身并 warn 一次（可见、可 grep；
+/// 返回空串会让界面出现无字按钮且无法排查）。
+pub fn tr<'a>(lang: &str, key: &'a str) -> &'a str {
     let s = if lang == "en" {
         lookup(EN, key).or_else(|| lookup(ZH, key))
     } else {
         lookup(ZH, key)
     };
-    s.unwrap_or("")
+    match s {
+        Some(v) => v,
+        None => {
+            // 同一 key 只 warn 一次，避免刷屏
+            static WARNED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+                std::sync::OnceLock::new();
+            let set = WARNED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+            if set.lock().unwrap().insert(key.to_string()) {
+                tracing::warn!("i18n 未知 key: {key}");
+            }
+            key
+        }
+    }
 }
 
 /// tr + 占位替换：依次把 {0} {1}… 换成 args。
@@ -260,8 +321,8 @@ mod tests {
         // 未知 lang 回退中文
         assert_eq!(tr("fr", "section_pending"), "待评审");
         assert_eq!(tr("", "section_pending"), "待评审");
-        // 未知 key 回退空串
-        assert_eq!(tr("zh", "no_such_key"), "");
+        // 未知 key 返回 key 本身（可 grep 排查）
+        assert_eq!(tr("zh", "no_such_key"), "no_such_key");
     }
 
     #[test]
@@ -270,8 +331,10 @@ mod tests {
         assert_eq!(trf("en", "added_review", &["o/r", "42"]), "Added to pre-review: o/r #42");
         // 多占位 + 顺序无关
         assert_eq!(
-            trf("en", "section_title_fmt", &["Board", "3"]),
-            "Board (3)"
+            trf("en", "review_start", &["o/r", "42"]),
+            "Starting review o/r #42…"
         );
+        // 未知 key：trf 拿到的模板是 key 本身，占位符原样保留
+        assert_eq!(trf("zh", "missing_key", &["x"]), "missing_key");
     }
 }

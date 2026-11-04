@@ -43,6 +43,11 @@ export global Theme {
     out property <length> fs_lg: 15px * fs_scale;
     out property <length> fs_xl: 18px * fs_scale;
 
+    // ── 等宽字体（diff / 代码块 / 文件路径）─────────────────────
+    // 由 MainWindow.mono_font 在启动时按平台写入（Windows Consolas / macOS Menlo /
+    // Linux Noto Sans Mono）；组件里不要再写死 "Consolas"
+    in-out property <string> mono_font: "Consolas";
+
     // ── 圆角（极简风整体更圆润）─────────────────────────────
     out property <length> r_sm: 6px;
     out property <length> r_md: 8px;

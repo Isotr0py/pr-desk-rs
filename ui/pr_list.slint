@@ -2,6 +2,7 @@
 // GitHub 风格精致列表：11px 表头 + 30px 紧凑行 + 左侧 accent 选中指示条。
 // 依赖共享契约：theme.slint 的 global Theme（sel/sel_text/hover/hairline/fs_*/r_*），
 // components.slint 的 Avatar / StatusDot / ScoreChip / SizeBadge / PriorityDot / TagChip。
+import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { I18n } from "i18n.slint";
 import { Avatar, StatusDot, ScoreChip, SizeBadge, PriorityDot, TagChip } from "components.slint";
@@ -34,13 +35,28 @@ export struct PrListRow {
     on_board: bool,
 }
 
-// 分组元数据：rows 按组顺序扁平排列，start/count 切片出本组行
+// 分组元数据（仅 GroupHeader 组件内部使用；列表模型已摊平为 PrListItem，见下）
 export struct PrGroup {
     key: string,        // pinned / board / needs-review / reviewed / rejected / closed
     name: string,       // 显示名（Pinned / 看板 / 待评审 / 已评审 / 不采纳 / 已合入关闭）
-    start: int,         // 在 rows 中的起始下标
-    count: int,         // 本组行数
+    start: int,         // 未使用（兼容字段）
+    count: int,         // 本组行数（徽章）
     collapsed: bool,
+}
+
+// 摊平后的列表项：组头（is_header）与数据行混排进同一个 ListView（虚拟化）。
+// 折叠组的行不进模型；ridx 是该行在「完整行序列」（含折叠组的行，即 Rust 侧
+// view_keys 序）中的下标——点击/快捷操作回调都传它，与折叠状态解耦。
+export struct PrListItem {
+    is_header: bool,
+    ridx: int,
+    // ── 组头字段（is_header=true 时有效）──
+    gkey: string,
+    gname: string,
+    gcount: int,
+    gcollapsed: bool,
+    // ── 数据行字段（is_header=false 时有效）──
+    row: PrListRow,
 }
 
 // 列宽契约（表头与数据行共用，保持一致）。in-out：表头拖拽手柄可改列宽。
@@ -58,6 +74,10 @@ global Cols {
     in-out property <length> updated: 40px;
     out property <length> row-pad-l: 10px;
     out property <length> row-pad-r: 8px;
+    // 全部固定列 + 列间隙 + 两侧 padding + Title 列最小宽（60px）：
+    // 视口窄于此时列表允许横向滚动，右侧 Age/Upd 列不被裁掉
+    out property <length> min-total: priority + number + author + turn + review + ci + size
+        + DiffCol.width + age + updated + 6px * 10 + row-pad-l + row-pad-r + 60px;
 }
 
 // 增删行数列宽（表头拖拽手柄可调）
@@ -207,15 +227,15 @@ component ListHeader inherits Rectangle {
 
     HeaderCell { x: root.x-p; width: Cols.priority; label: "P"; sort_key: "priority"; active: root.sort_col == "priority"; asc: root.sort_asc; clicked => { root.col_clicked("priority"); } }
     HeaderCell { x: root.x-num; width: Cols.number; label: "#"; sort_key: "num"; active: root.sort_col == "num"; asc: root.sort_asc; clicked => { root.col_clicked("num"); } }
-    HeaderCell { x: root.x-title; width: root.title-w; label: "Title"; sort_key: "title"; active: root.sort_col == "title"; asc: root.sort_asc; clicked => { root.col_clicked("title"); } }
-    HeaderCell { x: root.x-author; width: Cols.author; label: "Author"; sort_key: "author"; active: root.sort_col == "author"; asc: root.sort_asc; clicked => { root.col_clicked("author"); } }
-    HeaderCell { x: root.x-turn; width: Cols.turn; label: "Turn"; sort_key: "turn"; active: root.sort_col == "turn"; asc: root.sort_asc; clicked => { root.col_clicked("turn"); } }
-    HeaderCell { x: root.x-rev; width: Cols.review; label: "Rev"; sort_key: "review"; active: root.sort_col == "review"; asc: root.sort_asc; clicked => { root.col_clicked("review"); } }
+    HeaderCell { x: root.x-title; width: root.title-w; label: I18n.col_title; sort_key: "title"; active: root.sort_col == "title"; asc: root.sort_asc; clicked => { root.col_clicked("title"); } }
+    HeaderCell { x: root.x-author; width: Cols.author; label: I18n.col_author; sort_key: "author"; active: root.sort_col == "author"; asc: root.sort_asc; clicked => { root.col_clicked("author"); } }
+    HeaderCell { x: root.x-turn; width: Cols.turn; label: I18n.col_turn; sort_key: "turn"; active: root.sort_col == "turn"; asc: root.sort_asc; clicked => { root.col_clicked("turn"); } }
+    HeaderCell { x: root.x-rev; width: Cols.review; label: I18n.col_review; sort_key: "review"; active: root.sort_col == "review"; asc: root.sort_asc; clicked => { root.col_clicked("review"); } }
     HeaderCell { x: root.x-ci; width: Cols.ci; label: "CI"; sort_key: "ci"; active: root.sort_col == "ci"; asc: root.sort_asc; clicked => { root.col_clicked("ci"); } }
-    HeaderCell { x: root.x-size; width: Cols.size; label: "Size"; sort_key: "size"; active: root.sort_col == "size"; asc: root.sort_asc; clicked => { root.col_clicked("size"); } }
+    HeaderCell { x: root.x-size; width: Cols.size; label: I18n.col_size; sort_key: "size"; active: root.sort_col == "size"; asc: root.sort_asc; clicked => { root.col_clicked("size"); } }
     HeaderCell { x: root.x-diff; width: DiffCol.width; label: "+/-"; sort_key: "changes"; active: root.sort_col == "changes"; asc: root.sort_asc; clicked => { root.col_clicked("changes"); } }
-    HeaderCell { x: root.x-age; width: Cols.age; label: "Age"; sort_key: "age"; active: root.sort_col == "age"; asc: root.sort_asc; clicked => { root.col_clicked("age"); } }
-    HeaderCell { x: root.x-upd; width: Cols.updated; label: "Upd"; sort_key: "upd"; active: root.sort_col == "upd"; asc: root.sort_asc; clicked => { root.col_clicked("upd"); } }
+    HeaderCell { x: root.x-age; width: Cols.age; label: I18n.col_age; sort_key: "age"; active: root.sort_col == "age"; asc: root.sort_asc; clicked => { root.col_clicked("age"); } }
+    HeaderCell { x: root.x-upd; width: Cols.updated; label: I18n.col_updated; sort_key: "upd"; active: root.sort_col == "upd"; asc: root.sort_asc; clicked => { root.col_clicked("upd"); } }
 
     // 列宽拖拽手柄：拖分界线 = 相邻两列宽度互转（左列 + 右列 = 常量），
     // 其它列位置/宽度完全不动。手柄中心 = 间隙中心（右列左缘 - 3px）。
@@ -407,6 +427,7 @@ component GroupHeader inherits Rectangle {
 component QuickAction inherits Rectangle {
     in property <string> glyph;
     in property <image> icon;   // 优先于 glyph（内嵌 SVG，规避字形缺失豆腐块）
+    in property <string> tooltip: "";   // 悬停 450ms 后浮现（复用 components.slint 的延迟 tooltip 模式）
     out property <bool> hovered: qa-ta.has-hover;   // 暴露给父级：并入行 hover 条件，防覆盖层抖动
     callback activated();
 
@@ -415,10 +436,42 @@ component QuickAction inherits Rectangle {
     border-radius: Theme.r_sm;
     background: qa-ta.has-hover ? Theme.hover : transparent;
 
+    property <bool> show-tip: false;
+
     qa-ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.activated(); }
+        changed has-hover => {
+            if (!self.has-hover) { root.show-tip = false; }
+        }
     }
+
+    tip-timer := Timer {
+        interval: 450ms;
+        running: qa-ta.has-hover && root.tooltip != "" && !root.show-tip;
+        triggered => { root.show-tip = true; }
+    }
+
+    if root.show-tip && qa-ta.has-hover: Rectangle {
+        // 右对齐于图标（行右端紧邻视口边缘，居中会被裁掉右半）；
+        // 画在行的上方，依赖祖先不 clip（首行顶部可能被 Flickable 视口裁切，可接受）
+        x: parent.width - self.width;
+        y: -26px;
+        width: qa-tip.preferred-width + 12px;
+        height: 20px;
+        border-radius: Theme.r_sm;
+        background: Theme.card;
+        border-width: 1px;
+        border-color: Theme.hairline;
+        qa-tip := Text {
+            text: root.tooltip;
+            font-size: Theme.fs_xs;
+            color: Theme.text;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
     if root.icon.width > 0: Image {
         source: root.icon;
         width: 12px;
@@ -452,7 +505,7 @@ component TurnChip inherits Rectangle {
         padding-left: 6px;
         padding-right: 6px;
         Text {
-            text: root.mine ? "me" : "them";
+            text: root.mine ? I18n.turn_me : I18n.turn_them;
             color: root.mine ? Theme.accent : Theme.text_dim;
             font-size: Theme.fs_xs;
             font-weight: root.mine ? 700 : 400;
@@ -758,10 +811,10 @@ component PrRowItem inherits Rectangle {
             x: 4px;
             y: (parent.height - self.preferred-height) / 2;
             spacing: 4px;
-            qa-open := QuickAction { icon: @image-url("icons/open.svg"); activated => { root.open_browser(); } }
-            qa-pin := QuickAction { icon: @image-url("icons/pin.svg"); activated => { root.pin(); } }
-            qa-board := QuickAction { icon: @image-url("icons/plus.svg"); activated => { root.board(); } }
-            qa-reject := QuickAction { icon: @image-url("icons/x.svg"); activated => { root.reject(); } }
+            qa-open := QuickAction { icon: @image-url("icons/open.svg"); tooltip: I18n.inbox_open_browser; activated => { root.open_browser(); } }
+            qa-pin := QuickAction { icon: @image-url("icons/pin.svg"); tooltip: I18n.tip_pin; activated => { root.pin(); } }
+            qa-board := QuickAction { icon: @image-url("icons/plus.svg"); tooltip: I18n.detail_add_board; activated => { root.board(); } }
+            qa-reject := QuickAction { icon: @image-url("icons/x.svg"); tooltip: I18n.tip_reject; activated => { root.reject(); } }
         }
     }
 
@@ -775,66 +828,61 @@ component PrRowItem inherits Rectangle {
     }
 }
 
-// ── 分区列表 ──
-// rows 为扁平数据行（不含组头），groups 以 start/count 切片；groups 为空时退化为扁平列表。
-// 折叠状态直接写在 groups[i].collapsed（in-out，集成方可用 VecModel 持久化）。
+// ── 分区列表（扁平化模型 + 单 ListView 虚拟化）──
+// items 为组头/数据行混排的摊平模型（Rust 侧 build_items 装配；折叠组的行不在模型里）。
+// 行回调传 ridx = 该行在完整行序列（含折叠组的行）中的下标，与折叠状态解耦。
+// 折叠状态在 Rust 侧（App.collapsed），组头点击经 group_toggled 回调翻转后整体重建模型。
+// 键盘导航（j/k/Enter）也下沉到 Rust 侧（Slint 回调语言没有循环，无法跳组头扫描），
+// 行序与扁平化后的视觉顺序天然一致（同一份 view_visible）。
+// 横向滚动：内容窄于视口时铺满；视口比全部固定列还窄时（最小窗口 + 详情面板开着）
+// 允许横向拖拽滚动，表头与行同步横滚，右侧 Age/Upd 列不被裁掉。
 export component PrListView inherits FocusScope {
-    in property <[PrListRow]> rows: [];
-    in-out property <[PrGroup]> groups: [];
-    in-out property <int> selected_index: -1;   // in-out：集成方 Esc 取消选中时需要写
+    in property <[PrListItem]> items: [];
+    // 选中行身份（PrListRow.key = repo#number）。高亮以它为准——刷新重建行后
+    // 下标会漂移，身份不会。由点击/Rust 侧（键盘导航、rebuild 后回写）共同维护。
+    in-out property <string> selected_key: "";
     // 排序状态（表头高亮用；点击排序逻辑在集成方）
     in property <string> sort_col: "upd";
     in property <bool> sort_asc: false;
-    callback header_clicked(string);
-    // 选中行的身份（PrListRow.key = repo#number）。高亮以它为准——刷新重建行后
-    // 下标会漂移，身份不会。由点击/键盘/Rust 侧（rebuild 后回写）共同维护。
-    in-out property <string> selected_key: "";
+    // 弹窗/首启引导打开时锁键盘：key-pressed 全部 reject 放行给外层（外层负责 Esc 关弹窗）
+    in property <bool> keys_locked: false;
 
-    // 统一切选中：下标（键盘导航用）+ 身份（高亮/抗刷新用）
-    function select_at(i: int) {
-        root.selected_index = i;
-        root.selected_key = (i >= 0 && i < root.rows.length) ? root.rows[i].key : "";
-    }
-
-    callback row_activated(int);    // 点击或 Enter：打开详情（传 rows 下标）
+    callback header_clicked(string);    // 表头点击排序（传列 key）
+    callback group_toggled(string);     // 组头点击折叠/展开（传组 key）
+    callback row_activated(int);        // 点击行：打开详情（传 ridx）
     callback row_pin(int);
     callback row_reject(int);
     callback row_board(int);
-    callback row_open(int);         // 行内外链按钮：浏览器打开（传 rows 下标）
-    callback dismissed();           // Esc
+    callback row_open(int);             // 行内外链按钮：浏览器打开（传 ridx）
+    callback key_move(int);             // j/k/↑/↓：在可见行上移动选中（Rust 侧实现）
+    callback key_enter();               // Enter：打开当前选中（Rust 侧按身份解析）
+    callback dismissed();               // Esc
 
-    function move_selection(delta: int) {
-        if (root.rows.length == 0) { return; }
-        if (root.selected_index < 0 || root.selected_index >= root.rows.length) {
-            root.select_at(delta > 0 ? 0 : root.rows.length - 1);
-            return;
-        }
-        root.select_at(Math.min(root.rows.length - 1, Math.max(0, root.selected_index + delta)));
-    }
+    // 内容宽：视口宽与「固定列合计 + 最小标题列」取大（小于视口时铺满，大于时可横滚）
+    property <length> content-w: max(root.width, Cols.min-total);
 
-    // PageUp/PageDown 翻页滚动（由外层 FocusScope 调用；Flickable 自己不认键盘）
+    // PageUp/PageDown 翻页滚动（由外层 FocusScope 调用；ListView 自己不认键盘）
     public function page_scroll(dir: int) {
         if (dir > 0) {
-            flick.content-y = max(flick.height - flick.content-height, flick.content-y - flick.height * 0.9);
+            lv.content-y = max(lv.height - lv.content-height, lv.content-y - lv.height * 0.9);
         } else {
-            flick.content-y = min(0px, flick.content-y + flick.height * 0.9);
+            lv.content-y = min(0px, lv.content-y + lv.height * 0.9);
         }
     }
 
-    // 键盘导航：j/k 或 ↑/↓ 移动，Enter 打开，Esc 取消
+    // 键盘导航：j/k 或 ↑/↓ 移动（Rust 侧跳组头），Enter 打开，Esc 取消
     key-pressed(event) => {
+        if (root.keys_locked) { return reject; }
         if (event.text == "j" || event.text == Key.DownArrow) {
-            root.move_selection(1);
+            root.key_move(1);
             return accept;
         }
         if (event.text == "k" || event.text == Key.UpArrow) {
-            root.move_selection(-1);
+            root.key_move(-1);
             return accept;
         }
         if (event.text == Key.Return) {
-            if (root.selected_index >= 0 && root.selected_index < root.rows.length) {
-                root.row_activated(root.selected_index);
-            }
+            root.key_enter();
             return accept;
         }
         if (event.text == Key.Escape) {
@@ -846,82 +894,75 @@ export component PrListView inherits FocusScope {
 
     Rectangle {
         background: Theme.bg;
+        clip: true;
 
-        VerticalLayout {
-            alignment: start;
+        // 表头：纵向固定，横向随列表滚动（x 绑 content-x 反向偏移）
+        header-clip := Rectangle {
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: 26px;
+            clip: true;
 
             ListHeader {
+                x: flick.content-x;
+                y: 0;
+                width: root.content-w;
                 sort_col: root.sort_col;
                 sort_asc: root.sort_asc;
                 col_clicked(c) => { root.header_clicked(c); }
             }
+        }
 
-            flick := Flickable {
-                vertical-stretch: 1;
-                content-height: list_col.preferred-height;
+        // 空态
+        if root.items.length == 0: Text {
+            y: 26px;
+            width: 100%;
+            height: 48px;
+            text: I18n.empty_no_pr;
+            color: Theme.text_dim;
+            font-size: Theme.fs_md;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
 
-                // Flickable 子元素默认宽度是内容自然宽度，需显式铺满视口宽，
-                // 否则行内 stretch 列拿不到剩余空间、整体挤在中间
-                list_col := VerticalLayout {
-                    width: parent.width;
-                    alignment: start;
+        // 横向 Flickable 包 ListView：横向滚这层，纵向滚 ListView（标准嵌套）
+        flick := Flickable {
+            y: 26px;
+            width: 100%;
+            height: parent.height - 26px;
+            content-width: root.content-w;
+            content-height: self.height;
 
-                    // 空态
-                    if root.rows.length == 0: Text {
-                        text: I18n.empty_no_pr;
-                        color: Theme.text_dim;
-                        font-size: Theme.fs_md;
-                        horizontal-alignment: center;
-                        height: 48px;
-                        vertical-alignment: center;
+            lv := ListView {
+                x: 0;
+                y: 0;
+                width: root.content-w;
+                height: parent.height;
+
+                for it in root.items: Rectangle {
+                    height: it.is_header ? 26px : 30px * Theme.fs_scale;
+                    width: root.content-w;
+
+                    if it.is_header: GroupHeader {
+                        width: 100%;
+                        group: { key: it.gkey, name: it.gname, start: 0, count: it.gcount, collapsed: it.gcollapsed };
+                        toggled => { root.group_toggled(it.gkey); }
                     }
 
-                    // 退化模式：未提供分组时扁平渲染
-                    if root.rows.length > 0 && root.groups.length == 0: VerticalLayout {
-                        alignment: start;
-                        for r[i] in root.rows: PrRowItem {
-                            pr: r;
-                            selected: root.selected_key != "" && r.key == root.selected_key;
-                            clicked => {
-                                root.select_at(i);
-                                root.row_activated(i);
-                            }
-                            pin => { root.row_pin(i); }
-                            board => { root.row_board(i); }
-                            reject => { root.row_reject(i); }
-                            open_browser => { root.row_open(i); }
+                    if !it.is_header: PrRowItem {
+                        width: 100%;
+                        pr: it.row;
+                        selected: root.selected_key != "" && it.row.key == root.selected_key;
+                        clicked => {
+                            root.selected_key = it.row.key;
+                            root.row_activated(it.ridx);
                         }
+                        pin => { root.row_pin(it.ridx); }
+                        board => { root.row_board(it.ridx); }
+                        reject => { root.row_reject(it.ridx); }
+                        open_browser => { root.row_open(it.ridx); }
                     }
-
-                    // 分组模式
-                    for group[gi] in root.groups: VerticalLayout {
-                        alignment: start;
-
-                        GroupHeader {
-                            group: group;
-                            toggled => { root.groups[gi].collapsed = !root.groups[gi].collapsed; }
-                        }
-
-                        if !group.collapsed: VerticalLayout {
-                            alignment: start;
-                            for ri in group.count: PrRowItem {
-                                private property <int> idx: group.start + ri;
-                                pr: root.rows[self.idx];
-                                selected: root.selected_key != "" && root.rows[self.idx].key == root.selected_key;
-                                clicked => {
-                                    root.select_at(self.idx);
-                                    root.row_activated(self.idx);
-                                }
-                                pin => { root.row_pin(self.idx); }
-                                board => { root.row_board(self.idx); }
-                                reject => { root.row_reject(self.idx); }
-                                open_browser => { root.row_open(self.idx); }
-                            }
-                        }
-                    }
-
-                    // 列表末尾呼吸空间
-                    Rectangle { height: 8px; }
                 }
             }
         }

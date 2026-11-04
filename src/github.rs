@@ -74,6 +74,7 @@ impl GitHub {
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .user_agent("pr-desk-rs")
+            .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self { client, rate_limit: Arc::new(Mutex::new(None)) })
     }
@@ -221,7 +222,7 @@ impl GitHub {
     ) -> Result<std::collections::HashMap<String, String>> {
         let mut out = std::collections::HashMap::new();
         for chunk in items.chunks(100) {
-            let query = build_states_query(chunk);
+            let query = build_states_query(chunk)?;
             let resp = self
                 .client
                 .post(format!("{API}/graphql"))
@@ -266,7 +267,11 @@ impl GitHub {
             return Ok(None);
         }
         let v: Value = resp.json().await?;
-        Ok(v["avatar_url"].as_str().map(|s| format!("{s}&s=64")))
+        Ok(v["avatar_url"].as_str().map(|s| {
+            // avatar_url 可能已带 query（如 ?u=…）：已有 ? 用 & 续参数，否则开新 query
+            let sep = if s.contains('?') { '&' } else { '?' };
+            format!("{s}{sep}s=64")
+        }))
     }
 
     /// 下载任意 URL 的原始字节（头像 CDN 用；无鉴权需求）。
@@ -398,19 +403,30 @@ impl GitHub {
     }
 }
 
+/// owner/name 的字符白名单（GitHub 合法字符）：repo 名来自远程 API 响应，
+/// 要 format! 进 GraphQL 查询字符串，白名单校验防注入。
+fn valid_repo_part(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+}
+
 /// 构造批量状态查询的 GraphQL：每个条目一个 repository 别名块（r{i}），
-/// 内嵌 pullRequest/issue 字段（n{i}）。owner/name 只含 GitHub 合法字符，直接内联安全。
-fn build_states_query(items: &[(String, i64, bool)]) -> String {
+/// 内嵌 pullRequest/issue 字段（n{i}）。owner/name 先过白名单，非法直接报错。
+fn build_states_query(items: &[(String, i64, bool)]) -> Result<String> {
     let mut q = String::from("query {");
     for (i, (repo, number, is_pr)) in items.iter().enumerate() {
         let (owner, name) = repo.split_once('/').unwrap_or(("", repo.as_str()));
+        if !valid_repo_part(owner) || !valid_repo_part(name) {
+            anyhow::bail!("GraphQL 状态查询：非法仓库名 {repo:?}");
+        }
         let field = if *is_pr { "pullRequest" } else { "issue" };
         q.push_str(&format!(
             "r{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ n{i}: {field}(number: {number}) {{ state }} }}"
         ));
     }
     q.push('}');
-    q
+    Ok(q)
 }
 
 /// 解析 GraphQL 响应：按条目下标回读 r{i}/n{i}.state，小写化后写入 "repo#number"。
@@ -486,11 +502,22 @@ mod tests {
             ("vllm-project/vllm".to_string(), 123, true),
             ("o/r".to_string(), 7, false),
         ];
-        let q = build_states_query(&items);
+        let q = build_states_query(&items).unwrap();
         assert!(q.contains("r0: repository(owner: \"vllm-project\", name: \"vllm\")"));
         assert!(q.contains("n0: pullRequest(number: 123)"));
         assert!(q.contains("n1: issue(number: 7)"));
         assert!(q.starts_with("query {") && q.ends_with('}'));
+    }
+
+    #[test]
+    fn states_query_rejects_unsafe_repo_names() {
+        for bad in ["o/r\"; }", "o\"]/x", "o/r or true", "/r", "o/", "o/r;s"] {
+            let items = vec![(bad.to_string(), 1, true)];
+            assert!(build_states_query(&items).is_err(), "应拒绝 {bad:?}");
+        }
+        // 合法字符全集可通过
+        let items = vec![("A.b/C-d_e.f".to_string(), 1, true)];
+        assert!(build_states_query(&items).is_ok());
     }
 
     #[test]
