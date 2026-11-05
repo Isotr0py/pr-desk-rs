@@ -1437,9 +1437,14 @@ fn main() -> anyhow::Result<()> {
                 .upgrade()
                 .map(|u| u.get_settings_profile().to_string())
                 .unwrap_or_else(|| "default".into());
-            let (theme, language, mut profiles, active_profile, mut server_url, mut sync_token, mut ak_s) = {
+            #[allow(clippy::type_complexity)]
+            let (theme, language, mut profiles, active_profile, mut server_url, mut sync_token, mut ak_s,
+                 font_scale, window_width, window_height, panel_width) = {
                 let a = app.lock_recover();
-                // 主题/语言/数据源档案/活跃档不在设置页表单里，保留当前值
+                // 主题/语言/数据源档案/活跃档不在设置页表单里，保留当前值。
+                // 字号与窗口/面板几何同样是保留项——必须在同一个锁块里一次取完：
+                // 曾把它们放在下面 Config 字面量里逐字段 lock_recover()，临时 guard
+                // 活到整条 let 语句结束，同线程第二次 lock 即自死锁（一保存设置就卡死）
                 (
                     a.cfg.theme.clone(),
                     a.cfg.language.clone(),
@@ -1448,6 +1453,10 @@ fn main() -> anyhow::Result<()> {
                     a.cfg.server_url.clone(),
                     a.cfg.sync_token.clone(),
                     a.cfg.astrbot_api_key.clone(),
+                    a.cfg.font_scale,
+                    a.cfg.window_width,
+                    a.cfg.window_height,
+                    a.cfg.panel_width,
                 )
             };
             match edit_profile.as_str() {
@@ -1486,7 +1495,7 @@ fn main() -> anyhow::Result<()> {
                 theme,
                 language,
                 // 字号档位是即时生效项（不走设置表单），保存设置时保留现值
-                font_scale: app.lock_recover().cfg.font_scale,
+                font_scale,
                 llm_base_url: llm_base.trim().to_string(),
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),
@@ -1495,9 +1504,9 @@ fn main() -> anyhow::Result<()> {
                 profiles,
                 active_profile,
                 // 窗口/面板几何记忆不在设置表单里，保留现值
-                window_width: app.lock_recover().cfg.window_width,
-                window_height: app.lock_recover().cfg.window_height,
-                panel_width: app.lock_recover().cfg.panel_width,
+                window_width,
+                window_height,
+                panel_width,
             };
             if let Err(e) = new_cfg.save(&cfg_path) {
                 let lang = lang_of(&app);
