@@ -77,6 +77,11 @@ def expected_hash(sums_text: str, asset: str) -> str:
 
 
 def main() -> None:
+    # CI（GitHub Windows runner）stdout 默认 cp1252，中文 print 会炸 UnicodeEncodeError
+    for stream in (sys.stdout, sys.stderr):
+        if stream.encoding and stream.encoding.lower().replace("-", "") != "utf8":
+            stream.reconfigure(errors="replace")
+
     parser = argparse.ArgumentParser(description="下载 ocr CLI 到 bin/ 目录")
     parser.add_argument("--version", default=OCR_VERSION, help=f"ocr release 版本（默认 {OCR_VERSION}）")
     args = parser.parse_args()
