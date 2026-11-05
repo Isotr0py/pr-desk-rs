@@ -1,0 +1,89 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-gnu
+            name: windows-x86_64
+          # macOS 本地验证通过后取消注释（ocr sidecar 由 fetch_ocr.py 自动选对平台资产）：
+          # - os: macos-latest
+          #   target: aarch64-apple-darwin
+          #   name: macos-arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Add MinGW to PATH (windows-gnu linker)
+        if: runner.os == 'Windows'
+        run: echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Fetch ocr sidecar (bin/)
+        run: python scripts/fetch_ocr.py
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Verify artifact exists
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/pr-desk-rs"
+          test -s "$bin" || test -s "$bin.exe"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $pkg = "dist\pr-desk-rs"
+          New-Item -ItemType Directory -Force "$pkg\bin" | Out-Null
+          Copy-Item "target\${{ matrix.target }}\release\pr-desk-rs.exe" $pkg
+          Copy-Item bin\ocr.exe "$pkg\bin\"
+          Copy-Item README.md, LICENSE $pkg
+          Compress-Archive -Path $pkg -DestinationPath "dist\pr-desk-rs-${{ matrix.name }}.zip"
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist/pr-desk-rs/bin
+          cp target/${{ matrix.target }}/release/pr-desk-rs dist/pr-desk-rs/
+          cp bin/ocr dist/pr-desk-rs/bin/
+          cp README.md LICENSE dist/pr-desk-rs/
+          tar -C dist -czf dist/pr-desk-rs-${{ matrix.name }}.tar.gz pr-desk-rs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-desk-rs-${{ matrix.name }}
+          path: dist/pr-desk-rs-${{ matrix.name }}.*
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/pr-desk-rs-${{ matrix.name }}.*
+          generate_release_notes: true
