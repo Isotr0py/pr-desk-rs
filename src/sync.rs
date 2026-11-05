@@ -254,32 +254,47 @@ fn normalize_row_ts(row: &mut Value, fields: &[&str]) {
 
 /// 应用 pull 响应到本地。返回 (prs, reviews, todos) 行数。
 /// prs 行注入 source="server"：标记为服务器插件数据库跟踪的 PR（列表按来源过滤）。
+/// 整批 upsert 包在一个事务里：否则每行一次隐式提交（WAL fsync），首次全量拉时
+/// 调用方持有的全局锁会被占住几十秒乃至分钟级，UI 全程无响应（曾表现为卡死）。
 pub fn apply_pull(db: &Db, body: &Value) -> Result<(usize, usize, usize)> {
     let prs = body["prs"].as_array().cloned().unwrap_or_default();
     let reviews = body["reviews"].as_array().cloned().unwrap_or_default();
     let todos = body["todos"].as_array().cloned().unwrap_or_default();
-    for p in &prs {
-        let mut p = p.clone();
-        p["source"] = Value::from("server");
-        normalize_row_ts(&mut p, &["updated_at", "extras_updated_at"]);
-        db.upsert_pr(&p)?;
+    db.conn.execute_batch("BEGIN IMMEDIATE")?;
+    let applied = (|| -> Result<()> {
+        for p in &prs {
+            let mut p = p.clone();
+            p["source"] = Value::from("server");
+            normalize_row_ts(&mut p, &["updated_at", "extras_updated_at"]);
+            db.upsert_pr(&p)?;
+        }
+        for r in &reviews {
+            let mut r = r.clone();
+            normalize_row_ts(&mut r, &["reviewed_at"]);
+            db.upsert_review(&r)?;
+        }
+        for t in &todos {
+            let mut t = t.clone();
+            normalize_row_ts(&mut t, &["created_at", "done_at", "updated_at"]);
+            db.upsert_todo(&t)?;
+        }
+        // server_time 原样存游标：它会在下次 sync_pull 时作为 since 原样回传服务器，
+        // 服务器按自家格式比较，本地不做归一化以免破坏服务器侧语义。
+        if let Some(ts) = body["server_time"].as_str() {
+            db.set_cursor(ts)?;
+        }
+        Ok(())
+    })();
+    match applied {
+        Ok(()) => {
+            db.conn.execute_batch("COMMIT")?;
+            Ok((prs.len(), reviews.len(), todos.len()))
+        }
+        Err(e) => {
+            let _ = db.conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
     }
-    for r in &reviews {
-        let mut r = r.clone();
-        normalize_row_ts(&mut r, &["reviewed_at"]);
-        db.upsert_review(&r)?;
-    }
-    for t in &todos {
-        let mut t = t.clone();
-        normalize_row_ts(&mut t, &["created_at", "done_at", "updated_at"]);
-        db.upsert_todo(&t)?;
-    }
-    // server_time 原样存游标：它会在下次 sync_pull 时作为 since 原样回传服务器，
-    // 服务器按自家格式比较，本地不做归一化以免破坏服务器侧语义。
-    if let Some(ts) = body["server_time"].as_str() {
-        db.set_cursor(ts)?;
-    }
-    Ok((prs.len(), reviews.len(), todos.len()))
 }
 
 /// 把 outbox 条目按 (repo, number) 合并为 prs_updates（同字段后者覆盖，时间取最新）。
