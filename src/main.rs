@@ -683,6 +683,7 @@ fn main() -> anyhow::Result<()> {
     ui.set_s_sync_token(cfg.sync_token.clone().into());
     ui.set_s_ak(cfg.astrbot_api_key.clone().into());
     ui.set_s_gh_token(cfg.github_token.clone().unwrap_or_default().into());
+    ui.set_s_proxy(cfg.proxy.clone().into());
     ui.set_s_repos(cfg.repos.join("\n").into());
     ui.set_s_poll(cfg.poll_interval_min as i32);
     ui.set_s_llm_base(cfg.llm_base_url.clone().into());
@@ -1366,6 +1367,7 @@ fn main() -> anyhow::Result<()> {
                 ui.set_s_llm_model(cfg.llm_model.into());
                 ui.set_s_ocr_path(cfg.ocr_path.into());
                 ui.set_s_review_concurrency(cfg.review_concurrency as i32);
+                ui.set_s_proxy(cfg.proxy.into());
                 // 弹窗内联错误行清空（上一次失败的残留不带进本次会话）
                 ui.set_s_dialog_error("".into());
                 // 自定义评审模板每次打开重读（可能被外部编辑过）：
@@ -1407,7 +1409,7 @@ fn main() -> anyhow::Result<()> {
         let cmd_tx = cmd_tx.clone();
         let ui2 = ui.as_weak();
         let cfg_path = cfg_path.clone();
-        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model, ocr_path, review_conc_s, ak| {
+        ui.on_save_settings(move |server, sync_tok, gh_tok, repos_text, poll_s, llm_base, llm_key, llm_model, ocr_path, review_conc_s, ak, proxy| {
             let repos: Vec<String> = repos_text
                 .lines()
                 .map(|l| l.trim().to_string())
@@ -1419,6 +1421,17 @@ fn main() -> anyhow::Result<()> {
                 _ => 3,
             };
             let ocr_path = ocr_path.trim();
+            let proxy = proxy.trim().to_string();
+            // 代理地址保存前校验：非法直接拒绝保存（弹窗内联错误 + 状态栏各发一份）
+            if let Err(e) = pr_desk_rs::http_client(&proxy, std::time::Duration::from_secs(30)) {
+                let lang = lang_of(&app);
+                let msg = trf(&lang, "proxy_invalid", &[&e.to_string()]);
+                if let Some(ui) = ui2.upgrade() {
+                    ui.set_s_dialog_error(msg.clone().into());
+                }
+                send_msg(Msg::Status(msg));
+                return;
+            }
             // 服务器三字段按「正在编辑的档案」写回（local 档字段锁定，不读表单值）
             let edit_profile = ui2
                 .upgrade()
@@ -1467,6 +1480,7 @@ fn main() -> anyhow::Result<()> {
                 sync_token,
                 astrbot_api_key: ak_s,
                 github_token: Some(gh_tok.trim().to_string()).filter(|t| !t.is_empty()),
+                proxy,
                 repos,
                 poll_interval_min: poll,
                 theme,
@@ -2761,11 +2775,11 @@ async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: 
 async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mpsc::Sender<Msg>, cmd_tx: UnboundedSender<Cmd>, cfg_path: PathBuf) {
     let _ = MSG_TX.set(msg_tx.clone());
 
-    let token = {
+    let (token, proxy) = {
         let cfg = app.lock_recover().cfg.clone();
-        cfg.token()
+        (cfg.token(), cfg.proxy.clone())
     };
-    let mut gh = match github::GitHub::new(token) {
+    let mut gh = match github::GitHub::new(token, &proxy) {
         Ok(g) => Some(g),
         Err(e) => {
             let lang = lang_of(&app);
@@ -3047,7 +3061,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 let tx = msg_tx.clone();
                 tokio::spawn(async move {
                     let _guard = SlotGuard { slots, repo: repo.clone(), number };
-                    let rl = match github::GitHub::new(cfg.token()) {
+                    let rl = match github::GitHub::new(cfg.token(), &cfg.proxy) {
                         Ok(g) => {
                             let h = g.rate_limit_handle();
                             run_review_task(&cfg, &llm, &g, &app2, &tx, &repo, number).await;
@@ -3081,6 +3095,8 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 } else {
                     key.trim().to_string()
                 };
+                // 模型列表请求同属 LLM 流量：走当前配置的代理（弹窗里的代理可能尚未保存，用已生效值）
+                let proxy = app.lock_recover().cfg.proxy.clone();
                 let tx = msg_tx.clone();
                 let lang2 = lang.clone();
                 tokio::spawn(async move {
@@ -3089,10 +3105,9 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     let _ = tx.send(Msg::DialogMsg(tr(&lang2, "models_fetching").into()));
                     let url = format!("{base}/models");
                     let result = async {
-                        let resp = reqwest::Client::new()
+                        let resp = pr_desk_rs::http_client(&proxy, std::time::Duration::from_secs(15))?
                             .get(&url)
                             .header("Authorization", format!("Bearer {key}"))
-                            .timeout(std::time::Duration::from_secs(15))
                             .send()
                             .await?;
                         if !resp.status().is_success() {
@@ -3498,7 +3513,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
                 let cfg = app.lock_recover().cfg.clone();
-                match github::GitHub::new(cfg.token()) {
+                match github::GitHub::new(cfg.token(), &cfg.proxy) {
                     Ok(g) => {
                         // 重建客户端后替换配额共享句柄
                         app.lock_recover().rate_limit = g.rate_limit_handle();
@@ -3563,8 +3578,11 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     tokio::spawn(async move {
         // 用 GitHub::new 的标准客户端（与 fetch_inbox 同款构建方式，已证明稳定）；
         // 之前 prefetch 自建裸客户端在 worker 运行时下会挂死在 send()，原因未查明
-        let token = app2.lock_recover().cfg.token();
-        let Ok(gh) = github::GitHub::new(token) else { return };
+        let (token, proxy) = {
+            let c = app2.lock_recover().cfg.clone();
+            (c.token(), c.proxy)
+        };
+        let Ok(gh) = github::GitHub::new(token, &proxy) else { return };
         let fetched = avatars::prefetch(&gh, logins).await + avatars::prefetch_orgs(&gh, orgs).await;
         if fetched > 0 {
             // 新头像落盘：重建一次让 UI 拿到图（缓存已新鲜，不会递归预取）

@@ -61,7 +61,9 @@ pub struct Notification {
 }
 
 impl GitHub {
-    pub fn new(token: Option<String>) -> Result<Self> {
+    /// proxy：HTTP/SOCKS5 代理地址（空 = 直连）；非法时返回带中文说明的错误，
+    /// 调用方按现有降级路径处理（状态栏 gh_client_init_failed 提示，gh = None）。
+    pub fn new(token: Option<String>, proxy: &str) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("Accept", "application/vnd.github+json".parse()?);
         headers.insert("X-GitHub-Api-Version", "2022-11-28".parse()?);
@@ -71,10 +73,8 @@ impl GitHub {
                 format!("Bearer {t}").parse().context("token 含非法字符")?,
             );
         }
-        let client = reqwest::Client::builder()
+        let client = crate::http_client_builder(proxy, std::time::Duration::from_secs(30))?
             .default_headers(headers)
-            .user_agent("pr-desk-rs")
-            .timeout(std::time::Duration::from_secs(30))
             .build()?;
         Ok(Self { client, rate_limit: Arc::new(Mutex::new(None)) })
     }

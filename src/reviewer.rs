@@ -99,11 +99,17 @@ impl LlmSettings {
         if model.is_empty() {
             return None;
         }
-        let client = reqwest::Client::builder()
-            .user_agent("pr-desk-rs")
-            .timeout(std::time::Duration::from_secs(600))
-            .build()
-            .unwrap_or_default();
+        let client = crate::http_client(&cfg.proxy, std::time::Duration::from_secs(600))
+            .unwrap_or_else(|e| {
+                // 代理配置非法不应让预评审整个不可用：回退直连并告警
+                //（设置页保存时已校验，只有手改 config.toml 才会走到这里）
+                tracing::warn!("代理配置无效，LLM 客户端回退直连: {e}");
+                reqwest::Client::builder()
+                    .user_agent("pr-desk-rs")
+                    .timeout(std::time::Duration::from_secs(600))
+                    .build()
+                    .unwrap_or_default()
+            });
         Some(Self {
             base_url: cfg.llm_base_url.clone(),
             api_key,

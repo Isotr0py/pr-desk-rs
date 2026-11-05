@@ -121,6 +121,8 @@ impl SyncClient {
         // 数据源取当前生效档案（多数据源）：local 档 / 空 token → enabled() = false
         let p = cfg.active_sync();
         Self {
+            // 同步服务器通常部署在本地/内网（AstrBot 同机），走代理只会绕远甚至失败：
+            // 这里故意直连，不使用 cfg.proxy（代理只作用于 GitHub / LLM 请求）
             client: reqwest::Client::builder()
                 .user_agent("pr-desk-rs")
                 .timeout(std::time::Duration::from_secs(30))

@@ -53,6 +53,10 @@ export global I18n {
     out property <string> settings_gh_token_env: root.lang == "en" ? "GitHub token (GITHUB_TOKEN env var detected; env takes priority)" : "GitHub token（已检测到 GITHUB_TOKEN 环境变量，环境变量优先）";
     out property <string> settings_gh_token_placeholder_env: root.lang == "en" ? "Env var is active; can be left empty" : "环境变量生效中，此处可留空";
     out property <string> settings_gh_token_placeholder: root.lang == "en" ? "Optional for public repos (lower rate limit)" : "公开仓库可留空（限速更低）";
+    out property <string> settings_proxy: root.lang == "en" ? "Proxy (optional)" : "代理（可选）";
+    out property <string> settings_proxy_hint: root.lang == "en"
+        ? "http:// or socks5://, e.g. http://127.0.0.1:7890. Applies to GitHub / LLM requests only; the sync server always connects directly"
+        : "支持 http:// 或 socks5://，如 http://127.0.0.1:7890。仅作用于 GitHub / LLM 请求，同步服务器始终直连";
     out property <string> settings_repos: root.lang == "en" ? "Repositories (one owner/repo per line)" : "仓库列表（每行一个 owner/repo）";
     out property <string> settings_poll_interval: root.lang == "en" ? "Poll interval (minutes)" : "轮询间隔（分钟）";
     out property <string> settings_model_name: root.lang == "en" ? "Model name" : "模型名";

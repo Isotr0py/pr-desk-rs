@@ -25,6 +25,7 @@ const ZH: &[(&str, &str)] = &[
     // ── 通用操作反馈 ──
     ("open_browser_failed", "打开浏览器失败: {0}"),
     ("cfg_save_failed", "配置保存失败: {0}"),
+    ("proxy_invalid", "代理地址无效：{0}"),
     ("cfg_saved", "配置已保存并生效"),
     ("cfg_reloaded", "配置已重载"),
     ("field_updated", "已更新 {0}（待同步）"),
@@ -159,6 +160,7 @@ const EN: &[(&str, &str)] = &[
     ("sb_api_quota", "API quota {0}"),
     ("open_browser_failed", "Failed to open browser: {0}"),
     ("cfg_save_failed", "Failed to save config: {0}"),
+    ("proxy_invalid", "Invalid proxy address: {0}"),
     ("cfg_saved", "Settings saved and applied"),
     ("cfg_reloaded", "Config reloaded"),
     ("field_updated", "Updated {0} (pending sync)"),

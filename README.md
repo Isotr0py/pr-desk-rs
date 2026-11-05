@@ -85,14 +85,15 @@ slint = { version = "1", default-features = false,
 
 On first launch a `config.toml` template is created next to the exe.
 **Prefer editing it from the in-app ⚙ settings page** (hot-reloads, no
-restart) — it covers server URL, sync token, GitHub token, repo list, poll
-interval, LLM settings, and data-source profiles. When unconfigured, the
+restart) — it covers server URL, sync token, GitHub token, proxy, repo list,
+poll interval, LLM settings, and data-source profiles. When unconfigured, the
 app shows an onboarding card and opens settings (skippable for local mode).
 
 ```toml
 server_url = "http://127.0.0.1:6185"   # AstrBot address
 sync_token = ""                        # sync_token from the plugin config (empty = local browsing only)
 github_token = ""                      # stored in plaintext (personal use); GITHUB_TOKEN env var takes precedence
+proxy = ""                             # http:// or socks5:// proxy for GitHub / LLM requests only (empty = direct; sync server always direct)
 repos = ["owner/repo"]                 # repos to watch (open PRs)
 poll_interval_min = 5                  # auto-sync interval (minutes)
 ```

@@ -16,6 +16,9 @@ sync_token = ""
 astrbot_api_key = ""
 # GitHub token（明文本地存储自用；环境变量 GITHUB_TOKEN 优先级更高）
 github_token = ""
+# HTTP/SOCKS5 代理（仅作用于 GitHub / LLM 请求；同步服务器通常本地/内网，始终直连）
+# 形如 http://127.0.0.1:7890 或 socks5://127.0.0.1:7890；留空 = 直连
+proxy = ""
 # 关注的仓库（拉取 open PR 列表）
 repos = ["owner/repo"]
 # 轮询/自动同步间隔（分钟）
@@ -74,6 +77,8 @@ pub struct Config {
     /// AstrBot 面板 API Key（新版 AstrBot 对 /api 路由强制鉴权；空 = 不发送）
     pub astrbot_api_key: String,
     pub github_token: Option<String>,
+    /// HTTP/SOCKS5 代理（空 = 直连；仅 GitHub / LLM 请求走代理，同步服务器始终直连）
+    pub proxy: String,
     pub repos: Vec<String>,
     pub poll_interval_min: u64,
     /// 界面主题："light" | "dark"
@@ -108,6 +113,7 @@ impl Default for Config {
             sync_token: String::new(),
             astrbot_api_key: String::new(),
             github_token: None,
+            proxy: String::new(),
             repos: Vec::new(),
             poll_interval_min: 5,
             theme: "light".into(),
@@ -325,6 +331,8 @@ impl Config {
                 cfg.astrbot_api_key = unquote(v);
             } else if let Some(v) = parse_value(line, "github_token") {
                 cfg.github_token = Some(unquote(v)).filter(|t| !t.is_empty());
+            } else if let Some(v) = parse_value(line, "proxy") {
+                cfg.proxy = unquote(v);
             } else if let Some(v) = parse_value(line, "repos") {
                 cfg.repos = v
                     .trim_start_matches('[')
@@ -417,6 +425,7 @@ impl Config {
             ("sync_token", quote(&self.sync_token)),
             ("astrbot_api_key", quote(&self.astrbot_api_key)),
             ("github_token", quote(self.github_token.as_deref().unwrap_or(""))),
+            ("proxy", quote(&self.proxy)),
             ("repos", repos_toml),
             ("poll_interval_min", self.poll_interval_min.to_string()),
             ("theme", quote(&self.theme)),
@@ -512,6 +521,7 @@ mod tests {
         assert_eq!(cfg2.llm_model, "");
         assert_eq!(cfg2.ocr_path, "ocr");
         assert_eq!(cfg2.language, "zh");
+        assert_eq!(cfg2.proxy, ""); // 模板默认直连
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -526,6 +536,7 @@ mod tests {
             sync_token: "tok-1".into(),
             astrbot_api_key: "ak-1".into(),
             github_token: Some("ghp_x".into()),
+            proxy: "socks5://127.0.0.1:7890".into(),
             repos: vec!["a/b".into(), "c/d".into()],
             poll_interval_min: 15,
             theme: "dark".into(),
@@ -551,6 +562,7 @@ mod tests {
         assert_eq!(loaded.sync_token, "tok-1");
         assert_eq!(loaded.astrbot_api_key, "ak-1");
         assert_eq!(loaded.github_token.as_deref(), Some("ghp_x"));
+        assert_eq!(loaded.proxy, "socks5://127.0.0.1:7890");
         assert_eq!(loaded.repos, vec!["a/b".to_string(), "c/d".to_string()]);
         assert_eq!(loaded.poll_interval_min, 15);
         assert_eq!(loaded.theme, "dark");

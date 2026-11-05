@@ -17,7 +17,9 @@ slint = { version = "1", optional = true, default-features = false, features = [
     "accessibility", "compat-1-2",
 ] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# socks feature：支持 socks5:// 代理（Clash 等常见代理同时提供 http/socks5 端口）；
+# 注意没开 system-proxy——系统代理/环境变量一律不生效，只认配置里的显式 proxy 字段
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "socks"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

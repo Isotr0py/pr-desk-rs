@@ -11,6 +11,8 @@ pub mod ocr;
 pub mod reviewer;
 pub mod sync;
 
+use anyhow::Context;
+
 /// exe 所在目录（便携应用锚点）；取不到 exe 路径时回退当前目录。
 pub fn exe_dir() -> std::path::PathBuf {
     std::env::current_exe()
@@ -27,6 +29,41 @@ fn data_dir_from(exe_dir: &std::path::Path) -> std::path::PathBuf {
 /// 数据目录锚定到 exe 旁（`exe_dir()/data`），防止 cwd 不同时读到另一份数据。
 pub fn exe_data_dir() -> std::path::PathBuf {
     data_dir_from(&exe_dir())
+}
+
+/// 统一 reqwest ClientBuilder 构造：user_agent + 超时 + 可选代理。
+/// reqwest 是精简引入（没开 system-proxy），系统代理/HTTP_PROXY 等环境变量一律不生效，
+/// 只认配置里的显式 proxy 字段：非空时走该代理（http:// 或 socks5://），空 = 直连。
+/// 代理地址非法时返回带中文说明的错误（调用方按各自降级策略处理）。
+pub fn http_client_builder(
+    proxy: &str,
+    timeout: std::time::Duration,
+) -> anyhow::Result<reqwest::ClientBuilder> {
+    let mut b = reqwest::Client::builder()
+        .user_agent("pr-desk-rs")
+        .timeout(timeout);
+    let proxy = proxy.trim();
+    if !proxy.is_empty() {
+        // 先查 scheme 再交给 reqwest 解析：无 scheme（如 127.0.0.1:7890）或非常见 scheme
+        // 时 reqwest 的报错不直观，这里直接给出格式要求
+        let scheme_ok = proxy.starts_with("http://")
+            || proxy.starts_with("https://")
+            || proxy.starts_with("socks5://")
+            || proxy.starts_with("socks5h://");
+        anyhow::ensure!(
+            scheme_ok,
+            "代理地址格式无效：{proxy}（需形如 http://host:port 或 socks5://host:port）"
+        );
+        let p = reqwest::Proxy::all(proxy)
+            .context("代理地址解析失败（需形如 http://host:port 或 socks5://host:port）")?;
+        b = b.proxy(p);
+    }
+    Ok(b)
+}
+
+/// 统一 reqwest Client 构造（http_client_builder 的便捷封装）。
+pub fn http_client(proxy: &str, timeout: std::time::Duration) -> anyhow::Result<reqwest::Client> {
+    Ok(http_client_builder(proxy, timeout)?.build()?)
 }
 
 /// 行分组结果。key 是稳定的组标识（"pinned"/"board"/"needs-review"/"reviewed"/
