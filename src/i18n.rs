@@ -34,6 +34,11 @@ const ZH: &[(&str, &str)] = &[
     ("field_on_board", "看板"),
     ("field_priority", "优先级"),
     ("field_status", "状态"),
+    // ── 批量操作（多选）──
+    ("fields_updated", "已更新 {0} 项（待同步）"),
+    ("review_queued", "已排队 {0} 个评审"),
+    ("links_copied", "已复制 {0} 个链接"),
+    ("batch_open_capped", "一次最多打开 {0} 个，其余 {1} 个已忽略"),
     // ── Inbox 通知类型 / 原因（GitHub 原始枚举值 → 界面文案；未知值回退原串）──
     ("kind_pull_request", "拉取请求"),
     ("kind_issue", "议题"),
@@ -168,6 +173,10 @@ const EN: &[(&str, &str)] = &[
     ("field_on_board", "board"),
     ("field_priority", "priority"),
     ("field_status", "status"),
+    ("fields_updated", "Updated {0} items (pending sync)"),
+    ("review_queued", "Queued {0} reviews"),
+    ("links_copied", "Copied {0} links"),
+    ("batch_open_capped", "At most {0} opened at once; skipped {1}"),
     ("kind_pull_request", "Pull Request"),
     ("kind_issue", "Issue"),
     ("kind_release", "Release"),

@@ -244,6 +244,11 @@ export component MainWindow inherits Window {
     in-out property <string> sort_col: "upd";   // 列表排序列（Excel 式点表头）
     in-out property <bool> sort_asc: false;     // 排序方向（false = 降序）
     in-out property <bool> high_score_only: false;   // true = 只看评分 ≥8.0
+    // ── 多选状态（Rust 侧 push_selection_ui 回写）──
+    in property <int> sel_count: 0;             // 多选集合大小（0 = 无多选，操作条隐藏）
+    in property <bool> sel_all_pinned: false;   // 多选行全部已置顶（菜单/操作条文案翻转用）
+    in property <bool> sel_all_on_board: false;
+    in property <bool> sel_all_rejected: false;
     // PageUp/PageDown 桥接：keys FocusScope 在视图的 if 作用域之外，够不到
     // list/panel/inbox 的 id——计数器累加（有符号），各 if 作用域里的 changed 消费
     in-out property <int> page_req: 0;
@@ -322,6 +327,18 @@ export component MainWindow inherits Window {
     callback clear_selection();             // Esc（详情关着时）：清 Rust 侧选中态
     callback high_score_toggled(bool);      // 高分快筛开关（只看 ≥8.0）
     callback row_activated(int);
+    // 行左键点击（ridx + ctrl + shift）/ 右键（ridx）：多选语义在 Rust 侧
+    callback row_clicked(int, bool, bool);
+    callback row_context(int);
+    // ── 批量操作（作用于多选集合；为空时 Rust 侧回退主选中行）──
+    callback batch_set_priority(int);
+    callback batch_toggle_pin();
+    callback batch_toggle_board();
+    callback batch_set_status(string);  // "rejected" / "pending"
+    callback batch_run_review();
+    callback batch_copy_links();
+    callback batch_open_browser();
+    callback clear_multi_selection();
     callback row_pin(int);
     callback row_reject(int);
     callback row_board(int);
@@ -467,19 +484,35 @@ export component MainWindow inherits Window {
                     selected_key <=> root.selected_key;
                     sort_col: root.sort_col;
                     sort_asc: root.sort_asc;
+                    sel_count: root.sel_count;
+                    sel_all_pinned: root.sel_all_pinned;
+                    sel_all_on_board: root.sel_all_on_board;
+                    sel_all_rejected: root.sel_all_rejected;
                     // 弹窗/引导打开时锁键盘（Esc/j/k 等不得穿透到列表）
                     keys_locked: root.settings_open || (root.onboarding && !root.onboarding_dismissed);
                     header_clicked(c) => { root.header_clicked(c); }
                     group_toggled(k) => { root.group_toggled(k); }
-                    row_activated(i) => { root.row_activated(i); }
+                    row_clicked(i, ctrl, shift) => { root.row_clicked(i, ctrl, shift); }
+                    row_context(i) => { root.row_context(i); }
                     row_pin(i) => { root.row_pin(i); }
                     row_reject(i) => { root.row_reject(i); }
                     row_board(i) => { root.row_board(i); }
                     row_open(i) => { root.row_open(i); }
+                    batch_set_priority(p) => { root.batch_set_priority(p); }
+                    batch_toggle_pin() => { root.batch_toggle_pin(); }
+                    batch_toggle_board() => { root.batch_toggle_board(); }
+                    batch_set_status(s) => { root.batch_set_status(s); }
+                    batch_run_review() => { root.batch_run_review(); }
+                    batch_copy_links() => { root.batch_copy_links(); }
+                    batch_open_browser() => { root.batch_open_browser(); }
+                    clear_multi_selection() => { root.clear_multi_selection(); }
                     key_move(d) => { root.key_move(d); }
                     key_enter() => { root.key_enter(); }
                     dismissed => {
-                        if (root.d_open) { root.panel_close(); } else { self.selected_key = ""; root.clear_selection(); }
+                        // Esc 分级：先清多选，再关详情面板，最后才清选中
+                        if (root.sel_count > 0) { root.clear_multi_selection(); }
+                        else if (root.d_open) { root.panel_close(); }
+                        else { self.selected_key = ""; root.clear_selection(); }
                     }
                 }
                 panel := DetailPanel {

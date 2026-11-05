@@ -16,8 +16,8 @@ export global I18n {
     out property <string> theme_tooltip_light: root.lang == "en" ? "Switch to light theme" : "切换到浅色主题";
     out property <string> theme_tooltip_dark: root.lang == "en" ? "Switch to dark theme" : "切换到深色主题";
     out property <string> statusbar_hints: root.lang == "en"
-        ? "j/k move · Enter details · o open in browser · p pin · 1/2/3 priority · / search · Esc back"
-        : "j/k 移动 · Enter 详情 · o 浏览器打开 · p 置顶 · 1/2/3 优先级 · / 搜索 · Esc 返回";
+        ? "j/k move · Enter details · o open in browser · p pin · 1/2/3 priority · Ctrl/Shift+click multi-select · / search · Esc back"
+        : "j/k 移动 · Enter 详情 · o 浏览器打开 · p 置顶 · 1/2/3 优先级 · Ctrl/Shift+点击多选 · / 搜索 · Esc 返回";
     out property <string> statusbar_hints_inbox: root.lang == "en"
         ? "j/k move · Enter preview / open in browser · Esc back · / search"
         : "j/k 移动 · Enter 预览 / 浏览器打开 · Esc 返回 · / 搜索";
@@ -88,6 +88,21 @@ export global I18n {
 
     // ── pr_list.slint ──
     out property <string> empty_no_pr: root.lang == "en" ? "No PRs" : "没有 PR";
+    // 多选：右键菜单 + 操作条（tip_pin/detail_add_board/inbox_open_browser/review_start 复用现有 key）
+    out property <string> ctx_priority: root.lang == "en" ? "Priority" : "优先级";
+    out property <string> ctx_priority_high: root.lang == "en" ? "Priority: High" : "优先级：高";
+    out property <string> ctx_priority_medium: root.lang == "en" ? "Priority: Medium" : "优先级：中";
+    out property <string> ctx_priority_low: root.lang == "en" ? "Priority: Low" : "优先级：低";
+    out property <string> ctx_priority_clear: root.lang == "en" ? "Priority: Clear" : "优先级：清除";
+    out property <string> ctx_unpin: root.lang == "en" ? "Unpin" : "取消置顶";
+    out property <string> ctx_remove_board: root.lang == "en" ? "Remove from board" : "移出看板";
+    out property <string> ctx_skip: root.lang == "en" ? "Skip" : "跳过";
+    out property <string> ctx_restore: root.lang == "en" ? "Restore" : "恢复";
+    out property <string> ctx_copy_links: root.lang == "en" ? "Copy link(s)" : "复制链接";
+    out property <string> ctx_clear_selection: root.lang == "en" ? "Clear selection" : "清除选择";
+    // 操作条「已选 N 项」：pre + 数字 + post
+    out property <string> selbar_count_pre: root.lang == "en" ? "" : "已选 ";
+    out property <string> selbar_count_post: root.lang == "en" ? " selected" : " 项";
 
     // ── inbox.slint ──
     out property <string> inbox_title: root.lang == "en" ? "Notifications" : "通知";

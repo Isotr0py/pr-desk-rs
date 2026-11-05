@@ -548,10 +548,12 @@ export component InboxView inherits FocusScope {
                         }
 
                         repo-popup := PopupWindow {
-                            x: 0;
+                            // 右缘对齐按钮右缘（按钮贴工具栏右端，x:0 会溢出窗口右缘）；
+                            // 高度 clamp 到窗口内，超出部分 Flickable 滚动
+                            x: parent.width - max(200px, repo-btn.width);
                             y: parent.height + 4px;
                             width: max(200px, repo-btn.width);
-                            height: (root.repos.length + 1) * 26px + 8px;
+                            height: min((root.repos.length + 1) * 26px + 8px, max(120px, root.height - 60px));
                             close-policy: close-on-click-outside;
 
                             Rectangle {
@@ -562,68 +564,77 @@ export component InboxView inherits FocusScope {
                                 border-width: 1px;
                                 border-color: Theme.hairline;
 
-                                VerticalLayout {
+                                Flickable {
                                     x: 0;
-                                    y: 4px;
+                                    y: 0;
                                     width: 100%;
-                                    spacing: 0;
+                                    height: 100%;
+                                    content-width: self.width;
+                                    content-height: (root.repos.length + 1) * 26px + 8px;
 
-                                    // 「全部仓库」置顶项
-                                    Rectangle {
-                                        height: 26px;
-                                        background: root.repo_filter == "" ? Theme.sel
-                                            : (all-ta.has-hover ? Theme.hover : Theme.card);
-                                        all-ta := TouchArea {
-                                            mouse-cursor: pointer;
-                                            clicked => { root.repo_filter = ""; repo-popup.close(); }
+                                    VerticalLayout {
+                                        x: 0;
+                                        y: 4px;
+                                        width: 100%;
+                                        spacing: 0;
+
+                                        // 「全部仓库」置顶项
+                                        Rectangle {
+                                            height: 26px;
+                                            background: root.repo_filter == "" ? Theme.sel
+                                                : (all-ta.has-hover ? Theme.hover : Theme.card);
+                                            all-ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.repo_filter = ""; repo-popup.close(); }
+                                            }
+                                            Text {
+                                                x: 24px;
+                                                width: parent.width - 32px;
+                                                height: 100%;
+                                                text: I18n.inbox_filter_all;
+                                                font-size: Theme.fs_sm;
+                                                color: root.repo_filter == "" ? Theme.sel_text : Theme.text;
+                                                vertical-alignment: center;
+                                            }
+                                            Image {
+                                                visible: root.repo_filter == "";
+                                                x: 8px;
+                                                y: (parent.height - 10px) / 2;
+                                                width: 10px;
+                                                height: 10px;
+                                                source: @image-url("icons/check.svg");
+                                                image-fit: contain;
+                                                colorize: Theme.sel_text;
+                                            }
                                         }
-                                        Text {
-                                            x: 24px;
-                                            width: parent.width - 32px;
-                                            height: 100%;
-                                            text: I18n.inbox_filter_all;
-                                            font-size: Theme.fs_sm;
-                                            color: root.repo_filter == "" ? Theme.sel_text : Theme.text;
-                                            vertical-alignment: center;
-                                        }
-                                        Image {
-                                            visible: root.repo_filter == "";
-                                            x: 8px;
-                                            y: (parent.height - 10px) / 2;
-                                            width: 10px;
-                                            height: 10px;
-                                            source: @image-url("icons/check.svg");
-                                            image-fit: contain;
-                                            colorize: Theme.sel_text;
-                                        }
-                                    }
-                                    for p in root.repos: Rectangle {
-                                        height: 26px;
-                                        background: p == root.repo_filter ? Theme.sel
-                                            : (rp-ta.has-hover ? Theme.hover : Theme.card);
-                                        rp-ta := TouchArea {
-                                            mouse-cursor: pointer;
-                                            clicked => { root.repo_filter = p; repo-popup.close(); }
-                                        }
-                                        Text {
-                                            x: 24px;
-                                            width: parent.width - 32px;
-                                            height: 100%;
-                                            text: p;
-                                            font-size: Theme.fs_sm;
-                                            color: p == root.repo_filter ? Theme.sel_text : Theme.text;
-                                            vertical-alignment: center;
-                                            overflow: elide;
-                                        }
-                                        Image {
-                                            visible: p == root.repo_filter;
-                                            x: 8px;
-                                            y: (parent.height - 10px) / 2;
-                                            width: 10px;
-                                            height: 10px;
-                                            source: @image-url("icons/check.svg");
-                                            image-fit: contain;
-                                            colorize: Theme.sel_text;
+                                        for p in root.repos: Rectangle {
+                                            height: 26px;
+                                            background: p == root.repo_filter ? Theme.sel
+                                                : (rp-ta.has-hover ? Theme.hover : Theme.card);
+                                            rp-ta := TouchArea {
+                                                mouse-cursor: pointer;
+                                                clicked => { root.repo_filter = p; repo-popup.close(); }
+                                            }
+                                            Text {
+                                                x: 24px;
+                                                width: parent.width - 32px;
+                                                height: 100%;
+                                                text: p;
+                                                font-size: Theme.fs_sm;
+                                                color: p == root.repo_filter ? Theme.sel_text : Theme.text;
+                                                vertical-alignment: center;
+                                                overflow: elide;
+                                            }
+                                            Image {
+                                                visible: p == root.repo_filter;
+                                                x: 8px;
+                                                y: (parent.height - 10px) / 2;
+                                                width: 10px;
+                                                height: 10px;
+                                                source: @image-url("icons/check.svg");
+                                                image-fit: contain;
+                                                colorize: Theme.sel_text;
+                                            }
                                         }
                                     }
                                 }

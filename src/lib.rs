@@ -9,6 +9,7 @@ pub mod i18n;
 pub mod markdown;
 pub mod ocr;
 pub mod reviewer;
+pub mod selection;
 pub mod sync;
 
 use anyhow::Context;

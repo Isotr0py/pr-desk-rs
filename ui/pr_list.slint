@@ -50,6 +50,8 @@ export struct PrGroup {
 export struct PrListItem {
     is_header: bool,
     ridx: int,
+    // 多选标记（Ctrl/Shift 点选进入多选集合的行；弱一档底色高亮）
+    multi_selected: bool,
     // ── 组头字段（is_header=true 时有效）──
     gkey: string,
     gname: string,
@@ -515,11 +517,16 @@ component TurnChip inherits Rectangle {
 }
 
 // ── 紧凑数据行（30px）──
-// 选中：sel 底 + sel_text 字 + 左侧 2px accent 竖条；hover：Theme.hover。
+// 选中：sel 底 + sel_text 字 + 左侧 2px accent 竖条；多选：sel 弱底 + 半透明竖条（不变字色）；
+// hover：Theme.hover。两种高亮叠加时当前行（selected）优先。
+// 点击统一走 pointer-event（clicked 拿不到修饰键）：左键按下派发 clicked(ctrl, shift)，
+// 右键按下派发 context_menu（行内坐标，由外层换算 + clamp 后开 PopupWindow）。
 component PrRowItem inherits Rectangle {
     in property <PrListRow> pr;
     in property <bool> selected: false;
-    callback clicked();
+    in property <bool> multi_selected: false;
+    callback clicked(bool, bool);
+    callback context_menu(length, length);
     callback pin();
     callback board();
     callback reject();
@@ -533,12 +540,21 @@ component PrRowItem inherits Rectangle {
 
     height: 30px * Theme.fs_scale;
     background: root.selected ? Theme.sel
-        : (row-ta.has-hover ? Theme.hover : transparent);
+        : (root.multi_selected ? Theme.sel.with-alpha(0.5)
+        : (row-ta.has-hover ? Theme.hover : transparent));
 
     animate background { duration: root.selected ? 150ms : 100ms; }
 
     row-ta := TouchArea {
-        clicked => { root.clicked(); }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                if (e.button == PointerEventButton.right) {
+                    root.context_menu(self.mouse-x, self.mouse-y);
+                } else if (e.button == PointerEventButton.left) {
+                    root.clicked(e.modifiers.control, e.modifiers.shift);
+                }
+            }
+        }
     }
 
     // 选中指示条：左侧 2px accent 竖条
@@ -549,6 +565,16 @@ component PrRowItem inherits Rectangle {
         height: parent.height;
         background: Theme.accent;
         visible: root.selected;
+    }
+
+    // 多选指示条：同一位置半透明 accent 竖条（当前行优先，不叠加）
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 2px;
+        height: parent.height;
+        background: Theme.accent.with-alpha(0.55);
+        visible: root.multi_selected && !root.selected;
     }
 
     // 列 x 坐标：左锚定链式计算，Title 弹性吸收剩余宽度（与 ListHeader 相同）
@@ -828,6 +854,79 @@ component PrRowItem inherits Rectangle {
     }
 }
 
+// ── 右键菜单项 / 分隔线（ContextMenu 与操作条优先级下拉共用）──
+component CtxItem inherits Rectangle {
+    in property <string> label;
+    in property <string> hint: "";    // 右侧快捷键提示（对齐参考版菜单）
+    in property <bool> danger: false;
+    callback activated();
+
+    height: 26px;
+    background: ta.has-hover ? Theme.hover : transparent;
+
+    Text {
+        x: 12px;
+        width: parent.width - 12px - 44px;
+        height: 100%;
+        text: root.label;
+        font-size: Theme.fs_sm;
+        color: root.danger ? Theme.bad : Theme.text;
+        overflow: elide;
+        vertical-alignment: center;
+    }
+    if root.hint != "": Text {
+        x: parent.width - self.preferred-width - 10px;
+        width: self.preferred-width;
+        height: 100%;
+        text: root.hint;
+        font-size: Theme.fs_xs;
+        color: Theme.text_faint;
+        vertical-alignment: center;
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activated(); }
+    }
+}
+
+component CtxSep inherits Rectangle {
+    height: 9px;
+    Rectangle {
+        x: 8px;
+        y: 4px;
+        width: parent.width - 16px;
+        height: 1px;
+        background: Theme.hairline;
+    }
+}
+
+// ── 多选操作条按钮（小号幽灵按钮，同 inbox ToolButton 风格）──
+component BarButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+
+    height: 22px;
+    width: layout.preferred-width;
+    border-radius: Theme.r_sm;
+    background: ta.has-hover ? Theme.hover : transparent;
+    animate background { duration: 100ms; }
+
+    layout := HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        Text {
+            text: root.label;
+            font-size: Theme.fs_xs;
+            color: ta.has-hover ? Theme.text : Theme.text_dim;
+            vertical-alignment: center;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
 // ── 分区列表（扁平化模型 + 单 ListView 虚拟化）──
 // items 为组头/数据行混排的摊平模型（Rust 侧 build_items 装配；折叠组的行不在模型里）。
 // 行回调传 ridx = 该行在完整行序列（含折叠组的行）中的下标，与折叠状态解耦。
@@ -846,10 +945,19 @@ export component PrListView inherits FocusScope {
     in property <bool> sort_asc: false;
     // 弹窗/首启引导打开时锁键盘：key-pressed 全部 reject 放行给外层（外层负责 Esc 关弹窗）
     in property <bool> keys_locked: false;
+    // ── 多选状态（Rust 侧 push_selection_ui 回写；驱动操作条与右键菜单动态项）──
+    in property <int> sel_count: 0;
+    in property <bool> sel_all_pinned: false;
+    in property <bool> sel_all_on_board: false;
+    in property <bool> sel_all_rejected: false;
 
     callback header_clicked(string);    // 表头点击排序（传列 key）
     callback group_toggled(string);     // 组头点击折叠/展开（传组 key）
     callback row_activated(int);        // 点击行：打开详情（传 ridx）
+    // 左键点击（带修饰键）：ridx + ctrl + shift。选中语义在 Rust 侧
+    //（无修饰=单选+开详情，Ctrl=toggle 多选，Shift=锚点范围选）
+    callback row_clicked(int, bool, bool);
+    callback row_context(int);          // 右键：Rust 侧先把该行并入多选（不在则单选）
     callback row_pin(int);
     callback row_reject(int);
     callback row_board(int);
@@ -857,9 +965,34 @@ export component PrListView inherits FocusScope {
     callback key_move(int);             // j/k/↑/↓：在可见行上移动选中（Rust 侧实现）
     callback key_enter();               // Enter：打开当前选中（Rust 侧按身份解析）
     callback dismissed();               // Esc
+    // ── 批量操作（作用于多选集合；为空时 Rust 侧回退主选中行）──
+    callback batch_set_priority(int);   // 0/1/2/3
+    callback batch_toggle_pin();
+    callback batch_toggle_board();
+    callback batch_set_status(string);  // "rejected" / "pending"
+    callback batch_run_review();
+    callback batch_copy_links();
+    callback batch_open_browser();
+    callback clear_multi_selection();
+
+    // 多选操作条占位（列表顶部，0 或 32px；手动偏移体系，不走 stretch 布局）
+    property <length> top-off: root.sel_count > 0 ? 32px : 0px;
+    // 右键菜单高：行数（单选多一行 Open in Browser）×26 + 3 条分隔线 ×9 + 上下 padding 8
+    property <length> ctx-menu-h: (root.sel_count <= 1 ? 11 : 10) * 26px + 35px;
 
     // 内容宽：视口宽与「固定列合计 + 最小标题列」取大（小于视口时铺满，大于时可横滚）
     property <length> content-w: max(root.width, Cols.min-total);
+
+    // 打开右键菜单：Rust 同步修正多选（sel_count 等立即生效）后 clamp 到窗口内再弹出
+    //（PopupWindow 的 x/y 不允许外部事后改写，经 root 属性声明期绑定）
+    property <length> ctx-x: 0px;
+    property <length> ctx-y: 0px;
+    function open_ctx(ridx: int, x: length, y: length) {
+        root.row_context(ridx);
+        root.ctx-x = min(max(0px, x), max(0px, root.width - 230px - 4px));
+        root.ctx-y = min(max(0px, y), max(0px, root.height - root.ctx-menu-h - 4px));
+        ctx-popup.show();
+    }
 
     // PageUp/PageDown 翻页滚动（由外层 FocusScope 调用；ListView 自己不认键盘）
     public function page_scroll(dir: int) {
@@ -896,10 +1029,101 @@ export component PrListView inherits FocusScope {
         background: Theme.bg;
         clip: true;
 
+        // ── 多选操作条：selection 非空时出现在列表顶部（右键菜单的发现性兜底入口）──
+        selbar := Rectangle {
+            x: 0;
+            y: 0;
+            width: 100%;
+            height: 32px;
+            visible: root.sel_count > 0;
+            background: Theme.card;
+
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 8px;
+                spacing: 2px;
+
+                Text {
+                    text: I18n.selbar_count_pre + root.sel_count + I18n.selbar_count_post;
+                    color: Theme.accent;
+                    font-size: Theme.fs_sm;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+                Rectangle { horizontal-stretch: 1; }
+                // 优先级下拉：小弹窗右对齐锚在按钮下（左向展开，不溢出右缘）
+                Rectangle {
+                    width: prio-btn.width;
+                    prio-btn := BarButton {
+                        label: I18n.ctx_priority;
+                        clicked => { prio-popup.show(); }
+                    }
+                    prio-popup := PopupWindow {
+                        x: parent.width - self.width;
+                        y: parent.height + 2px;
+                        width: 170px;
+                        height: 4 * 26px + 8px;
+                        close-policy: close-on-click-outside;
+                        Rectangle {
+                            width: 100%;
+                            height: 100%;
+                            border-radius: Theme.r_lg;
+                            background: Theme.card;
+                            border-width: 1px;
+                            border-color: Theme.hairline;
+                            VerticalLayout {
+                                x: 0;
+                                y: 4px;
+                                width: 100%;
+                                spacing: 0;
+                                CtxItem { label: I18n.ctx_priority_high; hint: "1"; activated => { root.batch_set_priority(1); prio-popup.close(); } }
+                                CtxItem { label: I18n.ctx_priority_medium; hint: "2"; activated => { root.batch_set_priority(2); prio-popup.close(); } }
+                                CtxItem { label: I18n.ctx_priority_low; hint: "3"; activated => { root.batch_set_priority(3); prio-popup.close(); } }
+                                CtxItem { label: I18n.ctx_priority_clear; hint: "0"; activated => { root.batch_set_priority(0); prio-popup.close(); } }
+                            }
+                        }
+                    }
+                }
+                BarButton {
+                    label: root.sel_all_pinned ? I18n.ctx_unpin : I18n.tip_pin;
+                    clicked => { root.batch_toggle_pin(); }
+                }
+                BarButton {
+                    label: root.sel_all_on_board ? I18n.ctx_remove_board : I18n.detail_add_board;
+                    clicked => { root.batch_toggle_board(); }
+                }
+                BarButton {
+                    label: root.sel_all_rejected ? I18n.ctx_restore : I18n.ctx_skip;
+                    clicked => { root.batch_set_status(root.sel_all_rejected ? "pending" : "rejected"); }
+                }
+                BarButton {
+                    label: I18n.review_start;
+                    clicked => { root.batch_run_review(); }
+                }
+                BarButton {
+                    label: I18n.ctx_copy_links;
+                    clicked => { root.batch_copy_links(); }
+                }
+                BarButton {
+                    label: I18n.ctx_clear_selection;
+                    clicked => { root.clear_multi_selection(); }
+                }
+            }
+
+            // 操作条底 hairline
+            Rectangle {
+                x: 0;
+                y: parent.height - 1px;
+                width: 100%;
+                height: 1px;
+                background: Theme.hairline;
+            }
+        }
+
         // 表头：纵向固定，横向随列表滚动（x 绑 content-x 反向偏移）
         header-clip := Rectangle {
             x: 0;
-            y: 0;
+            y: root.top-off;
             width: 100%;
             height: 26px;
             clip: true;
@@ -916,7 +1140,7 @@ export component PrListView inherits FocusScope {
 
         // 空态
         if root.items.length == 0: Text {
-            y: 26px;
+            y: 26px + root.top-off;
             width: 100%;
             height: 48px;
             text: I18n.empty_no_pr;
@@ -928,9 +1152,9 @@ export component PrListView inherits FocusScope {
 
         // 横向 Flickable 包 ListView：横向滚这层，纵向滚 ListView（标准嵌套）
         flick := Flickable {
-            y: 26px;
+            y: 26px + root.top-off;
             width: 100%;
-            height: parent.height - 26px;
+            height: parent.height - 26px - root.top-off;
             content-width: root.content-w;
             content-height: self.height;
 
@@ -940,7 +1164,7 @@ export component PrListView inherits FocusScope {
                 width: root.content-w;
                 height: parent.height;
 
-                for it in root.items: Rectangle {
+                for it in root.items: row-wrap := Rectangle {
                     height: it.is_header ? 26px : 30px * Theme.fs_scale;
                     width: root.content-w;
 
@@ -953,16 +1177,88 @@ export component PrListView inherits FocusScope {
                     if !it.is_header: PrRowItem {
                         width: 100%;
                         pr: it.row;
+                        multi_selected: it.multi_selected;
                         selected: root.selected_key != "" && it.row.key == root.selected_key;
-                        clicked => {
+                        clicked(ctrl, shift) => {
                             root.selected_key = it.row.key;
-                            root.row_activated(it.ridx);
+                            root.row_clicked(it.ridx, ctrl, shift);
+                        }
+                        // 鼠标坐标（行内）→ PrListView 坐标：加回横向滚动偏移与
+                        // 表头/操作条纵向偏移 + 行在 ListView 里的 y（clamp 在 open_ctx 里做）
+                        context_menu(mx, my) => {
+                            root.open_ctx(it.ridx, flick.content-x + mx, flick.y + row-wrap.y + my);
                         }
                         pin => { root.row_pin(it.ridx); }
                         board => { root.row_board(it.ridx); }
                         reject => { root.row_reject(it.ridx); }
                         open_browser => { root.row_open(it.ridx); }
                     }
+                }
+            }
+        }
+    }
+
+    // ── 右键菜单（PopupWindow；坐标在 open_ctx 里 clamp 到窗口内，防右缘/下缘溢出）──
+    // 菜单项随多选状态动态：单选才显示「浏览器打开」；Pin/看板/跳过按集合状态翻转文案。
+    ctx-popup := PopupWindow {
+        x: root.ctx-x;
+        y: root.ctx-y;
+        width: 230px;
+        height: root.ctx-menu-h;
+        close-policy: close-on-click-outside;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: Theme.r_lg;
+            background: Theme.card;
+            border-width: 1px;
+            border-color: Theme.hairline;
+
+            VerticalLayout {
+                x: 0;
+                y: 4px;
+                width: 100%;
+                spacing: 0;
+
+                if root.sel_count <= 1: CtxItem {
+                    label: I18n.inbox_open_browser;
+                    hint: "o";
+                    activated => { root.batch_open_browser(); ctx-popup.close(); }
+                }
+                CtxSep {}
+                CtxItem { label: I18n.ctx_priority_high; hint: "1"; activated => { root.batch_set_priority(1); ctx-popup.close(); } }
+                CtxItem { label: I18n.ctx_priority_medium; hint: "2"; activated => { root.batch_set_priority(2); ctx-popup.close(); } }
+                CtxItem { label: I18n.ctx_priority_low; hint: "3"; activated => { root.batch_set_priority(3); ctx-popup.close(); } }
+                CtxItem { label: I18n.ctx_priority_clear; hint: "0"; activated => { root.batch_set_priority(0); ctx-popup.close(); } }
+                CtxItem {
+                    label: root.sel_all_pinned ? I18n.ctx_unpin : I18n.tip_pin;
+                    hint: "p";
+                    activated => { root.batch_toggle_pin(); ctx-popup.close(); }
+                }
+                CtxItem {
+                    label: root.sel_all_on_board ? I18n.ctx_remove_board : I18n.detail_add_board;
+                    activated => { root.batch_toggle_board(); ctx-popup.close(); }
+                }
+                CtxItem {
+                    label: root.sel_all_rejected ? I18n.ctx_restore : I18n.ctx_skip;
+                    danger: !root.sel_all_rejected;
+                    activated => { root.batch_set_status(root.sel_all_rejected ? "pending" : "rejected"); ctx-popup.close(); }
+                }
+                CtxSep {}
+                CtxItem {
+                    label: I18n.review_start;
+                    activated => { root.batch_run_review(); ctx-popup.close(); }
+                }
+                CtxItem {
+                    label: I18n.ctx_copy_links;
+                    activated => { root.batch_copy_links(); ctx-popup.close(); }
+                }
+                CtxSep {}
+                CtxItem {
+                    label: I18n.ctx_clear_selection;
+                    hint: "Esc";
+                    activated => { root.clear_multi_selection(); ctx-popup.close(); }
                 }
             }
         }

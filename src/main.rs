@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-use slint::{ModelRc, SharedString, VecModel};
+use slint::{Model as _, ModelRc, SharedString, VecModel};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 slint::include_modules!();
@@ -18,6 +18,7 @@ use pr_desk_rs::config::{Config, Profile};
 use pr_desk_rs::db::{self, Db};
 use pr_desk_rs::i18n::{tr, trf};
 use pr_desk_rs::reviewer::LlmSettings;
+use pr_desk_rs::selection;
 use pr_desk_rs::{diffview, github, ocr, reviewer, sync};
 
 // ── 后台命令 / 回送消息 ──
@@ -49,6 +50,7 @@ enum Cmd {
     // UI 线程只把 Msg::Panel/DiffParsed 装盒。refetch=false 用于 ReopenPanel（防 FetchPrMeta 死循环）
     OpenDrawer { repo: String, number: i64, refetch: bool },
     CopyReview,        // 详情面板「复制评审」：get_review SQL + 剪贴板写入都在 worker
+    CopyLinks(String), // 多选「复制链接」：换行拼接的 URL 文本，剪贴板写入在 worker
     LoadReviewPrompt,  // 设置页打开时重读 exe 旁 review_prompt.md（可能被外部编辑过）
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
     SwitchProfile(String),  // 切换数据源档案（"local"/"default"/自定义名）：换库 + 重建同步客户端
@@ -93,7 +95,8 @@ enum Msg {
     ViewPrefsChanged,  // 排序方式 / 高分快筛变化（重算过滤视图并重建行模型）
     // 只重组状态栏（配额 / 同步时间变化，不改临时消息）
     StatusBarRefresh,
-    // 详情面板：文本/JSON 字符串过界；ConvoEntry/CheckRun/FileChange 模型在 UI 线程装配
+    // 详情面板：文本/JSON 字符串过界；CheckRun/FileChange 模型在 UI 线程装配；
+    // 会话条目已在 worker 完成 markdown 解析（PlainConvoEntry 纯数据可跨线程）
     Panel {
         title: String,
         author: String,
@@ -105,7 +108,7 @@ enum Msg {
         priority: i32,
         pinned: bool,
         on_board: bool,
-        convo_json: String,
+        convo: Vec<PlainConvoEntry>,
         checks_json: String,
         files_json: String,
         // 评审 tab 数据（db.get_review 的 JSON 已格式化为 UI 直接可用的字段）
@@ -123,13 +126,13 @@ enum Msg {
     DiffParsed { repo: String, number: i64, files: Vec<DiffFileData> },
     // Inbox 通知行：serde_json 过界，NotifRow 模型在 UI 线程装配
     InboxRows(Vec<serde_json::Value>),
-    // Inbox 预览面板：JSON 字符串过界，ConvoEntry/FileChange 在 UI 线程装配；diff 已解析
-    //（标题/类型在点击时已由 on_inbox_activated 设置，这里只回送内容数据）。
+    // Inbox 预览面板：会话条目已在 worker 完成 markdown 解析；Files 保持 JSON 过界；
+    // diff 已解析（标题/类型在点击时已由 on_inbox_activated 设置，这里只回送内容数据）。
     // 携带身份：apply 前与 app.inbox_detail 比对，快速连点两条通知时旧结果丢弃
     NotifDetail {
         repo: String,
         number: i64,
-        convo_json: String,
+        convo: Vec<PlainConvoEntry>,
         files_json: String,
         diff_files: Vec<DiffFileData>,
     },
@@ -162,10 +165,21 @@ enum Msg {
         ci: Option<String>,
         state: Option<String>,
         updated: Option<String>,
-        convo_json: Option<String>,
+        convo: Option<Vec<PlainConvoEntry>>,
         checks_json: Option<String>,
         files_json: Option<String>,
     },
+}
+
+/// 会话条目展示数据（纯 Rust 数据可跨线程；markdown 在 worker 侧已解析成 blocks，
+/// UI 线程只做装盒——大会话 PR 几十条评论的 parse_markdown 不再占 UI 线程）。
+/// text 保留原文（blocks 为空时 UI 回退显示它）。
+struct PlainConvoEntry {
+    kind: String,
+    author: String,
+    time: String,
+    text: String,
+    blocks: Vec<pr_desk_rs::markdown::MdBlockOut>,
 }
 
 /// OCR 行级评论展示数据（纯 Rust 字符串可跨线程；Slint OcrComment 在 UI 线程装配）。
@@ -498,6 +512,8 @@ struct App {
     sort_asc: bool,                         // 排序方向（false = 降序）
     min_score: f32,                         // 高分快筛阈值（0 = 关；8 = 只看 ≥8.0）
     selected: Option<(String, i64)>,        // 选中 PR 身份（repo, number）；刷新后行序变化也不漂移
+    selection: Vec<(String, i64)>,          // 多选集合（Ctrl 点选/Shift 范围选，保持点选顺序；纯左键点击清空）
+    anchor: Option<(String, i64)>,          // Shift 范围选锚点（存身份而非下标：刷新后下标漂移、身份不漂）
     status_msg: String,                     // 状态栏临时消息（最近一条 Status）
     status_gen: u64,                        // 状态栏临时消息序号（自动清除定时器的竞态守卫）
     gh_refreshing: bool,                    // GitHub 刷新在途（顶栏转圈 + 连点去重）
@@ -658,6 +674,8 @@ fn main() -> anyhow::Result<()> {
         sort_asc: false,
         min_score: 0.0,
         selected: None,
+        selection: Vec::new(),
+        anchor: None,
         status_msg: config_status(&cfg),
         status_gen: 0,
         gh_refreshing: false,
@@ -1284,13 +1302,10 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
-        // 快捷键 o：浏览器打开当前选中 PR
+        // 快捷键 o：浏览器打开；多选存在时批量打开（上限 5 个防误炸浏览器）
         let app = app.clone();
         ui.on_key_open(move || {
-            let sel = app.lock_recover().selected.clone();
-            if let Some((repo, number)) = sel {
-                open_pr_url(&app, &repo, &number);
-            }
+            batch_open_browser(&app);
         });
     }
     {
@@ -1322,20 +1337,25 @@ fn main() -> anyhow::Result<()> {
         });
     }
     {
+        // 快捷键 p：多选存在时批量 toggle，否则单行
         let app = app.clone();
         ui.on_key_pin(move || {
-            let sel = app.lock_recover().selected.clone();
-            if let Some((repo, number)) = sel {
+            if !app.lock_recover().selection.is_empty() {
+                batch_toggle(&app, "pinned");
+            } else if let Some((repo, number)) = app.lock_recover().selected.clone() {
                 let v = toggle_of(&app, &repo, number, "pinned");
                 local_update(&app, &repo, number, "pinned", v);
             }
         });
     }
     {
+        // 快捷键 1/2/3：多选存在时批量设优先级，否则单行
         let app = app.clone();
         ui.on_key_priority(move |p| {
-            let sel = app.lock_recover().selected.clone();
-            if let Some((repo, number)) = sel {
+            let keys = effective_targets(&app);
+            if keys.len() > 1 {
+                batch_local_update(&app, &keys, "priority", p as i64);
+            } else if let Some((repo, number)) = keys.first().cloned() {
                 local_update(&app, &repo, number, "priority", p as i64);
             }
         });
@@ -1381,8 +1401,161 @@ fn main() -> anyhow::Result<()> {
             }
         });
     }
+    // ── 多选 / 批量操作 ──
     {
-        // 设置页切换编辑档案 → 回填该档案的服务器三字段（local → 空，字段锁定）
+        // 行左键点击（带修饰键语义；行的 pointer-event 统一派发）：
+        // 无修饰 = 清多选 + 单选 + 打开详情（与 row_activated 同出口）；
+        // Ctrl = toggle 该行进/出多选（移动主选中，但不开详情——多选场景下面板频闪）；
+        // Shift = 从锚点到本行（view_visible 序）范围入多选（不开详情）
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        let ui2 = ui.as_weak();
+        ui.on_row_clicked(move |i, ctrl, shift| {
+            let Some((repo, number)) = resolve_view(&app, i as usize) else { return };
+            let key = (repo.clone(), number);
+            let open = !ctrl && !shift;
+            {
+                let mut a = app.lock_recover();
+                if shift {
+                    let anchor = a.anchor.clone().unwrap_or_else(|| key.clone());
+                    let view = a.view_visible.clone();
+                    selection::extend_range(&mut a.selection, &view, &anchor, &key);
+                    if a.anchor.is_none() {
+                        a.anchor = Some(key.clone());
+                    }
+                } else if ctrl {
+                    selection::toggle(&mut a.selection, &key);
+                    a.anchor = Some(key.clone());
+                } else {
+                    a.selection.clear();
+                    a.anchor = Some(key.clone());
+                }
+                a.selected = Some(key);
+            }
+            if let Some(ui) = ui2.upgrade() {
+                push_selection_ui(&ui, &app);
+            }
+            if open {
+                let _ = cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: true });
+            }
+        });
+    }
+    {
+        // 行右键：该行不在多选内则先单选它（多选内含它则不动多选），菜单由 UI 侧打开
+        let app = app.clone();
+        let ui2 = ui.as_weak();
+        ui.on_row_context(move |i| {
+            let Some((repo, number)) = resolve_view(&app, i as usize) else { return };
+            let key = (repo.clone(), number);
+            {
+                let mut a = app.lock_recover();
+                if !selection::is_selected(&a.selection, &key) {
+                    selection::select_single(&mut a.selection, &key);
+                    a.anchor = Some(key.clone());
+                }
+                a.selected = Some(key);
+            }
+            if let Some(ui) = ui2.upgrade() {
+                // 右键转移主选中行：同步高亮
+                let k = format!("{repo}#{number}");
+                ui.set_selected_key(k.into());
+                push_selection_ui(&ui, &app);
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        ui.on_batch_set_priority(move |p| {
+            let keys = effective_targets(&app);
+            if !keys.is_empty() {
+                batch_local_update(&app, &keys, "priority", p as i64);
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        ui.on_batch_toggle_pin(move || batch_toggle(&app, "pinned"));
+    }
+    {
+        let app = app.clone();
+        ui.on_batch_toggle_board(move || batch_toggle(&app, "on_board"));
+    }
+    {
+        // 批量状态："rejected"（跳过）/ "pending"（恢复）
+        let app = app.clone();
+        ui.on_batch_set_status(move |s| {
+            let status = match s.as_str() {
+                "rejected" | "pending" => s.to_string(),
+                _ => return, // 白名单外的值不进库
+            };
+            let keys = effective_targets(&app);
+            if !keys.is_empty() {
+                batch_local_update(&app, &keys, "status", status);
+            }
+        });
+    }
+    {
+        // 批量预评审：逐行发 Cmd::RunReview（review_slots 并发槽排队/去重由 worker 侧保证）
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        ui.on_batch_run_review(move || {
+            let keys = effective_targets(&app);
+            if keys.is_empty() {
+                return;
+            }
+            let n = keys.len();
+            for (repo, number) in keys {
+                let _ = cmd_tx.send(Cmd::RunReview { repo, number });
+            }
+            let lang = lang_of(&app);
+            send_msg(Msg::Status(trf(&lang, "review_queued", &[&n.to_string()])));
+        });
+    }
+    {
+        // 批量复制链接：换行拼接 URL，剪贴板写入挪进 worker（Windows 剪贴板打开可能阻塞）
+        let app = app.clone();
+        let cmd_tx = cmd_tx.clone();
+        ui.on_batch_copy_links(move || {
+            let keys = effective_targets(&app);
+            if keys.is_empty() {
+                return;
+            }
+            let text = {
+                let a = app.lock_recover();
+                keys.iter()
+                    .map(|(repo, number)| {
+                        find_row(&a, repo, *number)
+                            .and_then(|i| a.rows[i]["url"].as_str().map(|s| s.to_string()))
+                            .filter(|u| !u.is_empty())
+                            .unwrap_or_else(|| format!("https://github.com/{repo}/pull/{number}"))
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let _ = cmd_tx.send(Cmd::CopyLinks(text));
+        });
+    }
+    {
+        let app = app.clone();
+        ui.on_batch_open_browser(move || batch_open_browser(&app));
+    }
+    {
+        // 清空多选（Esc 第一级 / 操作条 ✕）；主选中行保留。
+        // 高亮由 push_selection_ui 原地翻转（不做全量重建——重建会重置滚动位置）
+        let app = app.clone();
+        let ui2 = ui.as_weak();
+        ui.on_clear_multi_selection(move || {
+            {
+                let mut a = app.lock_recover();
+                a.selection.clear();
+                a.anchor = None;
+            }
+            if let Some(ui) = ui2.upgrade() {
+                push_selection_ui(&ui, &app);
+            }
+        });
+    }
+    {
         let app = app.clone();
         let ui2 = ui.as_weak();
         ui.on_settings_profile_focus(move |name| {
@@ -1721,6 +1894,133 @@ fn local_update<V: Into<serde_json::Value>>(app: &Arc<Mutex<App>>, repo: &str, n
     }
 }
 
+// ── 多选 / 批量操作 ──
+
+/// 批量操作的目标集合：多选非空用多选，否则回退主选中行（单选语义）。
+fn effective_targets(app: &Arc<Mutex<App>>) -> Vec<(String, i64)> {
+    let a = app.lock_recover();
+    if !a.selection.is_empty() {
+        a.selection.clone()
+    } else {
+        a.selected.clone().into_iter().collect()
+    }
+}
+
+/// 多选状态摘要（喂给 UI 的右键菜单/操作条）：数量 + 三个「全部已置位」标志。
+/// 标志从当前行数据现读；行已被滤掉的身份按「未置位」计（偏向显示 Pin/Add/Skip）。
+fn selection_summary(app: &Arc<Mutex<App>>) -> (usize, bool, bool, bool) {
+    let a = app.lock_recover();
+    let n = a.selection.len();
+    if n == 0 {
+        return (0, false, false, false);
+    }
+    let field_all = |field: &str| {
+        a.selection.iter().all(|(r, num)| {
+            find_row(&a, r, *num)
+                .and_then(|i| a.rows[i][field].as_i64())
+                .unwrap_or(0)
+                != 0
+        })
+    };
+    let all_rejected = a.selection.iter().all(|(r, num)| {
+        find_row(&a, r, *num)
+            .and_then(|i| a.rows[i]["status"].as_str())
+            == Some("rejected")
+    });
+    (n, field_all("pinned"), field_all("on_board"), all_rejected)
+}
+
+/// 把多选状态回写 UI（计数 + 菜单动态项标志）。selection 每次变动后都要调。
+/// 同时原地翻转行模型的 multi_selected：全量重建（rebuild_rows_ui）会重置滚动位置，
+/// 点击响应必须即时——逐行比对 row.key，只写回有变化的行（O(行数)，组头跳过）。
+fn push_selection_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
+    let (n, all_pinned, all_on_board, all_rejected) = selection_summary(app);
+    ui.set_sel_count(n as i32);
+    ui.set_sel_all_pinned(all_pinned);
+    ui.set_sel_all_on_board(all_on_board);
+    ui.set_sel_all_rejected(all_rejected);
+    let keys: HashSet<String> = {
+        let a = app.lock_recover();
+        a.selection.iter().map(|(r, num)| format!("{r}#{num}")).collect()
+    };
+    // ModelRc 的 Model 实现直接委托给内部 VecModel，无需 downcast
+    let model = ui.get_items();
+    for i in 0..model.row_count() {
+        let Some(mut it) = model.row_data(i) else { continue };
+        if it.is_header {
+            continue;
+        }
+        let want = keys.contains(it.row.key.as_str());
+        if it.multi_selected != want {
+            it.multi_selected = want;
+            model.set_row_data(i, it);
+        }
+    }
+}
+
+/// 批量字段更新：循环走 local_pr_update（字段白名单 + UPDATE/outbox 同事务不变），
+/// 全部写完后只重建一次行模型、只发一条状态栏汇总（逐条调 local_update 会
+/// 每条都重建 + 刷一条消息，N 大时闪屏且消息互相覆盖）。
+fn batch_local_update<V: Into<serde_json::Value> + Clone>(
+    app: &Arc<Mutex<App>>,
+    keys: &[(String, i64)],
+    field: &str,
+    value: V,
+) {
+    let (n, lang) = {
+        let a = app.lock_recover();
+        let mut n = 0usize;
+        for (repo, number) in keys {
+            if a.db.local_pr_update(repo, *number, field, &value.clone().into()).is_ok() {
+                n += 1;
+            }
+        }
+        (n, a.cfg.language.clone())
+    };
+    if n > 0 {
+        reload_rows_global(app);
+        send_msg(Msg::Status(trf(&lang, "fields_updated", &[&n.to_string()])));
+    }
+}
+
+/// 批量 toggle（pinned/on_board）：目标值按「是否全部已置位」决定（全 1 → 0，否则 1）。
+fn batch_toggle(app: &Arc<Mutex<App>>, field: &str) {
+    let keys = effective_targets(app);
+    if keys.is_empty() {
+        return;
+    }
+    let target = {
+        let a = app.lock_recover();
+        let vals: Vec<i64> = keys
+            .iter()
+            .map(|(r, n)| {
+                find_row(&a, r, *n)
+                    .and_then(|i| a.rows[i][field].as_i64())
+                    .unwrap_or(0)
+            })
+            .collect();
+        selection::batch_toggle_target(vals.iter())
+    };
+    batch_local_update(app, &keys, field, target);
+}
+
+/// 批量「浏览器打开」：上限 5 个（防快捷键误触一次弹几十个标签页），超出部分状态栏提示。
+fn batch_open_browser(app: &Arc<Mutex<App>>) {
+    const MAX_OPEN: usize = 5;
+    let keys = effective_targets(app);
+    for (repo, number) in keys.iter().take(MAX_OPEN) {
+        open_pr_url(app, repo, number);
+    }
+    if keys.len() > MAX_OPEN {
+        let lang = lang_of(app);
+        send_msg(Msg::Status(trf(
+            &lang,
+            "batch_open_capped",
+            &[&MAX_OPEN.to_string(), &(keys.len() - MAX_OPEN).to_string()],
+        )));
+    }
+}
+
 fn reload_rows_global(app: &Arc<Mutex<App>>) {
     let rows = {
         let a = app.lock_recover();
@@ -1821,11 +2121,14 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
         }
     }
 
-    // 会话 / Checks / Files：JSON 过界（Slint 模型不跨线程），UI 线程装盒
+    // 会话条目在 worker 完成 markdown 解析（纯数据过界）；Checks/Files 保持 JSON，UI 线程装盒
     let (convo_json, checks_json) = row
         .as_ref()
         .map(|r| drawer_extras_json(r))
         .unwrap_or_default();
+    let convo = plain_convo_entries(
+        &serde_json::from_str::<Vec<serde_json::Value>>(&convo_json).unwrap_or_default(),
+    );
     let files_json = match &diff_cached {
         Some(d) => {
             let j = files_json_from_diff(d);
@@ -1881,7 +2184,7 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
         priority,
         pinned,
         on_board,
-        convo_json,
+        convo,
         checks_json,
         files_json,
         review: review_props(review.as_ref(), &lang),
@@ -2044,11 +2347,6 @@ fn md_blocks_of(blocks: Vec<pr_desk_rs::markdown::MdBlockOut>) -> ModelRc<MdBloc
     ModelRc::new(VecModel::from(blocks))
 }
 
-/// 评论正文 Markdown → MdBlock 模型（会话 tab 按块渲染；text 字段仍保留原文兼容）。
-fn md_blocks(md: &str) -> ModelRc<MdBlock> {
-    md_blocks_of(pr_desk_rs::markdown::parse_markdown(md))
-}
-
 /// diff 文本 → 结构化数据（前 3 个文件展开）。
 /// 在 worker 调用：大 PR 几万行逐行解析是重活，UI 线程只做 VecModel 装盒。
 fn parse_diff(diff: &str) -> Vec<DiffFileData> {
@@ -2127,18 +2425,34 @@ fn diff_row_models(files: &[DiffFileData]) -> Vec<DiffRow> {
 
 // ── 后台 worker ──
 
-/// 会话 JSON → ConvoEntry 模型（Msg::Panel / PanelLive / NotifDetail 共用装配；
-/// kind 缺失（通知预览的评论条目无 kind 字段）时按 "comment" 处理）。
-fn convo_entries(json: &str) -> Vec<ConvoEntry> {
-    serde_json::from_str::<Vec<serde_json::Value>>(json)
-        .unwrap_or_default()
+/// 会话 JSON 行 → 纯数据条目（markdown 在这里解析；worker 侧调用，产物可跨线程）。
+/// kind 缺失（通知预览的评论条目无 kind 字段）时按 "comment" 处理。
+fn plain_convo_entries(entries: &[serde_json::Value]) -> Vec<PlainConvoEntry> {
+    entries
         .iter()
+        .map(|e| {
+            let text = e["text"].as_str().unwrap_or("").to_string();
+            PlainConvoEntry {
+                kind: e["kind"].as_str().unwrap_or("comment").to_string(),
+                author: e["author"].as_str().unwrap_or("").to_string(),
+                time: model::rel_time(e["time"].as_str().unwrap_or("")),
+                blocks: pr_desk_rs::markdown::parse_markdown(&text),
+                text,
+            }
+        })
+        .collect()
+}
+
+/// PlainConvoEntry → Slint ConvoEntry 模型（纯装盒，UI 线程；Msg::Panel / PanelLive / NotifDetail 共用）。
+fn convo_models(entries: Vec<PlainConvoEntry>) -> Vec<ConvoEntry> {
+    entries
+        .into_iter()
         .map(|e| ConvoEntry {
-            kind: e["kind"].as_str().unwrap_or("comment").into(),
-            author: e["author"].as_str().unwrap_or("").into(),
-            time: model::rel_time(e["time"].as_str().unwrap_or("")).into(),
-            text: e["text"].as_str().unwrap_or("").into(),
-            blocks: md_blocks(e["text"].as_str().unwrap_or("")),
+            kind: e.kind.into(),
+            author: e.author.into(),
+            time: e.time.into(),
+            text: e.text.into(),
+            blocks: md_blocks_of(e.blocks),
         })
         .collect()
 }
@@ -2804,11 +3118,13 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
         let cfg = app.lock_recover().cfg.clone();
         sync::SyncClient::new(&cfg)
     };
-    // 实时刷新节流：同一 PR 同一部分（parts 位标志）的上次拉取时间（120s 内不重复拉）
-    let mut live_fetched: std::collections::HashMap<(String, i64, u8), std::time::Instant> =
+    // 实时刷新节流：同一 PR 同一部分（parts 位标志）的上次拉取时间（120s 内不重复拉）。
+    // Arc<Mutex>：网络臂已 spawn 化，在飞任务的节流标记由 task 与命令循环共享
+    //（spawn 时乐观标记防在飞重入，失败由 task 移除标记——失败不吃满惩罚窗口）
+    let live_fetched: Arc<Mutex<std::collections::HashMap<(String, i64, u8), std::time::Instant>>> =
         Default::default();
     // 元数据补齐节流：同一行 300s 内最多补一次（兜底防 open_drawer↔ReopenPanel 循环）
-    let mut meta_healed: std::collections::HashMap<(String, i64), std::time::Instant> =
+    let meta_healed: Arc<Mutex<std::collections::HashMap<(String, i64), std::time::Instant>>> =
         Default::default();
 
     // unbounded channel + recv().await：不在 tokio 工作线程上做 std 阻塞 recv
@@ -2818,137 +3134,192 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
         match cmd {
             Cmd::RefreshGithub => {
                 // 先把本地库现有内容装进列表（本地模式手动策展的 PR 启动/刷新时立刻可见，
-                // 不能等网络；sync 模式下这是 sync_pull 前的缓存快照）
+                // 不能等网络；sync 模式下这是 sync_pull 前的缓存快照）——本地操作，留在循环内
                 reload_rows(&app, &msg_tx);
+                // 网络部分 spawn：直连 GitHub 不稳（30s 超时），内联 await 会把后面的
+                // OpenDrawer（行点击）堵在队列里秒级延迟。连点去重标志 gh_refreshing 在
+                // UI 回调置位、这里复位——在途期间重复命令在 UI 侧已被拒，spawn 不改变语义。
                 // 档案名随任务走：网络在途期间切档案时，在途结果不得写进切后的库
                 let for_profile = app.lock_recover().cfg.active_profile.clone();
-                if let Some(gh) = &gh {
-                    if sync_client.enabled() {
-                        // sync 模式：列表来自服务器插件数据库（sync_pull）+ 手动预评审，
-                        // 不再把配置仓库的全部 open PR 灌进列表库；通知仍从 GitHub 拉
-                        fetch_inbox(gh, &app, &msg_tx).await;
-                        do_sync(&app, &sync_client, &msg_tx, &for_profile).await;
-                    } else {
-                        refresh_from_github(gh, &app, &msg_tx, &for_profile).await;
-                        // 顺便拉一次通知
-                        fetch_inbox(gh, &app, &msg_tx).await;
-                    }
-                }
-                // 收尾：复位连点去重标志 + 停顶栏转圈 + 状态栏报结果（open PR 数）
-                let open_count = {
-                    let mut a = app.lock_recover();
-                    a.gh_refreshing = false;
-                    a.rows
-                        .iter()
-                        .filter(|r| !matches!(r["status"].as_str(), Some("merged") | Some("closed")))
-                        .count()
+                let finish = |app: &Arc<Mutex<App>>, tx: &mpsc::Sender<Msg>| {
+                    let open_count = {
+                        let mut a = app.lock_recover();
+                        a.gh_refreshing = false;
+                        a.rows
+                            .iter()
+                            .filter(|r| !matches!(r["status"].as_str(), Some("merged") | Some("closed")))
+                            .count()
+                    };
+                    let _ = tx.send(Msg::RefreshDone(open_count));
                 };
-                let _ = msg_tx.send(Msg::RefreshDone(open_count));
+                if let Some(g) = gh.clone() {
+                    let sc = sync_client.clone();
+                    let app2 = app.clone();
+                    let tx = msg_tx.clone();
+                    tokio::spawn(async move {
+                        if sc.enabled() {
+                            // sync 模式：列表来自服务器插件数据库（sync_pull）+ 手动预评审，
+                            // 不再把配置仓库的全部 open PR 灌进列表库；通知仍从 GitHub 拉
+                            fetch_inbox(&g, &app2, &tx).await;
+                            do_sync(&app2, &sc, &tx, &for_profile).await;
+                        } else {
+                            refresh_from_github(&g, &app2, &tx, &for_profile).await;
+                            // 顺便拉一次通知
+                            fetch_inbox(&g, &app2, &tx).await;
+                        }
+                        // 收尾：复位连点去重标志 + 停顶栏转圈 + 状态栏报结果（open PR 数）
+                        finish(&app2, &tx);
+                    });
+                } else {
+                    finish(&app, &msg_tx);
+                }
             }
             Cmd::Sync => {
-                // 通知与同步服务器无关，先顺手拉一次
+                // 同 RefreshGithub：网络部分 spawn，去重标志 sync_inflight 在 UI 回调置位、
+                // task 尾复位。do_sync 不依赖 gh（同步服务器流量），gh 缺失也要跑。
                 let for_profile = app.lock_recover().cfg.active_profile.clone();
-                if let Some(g) = &gh {
-                    fetch_inbox(g, &app, &msg_tx).await;
-                }
-                do_sync(&app, &sync_client, &msg_tx, &for_profile).await;
-                // 收尾：复位去重标志 + 停顶栏转圈（结果文案由 do_sync 自己的 Status 负责；
-                // 本地模式 sync 未启用时 do_sync 静默跳过，这里也不打扰状态栏）
-                app.lock_recover().sync_inflight = false;
-                let _ = msg_tx.send(Msg::SyncFinished);
+                let g = gh.clone();
+                let sc = sync_client.clone();
+                let app2 = app.clone();
+                let tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    // 通知与同步服务器无关，先顺手拉一次
+                    if let Some(g) = &g {
+                        fetch_inbox(g, &app2, &tx).await;
+                    }
+                    do_sync(&app2, &sc, &tx, &for_profile).await;
+                    // 收尾：复位去重标志 + 停顶栏转圈（结果文案由 do_sync 自己的 Status 负责；
+                    // 本地模式 sync 未启用时 do_sync 静默跳过，这里也不打扰状态栏）
+                    app2.lock_recover().sync_inflight = false;
+                    let _ = tx.send(Msg::SyncFinished);
+                });
             }
             Cmd::FetchDiff { repo, number } => {
-                if let Some(gh) = &gh {
-                    match gh.fetch_diff(&repo, number).await {
-                        Ok(diff) => {
-                            {
-                                let a = app.lock_recover();
-                                if let Err(e) = a.db.put_diff(&repo, number, &diff) {
-                                    tracing::warn!("diff 缓存写入失败 {repo} #{number}: {e}");
+                // spawn：diff 拉取是纯网络活；DiffParsed 带身份守卫（面板已切走 apply 丢弃）
+                if let Some(g) = gh.clone() {
+                    let app2 = app.clone();
+                    let tx = msg_tx.clone();
+                    tokio::spawn(async move {
+                        match g.fetch_diff(&repo, number).await {
+                            Ok(diff) => {
+                                {
+                                    let a = app2.lock_recover();
+                                    if let Err(e) = a.db.put_diff(&repo, number, &diff) {
+                                        tracing::warn!("diff 缓存写入失败 {repo} #{number}: {e}");
+                                    }
                                 }
+                                // 解析在 task 内完成；消息带身份，面板已切走时 apply 丢弃上屏
+                                let files = parse_diff(&diff);
+                                let _ = tx.send(Msg::DiffParsed { repo, number, files });
+                                // diff 响应也带配额头，状态栏重组刷新配额
+                                let _ = tx.send(Msg::StatusBarRefresh);
                             }
-                            // 解析在 worker 完成；消息带身份，面板已切走时 apply 丢弃上屏
-                            let files = parse_diff(&diff);
-                            let _ = msg_tx.send(Msg::DiffParsed { repo, number, files });
-                            // diff 响应也带配额头，状态栏重组刷新配额
-                            let _ = msg_tx.send(Msg::StatusBarRefresh);
+                            Err(e) => {
+                                let lang = lang_of(&app2);
+                                let _ = tx.send(Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
+                            }
                         }
-                        Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
-                        }
-                    }
+                    });
                 }
             }
             Cmd::FetchInbox => {
-                if let Some(gh) = &gh {
-                    fetch_inbox(gh, &app, &msg_tx).await;
-                } else {
-                    // 客户端初始化失败：也要关掉 UI 的「加载中…」（否则永远转圈）
-                    let _ = msg_tx.send(Msg::InboxLoading(false));
-                }
+                // spawn：通知拉取是纯网络活；InboxRows 是全量替换语义，无需身份守卫
+                let g = gh.clone();
+                let app2 = app.clone();
+                let tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    if let Some(g) = &g {
+                        fetch_inbox(g, &app2, &tx).await;
+                    } else {
+                        // 客户端初始化失败：也要关掉 UI 的「加载中…」（否则永远转圈）
+                        let _ = tx.send(Msg::InboxLoading(false));
+                    }
+                });
             }
             Cmd::FetchInboxMore => {
-                if let Some(gh) = &gh {
-                    fetch_inbox_more(gh, &app, &msg_tx).await;
+                // spawn：去重/追加/页码状态都在 fetch_inbox_more 内部持锁完成
+                if let Some(g) = gh.clone() {
+                    let app2 = app.clone();
+                    let tx = msg_tx.clone();
+                    tokio::spawn(async move {
+                        fetch_inbox_more(&g, &app2, &tx).await;
+                    });
                 }
             }
             Cmd::MarkNotifRead(thread_id) => {
-                if let Some(gh) = &gh {
-                    match gh.mark_notification_read(&thread_id).await {
-                        Ok(()) => fetch_inbox(gh, &app, &msg_tx).await,
-                        Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(trf(&lang, "mark_read_failed", &[&e.to_string()])));
+                if let Some(g) = gh.clone() {
+                    let app2 = app.clone();
+                    let tx = msg_tx.clone();
+                    tokio::spawn(async move {
+                        match g.mark_notification_read(&thread_id).await {
+                            Ok(()) => fetch_inbox(&g, &app2, &tx).await,
+                            Err(e) => {
+                                let lang = lang_of(&app2);
+                                let _ = tx.send(Msg::Status(trf(&lang, "mark_read_failed", &[&e.to_string()])));
+                            }
                         }
-                    }
-                    let _ = msg_tx.send(Msg::StatusBarRefresh);
+                        let _ = tx.send(Msg::StatusBarRefresh);
+                    });
                 }
             }
             Cmd::FetchNotifDetail { repo, number, kind } => {
-                // 每个出口都必须回送消息：失败也要把预览面板的 nd_loading 置 false，
-                // 否则面板永远停在「加载中」。消息带身份，快速连点两条通知时旧结果不上屏。
-                let Some(gh) = &gh else {
-                    let _ = msg_tx.send(Msg::NotifDetailFailed {
-                        repo,
-                        number,
-                        err: tr(&lang, "cfg_unconfigured").into(),
-                    });
-                    continue;
-                };
-                // 会话对 PR/Issue 都有；Files/Diff 仅 PullRequest
-                let convo = match gh.fetch_pr_convo(&repo, number).await {
-                    Ok(c) => c,
-                    Err(e) => {
-                        let _ = msg_tx.send(Msg::Status(trf(&lang, "convo_fetch_failed", &[&e.to_string()])));
-                        Vec::new()
-                    }
-                };
-                let (files, diff) = if kind == "PullRequest" {
-                    let files = match gh.fetch_pr_files(&repo, number).await {
-                        Ok(f) => f,
+                // spawn：3 个串行网络请求是会阻塞命令循环的重头。消息带身份守卫，
+                // 快速连点两条通知时旧结果不上屏（NotifDetail/NotifDetailFailed apply 比对）。
+                // 会话条目的 markdown 解析也在 task 内完成（不占 UI 线程）。
+                let g = gh.clone();
+                let app2 = app.clone();
+                let tx = msg_tx.clone();
+                tokio::spawn(async move {
+                    // 每个出口都必须回送消息：失败也要把预览面板的 nd_loading 置 false，
+                    // 否则面板永远停在「加载中」。
+                    let Some(g) = &g else {
+                        let lang = lang_of(&app2);
+                        let _ = tx.send(Msg::NotifDetailFailed {
+                            repo,
+                            number,
+                            err: tr(&lang, "cfg_unconfigured").into(),
+                        });
+                        return;
+                    };
+                    // 会话对 PR/Issue 都有；Files/Diff 仅 PullRequest
+                    let convo = match g.fetch_pr_convo(&repo, number).await {
+                        Ok(c) => c,
                         Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(trf(&lang, "files_fetch_failed", &[&e.to_string()])));
+                            let lang = lang_of(&app2);
+                            let _ = tx.send(Msg::Status(trf(&lang, "convo_fetch_failed", &[&e.to_string()])));
                             Vec::new()
                         }
                     };
-                    let diff = match gh.fetch_diff(&repo, number).await {
-                        Ok(d) => d,
-                        Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
-                            String::new()
-                        }
+                    let (files, diff) = if kind == "PullRequest" {
+                        let files = match g.fetch_pr_files(&repo, number).await {
+                            Ok(f) => f,
+                            Err(e) => {
+                                let lang = lang_of(&app2);
+                                let _ = tx.send(Msg::Status(trf(&lang, "files_fetch_failed", &[&e.to_string()])));
+                                Vec::new()
+                            }
+                        };
+                        let diff = match g.fetch_diff(&repo, number).await {
+                            Ok(d) => d,
+                            Err(e) => {
+                                let lang = lang_of(&app2);
+                                let _ = tx.send(Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
+                                String::new()
+                            }
+                        };
+                        (files, diff)
+                    } else {
+                        (Vec::new(), String::new())
                     };
-                    (files, diff)
-                } else {
-                    (Vec::new(), String::new())
-                };
-                let _ = msg_tx.send(Msg::NotifDetail {
-                    repo,
-                    number,
-                    convo_json: serde_json::to_string(&convo).unwrap_or_else(|_| "[]".into()),
-                    files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
-                    diff_files: parse_diff(&diff),
+                    let _ = tx.send(Msg::NotifDetail {
+                        repo,
+                        number,
+                        convo: plain_convo_entries(&convo),
+                        files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
+                        diff_files: parse_diff(&diff),
+                    });
+                    let _ = tx.send(Msg::StatusBarRefresh);
                 });
-                let _ = msg_tx.send(Msg::StatusBarRefresh);
             }
             Cmd::OpenDrawer { repo, number, refetch } => {
                 open_drawer_work(&app, &msg_tx, &cmd_tx, repo, number, refetch);
@@ -2982,6 +3353,19 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     }
                 }
             }
+            Cmd::CopyLinks(text) => {
+                // 多选「复制链接」：文本在 UI 回调拼好，剪贴板写入在 worker
+                //（与 CopyReview 同理：Windows 剪贴板打开可能重试阻塞）
+                let n = text.lines().count();
+                match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
+                    Ok(()) => {
+                        let _ = msg_tx.send(Msg::Status(trf(&lang, "links_copied", &[&n.to_string()])));
+                    }
+                    Err(e) => {
+                        let _ = msg_tx.send(Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()])));
+                    }
+                }
+            }
             Cmd::LoadReviewPrompt => {
                 // 设置页打开时重读自定义评审模板（可能被外部编辑过）；空/缺失 = 默认模板
                 let text = std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
@@ -2989,17 +3373,23 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 let _ = msg_tx.send(Msg::ReviewPromptLoaded(text));
             }
             Cmd::MarkAllNotifsRead => {
-                if let Some(gh) = &gh {
-                    match gh.mark_all_notifications_read().await {
-                        Ok(()) => {
-                            let _ = msg_tx.send(Msg::Status(tr(&lang, "all_marked_read").into()));
-                            fetch_inbox(gh, &app, &msg_tx).await;
+                if let Some(g) = gh.clone() {
+                    let app2 = app.clone();
+                    let tx = msg_tx.clone();
+                    tokio::spawn(async move {
+                        match g.mark_all_notifications_read().await {
+                            Ok(()) => {
+                                let lang = lang_of(&app2);
+                                let _ = tx.send(Msg::Status(tr(&lang, "all_marked_read").into()));
+                                fetch_inbox(&g, &app2, &tx).await;
+                            }
+                            Err(e) => {
+                                let lang = lang_of(&app2);
+                                let _ = tx.send(Msg::Status(trf(&lang, "mark_all_read_failed", &[&e.to_string()])));
+                            }
                         }
-                        Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(trf(&lang, "mark_all_read_failed", &[&e.to_string()])));
-                        }
-                    }
-                    let _ = msg_tx.send(Msg::StatusBarRefresh);
+                        let _ = tx.send(Msg::StatusBarRefresh);
+                    });
                 }
             }
             Cmd::AddNotifReview { repo, number, title, url } => {
@@ -3154,63 +3544,82 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 // 补齐残缺行（Inbox 入库的 PR 缺 author/head_sha）：拉 GitHub PR meta，
                 // 只填空缺字段，成功后刷新列表；面板正开着该 PR 则重新装载。
                 // 节流：同一行 300s 内最多一次（兜底防死循环烧穿 API 限额）。
-                let recently = meta_healed
-                    .get(&(repo.clone(), number))
-                    .map(|t| t.elapsed().as_secs() < 300)
-                    .unwrap_or(false);
-                if recently {
-                    continue;
+                // spawn 化后改为乐观标记：循环内先记账（防在飞重入），task 失败时移除
+                //（拉取失败不该吃满 300s 惩罚窗口）。
+                {
+                    let mut healed = meta_healed.lock_recover();
+                    let recently = healed
+                        .get(&(repo.clone(), number))
+                        .map(|t| t.elapsed().as_secs() < 300)
+                        .unwrap_or(false);
+                    if recently {
+                        continue;
+                    }
+                    healed.insert((repo.clone(), number), std::time::Instant::now());
                 }
-                if let Some(g) = &gh {
-                    match g.fetch_pr_meta(&repo, number).await {
-                        Ok(meta) => {
-                            // 成功后才记录节流时间戳：拉取失败不该吃满 300s 惩罚窗口
-                            meta_healed.insert((repo.clone(), number), std::time::Instant::now());
-                            let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
-                            let url = meta["html_url"].as_str().unwrap_or("").to_string();
-                            let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
-                            let title = meta["title"].as_str().unwrap_or("").to_string();
-                            let filled = {
-                                let a = app.lock_recover();
-                                match a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &head_sha, &title) {
-                                    Ok(f) => f,
-                                    Err(e) => {
-                                        tracing::warn!("补齐 PR 元数据落库失败 {repo} #{number}: {e}");
-                                        false
+                if let Some(g) = gh.clone() {
+                    let app2 = app.clone();
+                    let tx = msg_tx.clone();
+                    let healed = meta_healed.clone();
+                    tokio::spawn(async move {
+                        match g.fetch_pr_meta(&repo, number).await {
+                            Ok(meta) => {
+                                let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
+                                let url = meta["html_url"].as_str().unwrap_or("").to_string();
+                                let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
+                                let title = meta["title"].as_str().unwrap_or("").to_string();
+                                let filled = {
+                                    let a = app2.lock_recover();
+                                    match a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &head_sha, &title) {
+                                        Ok(f) => f,
+                                        Err(e) => {
+                                            tracing::warn!("补齐 PR 元数据落库失败 {repo} #{number}: {e}");
+                                            false
+                                        }
+                                    }
+                                };
+                                if filled {
+                                    reload_rows(&app2, &tx);
+                                    if panel_matches(&app2, &repo, number) {
+                                        let _ = tx.send(Msg::ReopenPanel);
                                     }
                                 }
-                            };
-                            if filled {
-                                reload_rows(&app, &msg_tx);
-                                if panel_matches(&app, &repo, number) {
-                                    let _ = msg_tx.send(Msg::ReopenPanel);
-                                }
+                            }
+                            Err(e) => {
+                                // 失败：移除节流标记（下次可立即重试）+ 状态栏报错
+                                healed.lock_recover().remove(&(repo.clone(), number));
+                                let lang = lang_of(&app2);
+                                let _ = tx.send(Msg::Status(trf(
+                                    &lang,
+                                    "meta_fill_failed",
+                                    &[&repo, &number.to_string(), &e.to_string()],
+                                )));
                             }
                         }
-                        Err(e) => {
-                            let _ = msg_tx.send(Msg::Status(trf(
-                                &lang,
-                                "meta_fill_failed",
-                                &[&repo, &number.to_string(), &e.to_string()],
-                            )));
-                        }
-                    }
+                    });
+                } else {
+                    // 无 gh 客户端不会发起拉取：刚记的节流标记撤掉
+                    meta_healed.lock_recover().remove(&(repo, number));
                 }
             }
             Cmd::FetchPrLive { repo, number, parts } => {
                 // 面板实时刷新：按位标志惰性拉取——打开面板只带 Checks（2 个请求），
                 // 会话/Files 切到对应 tab 才拉。每部分独立 120s 节流；配额 <50 跳过。
-                let fresh = |bit: u8| {
-                    live_fetched
-                        .get(&(repo.clone(), number, bit))
-                        .map(|t| t.elapsed().as_secs() < 120)
-                        .unwrap_or(false)
+                // spawn 化：节流检查 + 乐观记账在循环内做（防在飞重入），网络主体进 task
+                let (want_convo, want_files, want_checks) = {
+                    let fetched = live_fetched.lock_recover();
+                    let fresh = |bit: u8| {
+                        fetched
+                            .get(&(repo.clone(), number, bit))
+                            .map(|t| t.elapsed().as_secs() < 120)
+                            .unwrap_or(false)
+                    };
+                    (
+                        parts & PART_CONVO != 0 && !fresh(PART_CONVO),
+                        parts & PART_FILES != 0 && !fresh(PART_FILES),
+                        parts & PART_CHECKS != 0 && !fresh(PART_CHECKS),
+                    )
                 };
-                let (want_convo, want_files, want_checks) = (
-                    parts & PART_CONVO != 0 && !fresh(PART_CONVO),
-                    parts & PART_FILES != 0 && !fresh(PART_FILES),
-                    parts & PART_CHECKS != 0 && !fresh(PART_CHECKS),
-                );
                 let quota_low = app
                     .lock_recover()
                     .rate_limit
@@ -3223,7 +3632,27 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     }
                     continue;
                 }
-                if let Some(g) = &gh {
+                if let Some(g) = gh.clone() {
+                    // 乐观节流记账：spawn 前即刻标记，在飞期间的重复命令直接被节流拒掉；
+                    // task 内拉取失败的部分由 task 撤标（失败不吃满 120s 惩罚窗口）。
+                    // 克隆遮蔽同名局部变量，task 主体代码引用不变。
+                    {
+                        let mut fetched = live_fetched.lock_recover();
+                        let now = std::time::Instant::now();
+                        if want_convo {
+                            fetched.insert((repo.clone(), number, PART_CONVO), now);
+                        }
+                        if want_files {
+                            fetched.insert((repo.clone(), number, PART_FILES), now);
+                        }
+                        if want_checks {
+                            fetched.insert((repo.clone(), number, PART_CHECKS), now);
+                        }
+                    }
+                    let app = app.clone();
+                    let msg_tx = msg_tx.clone();
+                    let live_fetched = live_fetched.clone();
+                    tokio::spawn(async move {
                     // meta 只在 checks 部分需要（head.sha → check runs；state/updated → 面板头部）
                     let meta = if want_checks {
                         match g.fetch_pr_meta(&repo, number).await {
@@ -3234,8 +3663,13 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                                     "live_refresh_failed",
                                     &[&repo, &number.to_string(), &e.to_string()],
                                 )));
-                                // 拉取失败不记录节流时间戳（失败不该吃满 120s 惩罚窗口）
-                                continue;
+                                // meta 失败整轮放弃（原语义）：撤掉本次记的所有节流标记，
+                                // 下次操作可立即重试（失败不吃满 120s 惩罚窗口）
+                                let mut f = live_fetched.lock_recover();
+                                f.remove(&(repo.clone(), number, PART_CONVO));
+                                f.remove(&(repo.clone(), number, PART_FILES));
+                                f.remove(&(repo.clone(), number, PART_CHECKS));
+                                return;
                             }
                         }
                     } else {
@@ -3289,24 +3723,26 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         },
                     );
 
-                    // 节流时间戳在拉取成功后才记入（失败不吃满 120s 惩罚窗口）；
+                    // 撤掉失败部分的乐观节流标记（下次可立即重试）；
                     // checks 部分的代价在 meta 请求上，meta 成功即算 checks 已拉
-                    let now = std::time::Instant::now();
-                    if meta.is_some() {
-                        live_fetched.insert((repo.clone(), number, PART_CHECKS), now);
-                    }
-                    if convo_pair.is_some() {
-                        live_fetched.insert((repo.clone(), number, PART_CONVO), now);
-                    }
-                    if files.is_some() {
-                        live_fetched.insert((repo.clone(), number, PART_FILES), now);
+                    {
+                        let mut f = live_fetched.lock_recover();
+                        if convo_pair.is_none() {
+                            f.remove(&(repo.clone(), number, PART_CONVO));
+                        }
+                        if files.is_none() {
+                            f.remove(&(repo.clone(), number, PART_FILES));
+                        }
+                        if meta.is_none() {
+                            f.remove(&(repo.clone(), number, PART_CHECKS));
+                        }
                     }
 
                     let mut ci_out: Option<String> = None;
                     let mut state_out: Option<String> = None;
                     let mut updated_out: Option<String> = None;
                     let mut checks_json_out: Option<String> = None;
-                    let mut convo_json_out: Option<String> = None;
+                    let mut convo_out: Option<Vec<PlainConvoEntry>> = None;
                     let mut files_json_out: Option<String> = None;
                     let mut dirty = false;
 
@@ -3372,7 +3808,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                                 rusqlite::params![rd, repo, number],
                             );
                         }
-                        // 会话 = 评论 + 评审（按时间升序）
+                        // 会话 = 评论 + 评审（按时间升序）；markdown 在 task 内解析
                         let mut convo_items: Vec<serde_json::Value> = convo
                             .into_iter()
                             .map(|mut c| {
@@ -3387,8 +3823,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         convo_items.sort_by(|x, y| {
                             x["time"].as_str().unwrap_or("~").cmp(y["time"].as_str().unwrap_or("~"))
                         });
-                        convo_json_out =
-                            Some(serde_json::to_string(&convo_items).unwrap_or_else(|_| "[]".into()));
+                        convo_out = Some(plain_convo_entries(&convo_items));
                         dirty = true;
                     }
                     if let Some(files) = &files {
@@ -3418,12 +3853,13 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             ci: ci_out,
                             state: state_out,
                             updated: updated_out,
-                            convo_json: convo_json_out,
+                            convo: convo_out,
                             checks_json: checks_json_out,
                             files_json: files_json_out,
                         });
                         let _ = msg_tx.send(Msg::StatusBarRefresh);
                     }
+                    });
                 }
             }
             Cmd::SwitchProfile(name) => {
@@ -3477,6 +3913,8 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     }
                     a.db = new_db; // 旧 Db 随 drop 关闭连接
                     a.selected = None;
+                    a.selection.clear();
+                    a.anchor = None;
                     a.inbox_detail = None;
                     a.rows.clear();
                     a.view.clear();
@@ -3605,7 +4043,7 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
 /// 用当前 filter 过滤 app.rows 并重建摊平 items 模型（折叠状态存 App.collapsed，跨重建保留）。
 fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
     // 在 UI 线程装配 Slint 模型（SharedString/Image 是 Rc，不跨线程）
-    let (rows_json, lang, sort_col, sort_asc, collapsed) = {
+    let (rows_json, lang, sort_col, sort_asc, collapsed, selection) = {
         let a = app.lock_recover();
         (
             a.view.iter().map(|&i| a.rows[i].clone()).collect::<Vec<serde_json::Value>>(),
@@ -3613,18 +4051,26 @@ fn rebuild_rows_ui(ui: &MainWindow, app: &Arc<Mutex<App>>) {
             a.sort_col.clone(),
             a.sort_asc,
             a.collapsed.clone(),
+            a.selection.clone(),
         )
     };
     // view_keys：全部行（含折叠组）的展示序身份——行委托的 ridx 点击映射以此为准；
     // view_visible：可见行的展示序身份——j/k 键盘导航以它为准（与扁平化后的视觉顺序一致）。
     // 都不能用 a.view（数据库排序）代替：分组重排后不是一个序。
-    let (items, keys, visible) = model::build_items(&rows_json, &lang, &sort_col, sort_asc, &collapsed);
+    let (items, keys, visible) = model::build_items(&rows_json, &lang, &sort_col, sort_asc, &collapsed, &selection);
     {
         let mut a = app.lock_recover();
+        // 多选按身份修剪：被过滤/刷新掉的行退出多选（折叠组的行仍在 view_keys 里，保留）
+        selection::retain_existing(&mut a.selection, &keys);
+        if a.anchor.as_ref().is_some_and(|k| !keys.contains(k)) {
+            a.anchor = None;
+        }
         a.view_keys = keys;
         a.view_visible = visible;
     }
     ui.set_items(ModelRc::new(VecModel::from(items)));
+    // 多选计数/菜单标志可能因修剪变化，与行模型一起回写
+    push_selection_ui(ui, app);
     // 重建后高亮跟随选中 PR 的身份（下标已漂移，UI 侧以 selected_key 反查高亮）
     let sel_key = app
         .lock_recover()
@@ -3754,7 +4200,7 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
             rebuild_rows_ui(ui, app);
             update_status_bar(ui, app);
         }
-        Msg::Panel { title, author, state, ci, opened, updated, body, priority, pinned, on_board, convo_json, checks_json, files_json, review } => {
+        Msg::Panel { title, author, state, ci, opened, updated, body, priority, pinned, on_board, convo, checks_json, files_json, review } => {
             ui.set_d_title(title.into());
             ui.set_d_author(author.clone().into());
             // 头像在 UI 线程从磁盘缓存读（slint::Image 是 Rc，不过线程边界）
@@ -3767,8 +4213,8 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
             ui.set_d_priority(priority);
             ui.set_d_pinned(pinned);
             ui.set_d_on_board(on_board);
-            // JSON → Slint 模型（UI 线程装配）
-            ui.set_d_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
+            // 装盒（会话 markdown 已在 worker 解析；Checks/Files 是 JSON → 模型）
+            ui.set_d_convo(ModelRc::new(VecModel::from(convo_models(convo))));
             ui.set_d_checks(ModelRc::new(VecModel::from(check_run_models(&checks_json))));
             ui.set_d_files(ModelRc::new(VecModel::from(file_change_models(&files_json))));
             // 评审 tab：装载已有评审；状态重置（避免带出上一个 PR 的 running/failed）
@@ -3870,7 +4316,7 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
                 ui.set_nd_added(added);
             }
         }
-        Msg::NotifDetail { repo, number, convo_json, files_json, diff_files } => {
+        Msg::NotifDetail { repo, number, convo, files_json, diff_files } => {
             // 身份守卫：快速连点两条通知时，旧通知的内容不得覆盖正在看的那条
             let current = app
                 .lock_recover()
@@ -3880,8 +4326,8 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
             if current.as_ref() != Some(&(repo, number)) {
                 return;
             }
-            // JSON → Slint 模型（UI 线程装盒，同 Msg::Panel 的模式）；diff 已在 worker 解析
-            ui.set_nd_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
+            // 装盒（会话 markdown 已在 worker 解析；Files 是 JSON → 模型）；diff 已在 worker 解析
+            ui.set_nd_convo(ModelRc::new(VecModel::from(convo_models(convo))));
             ui.set_nd_files(ModelRc::new(VecModel::from(file_change_models(&files_json))));
             app.lock_recover().nd_diff_data = diff_files.clone();
             ui.set_nd_diff_files(ModelRc::new(VecModel::from(diff_row_models(&diff_files))));
@@ -3911,7 +4357,7 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
             ui.set_s_review_prompt(text.into());
             ui.set_s_prompt_loading(false);
         }
-        Msg::PanelLive { repo, number, ci, state, updated, convo_json, checks_json, files_json } => {
+        Msg::PanelLive { repo, number, ci, state, updated, convo, checks_json, files_json } => {
             // 实时数据只刷当前打开的面板；None 的区块本次未拉取，保持不动。
             // 面板已切走/关闭则丢弃（列表行已随落库 reload 更新）
             if panel_matches(app, &repo, number) {
@@ -3924,8 +4370,8 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
                 if let Some(updated) = updated {
                     ui.set_d_updated(updated.into());
                 }
-                if let Some(convo_json) = convo_json {
-                    ui.set_d_convo(ModelRc::new(VecModel::from(convo_entries(&convo_json))));
+                if let Some(convo) = convo {
+                    ui.set_d_convo(ModelRc::new(VecModel::from(convo_models(convo))));
                 }
                 if let Some(checks_json) = checks_json {
                     ui.set_d_checks(ModelRc::new(VecModel::from(check_run_models(&checks_json))));
@@ -4048,6 +4494,8 @@ mod tests {
         sort_asc: false,
         min_score: 0.0,
             selected: None,
+            selection: Vec::new(),
+            anchor: None,
             status_msg: String::new(),
             status_gen: 0,
             gh_refreshing: false,

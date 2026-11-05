@@ -142,12 +142,14 @@ pub fn author_orgs(r: &serde_json::Value) -> Vec<String> {
 /// - visible_keys：可见行（折叠组除外）的展示序身份，j/k 键盘导航以此为准。
 /// lang："zh"/"en"（组标题与 activity_text 的文案语言）。
 /// sort_col/sort_asc：组内排序，见 build_sections。collapsed：折叠的组 key 集合。
+/// selection：多选集合（身份键），命中的行置 multi_selected（行底色弱高亮）。
 pub fn build_items(
     rows: &[serde_json::Value],
     lang: &str,
     sort_col: &str,
     sort_asc: bool,
     collapsed: &std::collections::HashSet<String>,
+    selection: &[(String, i64)],
 ) -> (Vec<PrListItem>, Vec<(String, i64)>, Vec<(String, i64)>) {
     let mut items: Vec<PrListItem> = Vec::new();
     let mut keys: Vec<(String, i64)> = Vec::new();
@@ -172,10 +174,11 @@ pub fn build_items(
             let ridx = keys.len() as i32;
             keys.push(id.clone());
             if !is_collapsed {
-                visible.push(id);
+                visible.push(id.clone());
                 items.push(PrListItem {
                     is_header: false,
                     ridx,
+                    multi_selected: selection.iter().any(|k| *k == id),
                     row: to_row(r, lang),
                     ..Default::default()
                 });

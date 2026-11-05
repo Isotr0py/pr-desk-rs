@@ -792,6 +792,29 @@ mod tests {
     }
 
     #[test]
+    fn local_pr_update_batch_loop_writes_all_and_enqueues_all() {
+        // 批量操作的底层语义：对选中集逐行 local_pr_update —— 每行 UPDATE 立即生效
+        // 且每行进一条 outbox（同事务）；白名单外字段整批拒绝。
+        let db = Db::open_memory().unwrap();
+        for n in [1, 2, 3] {
+            db.upsert_pr(&pr_json_src("o/r", n, &format!("t{n}"), "github")).unwrap();
+        }
+        let keys: Vec<(String, i64)> = (1..=3).map(|n| ("o/r".to_string(), n)).collect();
+        for (repo, number) in &keys {
+            db.local_pr_update(repo, *number, "priority", &serde_json::json!(2)).unwrap();
+        }
+        let rows = db.list_prs(&[]).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().all(|r| r["priority"] == 2));
+        let items = db.outbox_drain().unwrap();
+        assert_eq!(items.len(), 3, "每行一条 outbox，待推送数 = 批量大小");
+        assert!(items.iter().all(|(_, p)| p["priority"] == 2));
+        // 白名单：未知字段拒绝且不进 outbox
+        assert!(db.local_pr_update("o/r", 1, "evil_field", &serde_json::json!(1)).is_err());
+        assert_eq!(db.outbox_drain().unwrap().len(), 3);
+    }
+
+    #[test]
     fn diff_cache_roundtrip() {
         let db = Db::open_memory().unwrap();
         assert!(db.get_diff("o/r", 1).unwrap().is_none());
