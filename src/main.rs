@@ -634,25 +634,18 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // 配置/数据目录锚定到 exe 所在目录（便携应用惯例）：
-    // 防止从不同工作目录启动时读到另一份 config.toml / 数据库（曾导致「双配置」分裂）。
+    // 配置锚定：cwd 里的 config.toml 优先（开发期从仓库根跑 exe 时，配置+数据都在
+    // 仓库根，cargo clean 清 target/ 不会误伤——真实教训）；cwd 没有则用 exe 旁的
+    //（便携分发场景：双击 exe 时配置+数据在 exe 旁，行为不变）。
     let exe_dir = pr_desk_rs::exe_dir();
-    let cfg_path = exe_dir.join("config.toml");
-    // 兼容迁移：exe 旁没有但旧式 cwd 里有配置时，搬过来再用
+    let exe_cfg = exe_dir.join("config.toml");
     let cwd_cfg = PathBuf::from("config.toml");
-    if !cfg_path.exists() && cwd_cfg.exists() && cwd_cfg != cfg_path {
-        let _ = std::fs::copy(&cwd_cfg, &cfg_path);
-    }
+    let cfg_path = if cwd_cfg.exists() && cwd_cfg != exe_cfg { cwd_cfg } else { exe_cfg };
     let cfg = Config::load(&cfg_path)?;
-    // 渲染器选择（必须在创建 Slint 窗口之前设置 SLINT_BACKEND 才生效）：
-    // 集显上 femtovg 整窗重绘填充率吃紧时可配 renderer="software" 切 CPU 渲染
-    //（软件渲染器支持局部重绘）；空 = 不动环境变量，走 Slint 默认（femtovg）。
-    match cfg.renderer.as_str() {
-        "software" => unsafe { std::env::set_var("SLINT_BACKEND", "winit-software") },
-        "femtovg" => unsafe { std::env::set_var("SLINT_BACKEND", "winit-femtovg") },
-        _ => {}
-    }
-    let data_dir = exe_dir.join("data");
+    // 数据目录跟随配置目录（同上：防 cargo clean 误伤）；renderer 字段已废弃
+    //（wgpu/femtovg 栈已砍，只编了 software 渲染器），保留解析兼容、值被忽略。
+    let data_dir = cfg_path.parent().unwrap_or(&exe_dir).join("data");
+    pr_desk_rs::set_data_dir(data_dir.clone());
     std::fs::create_dir_all(&data_dir)?;
     // 启动档案名收口：active_profile 指向不存在/非法的档案时回退本地（内存修正，不写盘）
     let active_name = if cfg.has_profile(&cfg.active_profile) {
@@ -4000,7 +3993,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 }
                 // 换库：local → pr-desk.db；其它档 → profiles/<name>.db
                 //（sync 游标/outbox 在库文件内，换库天然隔离；远程新库游标为空 = 首次全量拉）
-                let db_path = profile_db_path(&pr_desk_rs::exe_data_dir(), &name);
+                let db_path = profile_db_path(&pr_desk_rs::data_dir(), &name);
                 if let Some(parent) = db_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }

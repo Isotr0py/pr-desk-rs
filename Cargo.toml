@@ -10,13 +10,12 @@ ui = ["dep:slint", "dep:slint-build"]
 
 [dependencies]
 # 关默认特性砍掉 skia（约 30MB）。
-# 注意必须用 femtovg 的 wgpu 后端：OpenGL(glutin) 后端实测会渲染坏部分文本
-# （详情面板标题字形重叠，wgpu 后端正常；且 OpenGL 不支持 DWM 窗口 alpha）
-# renderer-software 与 femtovg 共存：config.toml 的 renderer="software" 在启动时
-# 经 SLINT_BACKEND=winit-software 切换（集显上 femtovg 整窗重绘吃紧时的备选，
-# 软件渲染器支持局部重绘）
+# 渲染器：只带 software（CPU 光栅 + 局部重绘）。wgpu/femtovg 栈已砍——它是体积和
+# 编译内存的最大来源（naga/wgpu 静态链接曾把页面文件撑爆，链接 OOM），且本 app 的
+# 内容形态（文本行 + 小图）是软件渲染器的最优场景。要 GPU 渲染就把
+# renderer-femtovg-wgpu 加回 features 并设 SLINT_BACKEND=winit-femtovg。
 slint = { version = "1", optional = true, default-features = false, features = [
-    "std", "backend-winit", "renderer-femtovg-wgpu", "renderer-software",
+    "std", "backend-winit", "renderer-software",
     "accessibility", "compat-1-2",
 ] }
 rusqlite = { version = "0.32", features = ["bundled"] }
@@ -41,10 +40,18 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 arboard = "3"
 
 [profile.release]
-# 二进制瘦身：瘦 LTO + 单编译单元 + 去符号（panic=abort 会弄坏 cargo test --release，不用）
+# 二进制瘦身：瘦 LTO + 单编译单元 + 去符号 + abort（panic=abort 会弄坏
+# cargo test --release——仓库不用它，测试跑 dev profile，无影响）
+# opt-level=s：体积与运行时性能的平衡（z 更极致但可能轻微拖慢运行）
 lto = "thin"
 codegen-units = 1
 strip = true
+panic = "abort"
+opt-level = "s"
+
+[profile.dev]
+# 开发构建瘦身：行级调试信息（IDE 断点不受影响），显著降低 target 体积与 rustc 内存
+debug = "line-tables-only"
 
 [build-dependencies]
 slint-build = { version = "1", optional = true }

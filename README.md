@@ -49,10 +49,12 @@ plugin over its sync API (pins / priorities / board / tags / todos).
 ## Build & run
 
 - Toolchain: **x86_64-pc-windows-gnu** (pure Rust, no MSVC/OpenSSL)
-- Stack: reqwest + rustls, rusqlite (bundled), Slint (femtovg-wgpu renderer)
+- Stack: reqwest + rustls, rusqlite (bundled), Slint (software renderer)
 
 ```bash
 cargo run --release
+# low-memory machines (Windows page-file pressure crashes rustc):
+scripts/build-release.sh   # = CARGO_INCREMENTAL=0 cargo build --release -j2
 ```
 
 Runtime requirements:
@@ -65,21 +67,15 @@ Runtime requirements:
   PATH. Without it only line-level comments are unavailable; scored reviews
   (pure LLM) still work.
 
-### Slint feature notes (GNU toolchain)
+### Renderer note
 
-The default features (`std` + `backend-winit` + `renderer-femtovg-wgpu`)
-build fine. The first full Slint build is heavy (hundreds of crates); on
-low-memory machines rustc may crash from Windows page-file pressure —
-use a low-parallelism build to work around it:
-`CARGO_INCREMENTAL=0 cargo build -j1`.
-
-If the femtovg renderer fails to build somewhere, fall back to the software
-renderer:
-
-```toml
-slint = { version = "1", default-features = false,
-          features = ["std", "backend-winit", "renderer-software"] }
-```
+The UI renders with Slint's **software renderer** (CPU raster + partial
+redraws) — the only renderer compiled in. The wgpu/femtovg GPU stack was
+dropped: it was the single largest contributor to binary size and build
+memory (its static link could blow the Windows page file), and this app's
+content (text rows + small avatar images) is the software renderer's best
+case. To bring GPU rendering back, re-add `renderer-femtovg-wgpu` to the
+slint features in `Cargo.toml` and set `SLINT_BACKEND=winit-femtovg`.
 
 ## Configuration
 
@@ -89,6 +85,12 @@ restart) — it covers server URL, sync token, GitHub token, proxy, repo list,
 poll interval, LLM settings, and data-source profiles. When unconfigured, the
 app shows an onboarding card and opens settings (skippable for local mode).
 
+The database and avatar cache live in `data/` next to the config file.
+Config resolution: `config.toml` next to the exe wins; if absent, a
+`config.toml` in the working directory is used in place (so dev runs from
+the repo root keep their data outside `target/` where `cargo clean` can't
+eat it).
+
 ```toml
 server_url = "http://127.0.0.1:6185"   # AstrBot address
 sync_token = ""                        # sync_token from the plugin config (empty = local browsing only)
@@ -96,16 +98,9 @@ github_token = ""                      # stored in plaintext (personal use); GIT
 proxy = ""                             # http:// or socks5:// proxy for GitHub / LLM requests only (empty = direct; sync server always direct)
 repos = ["owner/repo"]                 # repos to watch (open PRs)
 poll_interval_min = 5                  # auto-sync interval (minutes)
-renderer = ""                          # "" = default (femtovg-wgpu, GPU); "software" = CPU renderer
-                                       # with partial redraws — try it if the UI stutters on
-                                       # integrated graphics; "femtovg" = force the GPU renderer
+# renderer: REMOVED — the software renderer is now the only one compiled in;
+# the field is still parsed for backward compatibility but its value is ignored.
 ```
-
-`renderer` is read once at startup (restart required). It maps to Slint's
-`SLINT_BACKEND` (`winit-software` / `winit-femtovg`); the femtovg-wgpu renderer
-repaints the whole window on any change, which can hit fill-rate limits on
-integrated GPUs at high resolutions — the software renderer only repaints the
-dirty region. Invalid values are ignored with a warning.
 
 > **Token storage**: `github_token` / `sync_token` / `llm_api_key` are stored
 > in plaintext in `config.toml` (this is a personal-use app). Don't commit or
