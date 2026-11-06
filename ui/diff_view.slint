@@ -13,6 +13,7 @@
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { I18n } from "i18n.slint";
+import { VScrollBar } from "components.slint";
 
 // 摊平后的 diff 行：header（文件头）/ 内容行 / 截断提示行 三态
 export struct DiffRow {
@@ -265,5 +266,18 @@ export component DiffView inherits Rectangle {
             }
         }
     }
+    }
+
+    // 垂直滚动指示条：读内层 ListView 的纵向偏移（外层 hf 只管横向滚动），
+    // 贴 DiffView 右缘、不随横向滚动
+    VScrollBar {
+        x: parent.width - 6px;
+        y: 0;
+        width: 6px;
+        height: 100%;
+        viewport-h: lv.height;
+        content-h: lv.content-height;
+        value: -lv.content-y;
+        scrolled_to(y) => { lv.content-y = max(lv.height - lv.content-height, min(0px, -y)); }
     }
 }

@@ -96,7 +96,16 @@ github_token = ""                      # stored in plaintext (personal use); GIT
 proxy = ""                             # http:// or socks5:// proxy for GitHub / LLM requests only (empty = direct; sync server always direct)
 repos = ["owner/repo"]                 # repos to watch (open PRs)
 poll_interval_min = 5                  # auto-sync interval (minutes)
+renderer = ""                          # "" = default (femtovg-wgpu, GPU); "software" = CPU renderer
+                                       # with partial redraws — try it if the UI stutters on
+                                       # integrated graphics; "femtovg" = force the GPU renderer
 ```
+
+`renderer` is read once at startup (restart required). It maps to Slint's
+`SLINT_BACKEND` (`winit-software` / `winit-femtovg`); the femtovg-wgpu renderer
+repaints the whole window on any change, which can hit fill-rate limits on
+integrated GPUs at high resolutions — the software renderer only repaints the
+dirty region. Invalid values are ignored with a warning.
 
 > **Token storage**: `github_token` / `sync_token` / `llm_api_key` are stored
 > in plaintext in `config.toml` (this is a personal-use app). Don't commit or

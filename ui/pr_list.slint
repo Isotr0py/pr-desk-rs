@@ -5,7 +5,7 @@
 import { ListView } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { I18n } from "i18n.slint";
-import { Avatar, StatusDot, ScoreChip, SizeBadge, PriorityDot, TagChip } from "components.slint";
+import { Avatar, StatusDot, ScoreChip, SizeBadge, PriorityDot, TagChip, VScrollBar } from "components.slint";
 
 // 单行 PR 数据（分组头不在此数组里，见 PrGroup）
 export struct PrListRow {
@@ -1195,6 +1195,20 @@ export component PrListView inherits FocusScope {
                     }
                 }
             }
+        }
+
+        // 垂直滚动指示条：贴视口右缘（不随横向滚动——它在 flick 之外），
+        // 覆盖表头以下的列表区；横向滚动不设指示条（横滚是窄窗口+详面并开的边缘场景，
+        // 底部横条会与状态栏挤占同一视觉带，收益低）
+        VScrollBar {
+            x: parent.width - 6px;
+            y: 26px + root.top-off;
+            width: 6px;
+            height: parent.height - 26px - root.top-off;
+            viewport-h: lv.height;
+            content-h: lv.content-height;
+            value: -lv.content-y;
+            scrolled_to(y) => { lv.content-y = max(lv.height - lv.content-height, min(0px, -y)); }
         }
     }
 

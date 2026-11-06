@@ -1,6 +1,7 @@
 //! pr-desk-rs 库：本地 SQLite、GitHub 拉取、同步引擎、diff 解析、行分组。
 //! UI 无关的纯逻辑都在库里（可用 `cargo test --lib` 单独测试，不编译 Slint）。
 
+pub mod circle_crop;
 pub mod config;
 pub mod db;
 pub mod diffview;

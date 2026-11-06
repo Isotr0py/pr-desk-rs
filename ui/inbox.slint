@@ -4,7 +4,7 @@
 // 样式全部走 Theme 令牌；空态用 components.slint 的 EmptyState。
 import { Theme } from "theme.slint";
 import { I18n } from "i18n.slint";
-import { EmptyState, Avatar, MarkdownBlocks } from "components.slint";
+import { EmptyState, Avatar, MarkdownBlocks, VScrollBar } from "components.slint";
 import { ScrollView, ListView } from "std-widgets.slint";
 import { ConvoEntry, FileChange } from "detail_panel.slint";
 import { DiffView, DiffRow } from "diff_view.slint";
@@ -733,8 +733,12 @@ export component InboxView inherits FocusScope {
 
             // 行列表：ListView 虚拟化（行高固定，视口外不实例化）。
             // 仓库过滤在 Rust 侧做（模型预过滤），这里拿到的 rows 已是过滤后的。
-            if !root.needs_token && root.rows.length > 0: lv := ListView {
+            if !root.needs_token && root.rows.length > 0: Rectangle {
                 vertical-stretch: 1;
+
+                lv := ListView {
+                    width: 100%;
+                    height: 100%;
 
                 // PageUp/PageDown：page_req 计数桥接（if 作用域里 id 外部不可见、
                 // changed 又只能盯本地属性——mirror 绑定把外层计数引进来）
@@ -758,6 +762,19 @@ export component InboxView inherits FocusScope {
                         root.row_activated(i);
                     }
                     add_review => { root.row_add_review(i); }
+                }
+                }
+
+                // 垂直滚动指示条（外挂窄条，贴视口右缘）
+                VScrollBar {
+                    x: parent.width - 6px;
+                    y: 0;
+                    width: 6px;
+                    height: 100%;
+                    viewport-h: lv.height;
+                    content-h: lv.content-height;
+                    value: -lv.content-y;
+                    scrolled_to(y) => { lv.content-y = max(lv.height - lv.content-height, min(0px, -y)); }
                 }
             }
 
@@ -1045,7 +1062,10 @@ export component NotifPreview inherits Rectangle {
             // Flickable + VerticalLayout：Markdown 块换行后的高度随宽度变化，
             // ListView 会缓存委托高度导致条目重叠，这里整树重排更可靠
             if root.current_tab == 0: Rectangle {
-                if root.convo_entries.length > 0: Flickable {
+                if root.convo_entries.length > 0: Rectangle {
+                    nd_convo_scroll := Flickable {
+                    width: 100%;
+                    height: 100%;
                     content-width: self.width;
                     content-height: convo_layout.preferred-height;
 
@@ -1122,6 +1142,19 @@ export component NotifPreview inherits Rectangle {
                     }
                     }
                 }
+
+                    // 垂直滚动指示条（贴预览面板右缘）
+                    VScrollBar {
+                        x: parent.width - 6px;
+                        y: 0;
+                        width: 6px;
+                        height: 100%;
+                        viewport-h: nd_convo_scroll.height;
+                        content-h: nd_convo_scroll.content-height;
+                        value: -nd_convo_scroll.content-y;
+                        scrolled_to(y) => { nd_convo_scroll.content-y = max(nd_convo_scroll.height - nd_convo_scroll.content-height, min(0px, -y)); }
+                    }
+                }
                 if root.convo_entries.length == 0 && !root.loading: EmptyState {
                     icon_img: @image-url("icons/comment.svg");
                     title: I18n.convo_empty_title;
@@ -1131,7 +1164,10 @@ export component NotifPreview inherits Rectangle {
 
             // Files：文件名 + 增删数字（仅 PR 有此标签页）
             if root.current_tab == 1 && root.is_pr: Rectangle {
-                if root.files.length > 0: ListView {
+                if root.files.length > 0: Rectangle {
+                    nd_files_scroll := ListView {
+                    width: 100%;
+                    height: 100%;
                     for f[i] in root.files: Rectangle {
                         height: 30px;
                         HorizontalLayout {
@@ -1169,6 +1205,19 @@ export component NotifPreview inherits Rectangle {
                             height: 1px;
                             background: Theme.hairline;
                         }
+                    }
+                }
+
+                    // 垂直滚动指示条
+                    VScrollBar {
+                        x: parent.width - 6px;
+                        y: 0;
+                        width: 6px;
+                        height: 100%;
+                        viewport-h: nd_files_scroll.height;
+                        content-h: nd_files_scroll.content-height;
+                        value: -nd_files_scroll.content-y;
+                        scrolled_to(y) => { nd_files_scroll.content-y = max(nd_files_scroll.height - nd_files_scroll.content-height, min(0px, -y)); }
                     }
                 }
                 if root.files.length == 0 && !root.loading: EmptyState {

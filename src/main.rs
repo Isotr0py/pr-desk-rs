@@ -639,6 +639,14 @@ fn main() -> anyhow::Result<()> {
         let _ = std::fs::copy(&cwd_cfg, &cfg_path);
     }
     let cfg = Config::load(&cfg_path)?;
+    // 渲染器选择（必须在创建 Slint 窗口之前设置 SLINT_BACKEND 才生效）：
+    // 集显上 femtovg 整窗重绘填充率吃紧时可配 renderer="software" 切 CPU 渲染
+    //（软件渲染器支持局部重绘）；空 = 不动环境变量，走 Slint 默认（femtovg）。
+    match cfg.renderer.as_str() {
+        "software" => unsafe { std::env::set_var("SLINT_BACKEND", "winit-software") },
+        "femtovg" => unsafe { std::env::set_var("SLINT_BACKEND", "winit-femtovg") },
+        _ => {}
+    }
     let data_dir = exe_dir.join("data");
     std::fs::create_dir_all(&data_dir)?;
     // 启动档案名收口：active_profile 指向不存在/非法的档案时回退本地（内存修正，不写盘）
@@ -1621,10 +1629,10 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|| "default".into());
             #[allow(clippy::type_complexity)]
             let (theme, language, mut profiles, active_profile, mut server_url, mut sync_token, mut ak_s,
-                 font_scale, window_width, window_height, panel_width) = {
+                 font_scale, renderer, window_width, window_height, panel_width) = {
                 let a = app.lock_recover();
                 // 主题/语言/数据源档案/活跃档不在设置页表单里，保留当前值。
-                // 字号与窗口/面板几何同样是保留项——必须在同一个锁块里一次取完：
+                // 字号、渲染器与窗口/面板几何同样是保留项——必须在同一个锁块里一次取完：
                 // 曾把它们放在下面 Config 字面量里逐字段 lock_recover()，临时 guard
                 // 活到整条 let 语句结束，同线程第二次 lock 即自死锁（一保存设置就卡死）
                 (
@@ -1636,6 +1644,7 @@ fn main() -> anyhow::Result<()> {
                     a.cfg.sync_token.clone(),
                     a.cfg.astrbot_api_key.clone(),
                     a.cfg.font_scale,
+                    a.cfg.renderer.clone(),
                     a.cfg.window_width,
                     a.cfg.window_height,
                     a.cfg.panel_width,
@@ -1678,6 +1687,8 @@ fn main() -> anyhow::Result<()> {
                 language,
                 // 字号档位是即时生效项（不走设置表单），保存设置时保留现值
                 font_scale,
+                // 渲染器只从 config.toml 手改（启动时读取），保存设置时保留现值
+                renderer,
                 llm_base_url: llm_base.trim().to_string(),
                 llm_api_key: Some(llm_key.trim().to_string()).filter(|t| !t.is_empty()),
                 llm_model: llm_model.trim().to_string(),

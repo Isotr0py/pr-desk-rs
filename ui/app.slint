@@ -8,7 +8,7 @@ import { PrListView, PrListRow, PrListItem } from "pr_list.slint";
 import { DetailPanel, ConvoEntry, CheckRun, FileChange, OcrComment, DimScore } from "detail_panel.slint";
 import { DiffRow } from "diff_view.slint";
 import { InboxView, NotifRow, NotifPreview } from "inbox.slint";
-import { MdBlock } from "components.slint";
+import { MdBlock, VScrollBar } from "components.slint";
 
 // 类型再导出：slint-build 从本文件生成 Rust 绑定
 export { PrListRow, PrListItem, ConvoEntry, CheckRun, FileChange, DiffRow, NotifRow, OcrComment, DimScore, MdBlock }
@@ -738,7 +738,7 @@ export component MainWindow inherits Window {
                         stab0 := TouchArea {
                             x: 0; width: 112px; height: 100%;
                             mouse-cursor: pointer;
-                            clicked => { root.settings_tab = 0; }
+                            clicked => { root.settings_tab = 0; fields_scroll.content-y = 0px; }
                         }
                         Text {
                             x: 0; width: 112px; height: 100%;
@@ -751,7 +751,7 @@ export component MainWindow inherits Window {
                         stab1 := TouchArea {
                             x: 112px; width: 112px; height: 100%;
                             mouse-cursor: pointer;
-                            clicked => { root.settings_tab = 1; }
+                            clicked => { root.settings_tab = 1; fields_scroll.content-y = 0px; }
                         }
                         Text {
                             x: 112px; width: 112px; height: 100%;
@@ -764,7 +764,7 @@ export component MainWindow inherits Window {
                         stab2 := TouchArea {
                             x: 224px; width: 112px; height: 100%;
                             mouse-cursor: pointer;
-                            clicked => { root.settings_tab = 2; }
+                            clicked => { root.settings_tab = 2; fields_scroll.content-y = 0px; }
                         }
                         Text {
                             x: 224px; width: 112px; height: 100%;
@@ -778,14 +778,23 @@ export component MainWindow inherits Window {
                     Rectangle { horizontal-stretch: 1; }
                 }
 
-                Flickable {
+                // 滚动区：外包一层 Rectangle 承载 stretch（滚动指示条要绝对定位在视口右缘，
+                // 布局内的 Flickable 拿不到自己的坐标）。fields 必须 alignment: start——
+                // 默认 stretch 会把子项压进视口高度（底部字段被挤没，「滚动兜底」失效的根因，
+                // 见 inbox.slint 同款教训）；start 让子项保持自然高度溢出，Flickable 才能滚。
+                Rectangle {
                     vertical-stretch: 1;
-                    content-width: self.width;
-                    content-height: fields.preferred-height;
 
-                    fields := VerticalLayout {
+                    fields_scroll := Flickable {
                         width: 100%;
-                        spacing: 14px;
+                        height: 100%;
+                        content-width: self.width;
+                        content-height: fields.preferred-height;
+
+                        fields := VerticalLayout {
+                            width: 100%;
+                            spacing: 14px;
+                            alignment: start;
 
                 // ── tab 0：连接与同步 ──
                 if root.settings_tab == 0: VerticalLayout {
@@ -1371,6 +1380,19 @@ export component MainWindow inherits Window {
                 }
                 }
                 }
+                }
+
+                    // 垂直滚动指示条（内容超出视口时出现；贴视口右缘）
+                    VScrollBar {
+                        x: parent.width - 6px;
+                        y: 0;
+                        width: 6px;
+                        height: 100%;
+                        viewport-h: fields_scroll.height;
+                        content-h: fields_scroll.content-height;
+                        value: -fields_scroll.content-y;
+                        scrolled_to(y) => { fields_scroll.content-y = max(fields_scroll.height - fields_scroll.content-height, min(0px, -y)); }
+                    }
                 }
 
                 // 弹窗内联错误行（弹窗发起的操作失败时由 Rust 回填；状态栏被遮罩盖住看不见）

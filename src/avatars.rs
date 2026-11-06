@@ -1,8 +1,11 @@
 //! GitHub 头像 / 组织图标拉取与本地磁盘缓存。
 //! - 解析：`api.github.com/users/<name>` → `avatar_url`（github.com 被墙的网络下可用）
-//! - 下载：`avatars.githubusercontent.com/...&s=64` → `data/avatars/<login>.png`（orgs/ 子目录存组织）
+//! - 下载：`avatars.githubusercontent.com/...&s=64` → `data/avatars/<login>-v2.png`（orgs/ 子目录存组织）
 //! 文件缺失或超过 7 天由 `prefetch*` 重新拉取；`get_*` 只在缓存新鲜且能解码时返回
 //! `Some(slint::Image)`（像素经 Rgba8 SharedPixelBuffer 落位），否则返回 None，UI 走字母降级。
+//! 头像落盘前做圆形 alpha 预裁（见 pr_desk_rs::circle_crop），UI 侧不再开 stencil clip；
+//! `-v2` 文件名后缀是缓存版本号：预裁引入前的旧方图（无 -v2）自然失效重拉，不会圆/方混用。
+//! 组织图标是方形 logo，不裁圆（OrgIcon 组件走 3px 圆角矩形，不是圆形）。
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -25,7 +28,9 @@ pub fn cache_dir() -> PathBuf {
 }
 
 pub fn avatar_path(login: &str) -> PathBuf {
-    cache_dir().join(format!("{}.png", key(login)))
+    // -v2：缓存版本号。v1 是未裁圆的方图，路径错开后旧缓存永远不再命中，
+    // 由 prefetch 按 TTL/缺失语义自然重拉成预裁圆图（老 .png 残留无害）。
+    cache_dir().join(format!("{}-v2.png", key(login)))
 }
 
 pub fn org_icon_path(org: &str) -> PathBuf {
@@ -110,7 +115,7 @@ fn load_cached(path: &Path) -> Option<slint::Image> {
 /// 本机网络下不可用；api.github.com + avatars.githubusercontent.com 可达）。
 /// 复用 GitHub 客户端而不是自建——独立 reqwest 客户端在 worker 运行时下偶发
 /// 请求挂死（原因未查明），共享客户端的连接池已被证明稳定。
-async fn fetch_one(gh: &crate::github::GitHub, name: String, path: PathBuf) -> bool {
+async fn fetch_one(gh: &crate::github::GitHub, name: String, path: PathBuf, circle: bool) -> bool {
     let Ok(Some(avatar_url)) = gh.fetch_avatar_url(&name).await else {
         tracing::info!("avatar: {name} 的 /users 解析失败");
         return false;
@@ -127,26 +132,30 @@ async fn fetch_one(gh: &crate::github::GitHub, name: String, path: PathBuf) -> b
         return false;
     }
     // 只写真图片（网络错误页/代理拦截页不落盘）。CDN 对真人照片回 JPEG
-    //（FF D8 FF），默认头像才是 PNG——JPEG 先解码再按 PNG 落盘，
-    // 否则 image::open 按 .png 扩展名解析会解码失败，缓存被反复删了重拉
+    //（FF D8 FF），默认头像才是 PNG——统一解码再按 PNG 落盘，否则 image::open
+    // 按 .png 扩展名解析 JPEG 会解码失败，缓存被反复删了重拉
     let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
     let is_jpeg = bytes.starts_with(b"\xFF\xD8\xFF");
-    let bytes = if is_png {
-        bytes
-    } else if is_jpeg {
-        let Ok(img) = image::load_from_memory(&bytes) else {
-            tracing::info!("avatar: {name} JPEG 解码失败，丢弃");
-            return false;
-        };
-        let mut buf = Vec::new();
-        if img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).is_err() {
-            return false;
-        }
-        buf
-    } else {
+    if !is_png && !is_jpeg {
         tracing::info!("avatar: {name} 下载内容不是 PNG/JPEG，丢弃");
         return false;
+    }
+    let Ok(img) = image::load_from_memory(&bytes) else {
+        tracing::info!("avatar: {name} 图片解码失败，丢弃");
+        return false;
     };
+    // 头像做圆形 alpha 预裁（circle_crop）：透明圆角烘进像素后 UI 不再开
+    // stencil clip 裁圆。组织图标是方形 logo，不裁（OrgIcon 走圆角矩形 clip）。
+    let img = if circle {
+        image::DynamicImage::ImageRgba8(pr_desk_rs::circle_crop::circle_crop(&img.to_rgba8()))
+    } else {
+        img
+    };
+    let mut buf = Vec::new();
+    if img.write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png).is_err() {
+        return false;
+    }
+    let bytes = buf;
     if let Some(parent) = path.parent() {
         if std::fs::create_dir_all(parent).is_err() {
             return false;
@@ -160,7 +169,7 @@ async fn fetch_one(gh: &crate::github::GitHub, name: String, path: PathBuf) -> b
     std::fs::rename(&tmp, &path).is_ok()
 }
 
-async fn prefetch_to(gh: &crate::github::GitHub, path_of: fn(&str) -> PathBuf, names: Vec<String>) -> usize {
+async fn prefetch_to(gh: &crate::github::GitHub, path_of: fn(&str) -> PathBuf, names: Vec<String>, circle: bool) -> usize {
     let names: BTreeSet<String> = names
         .into_iter()
         .filter(|n| !n.trim().is_empty())
@@ -174,7 +183,7 @@ async fn prefetch_to(gh: &crate::github::GitHub, path_of: fn(&str) -> PathBuf, n
     for name in names {
         let path = path_of(&name);
         let gh = gh.clone();
-        set.spawn(async move { fetch_one(&gh, name, path).await });
+        set.spawn(async move { fetch_one(&gh, name, path, circle).await });
     }
     let mut fetched = 0;
     while let Some(res) = set.join_next().await {
@@ -188,12 +197,12 @@ async fn prefetch_to(gh: &crate::github::GitHub, path_of: fn(&str) -> PathBuf, n
 
 /// 后台预取用户头像；返回实际新拉取的数量（全部为新鲜缓存时返回 0，调用方据此决定是否重绘）。
 pub async fn prefetch(gh: &crate::github::GitHub, logins: Vec<String>) -> usize {
-    prefetch_to(gh, avatar_path, logins).await
+    prefetch_to(gh, avatar_path, logins, true).await
 }
 
-/// 后台预取组织图标。
+/// 后台预取组织图标（方形 logo，不做圆形预裁）。
 pub async fn prefetch_orgs(gh: &crate::github::GitHub, orgs: Vec<String>) -> usize {
-    prefetch_to(gh, org_icon_path, orgs).await
+    prefetch_to(gh, org_icon_path, orgs, false).await
 }
 
 #[cfg(test)]
@@ -214,6 +223,13 @@ mod tests {
         assert_eq!(key("Octo-Cat"), "octo-cat");
         assert_eq!(key("../etc/passwd"), "etcpasswd");
         assert_eq!(key("中文名"), "");
+    }
+
+    #[test]
+    fn avatar_path_is_v2_versioned() {
+        // 预裁圆引入缓存版本号：旧方图（无 -v2）永不命中，自然重拉
+        let p = avatar_path("Octo-Cat");
+        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "octo-cat-v2.png");
     }
 
     #[test]

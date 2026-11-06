@@ -5,6 +5,10 @@ import { I18n } from "i18n.slint";
 // 圆形头像：img 有效时裁剪为圆形图片；否则显示 login 首字母。
 // 无图底色：按 login 长度做稳定伪哈希，从 4 个主题色相中选 1 个，
 // 底色为色相 15% 透明、文字为色相本体，明暗主题下均柔和可读。
+// 有图时不开 clip：头像 PNG 已在 Rust 侧预裁圆（透明圆角烘进像素，
+// 见 circle_crop.rs / avatars.rs），femtovg 每个圆形 clip 都是一次
+// stencil pass，列表几十个头像滚动时集显扛不住。仅字母回退分支需要
+// clip 裁溢出文字。
 export component Avatar inherits Rectangle {
     in property <string> login;
     in property <image> img;
@@ -13,7 +17,7 @@ export component Avatar inherits Rectangle {
     width: root.size;
     height: root.size;
     border-radius: root.size / 2;
-    clip: true;
+    clip: !root.has-img;
 
     property <bool> has-img: root.img.width > 0 && root.img.height > 0;
     property <[color]> palette: [Theme.accent, Theme.purple, Theme.good, Theme.mid];
@@ -518,6 +522,58 @@ export component EmptyState inherits Rectangle {
             color: Theme.text_dim;
             horizontal-alignment: center;
             wrap: word-wrap;
+        }
+    }
+}
+
+// ── 垂直滚动指示条 ──
+// Flickable 无滚动条视觉、fluent 风格 ListView/ScrollView 的滚动条也不可见，
+// 本组件外挂到任何「content-y ∈ [viewport-h − content-h, 0] + content-height」契约的
+// 滚动容器（Flickable / ListView / ScrollView 三者同一套）的右缘，给出可发现的
+// 滚动指示；拇指可拖动，点轨道跳转到对应位置。内容不超视口时整条隐藏。
+// 用法：
+//   VScrollBar {
+//       x: parent.width - 6px; y: 0; width: 6px; height: 100%;
+//       viewport-h: lv.height; content-h: lv.content-height; value: -lv.content-y;
+//       scrolled_to(y) => { lv.content-y = max(lv.height - lv.content-height, min(0px, -y)); }
+//   }
+export component VScrollBar inherits Rectangle {
+    in property <length> viewport-h;    // 视口高（容器的 height）
+    in property <length> content-h;     // 内容高（容器的 content-height）
+    in property <length> value;         // 当前滚动偏移（= -content-y，非负）
+    callback scrolled_to(length);       // 请求滚到该偏移（宿主 clamp 后写回 content-y）
+
+    // 可滚距离与拇指几何（range/track 下限 1px 防除零）
+    property <length> range: max(1px, root.content-h - root.viewport-h);
+    property <length> thumb-h: max(28px, root.content-h > 1px ? root.height * root.viewport-h / root.content-h : 0px);
+    property <length> track: max(1px, root.height - root.thumb-h);
+    property <length> thumb-y: root.track * min(1.0, max(0.0, root.value / root.range));
+
+    visible: root.content-h > root.viewport-h + 2px && root.viewport-h > 0px;
+    background: transparent;
+
+    // 拇指：常显半透明，hover/拖拽加深（均为 Theme token，无明写色值）
+    thumb := Rectangle {
+        x: 1px;
+        y: root.thumb-y;
+        width: parent.width - 2px;
+        height: root.thumb-h;
+        border-radius: self.width / 2;
+        background: ta.pressed ? Theme.text_dim
+            : (ta.has-hover ? Theme.text_dim.with-alpha(0.7) : Theme.text_faint.with-alpha(0.45));
+        animate background { duration: 120ms; }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        // 拖动与点轨道同一换算：让拇指中心对准鼠标位置
+        moved => {
+            if (self.pressed) {
+                root.scrolled_to((self.mouse-y - root.thumb-h / 2) / root.track * root.range);
+            }
+        }
+        clicked => {
+            root.scrolled_to((self.mouse-y - root.thumb-h / 2) / root.track * root.range);
         }
     }
 }

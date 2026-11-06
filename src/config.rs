@@ -29,6 +29,8 @@ theme = "light"
 language = "zh"
 # 界面字号档位：0.9（小）/ 1.0（标准）/ 1.15（大）
 font_scale = 1.0
+# 渲染器：""（默认 femtovg-wgpu GPU 渲染）/ "software"（CPU 渲染，集显卡顿可试，支持局部重绘）/ "femtovg"
+renderer = ""
 # 本地 LLM 预评审（OpenAI 兼容 API；llm_api_key 留空时可用环境变量 LLM_API_KEY）
 llm_base_url = "https://api.openai.com/v1"
 llm_api_key = ""
@@ -87,6 +89,9 @@ pub struct Config {
     pub language: String,
     /// 字号档位系数：0.9 小 / 1.0 标准 / 1.15 大（解析时取最近档）
     pub font_scale: f32,
+    /// 渲染器："" = 默认（femtovg-wgpu）；"software" = CPU 渲染（局部重绘，集显备用）；
+    /// "femtovg" = 显式 GPU 渲染。非法值忽略并告警。只在启动时读取（不热生效）。
+    pub renderer: String,
     /// OpenAI 兼容 API 地址（本地预评审用）
     pub llm_base_url: String,
     pub llm_api_key: Option<String>,
@@ -119,6 +124,7 @@ impl Default for Config {
             theme: "light".into(),
             language: "zh".into(),
             font_scale: 1.0,
+            renderer: String::new(),
             llm_base_url: "https://api.openai.com/v1".into(),
             llm_api_key: None,
             llm_model: String::new(),
@@ -359,6 +365,13 @@ impl Config {
                     Ok(f) if (f - 1.15).abs() < 0.05 => 1.15,
                     _ => 1.0,
                 };
+            } else if let Some(v) = parse_value(line, "renderer") {
+                // 只认 ""/software/femtovg，非法值忽略并告警（别因手误改变默认行为）
+                let v = unquote(v);
+                match v.as_str() {
+                    "" | "software" | "femtovg" => cfg.renderer = v,
+                    _ => tracing::warn!("忽略非法 renderer 配置值 {v:?}（合法值：\"\" / \"software\" / \"femtovg\"）"),
+                }
             } else if let Some(v) = parse_value(line, "llm_base_url") {
                 let v = unquote(v);
                 if !v.is_empty() {
@@ -521,7 +534,31 @@ mod tests {
         assert_eq!(cfg2.llm_model, "");
         assert_eq!(cfg2.ocr_path, "ocr");
         assert_eq!(cfg2.language, "zh");
+        assert_eq!(cfg2.renderer, ""); // 模板默认渲染器
         assert_eq!(cfg2.proxy, ""); // 模板默认直连
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn renderer_parse_validates_and_preserves_on_save() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-renderer-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 合法值
+        for (input, want) in [("renderer = \"software\"", "software"), ("renderer = \"femtovg\"", "femtovg")] {
+            std::fs::write(&path, input).unwrap();
+            assert_eq!(Config::load(&path).unwrap().renderer, want);
+        }
+        // 非法值忽略回默认（告警不打断加载）
+        std::fs::write(&path, "renderer = \"skia\"").unwrap();
+        assert_eq!(Config::load(&path).unwrap().renderer, "");
+        // 手写的 renderer 行不受设置页保存影响（save 只改已知键，未知行原样保留）
+        std::fs::write(&path, "renderer = \"software\"\n").unwrap();
+        let cfg = Config::load(&path).unwrap();
+        cfg.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("renderer = \"software\""), "renderer 行应被保留");
+        assert_eq!(Config::load(&path).unwrap().renderer, "software");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -542,6 +579,7 @@ mod tests {
             theme: "dark".into(),
             language: "en".into(),
             font_scale: 1.15,
+            renderer: String::new(),
             llm_base_url: "http://nas:11434/v1".into(),
             llm_api_key: Some("sk-test".into()),
             llm_model: "qwen3-coder".into(),
