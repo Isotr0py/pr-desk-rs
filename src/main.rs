@@ -37,6 +37,10 @@ pub struct EguiApp {
     pub view_mode: usize, // 0 列表 / 1 Inbox
     pub profile_names: Vec<String>,
     pub filter_buf: String, // 顶栏搜索框文本（编辑即写回 App.filter 并重算视图）
+    /// 列表列宽（表头拖拽调宽；标题列弹性不占位）。不持久化，退出重置默认。
+    pub col_widths: Vec<f32>,
+    /// Files tab 的 FetchDiff 去重标记（打开面板已按需拉过则不再补发）
+    pub diff_requested: Option<(String, i64)>,
     // ── 详情面板 ──
     pub panel: Option<PanelData>,
     pub diff_files: Vec<DiffFileData>,
@@ -222,16 +226,21 @@ impl EguiApp {
     }
 
     /// 详情面板 tab 切换 → 惰性拉取对应数据（会话/Checks/Files；各自 120s 节流）。
-    pub fn panel_tab_changed(&self, t: usize) {
+    /// Files（合并 diff 视图）tab：diff 缓存缺失时补发 FetchDiff（每 PR 一次去重）。
+    pub fn panel_tab_changed(&mut self, t: usize) {
         let parts = match t {
             1 => PART_CONVO,
             2 => PART_CHECKS,
             3 => PART_FILES,
-            _ => return, // 评审/Diff 用本地数据
+            _ => return, // 评审用本地数据
         };
         let sel = self.app.lock_recover().selected.clone();
         if let Some((repo, number)) = sel {
-            let _ = self.cmd_tx.send(Cmd::FetchPrLive { repo, number, parts });
+            let _ = self.cmd_tx.send(Cmd::FetchPrLive { repo: repo.clone(), number, parts });
+            if t == 3 && self.diff_files.is_empty() && self.diff_requested != Some((repo.clone(), number)) {
+                self.diff_requested = Some((repo.clone(), number));
+                let _ = self.cmd_tx.send(Cmd::FetchDiff { repo, number });
+            }
         }
     }
 
@@ -416,6 +425,7 @@ impl EguiApp {
                 // worker 已把行写进 App 并 recompute_flat；这里无需动作
             }
             Msg::Panel(pd) => {
+                self.diff_requested = None;
                 self.panel = Some(*pd);
             }
             Msg::ClosePanel => self.panel = None,
@@ -806,6 +816,16 @@ impl EguiApp {
                 recompute_flat(&mut a);
             }
             "collapse" => self.group_toggled(arg),
+            // 列宽调整（与表头拖拽同一赋值路径）：colwidth <列idx> <宽>
+            "colwidth" => {
+                let i: usize = arg.parse().unwrap_or(0);
+                let w: f32 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+                if let Some(spec) = ui_list::COL_SPECS.get(i) {
+                    if !spec.flex && w > 0.0 {
+                        self.col_widths[i] = w.max(spec.min_w);
+                    }
+                }
+            }
             // 托盘
             "hide" => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -1295,6 +1315,8 @@ fn main() -> anyhow::Result<()> {
                 view_mode: 0,
                 profile_names,
                 filter_buf: String::new(),
+                col_widths: ui_list::default_col_widths(),
+                diff_requested: None,
                 panel: None,
                 diff_files: Vec::new(),
                 panel_tab: 0,

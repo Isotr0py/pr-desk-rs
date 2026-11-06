@@ -1,4 +1,5 @@
 //! 顶栏 / 状态栏 / 多选操作条 / PR 列表视图（分组 + 排序 + 多选 + hover 快捷 + 右键菜单）。
+//! 列布局：每列内容裁剪到自己列宽（clip + 省略号），表头分隔线可拖拽调宽。
 
 use std::time::Instant;
 
@@ -79,7 +80,12 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
             ui.separator();
             // 视图切换：列表 / Inbox
             for (i, t) in [tr(&lang, "tab_list"), tr(&lang, "tab_inbox")].iter().enumerate() {
-                if ui.selectable_label(app.view_mode == i, *t).clicked() && app.view_mode != i {
+                if ui
+                    .selectable_label(app.view_mode == i, *t)
+                    .on_hover_text(tr(&lang, if i == 0 { "tab_list" } else { "tab_inbox" }))
+                    .clicked()
+                    && app.view_mode != i
+                {
                     app.view_mode = i;
                     if i == 1 {
                         // 首次进 Inbox：拉取通知（加载态，不显示误导空态）
@@ -126,7 +132,8 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
             // 主题切换
             let dark = app.app.lock_recover().cfg.theme == "dark";
             let label = if dark { tr(&lang, "tb_theme_light") } else { tr(&lang, "tb_theme_dark") };
-            if ui.button(label).clicked() {
+            let tip = if dark { tr(&lang, "theme_tooltip_light") } else { tr(&lang, "theme_tooltip_dark") };
+            if ui.button(label).on_hover_text(tip).clicked() {
                 app.theme_toggled(ui.ctx());
             }
             // 设置
@@ -180,7 +187,7 @@ pub fn selection_bar(app: &mut EguiApp, ui: &mut Ui) {
                 tr(&lang, "selbar_count_post")
             ));
             ui.separator();
-            // 优先级下拉
+            // 优先级下拉（显示层映射：内部 1=P0 最紧急 / 2=P1 / 3=P2）
             egui::ComboBox::from_id_salt("sel-prio")
                 .selected_text(tr(&lang, "ctx_priority"))
                 .show_ui(ui, |ui| {
@@ -320,65 +327,106 @@ fn row_data(a: &App, idx: usize) -> RowData {
     }
 }
 
-/// 列定义：(排序 id, 表头 i18n key 或固定文本, 宽度；宽度 0 = 弹性)
-const COLS: &[(&str, &str, f32)] = &[
-    ("priority", "P", 20.0),
-    ("num", "#", 56.0),
-    ("title", "col_title", 0.0),
-    ("author", "col_author", 100.0),
-    ("turn", "col_turn", 36.0),
-    ("review", "col_review", 44.0),
-    ("ci", "CI", 40.0),
-    ("size", "col_size", 36.0),
-    ("changes", "+/-", 66.0),
-    ("score", "★", 36.0),
-    ("upd", "col_updated", 46.0),
+/// 列规格：(排序 id, 表头 i18n key 或固定文本, 默认宽, 最小宽；flex=标题列吃剩余宽)
+pub struct ColSpec {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub def_w: f32,
+    pub min_w: f32,
+    pub flex: bool,
+}
+
+pub const COL_SPECS: &[ColSpec] = &[
+    ColSpec { id: "priority", label: "P", def_w: 26.0, min_w: 24.0, flex: false },
+    ColSpec { id: "num", label: "#", def_w: 60.0, min_w: 44.0, flex: false },
+    ColSpec { id: "title", label: "col_title", def_w: 0.0, min_w: 120.0, flex: true },
+    ColSpec { id: "author", label: "col_author", def_w: 110.0, min_w: 60.0, flex: false },
+    ColSpec { id: "turn", label: "col_turn", def_w: 38.0, min_w: 30.0, flex: false },
+    ColSpec { id: "review", label: "col_review", def_w: 84.0, min_w: 40.0, flex: false },
+    ColSpec { id: "ci", label: "CI", def_w: 40.0, min_w: 32.0, flex: false },
+    ColSpec { id: "size", label: "col_size", def_w: 40.0, min_w: 32.0, flex: false },
+    ColSpec { id: "changes", label: "+/-", def_w: 70.0, min_w: 52.0, flex: false },
+    ColSpec { id: "score", label: "★", def_w: 40.0, min_w: 32.0, flex: false },
+    ColSpec { id: "upd", label: "col_updated", def_w: 48.0, min_w: 40.0, flex: false },
 ];
+
+/// 列宽初值（标题列占位的 0 会在布局时按剩余宽计算，不进 col_widths）。
+pub fn default_col_widths() -> Vec<f32> {
+    COL_SPECS.iter().map(|c| if c.flex { 0.0 } else { c.def_w }).collect()
+}
 
 fn col_label<'a>(key: &'a str, lang: &str) -> &'a str {
     match key {
         "col_title" | "col_author" | "col_turn" | "col_review" | "col_size" | "col_updated" => {
-            // i18n 键：tr 返回的是输入 key 的 &'static str 等价物，直接返回查询值
             tr(lang, key)
         }
         other => other,
     }
 }
 
+/// 行/表头共用的列布局：返回每列的 x 起点与宽度（标题列 = 剩余宽）。
+/// out: Vec<(x, w)>（相对 row/header 矩形左缘）。
+fn col_layout(total_w: f32, widths: &[f32]) -> Vec<(f32, f32)> {
+    let fixed: f32 = widths.iter().sum();
+    let title_w = (total_w - fixed - 8.0).max(COL_SPECS[2].min_w);
+    let mut out = Vec::with_capacity(COL_SPECS.len());
+    let mut x = 4.0;
+    for (i, c) in COL_SPECS.iter().enumerate() {
+        let w = if c.flex { title_w } else { widths[i] };
+        out.push((x, w));
+        x += w;
+    }
+    out
+}
+
+/// 裁剪 + 省略号画单元格文本（防溢出压到相邻列）。
+fn paint_cell(ui: &Ui, cell: egui::Rect, text: &str, font: FontId, color: Color32) {
+    if text.is_empty() {
+        return;
+    }
+    let text = ellipsize(ui, text, font.clone(), cell.width() - 4.0);
+    ui.painter()
+        .with_clip_rect(cell)
+        .text(egui::pos2(cell.left() + 2.0, cell.center().y), Align2::LEFT_CENTER, text, font, color);
+}
+
+/// 超出宽度时截断加「…」；按字符步进测量（行数少，成本可忽略）。
+fn ellipsize(ui: &Ui, text: &str, font: FontId, max_w: f32) -> String {
+    let measure = |ui: &Ui, s: String| {
+        ui.fonts_mut(|f| f.layout_no_wrap(s, font.clone(), Color32::WHITE).rect.width())
+    };
+    if measure(ui, text.to_string()) <= max_w {
+        return text.to_string();
+    }
+    let ell_w = measure(ui, "…".to_string());
+    let mut out = String::new();
+    let mut w = 0.0;
+    for c in text.chars() {
+        let cw = measure(ui, c.to_string());
+        if w + cw + ell_w > max_w {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// 优先级徽章：内部存储 1/2/3，显示层 1→P0（最紧急）2→P1 3→P2；0=未设不显示。
+pub fn priority_badge(p: i64) -> (&'static str, Color32) {
+    match p {
+        1 => ("P0", Color32::from_rgb(209, 36, 47)),
+        2 => ("P1", Color32::from_rgb(209, 100, 36)),
+        3 => ("P2", Color32::from_rgb(158, 126, 0)),
+        _ => ("", Color32::TRANSPARENT),
+    }
+}
+
 pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
     let lang = app.lang();
     egui::CentralPanel::default().show(ui, |ui| {
-        // ── 表头（Excel 式点击排序：同列反向，新列按默认方向）──
-        let (sort_col, sort_asc) = {
-            let a = app.app.lock_recover();
-            (a.sort_col.clone(), a.sort_asc)
-        };
-        ui.horizontal(|ui| {
-            let avail = ui.available_width();
-            let fixed: f32 = COLS.iter().map(|c| c.2).sum();
-            for &(cid, label_key, w) in COLS {
-                let w = if w == 0.0 { (avail - fixed - 24.0).max(120.0) } else { w };
-                let arrow = if sort_col == cid {
-                    if sort_asc { " ▲" } else { " ▼" }
-                } else {
-                    ""
-                };
-                let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(w, 20.0),
-                    egui::Sense::click(),
-                );
-                ui.painter().text(
-                    rect.left_center(),
-                    Align2::LEFT_CENTER,
-                    format!("{}{arrow}", col_label(label_key, &lang)),
-                    FontId::proportional(11.0),
-                    ui.visuals().weak_text_color(),
-                );
-                if resp.clicked() {
-                    app.header_clicked(cid);
-                }
-            }
-        });
+        header_row(app, ui, &lang);
         ui.separator();
 
         // ── 分组 + 行 ──
@@ -423,6 +471,64 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
     });
 }
 
+/// 表头：点击排序（Excel 式）+ 分隔线拖拽调宽 + hover 反馈。
+fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
+    let (sort_col, sort_asc) = {
+        let a = app.app.lock_recover();
+        (a.sort_col.clone(), a.sort_asc)
+    };
+    let total_w = ui.available_width();
+    let layout = col_layout(total_w, &app.col_widths);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, 22.0), egui::Sense::hover());
+    for (i, c) in COL_SPECS.iter().enumerate() {
+        let (x, w) = layout[i];
+        let cell = egui::Rect::from_min_size(egui::pos2(rect.left() + x, rect.top()), egui::vec2(w, rect.height()));
+        let resp = ui.interact(cell, egui::Id::unique(("col-h", c.id)), egui::Sense::click());
+        // hover 反馈：底色 + 手型 + 提示
+        if resp.hovered() {
+            ui.painter().rect_filled(cell, 2.0, ui.visuals().widgets.hovered.bg_fill);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        resp.clone().on_hover_text(tr(lang, "tip_sort"));
+        let arrow = if sort_col == c.id {
+            if sort_asc { " ▲" } else { " ▼" }
+        } else {
+            ""
+        };
+        paint_cell(
+            ui,
+            cell,
+            &format!("{}{arrow}", col_label(c.label, lang)),
+            FontId::proportional(11.0),
+            ui.visuals().weak_text_color(),
+        );
+        if resp.clicked() {
+            app.header_clicked(c.id);
+        }
+        // 拖拽调宽：非弹性列的右缘分隔线
+        if !c.flex {
+            let handle = egui::Rect::from_min_size(
+                egui::pos2(cell.right() - 3.0, cell.top()),
+                egui::vec2(6.0, cell.height()),
+            );
+            let dresp = ui.interact(handle, egui::Id::unique(("col-drag", c.id)), egui::Sense::drag());
+            if dresp.hovered() || dresp.dragged() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_size(egui::pos2(handle.center().x - 0.5, cell.top() + 4.0), egui::vec2(1.5, cell.height() - 8.0)),
+                    1.0,
+                    ui.visuals().hyperlink_color,
+                );
+            }
+            if dresp.dragged() {
+                let dx = dresp.drag_delta().x;
+                let new_w = (app.col_widths[i] + dx).max(c.min_w);
+                app.col_widths[i] = new_w;
+            }
+        }
+    }
+}
+
 fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_selected: bool, lang: &str) {
     let height = 24.0;
     let (rect, resp) = ui.allocate_exact_size(
@@ -450,54 +556,92 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     let dark = visuals.dark_mode;
     let text_color = visuals.text_color();
     let weak = visuals.weak_text_color();
-    let p = ui.painter();
-    let mut x = rect.left() + 4.0;
     let font = FontId::default();
     let small = FontId::proportional(11.0);
-    let col = |p: &egui::Painter, x: &mut f32, w: f32, text: String, font: FontId, color: Color32| {
-        p.text(egui::pos2(*x, rect.center().y), Align2::LEFT_CENTER, text, font, color);
-        *x += w;
+    let layout = col_layout(rect.width(), &app.col_widths);
+    let cell = |i: usize| -> egui::Rect {
+        let (x, w) = layout[i];
+        egui::Rect::from_min_max(egui::pos2(rect.left() + x, rect.top()), egui::pos2(rect.left() + x + w, rect.bottom()))
     };
-    // P（优先级）
-    let prio_text = if row.priority > 0 { format!("P{}", row.priority) } else { String::new() };
-    col(p, &mut x, 20.0, prio_text, small.clone(), if row.priority > 0 { Color32::from_rgb(209, 100, 36) } else { weak });
-    // #
-    col(p, &mut x, 56.0, format!("#{}", row.key.1), small.clone(), weak);
-    // 标题（弹性宽）：pinned/看板标记前缀
-    let fixed: f32 = COLS.iter().map(|c| c.2).sum();
-    let title_w = (rect.width() - fixed - 28.0).max(80.0);
-    let title_text = format!(
-        "{}{}{}",
-        if row.pinned { "▲ " } else { "" },
-        if row.on_board { "◆ " } else { "" },
-        row.title
-    );
-    col(p, &mut x, title_w, title_text, font.clone(), text_color);
-    col(p, &mut x, 100.0, row.author.clone(), small.clone(), weak);
-    // 作者公开组织的图标（最多 3 个；图标由 worker 的 prefetch_orgs 预取到磁盘缓存）
+
+    // P（优先级徽章：1→P0 最紧急 / 2→P1 / 3→P2；0=未设不显示）
+    let (badge, badge_color) = priority_badge(row.priority);
+    if !badge.is_empty() {
+        paint_cell(ui, cell(0), badge, small.clone(), badge_color);
+    }
+    // #编号：可点超链接（浏览器打开 PR）
     {
+        let key = row.key.clone();
+        let r = ui.put(
+            cell(1),
+            egui::Label::new(
+                RichText::new(format!("#{}", key.1))
+                    .size(11.0)
+                    .color(visuals.hyperlink_color)
+                    .underline(),
+            )
+            .sense(egui::Sense::click()),
+        );
+        if r.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        r.clone().on_hover_text(tr(lang, "inbox_open_browser"));
+        if r.clicked() {
+            worker::open_pr_url(&app.app, &key.0, &key.1);
+        }
+    }
+    // 标题（pinned=琥珀三角 / 看板=蓝菱形，painter 绘制，不依赖 emoji 字形）
+    {
+        let c = cell(2);
+        let mut tx = c.left() + 2.0;
+        let cy = c.center().y;
+        if row.pinned {
+            let p = ui.painter().with_clip_rect(c);
+            let pts = vec![
+                egui::pos2(tx, cy + 4.0),
+                egui::pos2(tx + 5.0, cy - 4.0),
+                egui::pos2(tx + 10.0, cy + 4.0),
+            ];
+            p.add(egui::Shape::convex_polygon(pts, Color32::from_rgb(191, 135, 0), egui::Stroke::NONE));
+            tx += 14.0;
+        }
+        if row.on_board {
+            let p = ui.painter().with_clip_rect(c);
+            let pts = vec![
+                egui::pos2(tx + 4.0, cy - 5.0),
+                egui::pos2(tx + 9.0, cy),
+                egui::pos2(tx + 4.0, cy + 5.0),
+                egui::pos2(tx - 1.0, cy),
+            ];
+            p.add(egui::Shape::convex_polygon(pts, Color32::from_rgb(56, 139, 253), egui::Stroke::NONE));
+            tx += 13.0;
+        }
+        let text_cell = egui::Rect::from_min_max(egui::pos2(tx, c.top()), c.max);
+        paint_cell(ui, text_cell, &row.title, font.clone(), text_color);
+    }
+    // 作者 + 组织图标（最多 3 个，磁盘缓存）
+    {
+        let c = cell(3);
+        paint_cell(ui, c, &row.author, small.clone(), weak);
         let icons: Vec<_> = row
             .orgs
             .iter()
             .take(3)
             .filter_map(|o| crate::avatars::get_org_icon(ui.ctx(), o))
             .collect();
+        // 图标贴单元格右缘（不压文字：文字已被 clip/省略号截断，图标 overlay 在右端）
         for (oi, tex) in icons.iter().enumerate() {
             let r = egui::Rect::from_min_size(
-                egui::pos2(x + oi as f32 * 14.0, rect.center().y - 6.0),
+                egui::pos2(c.right() - 14.0 * (icons.len() - oi) as f32, c.center().y - 6.0),
                 egui::vec2(12.0, 12.0),
             );
-            p.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
-        }
-        if !icons.is_empty() {
-            x += icons.len() as f32 * 14.0;
+            ui.painter().image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         }
     }
-    col(
-        p,
-        &mut x,
-        36.0,
-        match row.turn.as_str() {
+    paint_cell(
+        ui,
+        cell(4),
+        &match row.turn.as_str() {
             "me" => tr(lang, "turn_me").to_string(),
             "them" => tr(lang, "turn_them").to_string(),
             _ => String::new(),
@@ -507,24 +651,22 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     );
     // 评审结论 + 活动行
     let rev = if row.review.is_empty() { row.activity.clone() } else { row.review.clone() };
-    col(p, &mut x, 44.0, rev, small.clone(), weak);
-    // CI
-    let ci_color = ui_detail::ci_color(&row.ci);
+    paint_cell(ui, cell(5), &rev, small.clone(), weak);
+    // CI 圆点
     if !row.ci.is_empty() {
-        p.circle_filled(egui::pos2(x + 8.0, rect.center().y), 3.5, ci_color);
+        let c = cell(6);
+        ui.painter().circle_filled(egui::pos2(c.left() + 8.0, c.center().y), 3.5, ui_detail::ci_color(&row.ci));
     }
-    x += 40.0;
-    col(p, &mut x, 36.0, row.size.clone(), small.clone(), weak);
-    col(p, &mut x, 66.0, format!("+{}/-{}", row.adds, row.dels), small.clone(), weak);
-    col(
-        p,
-        &mut x,
-        36.0,
-        if row.score > 0.0 { format!("{:.1}", row.score) } else { String::new() },
+    paint_cell(ui, cell(7), &row.size, small.clone(), weak);
+    paint_cell(ui, cell(8), &format!("+{}/-{}", row.adds, row.dels), small.clone(), weak);
+    paint_cell(
+        ui,
+        cell(9),
+        &if row.score > 0.0 { format!("{:.1}", row.score) } else { String::new() },
         small.clone(),
         if row.score > 0.0 { ui_detail::score_color(row.score, dark) } else { weak },
     );
-    col(p, &mut x, 46.0, row.age.clone(), small.clone(), weak);
+    paint_cell(ui, cell(10), &row.age, small.clone(), weak);
 
     // 点击（带修饰键语义）
     if resp.clicked() {
@@ -547,7 +689,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
                 if ui.small_button("P").on_hover_text(tr(lang, "tip_pin")).clicked() {
                     worker::toggle_field(&app.app, &key.0, key.1, "pinned");
                 }
-                if ui.small_button("＋").on_hover_text(tr(lang, "detail_add_board")).clicked() {
+                if ui.small_button("+").on_hover_text(tr(lang, "detail_add_board")).clicked() {
                     worker::toggle_field(&app.app, &key.0, key.1, "on_board");
                 }
                 if ui.small_button("×").on_hover_text(tr(lang, "tip_reject")).clicked() {
@@ -569,7 +711,6 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
         context_menu(app, ui, lang);
     });
 }
-
 fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     let (n, all_pinned, all_on_board, all_rejected) = {
         let a = app.app.lock_recover();

@@ -383,7 +383,7 @@ fn tab_source(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
             if app.settings_profile != "local" {
                 let confirming = matches!(&app.del_confirm, Some((n, t)) if *n == app.settings_profile && t.elapsed().as_secs() < 3);
                 let btn = ui
-                    .button(RichText::new("🗑").color(if confirming {
+                    .button(RichText::new("×").color(if confirming {
                         egui::Color32::from_rgb(209, 36, 47)
                     } else {
                         ui.visuals().weak_text_color()

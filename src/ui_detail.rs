@@ -94,6 +94,19 @@ pub fn parse_files_json(json: &str) -> Vec<(String, i64, i64)> {
 
 const DIFF_LINE_H: f32 = 17.0;
 
+/// 行背景色（GitHub 风格整行底色；深浅主题各一套，深色用半透明叠加）。
+fn kind_bg(kind: LineKind, dark: bool) -> Option<Color32> {
+    match (kind, dark) {
+        (LineKind::Add, false) => Some(Color32::from_rgb(0xda, 0xfb, 0xe1)),
+        (LineKind::Del, false) => Some(Color32::from_rgb(0xff, 0xeb, 0xe9)),
+        (LineKind::Hunk, false) => Some(Color32::from_rgb(0xdd, 0xf4, 0xff)),
+        (LineKind::Add, true) => Some(Color32::from_rgba_unmultiplied(46, 160, 67, 40)),
+        (LineKind::Del, true) => Some(Color32::from_rgba_unmultiplied(248, 81, 73, 40)),
+        (LineKind::Hunk, true) => Some(Color32::from_rgba_unmultiplied(56, 139, 253, 32)),
+        _ => None,
+    }
+}
+
 /// diff 文件列表渲染：折叠头 + 展开文件的行虚拟化绘制（只画可见行，大 diff 不卡）。
 /// 长行不自动换行：内容宽度按最长行估算，横向滚动与纵向滚动解耦。
 pub fn diff_view(ui: &mut Ui, files: &mut [DiffFileData], lang: &str, id_prefix: &str) {
@@ -148,6 +161,17 @@ pub fn diff_view(ui: &mut Ui, files: &mut [DiffFileData], lang: &str, id_prefix:
                 let painter = ui.painter();
                 for (i, (kind, text, no)) in f.lines[first..last].iter().enumerate() {
                     let y = rect.top() + (first + i) as f32 * DIFF_LINE_H;
+                    // 行背景（整行宽，含 gutter）：新增淡绿 / 删除淡红 / hunk 淡蓝
+                    if let Some(bg) = kind_bg(*kind, dark) {
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(
+                                egui::pos2(rect.left(), y),
+                                egui::vec2(rect.width(), DIFF_LINE_H),
+                            ),
+                            0.0,
+                            bg,
+                        );
+                    }
                     // 行号 gutter（0 = 无行号）
                     if *no > 0 {
                         painter.text(
@@ -187,8 +211,10 @@ pub fn detail_panel(app: &mut EguiApp, ui: &mut Ui) {
         .show(ui, |ui| {
             // 面板宽度记忆（退出时写回 config.toml）
             app.panel_width_cur = ui.clip_rect().width();
+            // 滚动状态按 PR 隔离：跨 PR 复用会把上一个面板的滚动偏移带过来（内容错位）
+            let sid = app.panel.as_ref().map(|p| format!("detail-scroll-{}#{}", p.repo, p.number)).unwrap_or_default();
             egui::ScrollArea::vertical()
-                .id_salt("detail-scroll")
+                .id_salt(sid)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     detail_body(app, ui);
@@ -217,18 +243,38 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
     let checks = parse_checks_json(&p.checks_json);
     let files = parse_files_json(&p.files_json);
 
-    // ── 头部 ──
-    ui.horizontal(|ui| {
-        ui.heading(RichText::new(&title).size(15.0));
+    // ── 头部：✕ 单独一行钉右上；标题独占一行按面板宽度换行 ──
+    //（ horizontal 里混排 wrap Label 会把 galley 高度算炸——实测面板全空，勿合并）
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
         if ui.small_button("✕").clicked() {
             app.app.lock_recover().selected = None;
             app.panel = None;
         }
     });
+    ui.add(egui::Label::new(RichText::new(&title).size(15.0).strong()).wrap());
     ui.horizontal(|ui| {
         // 作者头像（磁盘缓存；miss → 字母降级）
         avatar_chip(ui, &author);
-        ui.label(format!("{repo} #{number} · {author}"));
+        ui.label(&repo);
+        // #编号：可点超链接（浏览器打开 PR；行 url 缺失时兜底拼接）
+        let link = ui.add(
+            egui::Label::new(
+                RichText::new(format!("#{number}"))
+                    .color(ui.visuals().hyperlink_color)
+                    .underline(),
+            )
+            .sense(egui::Sense::click()),
+        );
+        if link.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        link.clone().on_hover_text(tr(&lang, "inbox_open_browser"));
+        if link.clicked() {
+            crate::worker::open_pr_url(&app.app, &repo, &number);
+        }
+        if !author.is_empty() {
+            ui.weak(format!("· {author}"));
+        }
         if !updated.is_empty() {
             ui.weak(updated);
         }
@@ -272,15 +318,21 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
                 p.on_board = !on_board;
             }
         }
-        // 优先级 0-3
+        // 优先级：内部存储 1/2/3，显示层 1→P0（最紧急）2→P1 3→P2；0=未设
+        let cur = crate::ui_list::priority_badge(priority.into()).0;
         egui::ComboBox::from_id_salt("panel-prio")
-            .selected_text(format!("P{priority}"))
+            .selected_text(if cur.is_empty() { "—".to_string() } else { cur.to_string() })
             .show_ui(ui, |ui| {
-                for v in [0, 1, 2, 3] {
-                    if ui.selectable_label(priority == v, format!("P{v}")).clicked() {
-                        crate::worker::local_update(&app.app, &repo, number, "priority", v as i64);
+                for (v, key) in [
+                    (1i64, "ctx_priority_high"),
+                    (2, "ctx_priority_medium"),
+                    (3, "ctx_priority_low"),
+                    (0, "ctx_priority_clear"),
+                ] {
+                    if ui.selectable_label(priority as i64 == v, tr(&lang, key)).clicked() {
+                        crate::worker::local_update(&app.app, &repo, number, "priority", v);
                         if let Some(p) = app.panel.as_mut() {
-                            p.priority = v;
+                            p.priority = v as i32;
                         }
                     }
                 }
@@ -298,7 +350,7 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
             let _ = app.cmd_tx.send(Cmd::RunReview { repo: repo.clone(), number });
         }
         if ui
-            .button(RichText::new("📋").size(12.0))
+            .button(RichText::new("⧉").size(12.0))
             .on_hover_text(tr(&lang, "review_copy_tip"))
             .clicked()
         {
@@ -318,8 +370,8 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
         tr(&lang, "tab_review"),
         tr(&lang, "tab_conversation"),
         tr(&lang, "tab_checks"),
+        // Files 与 Diff 合并：文件清单（路径+增删计数）可折叠展开看行内容
         tr(&lang, "tab_files"),
-        tr(&lang, "tab_diff"),
     ];
     ui.horizontal(|ui| {
         for (i, t) in tabs.iter().enumerate() {
@@ -335,8 +387,15 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
         0 => review_tab(app, ui, &review, &lang),
         1 => convo_tab(app, ui, &convo, &lang),
         2 => checks_tab(ui, &checks, &lang),
-        3 => files_tab(ui, &files, &lang),
-        _ => diff_view(ui, &mut app.diff_files, &lang, "detail"),
+        // 合并的 Files changed：有解析后 diff 用折叠 diff 视图；
+        // 没有（缓存缺失且实时 files 已到）退回纯文件清单
+        _ => {
+            if !app.diff_files.is_empty() {
+                diff_view(ui, &mut app.diff_files, &lang, "detail");
+            } else {
+                files_tab(ui, &files, &lang);
+            }
+        }
     }
 }
 

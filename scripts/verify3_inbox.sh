@@ -45,7 +45,7 @@ cmd "inboxclose"
 cmd "inboxadd 0"; sleep 1.5
 SM=$(state | python -c "import json,sys; print(json.load(sys.stdin)['status_msg'])")
 echo "  [+ 预评审 status] $SM"
-echo "$SM" | grep -qE "已在列表|已加入" && { echo "  PASS: + 预评审保守语义（已在列表/已加入）"; PASS=$((PASS+1)); } || { echo "  FAIL: $SM"; FAIL=$((FAIL+1)); }
+echo "$SM" | grep -qE "已在列表|已加入|already|Added" && { echo "  PASS: + 预评审保守语义（已在列表/已加入）"; PASS=$((PASS+1)); } || { echo "  FAIL: $SM"; FAIL=$((FAIL+1)); }
 
 # 加载更多（page 1 → 2）
 cmd "loadmore"; sleep 3

@@ -17,7 +17,7 @@ cmd "settab 2"; shot "settings-llm"
 cmd "settingssave"; sleep 1.5
 SM=$(state | python -c "import json,sys; print(json.load(sys.stdin)['status_msg'])")
 echo "  [保存 status] $SM"
-echo "$SM" | grep -qE "已保存|重载|saved" && { echo "  PASS: 保存热生效"; PASS=$((PASS+1)); } || { echo "  FAIL: $SM"; FAIL=$((FAIL+1)); }
+echo "$SM" | grep -qE "已保存|重载|saved|reloaded" && { echo "  PASS: 保存热生效"; PASS=$((PASS+1)); } || { echo "  FAIL: $SM"; FAIL=$((FAIL+1)); }
 assert "保存后弹窗仍开（settingssave 指令不主动关）" "True"
 
 # 代理校验：非法代理拒绝保存
@@ -43,14 +43,15 @@ cmd "profile local"; sleep 1
 assert "同档重选无操作（行数不变）" "d['active_profile']=='local' and d['rows']>=8"
 
 # ── 主题（配置写回）──
+T0=$(state | python -c "import json,sys; print(json.load(sys.stdin)['theme'])")
 cmd "theme"
 sleep 0.5
 T1=$(state | python -c "import json,sys; print(json.load(sys.stdin)['theme'])")
 CT=$(grep '^theme' /d/Code/pr-desk-rs-egui/config.toml)
-echo "  [theme] $T1 / config: $CT"
-[ "$T1" = "dark" ] && echo "$CT" | grep -q dark && { echo "  PASS: 主题切换 + 写回 config.toml"; PASS=$((PASS+1)); } || { echo "  FAIL: theme=$T1 cfg=$CT"; FAIL=$((FAIL+1)); }
-shot "dark-theme"
-cmd "theme"  # 还原浅色
+echo "  [theme] $T0 → $T1 / config: $CT"
+{ [ "$T0" != "$T1" ] && echo "$CT" | grep -q "$T1"; } && { echo "  PASS: 主题切换 + 写回 config.toml"; PASS=$((PASS+1)); } || { echo "  FAIL: theme=$T0→$T1 cfg=$CT"; FAIL=$((FAIL+1)); }
+shot "theme-toggled"
+cmd "theme"  # 还原
 
 # ── 托盘 ──
 TRAY=$(powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class FT9 { [DllImport(\"user32.dll\", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr p, IntPtr c, string cls, string w); }'; [FT9]::FindWindowExW([IntPtr]::Zero,[IntPtr]::Zero,'PRDeskTrayWnd',\$null)")
