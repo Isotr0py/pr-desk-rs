@@ -1,746 +1,828 @@
-//! PR Desk 桌面端：egui/eframe UI 骨架（替换原 Slint UI）。
-//! 纯逻辑在 lib（pr_desk_rs）；本文件只做 UI 装配与后台 worker 胶水。
-//!
-//! 骨架范围：PR 列表（分组+搜索）+ 详情侧栏（评审+diff）+ 后台刷新 + 主题切换。
-//! TODO(egui): Inbox、设置页、多选批量操作、评审触发、托盘、头像、同步模式来源过滤、
-//!             窗口/面板几何记忆、列排序表头——均未从旧 Slint 版移植。
+//! PR Desk 桌面端：egui/eframe UI（自 Slint 版全量移植）。
+//! 纯逻辑在 lib（pr_desk_rs）与本 crate 的 state.rs；worker.rs 是后台命令循环；
+//! 本文件做装配：窗口/字体/主题/托盘/几何记忆/快捷键/消息落地。
 
-use std::collections::HashSet;
+mod avatars;
+mod state;
+mod tray;
+mod ui_detail;
+mod ui_inbox;
+mod ui_list;
+mod ui_settings;
+mod worker;
+
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use egui::{Color32, FontFamily, FontId, RichText};
-use serde_json::Value;
+use tokio::sync::mpsc::UnboundedSender;
 
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::Db;
-use pr_desk_rs::diffview::{self, LineKind};
-use pr_desk_rs::github;
 use pr_desk_rs::i18n::{tr, trf};
 
-// ── 后台命令 / 回送消息 ──
+use state::*;
 
-enum Cmd {
-    Refresh,
-    FetchDiff { repo: String, number: i64 },
+/// UI 侧即时状态（App 是业务状态；这里是面板/弹窗/表单等展示态）。
+pub struct EguiApp {
+    pub app: Arc<Mutex<App>>,
+    pub cmd_tx: UnboundedSender<Cmd>,
+    pub msg_rx: mpsc::Receiver<Msg>,
+    pub worker_handle: Option<std::thread::JoinHandle<()>>,
+    pub md_cache: egui_commonmark::CommonMarkCache,
+    pub last_poll: Instant,
+    pub cfg_path: PathBuf,
+    // ── 视图 ──
+    pub view_mode: usize, // 0 列表 / 1 Inbox
+    pub profile_names: Vec<String>,
+    pub filter_buf: String, // 顶栏搜索框文本（编辑即写回 App.filter 并重算视图）
+    // ── 详情面板 ──
+    pub panel: Option<PanelData>,
+    pub diff_files: Vec<DiffFileData>,
+    pub panel_tab: usize,
+    pub panel_width_cur: f32,
+    // ── Inbox ──
+    pub inbox_loading: bool,
+    pub inbox_sel: Option<usize>, // 当前选中通知在 inbox_view 里的下标
+    pub nd_open: bool,
+    pub nd_title: String,
+    pub nd_kind: String,
+    pub nd_kind_label: String,
+    pub nd_state: String,
+    pub nd_loading: bool,
+    pub nd_convo: Vec<PlainConvoEntry>,
+    pub nd_files: Vec<(String, i64, i64)>,
+    pub nd_diff: Vec<DiffFileData>,
+    pub mar_confirm: Option<Instant>, // 「全部已读」两步确认（3s 超时还原）
+    // ── 设置 ──
+    pub settings_open: bool,
+    pub settings_tab: usize,
+    pub settings_profile: String,
+    pub s_server: String,
+    pub s_sync_token: String,
+    pub s_ak: String,
+    pub s_gh_token: String,
+    pub s_proxy: String,
+    pub s_repos: String,
+    pub s_poll: i64,
+    pub s_llm_base: String,
+    pub s_llm_key: String,
+    pub s_llm_model: String,
+    pub s_ocr_path: String,
+    pub s_review_conc: i64,
+    pub s_review_prompt: String,
+    pub s_prompt_loading: bool,
+    pub dialog_error: String,
+    pub model_list: Vec<String>,
+    pub model_list_open: bool,
+    pub adding_profile: bool,
+    pub add_profile_name: String,
+    pub del_confirm: Option<(String, Instant)>, // 档案删除两步确认（3s 超时还原）
+    pub gh_token_from_env: bool,
+    // ── 引导 ──
+    pub onboarding_dismissed: bool,
+    // ── 托盘 ──
+    #[cfg(windows)]
+    pub tray: Option<tray::Tray>,
+    pub allow_close: bool,
+    /// j/k 导航后请求列表滚动到该行（渲染时消费）
+    pub scroll_to: Option<(String, i64)>,
 }
 
-struct DiffLine {
-    kind: LineKind,
-    text: String,
-    no: i32,
-}
-
-struct DiffFile {
-    path: String,
-    lines: Vec<DiffLine>,
-}
-
-enum Msg {
-    Status(String),
-    Rows(Vec<Value>),
-    RefreshDone(usize),
-    DiffParsed { repo: String, number: i64, files: Vec<DiffFile> },
-}
-
-/// 解析整段 diff 为按文件分组、带行号的行序列（diffview 纯逻辑）。
-fn parse_diff(diff: &str) -> Vec<DiffFile> {
-    diffview::split_files(diff)
-        .into_iter()
-        .map(|(path, text)| DiffFile {
-            path,
-            lines: diffview::numbered_lines(&text)
-                .into_iter()
-                .map(|(kind, text, no)| DiffLine { kind, text, no })
-                .collect(),
-        })
-        .collect()
-}
-
-/// 档案名 → db 文件路径（与旧版一致：local → pr-desk.db）。
-fn profile_db_path(data_dir: &std::path::Path, name: &str) -> PathBuf {
-    if name == "local" || !pr_desk_rs::config::valid_profile_name(name) {
-        data_dir.join("pr-desk.db")
-    } else {
-        data_dir.join("profiles").join(format!("{name}.db"))
+impl EguiApp {
+    pub fn lang(&self) -> String {
+        self.app.lock_recover().cfg.language.clone()
     }
-}
 
-// ── 行展示辅助（移植自已删除的 model.rs 的纯逻辑部分）──
-
-/// 解析 updated_at：兼容 db::now() 的本地 "YYYY-MM-DDTHH:MM:SS" 与 RFC3339。
-fn parse_ts(s: &str) -> Option<chrono::NaiveDateTime> {
-    use chrono::NaiveDateTime;
-    let s = s.trim();
-    if s.is_empty() {
-        return None;
+    /// 状态栏临时消息：覆盖显示，6 秒后自动清除（恢复「已同步 X 前」等常态文本）。
+    /// 竞态守卫：每条消息递增 status_gen，到期清除时序号不匹配则不清（防旧定时器清新消息）。
+    pub fn set_transient_status(&self, s: String) {
+        let mut a = self.app.lock_recover();
+        a.status_msg = s;
+        a.status_gen = a.status_gen.wrapping_add(1);
+        a.status_msg_at = Some(Instant::now());
     }
-    for fmt in ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%d %H:%M:%S%.f", "%Y-%m-%d"] {
-        if let Ok(t) = NaiveDateTime::parse_from_str(s, fmt) {
-            return Some(t);
-        }
-    }
-    chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .map(|t| t.with_timezone(&chrono::Local).naive_local())
-}
 
-/// 相对时间格式："27m" / "2h" / "3d" / "2mo" / "1y"。
-fn rel_time(updated_at: &str) -> String {
-    let Some(ts) = parse_ts(updated_at) else {
-        return String::new();
-    };
-    let mins = (chrono::Local::now().naive_local() - ts).num_minutes().max(0);
-    if mins < 60 {
-        format!("{mins}m")
-    } else if mins < 24 * 60 {
-        format!("{}h", mins / 60)
-    } else if mins < 30 * 24 * 60 {
-        format!("{}d", mins / (24 * 60))
-    } else if mins < 365 * 24 * 60 {
-        format!("{}mo", mins / (30 * 24 * 60))
-    } else {
-        format!("{}y", mins / (365 * 24 * 60))
-    }
-}
-
-/// 大小写不敏感子串匹配：title / number（query 可带 # 前缀）/ author / repo。
-fn row_matches(r: &Value, query: &str) -> bool {
-    let q = query.trim().trim_start_matches('#').to_lowercase();
-    if q.is_empty() {
-        return true;
-    }
-    let hit = |s: &str| s.to_lowercase().contains(&q);
-    hit(r["title"].as_str().unwrap_or(""))
-        || hit(r["author"].as_str().unwrap_or(""))
-        || hit(r["repo"].as_str().unwrap_or(""))
-        || r["number"].as_i64().is_some_and(|n| n.to_string().contains(&q))
-}
-
-// ── 后台 worker：独立线程 + 自己的 tokio runtime 与 Db 连接 ──
-
-fn spawn_worker(
-    db_path: PathBuf,
-    gh: Option<github::GitHub>,
-    msg_tx: mpsc::Sender<Msg>,
-    ctx: egui::Context,
-) -> mpsc::Sender<Cmd> {
-    let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
+    /// 状态栏临时消息 6s 自动清除（egui 版：update 里检查时刻，替代 Slint Timer）。
+    fn transient_tick(&self) {
+        let mut clear = false;
         {
-            Ok(rt) => rt,
-            Err(e) => {
-                tracing::error!("tokio runtime 创建失败: {e}");
-                return;
-            }
-        };
-        let send = |m: Msg| {
-            let _ = msg_tx.send(m);
-            ctx.request_repaint();
-        };
-        let db = match Db::open(&db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                send(Msg::Status(format!("数据库打开失败: {e}")));
-                return;
-            }
-        };
-        for cmd in cmd_rx {
-            match cmd {
-                Cmd::Refresh => refresh(&rt, &db, &gh, &send),
-                Cmd::FetchDiff { repo, number } => {
-                    fetch_diff(&rt, &db, &gh, &send, &repo, number)
+            let a = self.app.lock_recover();
+            if let Some(at) = a.status_msg_at {
+                if at.elapsed() > Duration::from_secs(6) && !a.status_msg.is_empty() {
+                    clear = true;
                 }
             }
         }
-    });
-    cmd_tx
-}
-
-fn refresh(
-    rt: &tokio::runtime::Runtime,
-    db: &Db,
-    gh: &Option<github::GitHub>,
-    send: &dyn Fn(Msg),
-) {
-    // 先把本地库现有内容上屏（不等网络）
-    match db.list_prs(&[]) {
-        Ok(rows) => send(Msg::Rows(rows)),
-        Err(e) => send(Msg::Status(format!("列表读取失败: {e}"))),
-    }
-    let Some(gh) = gh else {
-        send(Msg::RefreshDone(0));
-        return;
-    };
-    // 刷新在库 PR 的 GitHub 状态（merged/closed 落库后分组自动移出待评审区）；
-    // 本地库手动策展，不从 GitHub 拉新列表。TODO(egui): 通知/组织/同步模式。
-    let keys = db.list_pr_keys().unwrap_or_default();
-    if !keys.is_empty() {
-        let updates = rt.block_on(async {
-            let mut set = tokio::task::JoinSet::new();
-            for (repo, number) in keys {
-                let g = gh.clone();
-                set.spawn(async move {
-                    let meta = g.fetch_pr_meta(&repo, number).await;
-                    (repo, number, meta)
-                });
+        if clear {
+            let mut a = self.app.lock_recover();
+            // 再校验：持锁期间可能有新消息进来（status_msg_at 已更新则不清）
+            if let Some(at) = a.status_msg_at {
+                if at.elapsed() > Duration::from_secs(6) {
+                    a.status_msg.clear();
+                    a.status_msg_at = None;
+                }
             }
-            let mut out = Vec::new();
-            while let Some(Ok((repo, number, res))) = set.join_next().await {
-                match res {
-                    Ok(meta) => {
-                        let state = if meta["merged_at"].is_null() {
-                            meta["state"].as_str().unwrap_or("open").to_string()
-                        } else {
-                            "merged".to_string()
+        }
+    }
+
+    /// 状态栏三段：同步状态/临时消息 · API 配额 · PR 总数。
+    pub fn status_bar_sync_text(&self) -> String {
+        let a = self.app.lock_recover();
+        let lang = a.cfg.language.as_str();
+        if !a.status_msg.is_empty() {
+            a.status_msg.clone()
+        } else if a.cfg.is_unconfigured() {
+            // 未配置：临时消息 6s 自动清除后仍要留住「点右上角设置」的引导提示
+            tr(lang, "cfg_unconfigured").into()
+        } else if a.cfg.active_sync().is_none() {
+            // 未配置同步：明确提示本地模式，不留空白
+            tr(lang, "sb_local_mode").into()
+        } else {
+            pr_desk_rs::sync::last_sync_text(&a.last_sync, lang)
+                .unwrap_or_else(|| tr(lang, "sb_wait_sync").into())
+        }
+    }
+
+    /// 行点击（带修饰键语义）：
+    /// 无修饰 = 清多选 + 单选 + 打开详情；
+    /// Ctrl = toggle 进/出多选（集合为空时以当前选中行为起点扩充；不开详情——多选场景下面板频闪）；
+    /// Shift = 从锚点到本行（view_visible 序）范围入多选（不开详情）。
+    pub fn row_clicked(&self, key: (String, i64), ctrl: bool, shift: bool) {
+        let open = !ctrl && !shift;
+        {
+            let mut a = self.app.lock_recover();
+            if shift {
+                let anchor = a.anchor.clone().unwrap_or_else(|| key.clone());
+                let view = a.view_visible.clone();
+                pr_desk_rs::selection::extend_range(&mut a.selection, &view, &anchor, &key);
+                if a.anchor.is_none() {
+                    a.anchor = Some(key.clone());
+                }
+            } else if ctrl {
+                // 标准多选手感（Explorer/Finder）：集合为空时当前选中行是多选起点，
+                // Ctrl 加选在其基础上扩充，而不是从空集合开始丢掉它
+                if a.selection.is_empty()
+                    && let Some(cur) = a.selected.clone()
+                    && cur != key
+                {
+                    a.selection.push(cur);
+                }
+                pr_desk_rs::selection::toggle(&mut a.selection, &key);
+                a.anchor = Some(key.clone());
+            } else {
+                a.selection.clear();
+                a.anchor = Some(key.clone());
+            }
+            a.selected = Some(key.clone());
+        }
+        if open {
+            let _ = self.cmd_tx.send(Cmd::OpenDrawer { repo: key.0, number: key.1, refetch: true });
+        }
+    }
+
+    /// 行右键：该行不在多选内则先单选它（多选内含它则不动多选），菜单由 UI 侧打开。
+    pub fn row_context(&self, key: (String, i64)) {
+        let mut a = self.app.lock_recover();
+        if !pr_desk_rs::selection::is_selected(&a.selection, &key) {
+            pr_desk_rs::selection::select_single(&mut a.selection, &key);
+            a.anchor = Some(key.clone());
+        }
+        a.selected = Some(key);
+    }
+
+    /// 清空多选（Esc 第一级 / 操作条 ✕）；主选中行保留。
+    pub fn clear_multi_selection(&self) {
+        let mut a = self.app.lock_recover();
+        a.selection.clear();
+        a.anchor = None;
+    }
+
+    /// 组头折叠/展开：状态存 App.collapsed（跨刷新保留）。
+    pub fn group_toggled(&self, key: &str) {
+        let mut a = self.app.lock_recover();
+        if !a.collapsed.remove(key) {
+            a.collapsed.insert(key.to_string());
+        }
+        recompute_flat(&mut a);
+    }
+
+    /// 列表头点击排序（Excel 式）：同列再点反向；新列按该列的默认方向
+    ///（数值/时间列先降序——最新/最大在前；文本列先升序）。
+    pub fn header_clicked(&self, col: &str) {
+        let mut a = self.app.lock_recover();
+        if a.sort_col == col {
+            a.sort_asc = !a.sort_asc;
+        } else {
+            a.sort_col = col.to_string();
+            a.sort_asc = matches!(col, "num" | "title" | "author" | "turn" | "review" | "ci" | "size");
+        }
+        recompute_flat(&mut a);
+    }
+
+    /// 详情面板 tab 切换 → 惰性拉取对应数据（会话/Checks/Files；各自 120s 节流）。
+    pub fn panel_tab_changed(&self, t: usize) {
+        let parts = match t {
+            1 => PART_CONVO,
+            2 => PART_CHECKS,
+            3 => PART_FILES,
+            _ => return, // 评审/Diff 用本地数据
+        };
+        let sel = self.app.lock_recover().selected.clone();
+        if let Some((repo, number)) = sel {
+            let _ = self.cmd_tx.send(Cmd::FetchPrLive { repo, number, parts });
+        }
+    }
+
+    /// Inbox 行点击 / Enter：选中 + 展开右侧预览面板（发 FetchNotifDetail），并标记已读
+    ///（下标对仓库过滤后的视图 inbox_view）。
+    pub fn inbox_activated(&mut self, i: usize) {
+        let row = self.app.lock_recover().inbox_view.get(i).cloned();
+        let Some(n) = row else { return };
+        let repo = n["repo"].as_str().unwrap_or("").to_string();
+        let kind = n["kind"].as_str().unwrap_or("").to_string();
+        let title = n["title"].as_str().unwrap_or("").to_string();
+        let url = n["url"].as_str().unwrap_or("").to_string();
+        let state = n["state"].as_str().unwrap_or("").to_string();
+        let Some(number) = notif_url_number(&url) else { return };
+        let lang = self.lang();
+        {
+            let mut a = self.app.lock_recover();
+            a.inbox_detail = Some((repo.clone(), number, kind.clone(), url));
+            // 查询失败是错误不是「不存在」：保守按已加入处理（防重复插入）并告警
+            a.inbox_added = kind == "PullRequest" && {
+                a.db.pr_exists(&repo, number).unwrap_or_else(|e| {
+                    tracing::warn!("查询 PR 是否已加入失败 {repo} #{number}: {e}");
+                    true
+                })
+            };
+        }
+        self.inbox_sel = Some(i);
+        // 立即开面板并进加载态（数据由 worker 回送）
+        self.nd_title = title;
+        self.nd_kind_label = notif_kind_label(&lang, &kind);
+        self.nd_kind = kind.clone();
+        self.nd_state = state;
+        self.nd_loading = true;
+        self.nd_open = true;
+        let _ = self.cmd_tx.send(Cmd::FetchNotifDetail { repo, number, kind });
+        if let Some(id) = n["id"].as_str().filter(|s| !s.is_empty()) {
+            let _ = self.cmd_tx.send(Cmd::MarkNotifRead(id.to_string()));
+        }
+    }
+
+    /// 预览面板「在浏览器打开」/ Enter（面板已开时）。
+    pub fn inbox_open_browser(&self) {
+        let detail = self.app.lock_recover().inbox_detail.clone();
+        if let Some((_, _, _, url)) = detail {
+            if !url.is_empty() {
+                if let Err(e) = open::that(&url) {
+                    let lang = self.lang();
+                    worker::send_msg(Msg::Status(trf(&lang, "open_browser_failed", &[&e.to_string()])));
+                }
+            }
+        }
+    }
+
+    /// Inbox「+ 预评审」：按 UI 下标取 repo/number/title 交给 worker 入库。
+    pub fn inbox_add_review(&self, i: usize) {
+        let row = self.app.lock_recover().inbox_view.get(i).cloned();
+        if let Some(n) = row {
+            let repo = n["repo"].as_str().unwrap_or("").to_string();
+            let title = n["title"].as_str().unwrap_or("").to_string();
+            let url = n["url"].as_str().unwrap_or("").to_string();
+            if let Some(number) = notif_url_number(&url) {
+                let _ = self.cmd_tx.send(Cmd::AddNotifReview { repo, number, title, url });
+            }
+        }
+    }
+
+    /// 主题切换：即时持久化到 config.toml。
+    pub fn theme_toggled(&self, ctx: &egui::Context) {
+        let mut a = self.app.lock_recover();
+        a.cfg.theme = if a.cfg.theme == "dark" { "light".into() } else { "dark".into() };
+        let theme = a.cfg.theme.clone();
+        if let Err(e) = a.cfg.save(&self.cfg_path) {
+            tracing::warn!("主题写入 config.toml 失败: {e}");
+        }
+        drop(a);
+        apply_theme(ctx, &theme);
+    }
+
+    /// 语言切换：持久化到 config.toml，并重算行视图（组标题语言跟随）。
+    pub fn language_changed(&self, lang: &str) {
+        let lang = if lang == "en" { "en" } else { "zh" }.to_string();
+        {
+            let mut a = self.app.lock_recover();
+            if a.cfg.language == lang {
+                return; // 同值：不落盘不重算
+            }
+            a.cfg.language = lang;
+            if let Err(e) = a.cfg.save(&self.cfg_path) {
+                tracing::warn!("语言写入 config.toml 失败: {e}");
+            }
+            recompute_flat(&mut a);
+        }
+    }
+
+    /// 字号档位切换：即时生效并持久化（基准是 egui 默认字号表，不累乘漂移）。
+    pub fn font_scale_changed(&self, ctx: &egui::Context, s: f32) {
+        let snapped = if s < 0.95 { 0.9 } else if s > 1.07 { 1.15 } else { 1.0 };
+        {
+            let mut a = self.app.lock_recover();
+            if (a.cfg.font_scale - snapped).abs() < 0.001 {
+                return;
+            }
+            a.cfg.font_scale = snapped;
+            if let Err(e) = a.cfg.save(&self.cfg_path) {
+                tracing::warn!("字号写入 config.toml 失败: {e}");
+            }
+        }
+        apply_font_scale(ctx, snapped);
+    }
+
+    /// 窗口/面板几何记忆：小于最小值的尺寸不写（防御垃圾值）。
+    pub fn save_geometry(&self, ctx: &egui::Context) {
+        let (w, h) = ctx.input(|i| {
+            i.viewport().outer_rect.map(|r| (r.width() as f64, r.height() as f64)).unwrap_or((0.0, 0.0))
+        });
+        let pw = self.panel_width_cur as f64;
+        let mut a = self.app.lock_recover();
+        if w >= 900.0 && h >= 480.0 {
+            a.cfg.window_width = Some(w);
+            a.cfg.window_height = Some(h);
+        }
+        if pw >= 320.0 {
+            a.cfg.panel_width = Some(pw);
+        }
+        if let Err(e) = a.cfg.save(&self.cfg_path) {
+            tracing::warn!("窗口尺寸写入 config.toml 失败: {e}");
+        }
+    }
+
+    fn apply_msg(&mut self, ctx: &egui::Context, msg: Msg) {
+        match msg {
+            Msg::Status(s) => self.set_transient_status(s),
+            Msg::RefreshDone(open_count) => {
+                // 刷新完成：停顶栏转圈（去重标志已在 worker 复位）+ 状态栏结果（走 6s 自动清）
+                let lang = self.lang();
+                self.set_transient_status(trf(&lang, "gh_refresh_done", &[&open_count.to_string()]));
+            }
+            Msg::SyncFinished => {
+                // 同步结束（成败与否）：只负责停转圈；结果文案由 do_sync 自己的 Status 负责
+            }
+            Msg::DialogMsg(s) => self.dialog_error = s,
+            Msg::InboxLoading(v) => self.inbox_loading = v,
+            Msg::StatusBarRefresh => {} // 状态栏每帧从 App 现读，无需动作（重绘已由通道触发）
+            Msg::ModelsLoaded(models) => {
+                self.model_list = models;
+                // 拉取成功：清掉「正在拉取模型列表…」内联提示
+                self.dialog_error.clear();
+            }
+            Msg::Profiles { names, active: _ } => {
+                self.profile_names = names;
+                // active 已在 worker 写进 app.cfg.active_profile（顶栏现读）
+            }
+            Msg::SettingsProfile(name) => {
+                // 档案名校正：新增档案非法时写回之前的有效值并回填三字段
+                self.settings_profile = name;
+                let (server, token, ak) = {
+                    let a = self.app.lock_recover();
+                    profile_fields(&a.cfg, &self.settings_profile)
+                };
+                self.s_server = server;
+                self.s_sync_token = token;
+                self.s_ak = ak;
+            }
+            Msg::ReopenPanel => {
+                // 元数据补齐后重开面板（内容已变，身份不变）；
+                // refetch=false：这是刷新重载，不许再派发拉取命令（防 FetchPrMeta 死循环）
+                let sel = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = sel {
+                    let _ = self.cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: false });
+                }
+            }
+            Msg::FilterChanged(q) => {
+                let mut a = self.app.lock_recover();
+                a.filter = q;
+                recompute_flat(&mut a);
+            }
+            Msg::ViewPrefsChanged => {
+                let mut a = self.app.lock_recover();
+                recompute_flat(&mut a);
+            }
+            Msg::Rows(_) => {
+                // worker 已把行写进 App 并 recompute_flat；这里无需动作
+            }
+            Msg::Panel(pd) => {
+                self.panel = Some(*pd);
+            }
+            Msg::ClosePanel => self.panel = None,
+            Msg::ReviewProgress { repo, number, text } => {
+                {
+                    // 直写 status_msg 也要推序号，否则在途的 6s 自动清除会误清这条
+                    let mut a = self.app.lock_recover();
+                    a.status_msg = text.clone();
+                    a.status_gen = a.status_gen.wrapping_add(1);
+                    a.status_msg_at = Some(Instant::now());
+                }
+                if panel_matches(&self.app, &repo, number) {
+                    if let Some(p) = self.panel.as_mut() {
+                        p.review_status = "running".into();
+                        p.review_progress = text;
+                    }
+                }
+            }
+            Msg::ReviewDone { repo, number } => {
+                let lang = self.lang();
+                self.set_transient_status(trf(&lang, "review_done", &[&repo, &number.to_string()]));
+                // 评审分数进列表 Rev 列：重载行
+                worker::reload_rows_global(&self.app);
+                if panel_matches(&self.app, &repo, number) {
+                    let rv = { self.app.lock_recover().db.get_review(&repo, number).ok().flatten() };
+                    if let Some(p) = self.panel.as_mut() {
+                        p.review = review_props(rv.as_ref(), &lang);
+                        p.review_status = "done".into();
+                        p.review_progress.clear();
+                    }
+                }
+            }
+            Msg::ReviewFailed { repo, number, err } => {
+                let lang = self.lang();
+                self.set_transient_status(trf(&lang, "review_failed", &[&repo, &number.to_string(), &err]));
+                if panel_matches(&self.app, &repo, number) {
+                    if let Some(p) = self.panel.as_mut() {
+                        p.review_status = "failed".into();
+                    }
+                }
+            }
+            Msg::InboxRows(rows_json) => {
+                // 首次加载完成（成功路径）：关「加载中…」
+                self.inbox_loading = false;
+                // 存原始 JSON + 仓库过滤视图（inbox_activated 按下标取 thread id，以过滤视图为准）
+                let mut a = self.app.lock_recover();
+                a.inbox = rows_json;
+                a.inbox_view = inbox_filtered(&a);
+                // 预览面板开着时同步刷新「已加入」状态（+ 预评审后重发 InboxRows 会走到这里）；
+                // 查询失败保守按已加入处理（防重复插入）并告警
+                if let Some((repo, number, kind, _)) = a.inbox_detail.clone() {
+                    a.inbox_added = kind == "PullRequest"
+                        && a.db.pr_exists(&repo, number).unwrap_or_else(|e| {
+                            tracing::warn!("查询 PR 是否已加入失败 {repo} #{number}: {e}");
+                            true
+                        });
+                }
+            }
+            Msg::NotifDetail { repo, number, convo, files_json, diff_files } => {
+                // 身份守卫：快速连点两条通知时，旧通知的内容不得覆盖正在看的那条
+                let current = self
+                    .app
+                    .lock_recover()
+                    .inbox_detail
+                    .as_ref()
+                    .map(|(r, n, _, _)| (r.clone(), *n));
+                if current.as_ref() != Some(&(repo, number)) {
+                    return;
+                }
+                self.nd_convo = convo;
+                self.nd_files = ui_detail::parse_files_json(&files_json);
+                self.nd_diff = diff_files;
+                self.nd_loading = false;
+            }
+            Msg::NotifDetailFailed { repo, number, err } => {
+                // 拉取失败：身份匹配时关加载态并给状态栏错误（面板不再永远停在「加载中」）
+                let current = self
+                    .app
+                    .lock_recover()
+                    .inbox_detail
+                    .as_ref()
+                    .map(|(r, n, _, _)| (r.clone(), *n));
+                if current.as_ref() != Some(&(repo, number)) {
+                    return;
+                }
+                self.nd_loading = false;
+                self.set_transient_status(err);
+            }
+            Msg::ReviewPromptLoaded(text) => {
+                // 回填完成：解除编辑锁定（打开设置页时置的 loading 到此结束）
+                self.s_review_prompt = text;
+                self.s_prompt_loading = false;
+            }
+            Msg::PanelLive { repo, number, ci, state: st, updated, convo, checks_json, files_json } => {
+                // 实时数据只刷当前打开的面板；None 的区块本次未拉取，保持不动。
+                // 面板已切走/关闭则丢弃（列表行已随落库 reload 更新）
+                if panel_matches(&self.app, &repo, number) {
+                    if let Some(p) = self.panel.as_mut() {
+                        if let Some(ci) = ci {
+                            p.ci = ci;
+                        }
+                        if let Some(st) = st {
+                            p.state = st;
+                        }
+                        if let Some(updated) = updated {
+                            p.updated = updated;
+                        }
+                        if let Some(convo) = convo {
+                            p.convo = convo;
+                        }
+                        if let Some(cj) = checks_json {
+                            p.checks_json = cj;
+                        }
+                        if let Some(fj) = files_json {
+                            p.files_json = fj;
+                        }
+                    }
+                }
+            }
+            Msg::DiffParsed { repo, number, files } => {
+                // 身份守卫：快速切换 PR 时，A 的 diff 不得覆盖正在看的 B；
+                // 不匹配时不上屏（diff 缓存已在 worker 落库，下次打开能用）。
+                if panel_matches(&self.app, &repo, number) {
+                    self.diff_files = files;
+                }
+            }
+            Msg::ConvoAvatars { .. } => {
+                // egui 的纹理缓存按文件 mtime 自动失效（avatars.rs load_cached），
+                // 重绘已由通道触发——无需重装任何数据，天然「原地更新不闪烁」。
+            }
+            Msg::TrayShow => {
+                tracing::info!("托盘：还原窗口");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            Msg::TrayQuit => {
+                tracing::info!("托盘：退出");
+                self.allow_close = true;
+                self.save_geometry(ctx);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    /// 快捷键分发（无输入框聚焦时）。Esc 分级：设置弹窗 → 关弹窗；
+    /// 引导 → 吞掉；Inbox 预览 → 关预览；多选 → 清多选；详情面板 → 关面板；→ 清选中。
+    fn hotkeys(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let settings_or_onboarding = self.settings_open
+            || (self.app.lock_recover().cfg.is_unconfigured() && !self.onboarding_dismissed);
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if settings_or_onboarding {
+            if esc && self.settings_open {
+                self.settings_open = false;
+            }
+            return; // 快捷键不穿透到背后的列表（弹窗内输入框正常收键）
+        }
+        if esc {
+            if self.view_mode == 1 && self.nd_open {
+                self.nd_open = false;
+                self.app.lock_recover().inbox_detail = None;
+                return;
+            }
+            let (sel_count, panel_open) = {
+                let a = self.app.lock_recover();
+                (a.selection.len(), self.panel.is_some())
+            };
+            if sel_count > 0 {
+                self.clear_multi_selection();
+            } else if panel_open {
+                self.app.lock_recover().selected = None;
+                self.panel = None;
+            } else {
+                self.app.lock_recover().selected = None;
+            }
+            return;
+        }
+        // j/k 移动
+        let (j, k) = (ctx.input(|i| i.key_pressed(egui::Key::J)), ctx.input(|i| i.key_pressed(egui::Key::K)));
+        if j || k {
+            let delta = if j { 1i64 } else { -1i64 };
+            if self.view_mode == 0 {
+                let sel_key = {
+                    let mut a = self.app.lock_recover();
+                    if a.view_visible.is_empty() {
+                        None
+                    } else {
+                        let n = a.view_visible.len();
+                        let pos = a
+                            .selected
+                            .as_ref()
+                            .and_then(|s| a.view_visible.iter().position(|k2| k2 == s));
+                        let npos = match pos {
+                            None => {
+                                if delta > 0 { 0 } else { n - 1 }
+                            }
+                            Some(p) => (p as i64 + delta).clamp(0, n as i64 - 1) as usize,
                         };
-                        if state == "merged" || state == "closed" {
-                            out.push((repo, number, state));
-                        }
+                        a.selected = Some(a.view_visible[npos].clone());
+                        a.selected.clone()
                     }
-                    Err(e) => tracing::debug!("刷新 PR 状态失败 {repo} #{number}: {e}"),
+                };
+                if let Some(k2) = sel_key {
+                    // 滚动到选中行：渲染时由行消费（scroll_to_rect）
+                    self.scroll_to = Some(k2);
+                }
+            } else {
+                // Inbox：在过滤视图上下标移动
+                let n = self.app.lock_recover().inbox_view.len();
+                if n > 0 {
+                    let pos = self.inbox_sel.unwrap_or(if delta > 0 { usize::MAX } else { 0 });
+                    let npos = if pos == usize::MAX {
+                        0
+                    } else {
+                        (pos as i64 + delta).clamp(0, n as i64 - 1) as usize
+                    };
+                    self.inbox_sel = Some(npos);
                 }
             }
-            out
-        });
-        for (repo, number, state) in updates {
-            let _ = db.local_pr_update(&repo, number, "status", &Value::String(state));
+            return;
         }
-    }
-    let (rows, open_count) = match db.list_prs(&[]) {
-        Ok(rows) => {
-            let open = rows
-                .iter()
-                .filter(|r| !matches!(r["status"].as_str(), Some("merged") | Some("closed")))
-                .count();
-            (rows, open)
-        }
-        Err(e) => {
-            send(Msg::Status(format!("列表读取失败: {e}")));
-            (Vec::new(), 0)
-        }
-    };
-    send(Msg::Rows(rows));
-    send(Msg::RefreshDone(open_count));
-}
-
-fn fetch_diff(
-    rt: &tokio::runtime::Runtime,
-    db: &Db,
-    gh: &Option<github::GitHub>,
-    send: &dyn Fn(Msg),
-    repo: &str,
-    number: i64,
-) {
-    let Some(gh) = gh else { return };
-    let lang = "zh"; // worker 侧无界面语言上下文；错误文案以中文兜底
-    match rt.block_on(gh.fetch_diff(repo, number)) {
-        Ok(diff) => {
-            if let Err(e) = db.put_diff(repo, number, &diff) {
-                tracing::warn!("diff 缓存写入失败 {repo} #{number}: {e}");
-            }
-            send(Msg::DiffParsed { repo: repo.into(), number, files: parse_diff(&diff) });
-        }
-        Err(e) => send(Msg::Status(trf(lang, "diff_fetch_failed", &[&e.to_string()]))),
-    }
-}
-
-// ── egui 应用 ──
-
-struct DetailState {
-    repo: String,
-    number: i64,
-    review: Option<Value>,
-    diff: Option<Vec<DiffFile>>,
-    diff_loading: bool,
-}
-
-struct PrDeskApp {
-    cfg: Config,
-    cfg_path: PathBuf,
-    db: Db,
-    rows: Vec<Value>,
-    filter: String,
-    collapsed: HashSet<String>,
-    selected: Option<(String, i64)>,
-    detail: Option<DetailState>,
-    status_msg: String,
-    refreshing: bool,
-    cmd_tx: mpsc::Sender<Cmd>,
-    msg_rx: mpsc::Receiver<Msg>,
-    rate_limit: Option<Arc<Mutex<Option<u64>>>>,
-    last_poll: Instant,
-    md_cache: egui_commonmark::CommonMarkCache,
-}
-
-impl PrDeskApp {
-    fn lang(&self) -> &str {
-        &self.cfg.language
-    }
-
-    fn open_detail(&mut self, repo: &str, number: i64) {
-        let review = self.db.get_review(repo, number).unwrap_or_else(|e| {
-            tracing::warn!("评审读取失败 {repo} #{number}: {e}");
-            None
-        });
-        let diff_cached = self.db.get_diff(repo, number).unwrap_or_else(|e| {
-            tracing::warn!("diff 缓存读取失败 {repo} #{number}: {e}");
-            None
-        });
-        let (diff, diff_loading) = match diff_cached {
-            Some(text) => (Some(parse_diff(&text)), false),
-            None => {
-                let _ = self.cmd_tx.send(Cmd::FetchDiff { repo: repo.into(), number });
-                (None, true)
-            }
-        };
-        self.detail = Some(DetailState {
-            repo: repo.into(),
-            number,
-            review,
-            diff,
-            diff_loading,
-        });
-    }
-
-    fn handle_msgs(&mut self) {
-        while let Ok(msg) = self.msg_rx.try_recv() {
-            match msg {
-                Msg::Status(s) => self.status_msg = s,
-                Msg::Rows(rows) => self.rows = rows,
-                Msg::RefreshDone(open) => {
-                    self.refreshing = false;
-                    if open > 0 {
-                        self.status_msg =
-                            trf(self.lang(), "gh_refresh_done", &[&open.to_string()]);
-                    }
+        if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if self.view_mode == 0 {
+                let sel = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = sel {
+                    let _ = self.cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: true });
                 }
-                Msg::DiffParsed { repo, number, files } => {
-                    if let Some(d) = self.detail.as_mut() {
-                        if d.repo == repo && d.number == number
-                            && self.selected.as_ref().is_some_and(|s| s.0 == repo && s.1 == number)
-                        {
-                            d.diff = Some(files);
-                            d.diff_loading = false;
-                        }
-                    }
+            } else if let Some(i) = self.inbox_sel {
+                if self.nd_open {
+                    self.inbox_open_browser();
+                } else {
+                    self.inbox_activated(i);
                 }
             }
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::O)) {
+            if self.view_mode == 0 {
+                worker::batch_open_browser(&self.app);
+            } else {
+                self.inbox_open_browser();
+            }
+            return;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::P)) && self.view_mode == 0 {
+            // 快捷键 p：多选存在时批量 toggle，否则单行
+            let (has_sel, single) = {
+                let a = self.app.lock_recover();
+                (a.selection.is_empty(), a.selected.clone())
+            };
+            if !has_sel {
+                worker::batch_toggle(&self.app, "pinned");
+            } else if let Some((repo, number)) = single {
+                worker::toggle_field(&self.app, &repo, number, "pinned");
+            }
+            return;
+        }
+        // 快捷键 1/2/3：多选存在时批量设优先级，否则单行
+        for (key, p) in [(egui::Key::Num1, 1i64), (egui::Key::Num2, 2), (egui::Key::Num3, 3)] {
+            if ctx.input(|i| i.key_pressed(key)) && self.view_mode == 0 {
+                let keys = {
+                    let a = self.app.lock_recover();
+                    effective_targets(&a)
+                };
+                if keys.len() > 1 {
+                    worker::batch_local_update(&self.app, &keys, "priority", p);
+                } else if let Some((repo, number)) = keys.first().cloned() {
+                    worker::local_update(&self.app, &repo, number, "priority", p);
+                }
+                return;
+            }
+        }
+        // "/" 聚焦搜索框
+        if ctx.input(|i| i.key_pressed(egui::Key::Slash)) {
+            ctx.memory_mut(|m| m.request_focus(ui_list::search_id()));
         }
     }
 
-    /// 轮询定时：到点且空闲时发刷新；request_repaint_after 保证零 CPU 空闲。
+    /// 轮询定时（每轮重读当前间隔，设置页改间隔下轮生效）；
+    /// 在途去重：上一轮还没跑完就跳过本轮（不排队堆叠全量同步）。
     fn poll_tick(&mut self, ctx: &egui::Context) {
-        let interval = Duration::from_secs(self.cfg.poll_interval_min.max(1) * 60);
+        let interval = {
+            let a = self.app.lock_recover();
+            Duration::from_secs(a.cfg.poll_interval_min.max(1) * 60)
+        };
         let elapsed = self.last_poll.elapsed();
         if elapsed >= interval {
             self.last_poll = Instant::now();
-            if !self.refreshing {
-                self.refreshing = true;
-                let _ = self.cmd_tx.send(Cmd::Refresh);
+            let send = {
+                let mut a = self.app.lock_recover();
+                if a.sync_inflight {
+                    false
+                } else {
+                    a.sync_inflight = true;
+                    true
+                }
+            };
+            if send {
+                let _ = self.cmd_tx.send(Cmd::Sync);
             }
         } else {
             ctx.request_repaint_after((interval - elapsed).min(Duration::from_secs(5)));
         }
     }
-
-    fn top_bar(&mut self, ui: &mut egui::Ui) {
-        egui::Panel::top("top_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let lang = self.lang().to_string();
-                if ui.button(tr(&lang, "tb_refresh")).clicked() && !self.refreshing {
-                    self.refreshing = true;
-                    self.last_poll = Instant::now();
-                    let _ = self.cmd_tx.send(Cmd::Refresh);
-                }
-                if self.refreshing {
-                    ui.add(egui::Spinner::new());
-                }
-                ui.separator();
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text(tr(&lang, "tb_search_hint"))
-                        .desired_width(260.0),
-                );
-                ui.separator();
-                let dark = self.cfg.theme == "dark";
-                let label = if dark { tr(&lang, "tb_theme_light") } else { tr(&lang, "tb_theme_dark") };
-                if ui.button(label).clicked() {
-                    self.cfg.theme = if dark { "light".into() } else { "dark".into() };
-                    apply_theme(ui.ctx(), &self.cfg.theme);
-                    if let Err(e) = self.cfg.save(&self.cfg_path) {
-                        self.status_msg =
-                            trf(&lang, "cfg_save_failed", &[&e.to_string()]);
-                    }
-                }
-            });
-        });
-    }
-
-    fn status_bar(&self, ui: &mut egui::Ui) {
-        egui::Panel::bottom("status_bar").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let lang = self.lang();
-                ui.label(&self.status_msg);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(trf(lang, "sb_pr_count", &[&self.rows.len().to_string()]));
-                    if let Some(rl) = &self.rate_limit {
-                        if let Some(q) = *rl.lock().unwrap_or_else(|e| e.into_inner()) {
-                            ui.label(trf(lang, "sb_api_quota", &[&q.to_string()]));
-                        }
-                    }
-                });
-            });
-        });
-    }
-
-    fn pr_list(&mut self, ui: &mut egui::Ui) {
-        egui::CentralPanel::default().show(ui, |ui| {
-            let sections =
-                pr_desk_rs::build_sections(&self.rows, self.lang(), "upd", false);
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    for sec in &sections {
-                        let idxs: Vec<usize> = sec
-                            .idxs
-                            .iter()
-                            .copied()
-                            .filter(|&i| row_matches(&self.rows[i], &self.filter))
-                            .collect();
-                        if idxs.is_empty() {
-                            continue;
-                        }
-                        let collapsed = self.collapsed.contains(sec.key);
-                        // ▼/▶ 在微软雅黑中有字形；▸/▾（U+25B8/25BE）无（会豆腐块）
-                        let arrow = if collapsed { "▶" } else { "▼" };
-                        let header = format!("{arrow} {} ({})", sec.title, idxs.len());
-                        let resp = ui.add(
-                            egui::Label::new(RichText::new(header).strong())
-                                .sense(egui::Sense::click()),
-                        );
-                        if resp.clicked() {
-                            if collapsed {
-                                self.collapsed.remove(sec.key);
-                            } else {
-                                self.collapsed.insert(sec.key.to_string());
-                            }
-                        }
-                        if collapsed {
-                            continue;
-                        }
-                        for i in idxs {
-                            self.pr_row(ui, &self.rows[i].clone());
-                        }
-                    }
-                });
-        });
-    }
-
-    fn pr_row(&mut self, ui: &mut egui::Ui, row: &Value) {
-        let repo = row["repo"].as_str().unwrap_or("").to_string();
-        let number = row["number"].as_i64().unwrap_or(0);
-        let key = (repo.clone(), number);
-        let selected = self.selected.as_ref() == Some(&key);
-
-        let title = row["title"].as_str().unwrap_or("").to_string();
-        let author = row["author"].as_str().unwrap_or("");
-        let ci = row["ci_status"].as_str().unwrap_or("");
-        let score = row["score"].as_f64();
-        let age = rel_time(row["updated_at"].as_str().unwrap_or(""));
-
-        let height = 36.0;
-        let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), height),
-            egui::Sense::click(),
-        );
-        let visuals = ui.visuals();
-        let bg = if selected {
-            visuals.selection.bg_fill
-        } else if resp.hovered() {
-            visuals.widgets.hovered.bg_fill
-        } else {
-            Color32::TRANSPARENT
-        };
-        ui.painter().rect_filled(rect, 3.0, bg);
-
-        let title_color = if selected {
-            visuals.selection.stroke.color
-        } else {
-            visuals.text_color()
-        };
-        ui.painter().text(
-            rect.left_top() + egui::vec2(6.0, 3.0),
-            egui::Align2::LEFT_TOP,
-            &title,
-            FontId::default(),
-            title_color,
-        );
-        let mut meta = format!("{repo} #{number} · {author}");
-        if !age.is_empty() {
-            meta.push_str(&format!(" · {age}"));
-        }
-        ui.painter().text(
-            rect.left_bottom() + egui::vec2(6.0, -3.0),
-            egui::Align2::LEFT_BOTTOM,
-            meta,
-            FontId::proportional(11.0),
-            visuals.weak_text_color(),
-        );
-        // 右侧：CI 圆点 + 评分
-        let mut right = rect.right_center() + egui::vec2(-6.0, 0.0);
-        if let Some(s) = score {
-            ui.painter().text(
-                right,
-                egui::Align2::RIGHT_CENTER,
-                format!("{s:.1}"),
-                FontId::default(),
-                score_color(s, visuals.dark_mode),
-            );
-            right.x -= 34.0;
-        }
-        if !ci.is_empty() {
-            ui.painter().circle_filled(right - egui::vec2(5.0, 0.0), 4.0, ci_color(ci));
-        }
-
-        if resp.clicked() {
-            self.selected = Some(key);
-            self.open_detail(&repo, number);
-        }
-    }
-
-    fn detail_panel(&mut self, ui: &mut egui::Ui) {
-        if self.selected.is_none() {
-            return;
-        }
-        let mut open = true;
-        egui::Panel::right("detail")
-            .resizable(true)
-            .default_size(self.cfg.panel_width.unwrap_or(420.0) as f32)
-            .min_size(300.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        self.detail_body(ui, &mut open);
-                    });
-            });
-        if !open {
-            self.selected = None;
-            self.detail = None;
-        }
-    }
-
-    fn detail_body(&mut self, ui: &mut egui::Ui, open: &mut bool) {
-        let Some(sel) = self.selected.clone() else { return };
-        let Some(detail) = &self.detail else { return };
-        if (detail.repo.as_str(), detail.number) != (sel.0.as_str(), sel.1) {
-            return;
-        }
-        let lang = self.lang().to_string();
-        let Some(row) = self
-            .rows
-            .iter()
-            .find(|r| r["repo"].as_str() == Some(&sel.0) && r["number"].as_i64() == Some(sel.1))
-            .cloned()
-        else {
-            ui.label("…");
-            return;
-        };
-
-        ui.horizontal(|ui| {
-            ui.heading(row["title"].as_str().unwrap_or(""));
-            if ui.small_button("✕").clicked() {
-                *open = false;
-            }
-        });
-        let url = row["url"].as_str().unwrap_or("").to_string();
-        ui.label(format!(
-            "{} #{} · {} · {}",
-            sel.0,
-            sel.1,
-            row["author"].as_str().unwrap_or(""),
-            row["status"].as_str().unwrap_or(""),
-        ));
-        if !url.is_empty() {
-            ui.hyperlink_to(&url, &url);
-        }
-        ui.separator();
-
-        // ── 评审结果 ──
-        match &detail.review {
-            Some(rv) => {
-                let score = rv["score"].as_f64();
-                if let Some(s) = score {
-                    ui.label(
-                        RichText::new(trf(&lang, "body_score", &[&format!("{s:.1}")]))
-                            .strong()
-                            .size(15.0),
-                    );
-                } else {
-                    ui.label(tr(&lang, "body_score_failed"));
-                }
-                let mut size_bits = Vec::new();
-                if let Some(l) = rv["size_label"].as_str() {
-                    size_bits.push(l.to_string());
-                }
-                if let Some(f) = rv["files_changed"].as_i64() {
-                    size_bits.push(trf(&lang, "size_files", &[&f.to_string()]));
-                }
-                let adds = rv["additions"].as_i64().unwrap_or(0);
-                let dels = rv["deletions"].as_i64().unwrap_or(0);
-                if adds > 0 || dels > 0 {
-                    size_bits.push(format!("+{adds}/-{dels}"));
-                }
-                if !size_bits.is_empty() {
-                    ui.weak(size_bits.join(" · "));
-                }
-                if let Some(dims) = rv["dimensions"].as_str() {
-                    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(dims) {
-                        let text = map
-                            .iter()
-                            .map(|(k, v)| format!("{k}: {}", v.as_f64().unwrap_or(0.0)))
-                            .collect::<Vec<_>>()
-                            .join("  ");
-                        ui.label(trf(&lang, "body_dimensions", &[&text]));
-                    }
-                }
-                if let Some(summary) = rv["summary"].as_str().filter(|s| !s.is_empty()) {
-                    ui.separator();
-                    egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.md_cache, summary);
-                }
-            }
-            None => {
-                ui.weak(tr(&lang, "detail_no_review"));
-            }
-        }
-        ui.separator();
-
-        // ── diff 视图 ──
-        match &detail.diff {
-            Some(files) => {
-                for f in files {
-                    let adds = f.lines.iter().filter(|l| l.kind == LineKind::Add).count();
-                    let dels = f.lines.iter().filter(|l| l.kind == LineKind::Del).count();
-                    egui::CollapsingHeader::new(format!("{}  (+{adds}/-{dels})", f.path))
-                        .id_salt(&f.path)
-                        .default_open(false)
-                        .show(ui, |ui| {
-                            render_diff_file(ui, f, &lang);
-                        });
-                }
-            }
-            None => {
-                if detail.diff_loading {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new());
-                        ui.label(tr(&lang, "prog_fetch_diff"));
-                    });
-                } else {
-                    ui.weak(tr(&lang, "detail_no_diff"));
-                }
-            }
-        }
-    }
 }
 
-/// 单文件 diff 行渲染：等宽字体 + LineKind 着色；超长文件截断（大 diff 不整屏渲染）。
-/// TODO(egui): 真正的行虚拟化（egui_extras TableBody / show_rows），取消截断上限。
-const MAX_DIFF_LINES: usize = 800;
-
-fn render_diff_file(ui: &mut egui::Ui, f: &DiffFile, lang: &str) {
-    let dark = ui.visuals().dark_mode;
-    let mono = FontId::monospace(12.0);
-    let n = f.lines.len().min(MAX_DIFF_LINES);
-    // 长行不自动换行：横向滚动区域把内容宽度与面板宽度解耦，防止面板被撑宽
-    egui::ScrollArea::horizontal()
-        .id_salt(&f.path)
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            for line in &f.lines[..n] {
-                ui.horizontal(|ui| {
-                    if line.no > 0 {
-                        ui.weak(
-                            RichText::new(format!("{:>5}", line.no))
-                                .monospace()
-                                .size(11.0),
-                        );
-                    } else {
-                        ui.weak(RichText::new("     ").monospace().size(11.0));
-                    }
-                    let mut text = RichText::new(&line.text)
-                        .font(mono.clone())
-                        .color(kind_color(line.kind, dark));
-                    if line.kind == LineKind::Meta {
-                        text = text.strong();
-                    }
-                    ui.add(egui::Label::new(text).extend());
-                });
-            }
-        });
-    if f.lines.len() > MAX_DIFF_LINES {
-        ui.weak(trf(
-            lang,
-            "diff_truncated",
-            &[&MAX_DIFF_LINES.to_string(), &f.lines.len().to_string()],
-        ));
-    }
-}
-
-fn kind_color(kind: LineKind, dark: bool) -> Color32 {
-    match (kind, dark) {
-        (LineKind::Add, true) => Color32::from_rgb(86, 211, 100),
-        (LineKind::Add, false) => Color32::from_rgb(26, 127, 55),
-        (LineKind::Del, true) => Color32::from_rgb(248, 81, 73),
-        (LineKind::Del, false) => Color32::from_rgb(209, 36, 47),
-        (LineKind::Hunk, true) => Color32::from_rgb(151, 128, 255),
-        (LineKind::Hunk, false) => Color32::from_rgb(102, 57, 186),
-        (LineKind::Meta, true) => Color32::from_rgb(160, 160, 160),
-        (LineKind::Meta, false) => Color32::from_rgb(90, 90, 90),
-        (LineKind::Ctx, true) => Color32::from_rgb(190, 190, 190),
-        (LineKind::Ctx, false) => Color32::from_rgb(80, 80, 80),
-    }
-}
-
-fn ci_color(ci: &str) -> Color32 {
-    match ci {
-        "success" => Color32::from_rgb(46, 160, 67),
-        "failure" => Color32::from_rgb(209, 36, 47),
-        "pending" => Color32::from_rgb(191, 135, 0),
-        _ => Color32::GRAY,
-    }
-}
-
-fn score_color(s: f64, dark: bool) -> Color32 {
-    if s >= 7.0 {
-        kind_color(LineKind::Add, dark)
-    } else if s >= 5.0 {
-        Color32::from_rgb(191, 135, 0)
-    } else {
-        kind_color(LineKind::Del, dark)
-    }
-}
-
-impl eframe::App for PrDeskApp {
+impl eframe::App for EguiApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.handle_msgs();
-        self.poll_tick(ui.ctx());
-        // 面板顺序即层级：先加的在外层；CentralPanel 永远最后
-        self.top_bar(ui);
-        self.status_bar(ui);
-        self.detail_panel(ui);
-        self.pr_list(ui);
+        let ctx = ui.ctx().clone();
+        // 诊断（临时）：帧计数 + 视口状态，验证「不刷新」是事件循环没醒还是逻辑没跑
+        {
+            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let vp = ctx.input(|i| i.viewport().clone());
+            let ptr = ctx.input(|i| i.pointer.latest_pos());
+            let any_click = ctx.input(|i| i.pointer.any_click());
+            tracing::debug!("frame {n} focused={:?} minimized={:?} visible={:?} ptr={:?} click={}", vp.focused, vp.minimized, vp.visible(), ptr, any_click);
+        }
+
+        // ── 消息落地 ──
+        while let Ok(msg) = self.msg_rx.try_recv() {
+            self.apply_msg(&ctx, msg);
+        }
+        // F12 = 视口截图存 %TEMP%/prdesk-shot.png（自动化验证读屏用：
+        // 回调由 GPU 回读，不受窗口遮挡/多屏 DPI 影响；PostMessage WM_KEYDOWN 可达）
+        if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(|image| {
+                let path = std::env::temp_dir().join("prdesk-shot.png");
+                let img = image::DynamicImage::ImageRgba8(
+                    image::RgbaImage::from_raw(
+                        image.width() as u32,
+                        image.height() as u32,
+                        image.as_raw().to_vec(),
+                    )
+                    .unwrap_or_default(),
+                );
+                match img.save(&path) {
+                    Ok(()) => tracing::info!("截图已存 {}", path.display()),
+                    Err(e) => tracing::warn!("截图保存失败: {e}"),
+                }
+            })));
+        }
+        self.transient_tick();
+        self.poll_tick(&ctx);
+
+        // ── 关窗 → 托盘（而非退出）──
+        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            tracing::info!("收到 close_requested：隐藏到托盘");
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.save_geometry(&ctx);
+        }
+
+        self.hotkeys(ui);
+
+        // ── 布局：顶栏 / 状态栏 /（选中条）/ 中央视图 ──
+        ui_list::top_bar(self, ui);
+        ui_list::status_bar(self, ui);
+        ui_list::selection_bar(self, ui);
+        match self.view_mode {
+            0 => {
+                ui_detail::detail_panel(self, ui);
+                ui_list::pr_list_view(self, ui);
+            }
+            _ => {
+                ui_inbox::notif_preview(self, ui);
+                ui_inbox::inbox_view(self, ui);
+            }
+        }
+
+        // ── 弹窗（模态，顶层）──
+        ui_settings::settings_window(self, &ctx);
+        ui_settings::onboarding_window(self, &ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 真正退出（托盘「退出」）：通知 worker 停命令循环 + 收托盘线程
+        let _ = self.cmd_tx.send(Cmd::Shutdown);
+        if let Some(t) = self.tray.as_mut() {
+            t.stop();
+        }
+        if let Some(h) = self.worker_handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
-fn apply_theme(ctx: &egui::Context, theme: &str) {
+// ── 主题 / 字体 ──
+
+pub fn apply_theme(ctx: &egui::Context, theme: &str) {
     ctx.set_theme(if theme == "dark" { egui::Theme::Dark } else { egui::Theme::Light });
+}
+
+/// 字号档位：从 egui 默认基准重算（不累乘，避免多次切换漂移）。
+pub fn apply_font_scale(ctx: &egui::Context, scale: f32) {
+    use std::collections::BTreeMap;
+    let base: BTreeMap<egui::TextStyle, egui::FontId> = egui::Style::default().text_styles;
+    ctx.all_styles_mut(|style| {
+        style.text_styles = base
+            .iter()
+            .map(|(k, v)| (k.clone(), egui::FontId { size: v.size * scale, ..v.clone() }))
+            .collect();
+    });
 }
 
 /// 加载 CJK 字体：egui 内置字体不含中文，Windows 上注册微软雅黑（失败再试黑体/宋体）。
@@ -759,12 +841,12 @@ fn install_cjk_fonts(ctx: &egui::Context) {
                 fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(bytes).into());
                 fonts
                     .families
-                    .entry(FontFamily::Proportional)
+                    .entry(egui::FontFamily::Proportional)
                     .or_default()
                     .push("cjk".into());
                 fonts
                     .families
-                    .entry(FontFamily::Monospace)
+                    .entry(egui::FontFamily::Monospace)
                     .or_default()
                     .push("cjk".into());
                 tracing::info!("CJK 字体已加载: {path}");
@@ -797,6 +879,7 @@ fn main() -> anyhow::Result<()> {
     let data_dir = cfg_path.parent().unwrap_or(&exe_dir).join("data");
     pr_desk_rs::set_data_dir(data_dir.clone());
     std::fs::create_dir_all(&data_dir)?;
+    // 启动档案名收口：active_profile 指向不存在/非法的档案时回退本地（内存修正，不写盘）
     let active_name = if cfg.has_profile(&cfg.active_profile) {
         cfg.active_profile.clone()
     } else {
@@ -809,29 +892,21 @@ fn main() -> anyhow::Result<()> {
     let db = Db::open(&db_path)?;
     let cfg = Config { active_profile: active_name, ..cfg };
 
-    // GitHub 客户端（失败降级：本地列表仍可用，网络刷新跳过）
-    let gh = match github::GitHub::new(cfg.token(), &cfg.proxy) {
-        Ok(g) => Some(g),
-        Err(e) => {
-            tracing::warn!("GitHub 客户端初始化失败: {e}");
-            None
-        }
+    // 窗口几何记忆：配置里有记录才应用（首启不覆盖默认值；小于最小值视为垃圾忽略）
+    let (w, h) = match (cfg.window_width, cfg.window_height) {
+        (Some(w), Some(h)) if w >= 900.0 && h >= 480.0 => (w as f32, h as f32),
+        _ => (1280.0, 760.0),
     };
-    let rate_limit = gh.as_ref().map(|g| g.rate_limit_handle());
-
-    let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
-
-    let w = cfg.window_width.unwrap_or(1280.0) as f32;
-    let h = cfg.window_height.unwrap_or(760.0) as f32;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([w, h]),
         ..Default::default()
     };
-    let status_msg = if cfg.is_unconfigured() {
-        tr(&cfg.language, "cfg_unconfigured").to_string()
-    } else {
-        trf(&cfg.language, "cfg_repos", &[&cfg.repos.len().to_string()])
-    };
+
+    let unconfigured = cfg.is_unconfigured();
+    let gh_token_from_env = std::env::var("GITHUB_TOKEN").map(|t| !t.is_empty()).unwrap_or(false);
+    let profile_names = cfg.profile_names();
+    let status_msg = config_status(&cfg);
+    let s_review_prompt = String::new(); // 打开设置页时经 LoadReviewPrompt 重读
 
     eframe::run_native(
         "PR Desk",
@@ -839,32 +914,81 @@ fn main() -> anyhow::Result<()> {
         Box::new(move |cc| {
             install_cjk_fonts(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx, &cfg.theme);
-            // 字号档位（0.9 / 1.0 / 1.15）
-            cc.egui_ctx.all_styles_mut(|style| {
-                for fid in style.text_styles.values_mut() {
-                    fid.size *= cfg.font_scale;
-                }
-            });
+            apply_font_scale(&cc.egui_ctx, cfg.font_scale);
 
-            let cmd_tx = spawn_worker(db_path, gh, msg_tx, cc.egui_ctx.clone());
-            // 启动即刷新（先本地行上屏，网络在后台）
-            let _ = cmd_tx.send(Cmd::Refresh);
-            Ok(Box::new(PrDeskApp {
-                refreshing: true,
-                cfg: cfg.clone(),
-                cfg_path: cfg_path.clone(),
-                db,
-                rows: Vec::new(),
-                filter: String::new(),
-                collapsed: HashSet::new(),
-                selected: None,
-                detail: None,
-                status_msg,
+            let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
+            let app = Arc::new(Mutex::new(App::new(cfg.clone(), db)));
+            app.lock_recover().status_msg = status_msg;
+            let (cmd_tx, worker_handle) =
+                worker::spawn(app.clone(), msg_tx.clone(), cc.egui_ctx.clone(), cfg_path.clone());
+            // 托盘：左键还原 / 右键菜单「显示 / 退出」
+            let lang = cfg.language.clone();
+            let tray = tray::Tray::start(
+                msg_tx,
+                cc.egui_ctx.clone(),
+                tr(&lang, "tray_show"),
+                tr(&lang, "tray_quit"),
+            );
+
+            // 启动：初始刷新 + 同步
+            let _ = cmd_tx.send(Cmd::RefreshGithub);
+            let _ = cmd_tx.send(Cmd::Sync);
+
+            Ok(Box::new(EguiApp {
+                app,
                 cmd_tx,
                 msg_rx,
-                rate_limit,
-                last_poll: Instant::now(),
+                worker_handle: Some(worker_handle),
                 md_cache: egui_commonmark::CommonMarkCache::default(),
+                last_poll: Instant::now(),
+                cfg_path,
+                view_mode: 0,
+                profile_names,
+                filter_buf: String::new(),
+                panel: None,
+                diff_files: Vec::new(),
+                panel_tab: 0,
+                panel_width_cur: cfg.panel_width.unwrap_or(420.0).max(320.0) as f32,
+                scroll_to: None,
+                inbox_loading: false,
+                inbox_sel: None,
+                nd_open: false,
+                nd_title: String::new(),
+                nd_kind: String::new(),
+                nd_kind_label: String::new(),
+                nd_state: String::new(),
+                nd_loading: false,
+                nd_convo: Vec::new(),
+                nd_files: Vec::new(),
+                nd_diff: Vec::new(),
+                mar_confirm: None,
+                settings_open: unconfigured, // 首启自动打开设置
+                settings_tab: 0,
+                settings_profile: "local".into(),
+                s_server: String::new(),
+                s_sync_token: String::new(),
+                s_ak: String::new(),
+                s_gh_token: String::new(),
+                s_proxy: String::new(),
+                s_repos: String::new(),
+                s_poll: 5,
+                s_llm_base: String::new(),
+                s_llm_key: String::new(),
+                s_llm_model: String::new(),
+                s_ocr_path: String::new(),
+                s_review_conc: 3,
+                s_review_prompt,
+                s_prompt_loading: false,
+                dialog_error: String::new(),
+                model_list: Vec::new(),
+                model_list_open: false,
+                adding_profile: false,
+                add_profile_name: String::new(),
+                del_confirm: None,
+                gh_token_from_env,
+                onboarding_dismissed: false,
+                allow_close: false,
+                tray: Some(tray),
             }))
         }),
     )
