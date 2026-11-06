@@ -265,6 +265,7 @@ export component MainWindow inherits Window {
     in property <bool> d_open: false;
     in property <string> d_title: "";
     in property <string> d_author: "";
+    in property <string> d_author_initial: "?";   // 头像降级单字母（Rust 侧算好）
     in property <image> d_avatar;
     in property <string> d_state: "open";
     in property <string> d_ci: "";
@@ -521,6 +522,7 @@ export component MainWindow inherits Window {
                     max_panel_width: root.width * 0.6;
                     title: root.d_title;
                     author: root.d_author;
+                    author_initial: root.d_author_initial;
                     avatar: root.d_avatar;
                     state: root.d_state;
                     ci: root.d_ci;

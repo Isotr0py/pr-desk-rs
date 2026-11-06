@@ -15,6 +15,7 @@ export struct PrListRow {
     priority: int,      // 0 未排 / 1 高 / 2 中 / 3 低
     author: string,
     avatar: image,      // Rust 侧传入的头像
+    initial: string,    // 头像缺失时的降级单字母（Rust 侧 avatar_initial 算好）
     org1: image,        // 作者公开组织的图标（最多 3 个；无则空 image）
     org2: image,
     org3: image,
@@ -688,6 +689,7 @@ component PrRowItem inherits Rectangle {
         Avatar {
             img: root.pr.avatar;
             login: root.pr.author;
+            initial: root.pr.initial;
             size: 16px;
             x: 0;
             y: (parent.height - 16px) / 2;

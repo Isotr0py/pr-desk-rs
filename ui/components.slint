@@ -2,51 +2,48 @@
 import { Theme } from "theme.slint";
 import { I18n } from "i18n.slint";
 
-// 圆形头像：img 有效时裁剪为圆形图片；否则显示 login 首字母。
+// 圆形头像：img 有效时裁剪为圆形图片；否则显示首字母。
 // 无图底色：按 login 长度做稳定伪哈希，从 4 个主题色相中选 1 个，
 // 底色为色相 15% 透明、文字为色相本体，明暗主题下均柔和可读。
-// 有图时不开 clip：头像 PNG 已在 Rust 侧预裁圆（透明圆角烘进像素，
-// 见 circle_crop.rs / avatars.rs），femtovg 每个圆形 clip 都是一次
-// stencil pass，列表几十个头像滚动时集显扛不住。仅字母回退分支需要
-// clip 裁溢出文字。
+// 全路径不开 clip：底圆由 border-radius 直接绘制（不需要 stencil），
+// 降级字母是 Rust 侧算好的单字符（initial），居中不溢出无需裁剪；
+// 图片已在 Rust 侧预裁圆（透明圆角烘进像素，见 circle_crop.rs / avatars.rs）。
+// 此前的 clip: !has-img 与外层容器 clip 嵌套会把降级文字画坏（femtovg 嵌套 clip
+// 在雅黑/Consolas 下又小又偏，实测可偏出圆外呈全空白）；降级字母常画在图片下层，
+// 图片透明角/渲染异常时兜底可见——任何状态下这里都不应该是空白。
 export component Avatar inherits Rectangle {
     in property <string> login;
     in property <image> img;
     in property <length> size: 20px;
+    in property <string> initial: "?";   // 降级显示的单字母（Rust 侧 avatar_initial 算好）
 
     width: root.size;
     height: root.size;
     border-radius: root.size / 2;
-    clip: !root.has-img;
 
     property <bool> has-img: root.img.width > 0 && root.img.height > 0;
     property <[color]> palette: [Theme.accent, Theme.purple, Theme.good, Theme.mid];
     property <color> tone: root.palette[mod(root.login.character-count, 4)];
 
-    background: root.has-img ? #00000000 : root.tone.with-alpha(0.15);
+    background: root.tone.with-alpha(0.15);
 
+    // 降级字母：常画（有图时被不透明像素盖住；图透明/渲染异常时兜底可见）
+    Text {
+        width: 100%;
+        height: 100%;
+        text: root.initial;
+        font-family: Theme.mono_font;
+        font-size: root.size * 0.5;
+        font-weight: 600;
+        color: root.tone;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
     if root.has-img: Image {
         width: 100%;
         height: 100%;
         source: root.img;
         image-fit: cover;
-    }
-    if !root.has-img: Text {
-        property <length> fs: root.size * 0.5;
-        // 首字母居中：文本左缘放在 (size - 字宽)/2，后续字母自然溢出，
-        // 由外层圆形 clip 裁掉。不要再套内层 clip 窗口——femtovg 嵌套 clip
-        // 会把文字画得又小又偏（雅黑/Consolas 均中招）
-        property <length> gw: fs * 0.62;  // 等宽字体单字宽 ≈ 0.6em
-        x: (root.size - gw) / 2;
-        width: root.size * 2;
-        height: parent.height;
-        text: root.login.to-uppercase();
-        font-family: Theme.mono_font;
-        font-size: fs;
-        font-weight: 600;
-        color: root.tone;
-        wrap: no-wrap;
-        vertical-alignment: center;
     }
 }
 

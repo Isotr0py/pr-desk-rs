@@ -188,6 +188,16 @@ pub fn build_items(
     (items, keys, visible)
 }
 
+/// 头像字母降级的单字母：作者名首字符大写（空 → "?"）。
+/// Slint 表达式没有字符串切片，首字母只能 Rust 侧算好随模型下发。
+pub fn avatar_initial(author: &str) -> String {
+    author
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().collect())
+        .unwrap_or_else(|| "?".into())
+}
+
 pub fn to_row(r: &serde_json::Value, lang: &str) -> PrListRow {
     let author = r["author"].as_str().unwrap_or("");
     // 作者公开组织的图标（最多 3 个，右对齐展示；图标由 prefetch_orgs 预取到磁盘缓存）
@@ -206,6 +216,7 @@ pub fn to_row(r: &serde_json::Value, lang: &str) -> PrListRow {
         priority: r["priority"].as_i64().unwrap_or(0) as i32,
         author: author.into(),
         avatar: avatars::get_avatar(author).unwrap_or_default(),
+        initial: avatar_initial(author).into(),
         org1: org_icon(0),
         org2: org_icon(1),
         org3: org_icon(2),
@@ -295,6 +306,15 @@ mod tests {
         assert_eq!(activity_text(&r3, "zh"), "");
         // 都没有
         assert_eq!(activity_text(&serde_json::json!({}), "zh"), "");
+    }
+
+    #[test]
+    fn avatar_initial_first_letter_or_fallback() {
+        assert_eq!(avatar_initial("octocat"), "O");
+        assert_eq!(avatar_initial("claude[bot]"), "C");
+        assert_eq!(avatar_initial(""), "?");
+        // 非 ASCII 首字符原样大写（不崩）
+        assert_eq!(avatar_initial("中文名"), "中");
     }
 
     fn frow(repo: &str, number: i64, title: &str, author: &str) -> serde_json::Value {

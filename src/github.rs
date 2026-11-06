@@ -8,6 +8,20 @@ use serde_json::Value;
 
 const API: &str = "https://api.github.com";
 
+/// URL 路径段转义（percent-encode，保留 RFC 3986 unreserved 字符）。
+/// GitHub login 名义上只含 [A-Za-z0-9-]，但 bot 账号（如 claude[bot]）带方括号，
+/// 未编码直接拼进 /users/{login} 会被代理解析坏或被 GitHub 400。
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// 聚合 check runs → ci_status：任一失败类 conclusion → "failure"；
 /// 否则任一未完成（status 为 queued/in_progress/waiting 或 conclusion 为空）→ "pending"；
 /// 空列表 → "none"；全部成功 → "success"。
@@ -245,7 +259,7 @@ impl GitHub {
 
     /// 拉用户的公开组织成员关系（GET /users/{login}/orgs）→ org login 列表。
     pub async fn fetch_user_orgs(&self, login: &str) -> Result<Vec<String>> {
-        let url = format!("{API}/users/{login}/orgs");
+        let url = format!("{API}/users/{}/orgs", encode_path_segment(login));
         let resp = self.client.get(&url).send().await?;
         self.record_rate_limit(resp.headers());
         if !resp.status().is_success() {
@@ -260,7 +274,7 @@ impl GitHub {
 
     /// login → avatar_url（GET /users/{login}；org 账号同路径）。
     pub async fn fetch_avatar_url(&self, login: &str) -> Result<Option<String>> {
-        let url = format!("{API}/users/{login}");
+        let url = format!("{API}/users/{}", encode_path_segment(login));
         let resp = self.client.get(&url).send().await?;
         self.record_rate_limit(resp.headers());
         if !resp.status().is_success() {
@@ -449,6 +463,20 @@ fn parse_states_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encode_path_segment_encodes_non_unreserved() {
+        // GitHub 用户名片段只需 unreserved 原样通过
+        assert_eq!(encode_path_segment("octocat"), "octocat");
+        assert_eq!(encode_path_segment("some-user_1.2~3"), "some-user_1.2~3");
+        // bot 名的方括号必须编码（未编码拼进 /users/{login} 路径会被拒绝/解析坏）
+        assert_eq!(encode_path_segment("claude[bot]"), "claude%5Bbot%5D");
+        // 非 ASCII 按 UTF-8 逐字节编码
+        assert_eq!(encode_path_segment("中文"), "%E4%B8%AD%E6%96%87");
+        // 斜杠不得穿透成路径分隔
+        assert_eq!(encode_path_segment("a/b"), "a%2Fb");
+        assert_eq!(encode_path_segment(""), "");
+    }
 
     fn run(status: &str, conclusion: Option<&str>) -> Value {
         match conclusion {

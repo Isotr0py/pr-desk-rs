@@ -169,6 +169,9 @@ enum Msg {
         checks_json: Option<String>,
         files_json: Option<String>,
     },
+    // 会话头像预取落盘完成（有实际新拉取才发）：apply 侧按身份守卫后原地更新
+    // d_convo/nd_convo 各行的 avatar 字段（不重装模型，避免闪烁），顺带刷面板头部头像
+    ConvoAvatars { repo: String, number: i64 },
 }
 
 /// 会话条目展示数据（纯 Rust 数据可跨线程；markdown 在 worker 侧已解析成 blocks，
@@ -525,6 +528,8 @@ struct App {
     inbox_page: u32,                        // 已加载到的页码（每页 50 条；「加载更多」追加下一页）
     inbox_has_more: bool,                   // 是否还有下一页可加载
     inbox_loading_more: bool,               // 「加载更多」进行中（防重入）
+    inbox_fetching: bool,                   // 通知拉取在飞（fetch_inbox 在飞去重：并发触发合并为一次+补跑）
+    inbox_fetch_again: bool,                // 在飞期间又来拉取需求：结束后补跑一次
     inbox_detail: Option<(String, i64, String, String)>,  // 预览面板当前行（repo, number, kind, url）
     diff_data: Vec<DiffFileData>,           // 详情面板当前 diff 缓存（折叠翻转重建模型用）
     nd_diff_data: Vec<DiffFileData>,        // Inbox 预览面板当前 diff 缓存（同上）
@@ -695,6 +700,8 @@ fn main() -> anyhow::Result<()> {
         inbox_page: 1,
         inbox_has_more: false,
         inbox_loading_more: false,
+        inbox_fetching: false,
+        inbox_fetch_again: false,
         inbox_detail: None,
         diff_data: Vec::new(),
         nd_diff_data: Vec::new(),
@@ -2149,6 +2156,35 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
     let convo = plain_convo_entries(
         &serde_json::from_str::<Vec<serde_json::Value>>(&convo_json).unwrap_or_default(),
     );
+    // 会话作者头像预取：装盒时读的是磁盘缓存（miss → 字母降级），这里后台补齐；
+    // 有实际新拉取才发 ConvoAvatars 让 UI 原地回填（模式照抄 reload_rows 尾部的头像预取：
+    // 必须 GitHub::new 标准客户端——自建裸 reqwest 在 worker 会挂死）。spawn 而非 inline
+    // await：open_drawer_work 跑在命令循环里，网络 await 会堵住后续命令（延迟事故的教训）
+    let convo_authors: Vec<String> = {
+        let mut v: Vec<String> = convo
+            .iter()
+            .map(|e| e.author.clone())
+            .filter(|a| !a.is_empty())
+            .collect();
+        v.sort();
+        v.dedup();
+        v
+    };
+    if !convo_authors.is_empty() {
+        let app2 = app.clone();
+        let msg_tx2 = msg_tx.clone();
+        let (repo2, number2) = (repo.clone(), number);
+        tokio::spawn(async move {
+            let (token, proxy) = {
+                let c = app2.lock_recover().cfg.clone();
+                (c.token(), c.proxy)
+            };
+            let Ok(gh) = github::GitHub::new(token, &proxy) else { return };
+            if avatars::prefetch(&gh, convo_authors).await > 0 {
+                let _ = msg_tx2.send(Msg::ConvoAvatars { repo: repo2, number: number2 });
+            }
+        });
+    }
     let files_json = match &diff_cached {
         Some(d) => {
             let j = files_json_from_diff(d);
@@ -2464,11 +2500,15 @@ fn plain_convo_entries(entries: &[serde_json::Value]) -> Vec<PlainConvoEntry> {
 }
 
 /// PlainConvoEntry → Slint ConvoEntry 模型（纯装盒，UI 线程；Msg::Panel / PanelLive / NotifDetail 共用）。
+/// 头像读磁盘缓存（get_avatar 带 mtime 校验，prefetch 落盘后自动命中新图）；
+/// 缓存未命中走字母降级，实际拉取由 ConvoAvatars 预取回填补齐。
 fn convo_models(entries: Vec<PlainConvoEntry>) -> Vec<ConvoEntry> {
     entries
         .into_iter()
         .map(|e| ConvoEntry {
+            initial: model::avatar_initial(&e.author).into(),
             kind: e.kind.into(),
+            avatar: avatars::get_avatar(&e.author).unwrap_or_default(),
             author: e.author.into(),
             time: e.time.into(),
             text: e.text.into(),
@@ -2662,7 +2702,33 @@ fn build_inbox_rows(a: &App, jsons: &[serde_json::Value]) -> Vec<NotifRow> {
 /// 拉取 GitHub 通知并回送 UI（无 token 时静默跳过：通知接口必须鉴权）。
 /// 刷新语义：重拉已加载的全部页（1..=inbox_page），保序拼接 + 按 thread id 去重，
 /// 这样用户「加载更多」后定时刷新不会把多页数据塌回第一页。
+/// 拉取通知（在飞合并去重）：spawn 化后启动路径会同时发 RefreshGithub + Sync，
+/// 两臂都拉通知——同一毫秒跑两次全量拉取白烧 API 配额。这里做在飞去重：
+/// 已有拉取在飞时只记「结束后补跑一次」（coalesce，不排队 N 次），
+/// 单独触发（如同步按钮）时在飞为空、正常执行——语义两端都保住。
 async fn fetch_inbox(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
+    loop {
+        {
+            let mut a = app.lock_recover();
+            if a.inbox_fetching {
+                a.inbox_fetch_again = true;
+                return;
+            }
+            a.inbox_fetching = true;
+        }
+        fetch_inbox_once(gh, app, msg_tx).await;
+        let again = {
+            let mut a = app.lock_recover();
+            a.inbox_fetching = false;
+            std::mem::take(&mut a.inbox_fetch_again)
+        };
+        if !again {
+            return;
+        }
+    }
+}
+
+async fn fetch_inbox_once(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
     let (has_token, all, pages) = {
         let a = app.lock_recover();
         (a.cfg.token().is_some(), a.inbox_all, a.inbox_page.max(1))
@@ -3331,14 +3397,27 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     } else {
                         (Vec::new(), String::new())
                     };
+                    let convo_entries = plain_convo_entries(&convo);
+                    // 会话作者头像：装盒读缓存（miss → 字母降级），随后用现成的标准客户端
+                    // 预取补齐（本 task 已在后台，inline await 不堵命令循环）；有新图发回填消息
+                    let mut authors: Vec<String> = convo_entries
+                        .iter()
+                        .map(|e| e.author.clone())
+                        .filter(|a| !a.is_empty())
+                        .collect();
+                    authors.sort();
+                    authors.dedup();
                     let _ = tx.send(Msg::NotifDetail {
-                        repo,
+                        repo: repo.clone(),
                         number,
-                        convo: plain_convo_entries(&convo),
+                        convo: convo_entries,
                         files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
                         diff_files: parse_diff(&diff),
                     });
                     let _ = tx.send(Msg::StatusBarRefresh);
+                    if !authors.is_empty() && avatars::prefetch(g, authors).await > 0 {
+                        let _ = tx.send(Msg::ConvoAvatars { repo, number });
+                    }
                 });
             }
             Cmd::OpenDrawer { repo, number, refetch } => {
@@ -3763,6 +3842,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     let mut updated_out: Option<String> = None;
                     let mut checks_json_out: Option<String> = None;
                     let mut convo_out: Option<Vec<PlainConvoEntry>> = None;
+                    let mut convo_authors: Vec<String> = Vec::new();
                     let mut files_json_out: Option<String> = None;
                     let mut dirty = false;
 
@@ -3844,6 +3924,12 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             x["time"].as_str().unwrap_or("~").cmp(y["time"].as_str().unwrap_or("~"))
                         });
                         convo_out = Some(plain_convo_entries(&convo_items));
+                        // 会话作者收集（含评论与评审）：头像预取在 PanelLive 回送后做，
+                        // 装盒时缓存 miss 的字母降级由随后的 ConvoAvatars 原地回填
+                        convo_authors = convo_out
+                            .as_ref()
+                            .map(|es| es.iter().map(|e| e.author.clone()).collect())
+                            .unwrap_or_default();
                         dirty = true;
                     }
                     if let Some(files) = &files {
@@ -3868,7 +3954,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     if dirty {
                         reload_rows(&app, &msg_tx);
                         let _ = msg_tx.send(Msg::PanelLive {
-                            repo,
+                            repo: repo.clone(),
                             number,
                             ci: ci_out,
                             state: state_out,
@@ -3878,6 +3964,17 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             files_json: files_json_out,
                         });
                         let _ = msg_tx.send(Msg::StatusBarRefresh);
+                    }
+                    // 会话作者头像预取回填（与 open_drawer / NotifDetail 同款）：
+                    // 首屏会话可能来自面板缓存（extras_detail 滞后），新条目由本路径带进来——
+                    // 不在这里预取的话这些作者永远停在字母降级。跟 FetchPrLive 的 120s
+                    // 节流同频，且 prefetch 内部按 TTL 过滤新鲜缓存，不放大请求量。
+                    if !convo_authors.is_empty() {
+                        convo_authors.sort();
+                        convo_authors.dedup();
+                        if avatars::prefetch(&g, convo_authors).await > 0 {
+                            let _ = msg_tx.send(Msg::ConvoAvatars { repo, number });
+                        }
                     }
                     });
                 }
@@ -4223,8 +4320,10 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
         Msg::Panel { title, author, state, ci, opened, updated, body, priority, pinned, on_board, convo, checks_json, files_json, review } => {
             ui.set_d_title(title.into());
             ui.set_d_author(author.clone().into());
-            // 头像在 UI 线程从磁盘缓存读（slint::Image 是 Rc，不过线程边界）
+            // 头像在 UI 线程从磁盘缓存读（slint::Image 是 Rc，不过线程边界）；
+            // initial 是头像缺失时的降级字母（Slint 无字符串切片，Rust 算好）
             ui.set_d_avatar(avatars::get_avatar(&author).unwrap_or_default());
+            ui.set_d_author_initial(model::avatar_initial(&author).into());
             ui.set_d_state(state.into());
             ui.set_d_ci(ci.into());
             ui.set_d_opened(opened.into());
@@ -4411,6 +4510,35 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
                 ui.set_diff_max_text(diff_max_line(&files));
             }
         }
+        Msg::ConvoAvatars { repo, number } => {
+            // 会话头像预取落盘后的原地回填：逐行 set_row_data 只换 avatar 字段
+            //（不重装整个模型——重装配会重置滚动位置并闪）。get_avatar 带 mtime
+            // 一致性校验，prefetch 落盘后这里读到新图；仍无缓存的行保持字母降级。
+            fn backfill(model: ModelRc<ConvoEntry>) {
+                for i in 0..model.row_count() {
+                    let Some(mut e) = model.row_data(i) else { continue };
+                    if let Some(img) = avatars::get_avatar(&e.author) {
+                        e.avatar = img;
+                        model.set_row_data(i, e);
+                    }
+                }
+            }
+            if panel_matches(app, &repo, number) {
+                backfill(ui.get_d_convo());
+                // 面板头部头像顺带刷新（同一作者可能刚落盘）
+                let author = ui.get_d_author().to_string();
+                ui.set_d_avatar(avatars::get_avatar(&author).unwrap_or_default());
+            }
+            // Inbox 预览面板：身份守卫后同样回填（与主面板身份互不妨碍，都匹配就都刷）
+            let current = app
+                .lock_recover()
+                .inbox_detail
+                .as_ref()
+                .map(|(r, n, _, _)| (r.clone(), *n));
+            if current.as_ref() == Some(&(repo, number)) {
+                backfill(ui.get_nd_convo());
+            }
+        }
     }
 }
 
@@ -4527,6 +4655,8 @@ mod tests {
             inbox_page: 1,
             inbox_has_more: false,
             inbox_loading_more: false,
+            inbox_fetching: false,
+            inbox_fetch_again: false,
             inbox_detail: None,
             diff_data: Vec::new(),
             nd_diff_data: Vec::new(),

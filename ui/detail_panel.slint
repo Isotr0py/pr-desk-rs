@@ -19,6 +19,8 @@ export struct ConvoEntry {
     time: string,   // 相对时间，如 "2h"
     text: string,   // 内容摘要（blocks 为空时的回退显示）
     blocks: [MdBlock],  // Rust 端解析出的 Markdown 块；空数组 → 回退渲染 text
+    avatar: image,  // 作者头像（Rust 侧装盒时读磁盘缓存；空 image → 字母降级）
+    initial: string,  // 头像缺失时的降级单字母（Rust 侧算好，居中不溢出）
 }
 
 // CI 检查项：conclusion = "success" / "failure" / "pending" / 其他（灰显原文）
@@ -237,6 +239,7 @@ export component DetailPanel inherits Rectangle {
     in property <string> title: "";
     in property <string> author: "";
     in property <image> avatar;
+    in property <string> author_initial: "?";   // 头像缺失时的降级单字母（Rust 侧算好）
     in property <string> state: "open";     // open / merged / closed
     in property <string> ci: "";            // success / failure / pending / ""（空不显示 CI 徽章）
     in property <string> opened: "";        // 创建相对时间，如 "3d"
@@ -390,6 +393,7 @@ export component DetailPanel inherits Rectangle {
                             y: 2px;
                             login: root.author;
                             img: root.avatar;
+                            initial: root.author_initial;
                             size: 16px;
                         }
                     }
@@ -1035,6 +1039,8 @@ export component DetailPanel inherits Rectangle {
                                 width: 24px;
                                 Avatar {
                                     login: e.author;
+                                    img: e.avatar;
+                                    initial: e.initial;
                                     size: 24px;
                                 }
                             }
