@@ -3,6 +3,15 @@
 
 /// 中文表（现状文案，key 的最终来源）。
 const ZH: &[(&str, &str)] = &[
+    // ── egui 骨架 UI（顶栏/状态栏/详情面板）──
+    ("tb_refresh", "刷新"),
+    ("tb_search_hint", "搜索（标题 / #编号 / 作者 / 仓库）"),
+    ("tb_theme_dark", "深色"),
+    ("tb_theme_light", "浅色"),
+    ("sb_pr_count", "共 {0} 个 PR"),
+    ("detail_no_review", "暂无评审结果"),
+    ("detail_no_diff", "暂无 diff（点刷新拉取）"),
+    ("diff_truncated", "… 仅显示前 {0} 行，共 {1} 行"),
     // ── 列表分组标题（lib.rs build_sections；数量徽章由 UI 层画，标题不再拼计数）──
     ("section_pinned", "Pinned"),
     ("section_board", "看板"),
@@ -148,6 +157,15 @@ const ZH: &[(&str, &str)] = &[
 
 /// 英文表；缺 key 回退中文。
 const EN: &[(&str, &str)] = &[
+    // egui skeleton UI (top bar / status bar / detail panel)
+    ("tb_refresh", "Refresh"),
+    ("tb_search_hint", "Search (title / #number / author / repo)"),
+    ("tb_theme_dark", "Dark"),
+    ("tb_theme_light", "Light"),
+    ("sb_pr_count", "{0} PRs"),
+    ("detail_no_review", "No review yet"),
+    ("detail_no_diff", "No diff yet (refresh to fetch)"),
+    ("diff_truncated", "… showing first {0} of {1} lines"),
     ("section_pinned", "Pinned"),
     ("section_board", "Board"),
     ("section_pending", "To Review"),

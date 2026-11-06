@@ -1,8 +1,7 @@
 //! 头像圆形 alpha 预裁：把圆角透明烘进像素，UI 不再靠 stencil clip 裁圆。
-//! femtovg 每个圆形 clip 都是一次 stencil pass——列表里 25-50 个头像滚动时
+//! GPU 渲染器每个圆形 clip 都是一次 stencil pass——列表里 25-50 个头像滚动时
 //! 在集显上是最大的渲染热点；预裁后 Image 自带透明圆角，clip 整个省掉。
-//! 放在 lib（而不是二进制侧的 avatars.rs）是为了 `cargo test --no-default-features --lib`
-//! 能覆盖（avatars.rs 依赖 slint::Image，只能随 UI feature 编译）。
+//! 放在 lib（而不是二进制侧的 UI 代码）是为了 `cargo test --lib` 能覆盖。
 
 /// 把方形 RGBA 图裁成圆形：内切圆内保持原 alpha，圆外 alpha=0，
 /// 边缘留约 1px 线性过渡带抗锯齿。非方形图按短边内切圆居中裁。
