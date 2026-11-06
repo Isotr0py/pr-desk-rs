@@ -1405,7 +1405,8 @@ fn main() -> anyhow::Result<()> {
     {
         // 行左键点击（带修饰键语义；行的 pointer-event 统一派发）：
         // 无修饰 = 清多选 + 单选 + 打开详情（与 row_activated 同出口）；
-        // Ctrl = toggle 该行进/出多选（移动主选中，但不开详情——多选场景下面板频闪）；
+        // Ctrl = toggle 该行进/出多选（集合为空时以当前选中行为起点扩充；
+        // 移动主选中，但不开详情——多选场景下面板频闪）；
         // Shift = 从锚点到本行（view_visible 序）范围入多选（不开详情）
         let app = app.clone();
         let cmd_tx = cmd_tx.clone();
@@ -1424,6 +1425,14 @@ fn main() -> anyhow::Result<()> {
                         a.anchor = Some(key.clone());
                     }
                 } else if ctrl {
+                    // 标准多选手感（Explorer/Finder）：集合为空时当前选中行是多选起点，
+                    // Ctrl 加选在其基础上扩充，而不是从空集合开始丢掉它
+                    if a.selection.is_empty()
+                        && let Some(cur) = a.selected.clone()
+                        && cur != key
+                    {
+                        a.selection.push(cur);
+                    }
                     selection::toggle(&mut a.selection, &key);
                     a.anchor = Some(key.clone());
                 } else {
