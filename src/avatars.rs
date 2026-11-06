@@ -24,7 +24,8 @@ fn key(name: &str) -> String {
 }
 
 pub fn cache_dir() -> PathBuf {
-    pr_desk_rs::exe_data_dir().join("avatars")
+    // 数据目录可被 set_data_dir 重锚定（防 cargo clean 清掉 target/ 里的库）
+    pr_desk_rs::data_dir().join("avatars")
 }
 
 pub fn avatar_path(login: &str) -> PathBuf {

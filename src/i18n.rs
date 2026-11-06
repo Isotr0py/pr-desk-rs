@@ -39,6 +39,10 @@ const ZH: &[(&str, &str)] = &[
     ("review_queued", "已排队 {0} 个评审"),
     ("links_copied", "已复制 {0} 个链接"),
     ("batch_open_capped", "一次最多打开 {0} 个，其余 {1} 个已忽略"),
+    // ── 跨档案复制 ──
+    ("copy_done", "已复制 {0} 项到档案「{1}」（含 {2} 条评审）"),
+    ("copy_done_skipped", "已复制 {0} 项到档案「{1}」（含 {2} 条评审；{3} 项已存在跳过）"),
+    ("copy_failed", "复制到档案失败: {0}"),
     // ── Inbox 通知类型 / 原因（GitHub 原始枚举值 → 界面文案；未知值回退原串）──
     ("kind_pull_request", "拉取请求"),
     ("kind_issue", "议题"),
@@ -177,6 +181,9 @@ const EN: &[(&str, &str)] = &[
     ("review_queued", "Queued {0} reviews"),
     ("links_copied", "Copied {0} links"),
     ("batch_open_capped", "At most {0} opened at once; skipped {1}"),
+    ("copy_done", "Copied {0} PR(s) to profile \"{1}\" ({2} reviews included)"),
+    ("copy_done_skipped", "Copied {0} PR(s) to profile \"{1}\" ({2} reviews included; {3} already existed, skipped)"),
+    ("copy_failed", "Copy to profile failed: {0}"),
     ("kind_pull_request", "Pull Request"),
     ("kind_issue", "Issue"),
     ("kind_release", "Release"),

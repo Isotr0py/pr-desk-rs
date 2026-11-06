@@ -249,6 +249,8 @@ export component MainWindow inherits Window {
     in property <bool> sel_all_pinned: false;   // 多选行全部已置顶（菜单/操作条文案翻转用）
     in property <bool> sel_all_on_board: false;
     in property <bool> sel_all_rejected: false;
+    // 「复制到档案…」的目标名单（全部档案 − 当前档案；Rust 侧 set_copy_targets 回写）
+    in property <[string]> copy_targets: [];
     // PageUp/PageDown 桥接：keys FocusScope 在视图的 if 作用域之外，够不到
     // list/panel/inbox 的 id——计数器累加（有符号），各 if 作用域里的 changed 消费
     in-out property <int> page_req: 0;
@@ -340,6 +342,7 @@ export component MainWindow inherits Window {
     callback batch_copy_links();
     callback batch_open_browser();
     callback clear_multi_selection();
+    callback copy_to_profile(string);   // 右键菜单/操作条：当前选择集复制到目标档案
     callback row_pin(int);
     callback row_reject(int);
     callback row_board(int);
@@ -489,6 +492,7 @@ export component MainWindow inherits Window {
                     sel_all_pinned: root.sel_all_pinned;
                     sel_all_on_board: root.sel_all_on_board;
                     sel_all_rejected: root.sel_all_rejected;
+                    copy_targets: root.copy_targets;
                     // 弹窗/引导打开时锁键盘（Esc/j/k 等不得穿透到列表）
                     keys_locked: root.settings_open || (root.onboarding && !root.onboarding_dismissed);
                     header_clicked(c) => { root.header_clicked(c); }
@@ -507,6 +511,7 @@ export component MainWindow inherits Window {
                     batch_copy_links() => { root.batch_copy_links(); }
                     batch_open_browser() => { root.batch_open_browser(); }
                     clear_multi_selection() => { root.clear_multi_selection(); }
+                    copy_to_profile(p) => { root.copy_to_profile(p); }
                     key_move(d) => { root.key_move(d); }
                     key_enter() => { root.key_enter(); }
                     dismissed => {

@@ -952,6 +952,8 @@ export component PrListView inherits FocusScope {
     in property <bool> sel_all_pinned: false;
     in property <bool> sel_all_on_board: false;
     in property <bool> sel_all_rejected: false;
+    // 「复制到档案…」的目标名单（全部档案 − 当前档案；MainWindow 透传）
+    in property <[string]> copy_targets: [];
 
     callback header_clicked(string);    // 表头点击排序（传列 key）
     callback group_toggled(string);     // 组头点击折叠/展开（传组 key）
@@ -976,11 +978,17 @@ export component PrListView inherits FocusScope {
     callback batch_copy_links();
     callback batch_open_browser();
     callback clear_multi_selection();
+    callback copy_to_profile(string);   // 「复制到档案…」选定目标档案（传档案名）
 
     // 多选操作条占位（列表顶部，0 或 32px；手动偏移体系，不走 stretch 布局）
     property <length> top-off: root.sel_count > 0 ? 32px : 0px;
-    // 右键菜单高：行数（单选多一行 Open in Browser）×26 + 3 条分隔线 ×9 + 上下 padding 8
-    property <length> ctx-menu-h: (root.sel_count <= 1 ? 11 : 10) * 26px + 35px;
+    // 右键菜单处于档案选择模式（「复制到档案…」点入后同弹窗换成档案列表）
+    property <bool> ctx-profile-mode: false;
+    // 右键菜单高：普通模式 = 行数（单选多一行 Open in Browser；有复制目标多一行复制到档案）
+    // ×26 + 3 条分隔线 ×9 + 上下 padding 8；档案模式 = 标题行 + N 个档案 + padding
+    property <length> ctx-menu-h: root.ctx-profile-mode
+        ? (root.copy_targets.length + 1) * 26px + 8px
+        : ((root.sel_count <= 1 ? 11 : 10) + (root.copy_targets.length > 0 ? 1 : 0)) * 26px + 35px;
 
     // 内容宽：视口宽与「固定列合计 + 最小标题列」取大（小于视口时铺满，大于时可横滚）
     property <length> content-w: max(root.width, Cols.min-total);
@@ -991,6 +999,7 @@ export component PrListView inherits FocusScope {
     property <length> ctx-y: 0px;
     function open_ctx(ridx: int, x: length, y: length) {
         root.row_context(ridx);
+        root.ctx-profile-mode = false;   // 每次打开回到普通模式
         root.ctx-x = min(max(0px, x), max(0px, root.width - 230px - 4px));
         root.ctx-y = min(max(0px, y), max(0px, root.height - root.ctx-menu-h - 4px));
         ctx-popup.show();
@@ -1106,6 +1115,39 @@ export component PrListView inherits FocusScope {
                     label: I18n.ctx_copy_links;
                     clicked => { root.batch_copy_links(); }
                 }
+                // 复制到档案：下拉列出目标档案（右对齐锚在按钮下，同优先级下拉模式）
+                if root.copy_targets.length > 0: Rectangle {
+                    width: copy-btn.width;
+                    copy-btn := BarButton {
+                        label: I18n.ctx_copy_to_profile;
+                        clicked => { copy-popup.show(); }
+                    }
+                    copy-popup := PopupWindow {
+                        x: parent.width - self.width;
+                        y: parent.height + 2px;
+                        width: 180px;
+                        height: root.copy_targets.length * 26px + 8px;
+                        close-policy: close-on-click-outside;
+                        Rectangle {
+                            width: 100%;
+                            height: 100%;
+                            border-radius: Theme.r_lg;
+                            background: Theme.card;
+                            border-width: 1px;
+                            border-color: Theme.hairline;
+                            VerticalLayout {
+                                x: 0;
+                                y: 4px;
+                                width: 100%;
+                                spacing: 0;
+                                for p in root.copy_targets: CtxItem {
+                                    label: p;
+                                    activated => { root.copy_to_profile(p); copy-popup.close(); }
+                                }
+                            }
+                        }
+                    }
+                }
                 BarButton {
                     label: I18n.ctx_clear_selection;
                     clicked => { root.clear_multi_selection(); }
@@ -1216,6 +1258,9 @@ export component PrListView inherits FocusScope {
 
     // ── 右键菜单（PopupWindow；坐标在 open_ctx 里 clamp 到窗口内，防右缘/下缘溢出）──
     // 菜单项随多选状态动态：单选才显示「浏览器打开」；Pin/看板/跳过按集合状态翻转文案。
+    // 「复制到档案…」不切走弹窗做嵌套（Slint 里 PopupWindow 套 PopupWindow 不稳），
+    // 而是把同一弹窗切成档案列表模式（ctx-profile-mode）；visible: false 的项不参与
+    // 布局计量，两种模式自然伸缩。模式切换后高度可能变大，重新 clamp 一次 y。
     ctx-popup := PopupWindow {
         x: root.ctx-x;
         y: root.ctx-y;
@@ -1237,44 +1282,79 @@ export component PrListView inherits FocusScope {
                 width: 100%;
                 spacing: 0;
 
-                if root.sel_count <= 1: CtxItem {
+                if root.sel_count <= 1 && !root.ctx-profile-mode: CtxItem {
                     label: I18n.inbox_open_browser;
                     hint: "o";
                     activated => { root.batch_open_browser(); ctx-popup.close(); }
                 }
-                CtxSep {}
-                CtxItem { label: I18n.ctx_priority_high; hint: "1"; activated => { root.batch_set_priority(1); ctx-popup.close(); } }
-                CtxItem { label: I18n.ctx_priority_medium; hint: "2"; activated => { root.batch_set_priority(2); ctx-popup.close(); } }
-                CtxItem { label: I18n.ctx_priority_low; hint: "3"; activated => { root.batch_set_priority(3); ctx-popup.close(); } }
-                CtxItem { label: I18n.ctx_priority_clear; hint: "0"; activated => { root.batch_set_priority(0); ctx-popup.close(); } }
+                CtxSep { visible: !root.ctx-profile-mode; }
+                CtxItem { visible: !root.ctx-profile-mode; label: I18n.ctx_priority_high; hint: "1"; activated => { root.batch_set_priority(1); ctx-popup.close(); } }
+                CtxItem { visible: !root.ctx-profile-mode; label: I18n.ctx_priority_medium; hint: "2"; activated => { root.batch_set_priority(2); ctx-popup.close(); } }
+                CtxItem { visible: !root.ctx-profile-mode; label: I18n.ctx_priority_low; hint: "3"; activated => { root.batch_set_priority(3); ctx-popup.close(); } }
+                CtxItem { visible: !root.ctx-profile-mode; label: I18n.ctx_priority_clear; hint: "0"; activated => { root.batch_set_priority(0); ctx-popup.close(); } }
                 CtxItem {
+                    visible: !root.ctx-profile-mode;
                     label: root.sel_all_pinned ? I18n.ctx_unpin : I18n.tip_pin;
                     hint: "p";
                     activated => { root.batch_toggle_pin(); ctx-popup.close(); }
                 }
                 CtxItem {
+                    visible: !root.ctx-profile-mode;
                     label: root.sel_all_on_board ? I18n.ctx_remove_board : I18n.detail_add_board;
                     activated => { root.batch_toggle_board(); ctx-popup.close(); }
                 }
                 CtxItem {
+                    visible: !root.ctx-profile-mode;
                     label: root.sel_all_rejected ? I18n.ctx_restore : I18n.ctx_skip;
                     danger: !root.sel_all_rejected;
                     activated => { root.batch_set_status(root.sel_all_rejected ? "pending" : "rejected"); ctx-popup.close(); }
                 }
-                CtxSep {}
+                CtxSep { visible: !root.ctx-profile-mode; }
                 CtxItem {
+                    visible: !root.ctx-profile-mode;
                     label: I18n.review_start;
                     activated => { root.batch_run_review(); ctx-popup.close(); }
                 }
                 CtxItem {
+                    visible: !root.ctx-profile-mode;
                     label: I18n.ctx_copy_links;
                     activated => { root.batch_copy_links(); ctx-popup.close(); }
                 }
-                CtxSep {}
+                // 「复制到档案…」：切档案列表模式（不切弹窗），模式变高后重新 clamp y 防下缘溢出
+                if root.copy_targets.length > 0 && !root.ctx-profile-mode: CtxItem {
+                    label: I18n.ctx_copy_to_profile;
+                    activated => {
+                        root.ctx-profile-mode = true;
+                        root.ctx-y = min(root.ctx-y, max(0px, root.height - root.ctx-menu-h - 4px));
+                    }
+                }
+                CtxSep { visible: !root.ctx-profile-mode; }
                 CtxItem {
+                    visible: !root.ctx-profile-mode;
                     label: I18n.ctx_clear_selection;
                     hint: "Esc";
                     activated => { root.clear_multi_selection(); ctx-popup.close(); }
+                }
+
+                // ── 档案选择模式（标题行 + 目标档案列表；点外/选完即关）──
+                if root.ctx-profile-mode: Rectangle {
+                    height: 26px;
+                    Text {
+                        x: 12px;
+                        width: parent.width - 12px;
+                        height: 100%;
+                        text: I18n.ctx_copy_to_profile_title;
+                        font-size: Theme.fs_xs;
+                        color: Theme.text_faint;
+                        vertical-alignment: center;
+                    }
+                }
+                if root.ctx-profile-mode: VerticalLayout {
+                    spacing: 0;
+                    for p in root.copy_targets: CtxItem {
+                        label: p;
+                        activated => { root.copy_to_profile(p); ctx-popup.close(); }
+                    }
                 }
             }
         }

@@ -33,6 +33,19 @@ pub fn exe_data_dir() -> std::path::PathBuf {
     data_dir_from(&exe_dir())
 }
 
+/// 数据目录覆盖：默认 exe 旁 data/（便携应用惯例）；启动时可经 `set_data_dir`
+/// 锚定到 config.toml 所在目录——开发期从仓库根跑 exe 时，cargo clean 清 target/
+/// 不会连数据库一起删掉（真实教训）。
+static DATA_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+pub fn set_data_dir(dir: std::path::PathBuf) {
+    let _ = DATA_DIR.set(dir);
+}
+
+pub fn data_dir() -> std::path::PathBuf {
+    DATA_DIR.get().cloned().unwrap_or_else(exe_data_dir)
+}
+
 /// 统一 reqwest ClientBuilder 构造：user_agent + 超时 + 可选代理。
 /// reqwest 是精简引入（没开 system-proxy），系统代理/HTTP_PROXY 等环境变量一律不生效，
 /// 只认配置里的显式 proxy 字段：非空时走该代理（http:// 或 socks5://），空 = 直连。

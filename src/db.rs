@@ -611,6 +611,143 @@ impl Db {
         Ok(())
     }
 
+    // ── 跨档案复制 ──
+
+    /// 单个 PR 的全部原始字段（显式列名；跨档案复制的数据源——list_prs 的联表视图
+    /// 缺 head_sha/extras_updated_at，不能用来复制）。产出形状与 upsert 系输入兼容。
+    pub fn get_pr_full(&self, repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repo, number, title, author, url, head_sha, status, tags, role,
+                on_board, priority, pinned, ci_status, review_decision, turn, updated_at,
+                recent_commits, extras_detail, extras_updated_at, source, author_orgs
+             FROM prs WHERE repo=?1 AND number=?2",
+        )?;
+        let mut rows = stmt.query(params![repo, number])?;
+        let Some(r) = rows.next()? else { return Ok(None) };
+        Ok(Some(serde_json::json!({
+            "repo": r.get::<_, String>(0)?,
+            "number": r.get::<_, i64>(1)?,
+            "title": r.get::<_, Option<String>>(2)?,
+            "author": r.get::<_, Option<String>>(3)?,
+            "url": r.get::<_, Option<String>>(4)?,
+            "head_sha": r.get::<_, Option<String>>(5)?,
+            "status": r.get::<_, String>(6)?,
+            "tags": r.get::<_, String>(7)?,
+            "role": r.get::<_, String>(8)?,
+            "on_board": r.get::<_, i64>(9)?,
+            "priority": r.get::<_, i64>(10)?,
+            "pinned": r.get::<_, i64>(11)?,
+            "ci_status": r.get::<_, Option<String>>(12)?,
+            "review_decision": r.get::<_, Option<String>>(13)?,
+            "turn": r.get::<_, Option<String>>(14)?,
+            "updated_at": r.get::<_, Option<String>>(15)?,
+            "recent_commits": r.get::<_, String>(16)?,
+            "extras_detail": r.get::<_, Option<String>>(17)?,
+            "extras_updated_at": r.get::<_, Option<String>>(18)?,
+            "source": r.get::<_, String>(19)?,
+            "author_orgs": r.get::<_, String>(20)?,
+        })))
+    }
+
+    /// 一个 PR 的全部评审记录（reviews 主键含 head_sha，同一 PR 可能多条）。
+    /// 产出形状与 upsert_review 输入兼容（字符串列透传，json_or_str/COALESCE 路径已兼容）。
+    pub fn list_reviews_of(&self, repo: &str, number: i64) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repo, number, head_sha, score, dimensions, summary, flagged_files,
+                reviewed_at, high_value, oversized, files_changed, additions, deletions,
+                size_label, comments
+             FROM reviews WHERE repo=?1 AND number=?2 ORDER BY reviewed_at",
+        )?;
+        let rows = stmt
+            .query_map(params![repo, number], |r| {
+                Ok(serde_json::json!({
+                    "repo": r.get::<_, String>(0)?,
+                    "number": r.get::<_, i64>(1)?,
+                    "head_sha": r.get::<_, String>(2)?,
+                    "score": r.get::<_, Option<f64>>(3)?,
+                    "dimensions": r.get::<_, Option<String>>(4)?,
+                    "summary": r.get::<_, Option<String>>(5)?,
+                    "flagged_files": r.get::<_, Option<String>>(6)?,
+                    "reviewed_at": r.get::<_, Option<String>>(7)?,
+                    "high_value": r.get::<_, i64>(8)?,
+                    "oversized": r.get::<_, i64>(9)?,
+                    "files_changed": r.get::<_, Option<i64>>(10)?,
+                    "additions": r.get::<_, Option<i64>>(11)?,
+                    "deletions": r.get::<_, Option<i64>>(12)?,
+                    "size_label": r.get::<_, Option<String>>(13)?,
+                    "comments": r.get::<_, Option<String>>(14)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// 仅当目标库不存在该 PR 时插入（跨档案复制用）。已存在则整行不动——
+    /// 目标档案的 pinned/priority/on_board/status 等本地策展状态绝不能被源覆盖。
+    /// 返回 true = 本次新插入。
+    pub fn insert_pr_if_absent(&self, p: &serde_json::Value) -> Result<bool> {
+        let n = self.conn.execute(
+            "INSERT OR IGNORE INTO prs(repo, number, title, author, url, head_sha, status, tags, role,
+                on_board, priority, pinned, ci_status, review_decision, turn, updated_at,
+                recent_commits, extras_detail, extras_updated_at, source, author_orgs)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+            params![
+                p["repo"].as_str().unwrap_or(""),
+                p["number"].as_i64().unwrap_or(0),
+                p["title"].as_str(),
+                p["author"].as_str(),
+                p["url"].as_str(),
+                p["head_sha"].as_str(),
+                p["status"].as_str().unwrap_or("pending"),
+                p["tags"].as_str().unwrap_or("[]"),
+                p["role"].as_str().unwrap_or("reviewer"),
+                p["on_board"].as_i64().unwrap_or(0),
+                p["priority"].as_i64().unwrap_or(0),
+                p["pinned"].as_i64().unwrap_or(0),
+                p["ci_status"].as_str(),
+                p["review_decision"].as_str(),
+                p["turn"].as_str(),
+                p["updated_at"].as_str(),
+                p["recent_commits"].as_str().unwrap_or("[]"),
+                p["extras_detail"].as_str(),
+                p["extras_updated_at"].as_str(),
+                p["source"].as_str().unwrap_or("github"),
+                p["author_orgs"].as_str().unwrap_or("[]"),
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 跨档案复制：keys 指定的 PR 行 + 各自全部评审记录写入 dst。
+    /// prs 走 insert_pr_if_absent（目标已有行整行跳过，本地策展状态不动）；
+    /// 评审走 upsert_review（同 head_sha 幂等覆盖同内容，comments COALESCE 安全）。
+    /// 源库只读；目标库写入包在一个事务里（unchecked_transaction 是连接级事务，
+    /// 后续经 self.conn 的写入都在事务内——与 local_pr_update 同款）。
+    /// 返回 (新插入 PR 数, 已存在跳过数, 复制评审数)。
+    pub fn copy_prs_to(src: &Db, dst: &Db, keys: &[(String, i64)]) -> Result<(usize, usize, usize)> {
+        // 先全部从源库读出（纯读，无需事务；复制中途源库变化最多拿到稍旧的行，可接受）
+        let mut prs = Vec::new();
+        let mut reviews = Vec::new();
+        for (repo, number) in keys {
+            if let Some(p) = src.get_pr_full(repo, *number)? {
+                prs.push(p);
+            }
+            reviews.extend(src.list_reviews_of(repo, *number)?);
+        }
+        let _tx = dst.conn.unchecked_transaction()?;
+        let mut inserted = 0usize;
+        for p in &prs {
+            if dst.insert_pr_if_absent(p)? {
+                inserted += 1;
+            }
+        }
+        for r in &reviews {
+            dst.upsert_review(r)?;
+        }
+        _tx.commit()?;
+        Ok((inserted, prs.len() - inserted, reviews.len()))
+    }
+
     // ── diff 缓存 ──
     pub fn get_diff(&self, repo: &str, number: i64) -> Result<Option<String>> {
         let mut stmt = self
@@ -812,6 +949,49 @@ mod tests {
         // 白名单：未知字段拒绝且不进 outbox
         assert!(db.local_pr_update("o/r", 1, "evil_field", &serde_json::json!(1)).is_err());
         assert_eq!(db.outbox_drain().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn copy_prs_to_carries_prs_and_reviews_without_clobbering_target() {
+        // 跨档案复制：prs（全部字段，含 head_sha）+ 全部评审记录（一个 PR 可多 sha 多条）。
+        // 目标已有行整行跳过（本地策展状态不动）；重复复制幂等。
+        let src = Db::open_memory().unwrap();
+        let dst = Db::open_memory().unwrap();
+        src.upsert_pr(&pr_json_src("o/r", 1, "src pr1", "server")).unwrap();
+        src.upsert_pr(&pr_json_src("o/r", 2, "src pr2", "server")).unwrap();
+        src.upsert_review(&review_json("o/r", 1, "sha-a", 8.0)).unwrap();
+        src.upsert_review(&review_json("o/r", 1, "sha-b", 6.5)).unwrap();
+        // 目标档案已有 o/r#2，且带本地策展状态（pinned/priority/status 是本地改的）
+        dst.upsert_pr(&pr_json_src("o/r", 2, "dst pr2", "github")).unwrap();
+        dst.local_pr_update("o/r", 2, "pinned", &serde_json::json!(1)).unwrap();
+        dst.local_pr_update("o/r", 2, "priority", &serde_json::json!(3)).unwrap();
+        dst.local_pr_update("o/r", 2, "status", &serde_json::json!("reviewed")).unwrap();
+
+        let keys = vec![("o/r".to_string(), 1), ("o/r".to_string(), 2)];
+        let (inserted, skipped, n_reviews) = Db::copy_prs_to(&src, &dst, &keys).unwrap();
+        assert_eq!((inserted, skipped, n_reviews), (1, 1, 2));
+
+        // 新插入行全字段带过来（含 list_prs 视图里没有的 head_sha）
+        let r1 = dst.get_pr_full("o/r", 1).unwrap().unwrap();
+        assert_eq!(r1["title"], "src pr1");
+        assert_eq!(r1["head_sha"], "s");
+        assert_eq!(r1["source"], "server");
+        // 目标已有行的本地策展状态不被覆盖
+        let r2 = dst.get_pr_full("o/r", 2).unwrap().unwrap();
+        assert_eq!(r2["pinned"], 1);
+        assert_eq!(r2["priority"], 3);
+        assert_eq!(r2["status"], "reviewed");
+        assert_eq!(r2["title"], "dst pr2"); // 连标题都不动（整行跳过，不是补空缺）
+        // 评审带全：同一 PR 两条不同 head_sha
+        let rvs = dst.list_reviews_of("o/r", 1).unwrap();
+        assert_eq!(rvs.len(), 2);
+        assert!(rvs.iter().any(|r| r["head_sha"] == "sha-a" && r["score"] == 8.0));
+        assert!(rvs.iter().any(|r| r["head_sha"] == "sha-b" && r["score"] == 6.5));
+
+        // 重复复制幂等：PR 全部跳过，评审 upsert 同内容不翻倍
+        let (inserted2, skipped2, n_reviews2) = Db::copy_prs_to(&src, &dst, &keys).unwrap();
+        assert_eq!((inserted2, skipped2, n_reviews2), (0, 2, 2));
+        assert_eq!(dst.list_reviews_of("o/r", 1).unwrap().len(), 2);
     }
 
     #[test]

@@ -634,25 +634,18 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // 配置/数据目录锚定到 exe 所在目录（便携应用惯例）：
-    // 防止从不同工作目录启动时读到另一份 config.toml / 数据库（曾导致「双配置」分裂）。
+    // 配置锚定：cwd 里的 config.toml 优先（开发期从仓库根跑 exe 时，配置+数据都在
+    // 仓库根，cargo clean 清 target/ 不会误伤——真实教训）；cwd 没有则用 exe 旁的
+    //（便携分发场景：双击 exe 时配置+数据在 exe 旁，行为不变）。
     let exe_dir = pr_desk_rs::exe_dir();
-    let cfg_path = exe_dir.join("config.toml");
-    // 兼容迁移：exe 旁没有但旧式 cwd 里有配置时，搬过来再用
+    let exe_cfg = exe_dir.join("config.toml");
     let cwd_cfg = PathBuf::from("config.toml");
-    if !cfg_path.exists() && cwd_cfg.exists() && cwd_cfg != cfg_path {
-        let _ = std::fs::copy(&cwd_cfg, &cfg_path);
-    }
+    let cfg_path = if cwd_cfg.exists() && cwd_cfg != exe_cfg { cwd_cfg } else { exe_cfg };
     let cfg = Config::load(&cfg_path)?;
-    // 渲染器选择（必须在创建 Slint 窗口之前设置 SLINT_BACKEND 才生效）：
-    // 集显上 femtovg 整窗重绘填充率吃紧时可配 renderer="software" 切 CPU 渲染
-    //（软件渲染器支持局部重绘）；空 = 不动环境变量，走 Slint 默认（femtovg）。
-    match cfg.renderer.as_str() {
-        "software" => unsafe { std::env::set_var("SLINT_BACKEND", "winit-software") },
-        "femtovg" => unsafe { std::env::set_var("SLINT_BACKEND", "winit-femtovg") },
-        _ => {}
-    }
-    let data_dir = exe_dir.join("data");
+    // 数据目录跟随配置目录（同上：防 cargo clean 误伤）；renderer 字段已废弃
+    //（wgpu/femtovg 栈已砍，只编了 software 渲染器），保留解析兼容、值被忽略。
+    let data_dir = cfg_path.parent().unwrap_or(&exe_dir).join("data");
+    pr_desk_rs::set_data_dir(data_dir.clone());
     std::fs::create_dir_all(&data_dir)?;
     // 启动档案名收口：active_profile 指向不存在/非法的档案时回退本地（内存修正，不写盘）
     let active_name = if cfg.has_profile(&cfg.active_profile) {
@@ -744,11 +737,12 @@ fn main() -> anyhow::Result<()> {
             .unwrap_or_default()
             .into(),
     );
-    // 数据源档案回填：名单（local 恒首位）+ 当前选中
+    // 数据源档案回填：名单（local 恒首位）+ 当前选中 + 复制目标名单（全部 − 当前）
     ui.set_profile_names(ModelRc::new(VecModel::from(
         cfg.profile_names().iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
     )));
     ui.set_active_profile(cfg.active_profile.clone().into());
+    ui.set_copy_targets(copy_targets_model(&cfg.profile_names(), &cfg.active_profile));
 
     // 字体按平台赋值（UI 侧只认 MainWindow.ui_font / Theme.mono_font，不写死字体名）：
     // Windows 雅黑 UI + Consolas；macOS PingFang SC + Menlo；
@@ -1564,6 +1558,13 @@ fn main() -> anyhow::Result<()> {
         ui.on_batch_open_browser(move || batch_open_browser(&app));
     }
     {
+        // 右键菜单/操作条「复制到档案…」：当前选择集（含评审记录）复制到目标档案
+        let app = app.clone();
+        ui.on_copy_to_profile(move |target| {
+            copy_to_profile(&app, &target);
+        });
+    }
+    {
         // 清空多选（Esc 第一级 / 操作条 ✕）；主选中行保留。
         // 高亮由 push_selection_ui 原地翻转（不做全量重建——重建会重置滚动位置）
         let app = app.clone();
@@ -1746,6 +1747,7 @@ fn main() -> anyhow::Result<()> {
                 ui.set_profile_names(ModelRc::new(VecModel::from(
                     new_cfg.profile_names().iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
                 )));
+                ui.set_copy_targets(copy_targets_model(&new_cfg.profile_names(), &new_cfg.active_profile));
                 update_status_bar(&ui, &app);
             }
             send_msg(Msg::Status(tr(&lang_of(&app), "cfg_saved").into()));
@@ -1820,6 +1822,7 @@ fn main() -> anyhow::Result<()> {
                 ui.set_profile_names(ModelRc::new(VecModel::from(
                     names.iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
                 )));
+                ui.set_copy_targets(copy_targets_model(&names, &app.lock_recover().cfg.active_profile));
                 ui.set_s_dialog_error("".into()); // 成功：清掉之前的内联错误
             }
             send_msg(Msg::Status(trf(&lang, "profile_added", &[&name])));
@@ -1862,6 +1865,7 @@ fn main() -> anyhow::Result<()> {
                 ui.set_profile_names(ModelRc::new(VecModel::from(
                     names.iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
                 )));
+                ui.set_copy_targets(copy_targets_model(&names, &app.lock_recover().cfg.active_profile));
                 // 被删的正是设置页在编辑的档案：编辑目标回到 local（changed 触发三字段回填）
                 ui.set_settings_profile("local".into());
                 ui.set_s_dialog_error("".into()); // 成功：清掉之前的内联错误
@@ -2045,6 +2049,58 @@ fn batch_open_browser(app: &Arc<Mutex<App>>) {
             "batch_open_capped",
             &[&MAX_OPEN.to_string(), &(keys.len() - MAX_OPEN).to_string()],
         )));
+    }
+}
+
+/// 右键菜单「复制到档案…」的目标名单 = 全部档案 − 当前档案（Rust 侧算好，Slint 无列表过滤）。
+fn copy_targets_model(names: &[String], active: &str) -> ModelRc<SharedString> {
+    ModelRc::new(VecModel::from(
+        names
+            .iter()
+            .filter(|n| n.as_str() != active)
+            .map(|n| n.as_str().into())
+            .collect::<Vec<SharedString>>(),
+    ))
+}
+
+/// 跨档案复制：当前选择集（多选或当前行）从当前档案库复制到目标档案库。
+/// 本地 SQLite 微秒级，直接在 UI 回调里同步做（同 batch_local_update 的先例）；
+/// 目标库文件未被本进程持有，外部占用由 busy_timeout(3s) 兜底，失败进状态栏。
+/// 源档案的列表视图无需刷新（复制不改源）；目标档案切过去时自然读到。
+fn copy_to_profile(app: &Arc<Mutex<App>>, target: &str) {
+    let keys = effective_targets(app);
+    if keys.is_empty() {
+        return;
+    }
+    let result = {
+        let a = app.lock_recover();
+        if target == a.cfg.active_profile {
+            return; // UI 名单已排除当前档案，双保险
+        }
+        let lang = a.cfg.language.clone();
+        let dst_path = profile_db_path(&pr_desk_rs::exe_data_dir(), target);
+        let r = Db::open(&dst_path)
+            .and_then(|dst| Db::copy_prs_to(&a.db, &dst, &keys));
+        (r, lang)
+    };
+    let (r, lang) = result;
+    match r {
+        Ok((inserted, skipped, n_reviews)) => {
+            let msg = if skipped > 0 {
+                trf(&lang, "copy_done_skipped", &[
+                    &inserted.to_string(),
+                    target,
+                    &n_reviews.to_string(),
+                    &skipped.to_string(),
+                ])
+            } else {
+                trf(&lang, "copy_done", &[&inserted.to_string(), target, &n_reviews.to_string()])
+            };
+            send_msg(Msg::Status(msg));
+        }
+        Err(e) => {
+            send_msg(Msg::Status(trf(&lang, "copy_failed", &[&e.to_string()])));
+        }
     }
 }
 
@@ -4000,7 +4056,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 }
                 // 换库：local → pr-desk.db；其它档 → profiles/<name>.db
                 //（sync 游标/outbox 在库文件内，换库天然隔离；远程新库游标为空 = 首次全量拉）
-                let db_path = profile_db_path(&pr_desk_rs::exe_data_dir(), &name);
+                let db_path = profile_db_path(&pr_desk_rs::data_dir(), &name);
                 if let Some(parent) = db_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
@@ -4277,7 +4333,8 @@ fn apply_msg(ui: &MainWindow, app: &Arc<Mutex<App>>, cmd_tx: &UnboundedSender<Cm
             ui.set_profile_names(ModelRc::new(VecModel::from(
                 names.iter().map(|n| n.as_str().into()).collect::<Vec<SharedString>>(),
             )));
-            ui.set_active_profile(active.into());
+            ui.set_active_profile(active.clone().into());
+            ui.set_copy_targets(copy_targets_model(&names, &active));
         }
         Msg::SettingsProfile(name) => {
             // 写回 settings_profile 会触发 changed → settings_profile_focus 回填三字段
