@@ -789,10 +789,14 @@ export component MainWindow inherits Window {
                         width: 100%;
                         height: 100%;
                         content-width: self.width;
-                        content-height: fields.preferred-height;
+                        // 不能用 fields.preferred-height：布局求解期对 word-wrap 文本按
+                        // 未换行（单行）测量，会少算一行导致底部字段被切（代理 hint 踩中）。
+                        // 末尾零高哨兵的 y 是排版后的真实底缘，用它做内容高度。
+                        content-height: fields_end.y;
 
                         fields := VerticalLayout {
                             width: 100%;
+                            height: self.preferred-height;
                             spacing: 14px;
                             alignment: start;
 
@@ -1379,6 +1383,8 @@ export component MainWindow inherits Window {
                     }
                 }
                 }
+                // 内容底缘哨兵（见 fields_scroll.content-height 注释）
+                fields_end := Rectangle { height: 0px; }
                 }
                 }
 
