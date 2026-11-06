@@ -131,6 +131,9 @@ pub enum Msg {
     // 托盘：左键还原窗口 / 右键菜单「退出」
     TrayShow,
     TrayQuit,
+    // 自动化验证指令（仅 PR_DESK_TEST=1 时由指令文件监听线程投递；
+    // 经消息泵走 logic()，与 UI 回调同线程同路径调用处理器）
+    TestCmd(String),
 }
 
 /// 会话条目展示数据（markdown 由 UI 侧 egui_commonmark 渲染；text 是原文）。

@@ -558,13 +558,352 @@ impl EguiApp {
                 self.save_geometry(ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
+            Msg::TestCmd(line) => self.handle_test_cmd(ctx, &line),
+        }
+    }
+
+    /// ── 自动化验证指令（PR_DESK_TEST=1 时启用；%TEMP%/prdesk-cmd.txt 逐行指令）──
+    /// 每条指令调用的就是对应 UI 控件背后的处理器（同函数同路径）。
+    /// `dumpstate` 把关键状态写成 JSON（%TEMP%/prdesk-state.json）供断言。
+    pub fn handle_test_cmd(&mut self, ctx: &egui::Context, line: &str) {
+        let mut it = line.split_whitespace();
+        let Some(cmd) = it.next() else { return };
+        let arg = it.next().unwrap_or("");
+        match cmd {
+            "shot" => self.request_shot(ctx),
+            "inbox" => {
+                self.view_mode = 1;
+                self.inbox_loading = true;
+                let _ = self.cmd_tx.send(Cmd::FetchInbox);
+            }
+            "list" => self.view_mode = 0,
+            "refresh" => {
+                let mut a = self.app.lock_recover();
+                if !a.gh_refreshing {
+                    a.gh_refreshing = true;
+                    drop(a);
+                    let _ = self.cmd_tx.send(Cmd::RefreshGithub);
+                }
+            }
+            "sync" => {
+                let mut a = self.app.lock_recover();
+                if !a.sync_inflight {
+                    a.sync_inflight = true;
+                    drop(a);
+                    let _ = self.cmd_tx.send(Cmd::Sync);
+                }
+            }
+            "theme" => self.theme_toggled(ctx),
+            // row <n> [ctrl|shift]：点可见行（view_visible 序）
+            // 按身份直接打开详情（测试指令；等价于点行 + Enter）
+            "openpr" => {
+                let number: i64 = it.next().unwrap_or("0").parse().unwrap_or(0);
+                {
+                    self.app.lock_recover().selected = Some((arg.to_string(), number));
+                }
+                let _ = self.cmd_tx.send(Cmd::OpenDrawer { repo: arg.to_string(), number, refetch: true });
+            }
+            "row" | "rowctrl" | "rowshift" => {
+                let n: usize = arg.parse().unwrap_or(0);
+                let key = self.app.lock_recover().view_visible.get(n).cloned();
+                if let Some(key) = key {
+                    self.row_clicked(key, cmd == "rowctrl", cmd == "rowshift");
+                }
+            }
+            "enter" => {
+                let sel = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = sel {
+                    let _ = self.cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: true });
+                }
+            }
+            "esc" => {
+                let (sel_count, panel_open) = {
+                    let a = self.app.lock_recover();
+                    (a.selection.len(), self.panel.is_some())
+                };
+                if self.settings_open {
+                    self.settings_open = false;
+                } else if self.view_mode == 1 && self.nd_open {
+                    self.nd_open = false;
+                    self.app.lock_recover().inbox_detail = None;
+                } else if sel_count > 0 {
+                    self.clear_multi_selection();
+                } else if panel_open {
+                    self.app.lock_recover().selected = None;
+                    self.panel = None;
+                } else {
+                    self.app.lock_recover().selected = None;
+                }
+            }
+            "key" => {
+                // key j/k/o/p/1/2/3：与 hotkeys 同一处理器语义
+                match arg {
+                    "j" | "k" => {
+                        let delta = if arg == "j" { 1i64 } else { -1 };
+                        if self.view_mode == 0 {
+                            let sel_key = {
+                                let mut a = self.app.lock_recover();
+                                if a.view_visible.is_empty() {
+                                    None
+                                } else {
+                                    let n = a.view_visible.len();
+                                    let pos = a
+                                        .selected
+                                        .as_ref()
+                                        .and_then(|s| a.view_visible.iter().position(|k2| k2 == s));
+                                    let npos = match pos {
+                                        None => if delta > 0 { 0 } else { n - 1 },
+                                        Some(p) => (p as i64 + delta).clamp(0, n as i64 - 1) as usize,
+                                    };
+                                    a.selected = Some(a.view_visible[npos].clone());
+                                    a.selected.clone()
+                                }
+                            };
+                            if let Some(k2) = sel_key {
+                                self.scroll_to = Some(k2);
+                            }
+                        }
+                    }
+                    "o" => worker::batch_open_browser(&self.app),
+                    "p" => {
+                        let (has_sel, single) = {
+                            let a = self.app.lock_recover();
+                            (a.selection.is_empty(), a.selected.clone())
+                        };
+                        if !has_sel {
+                            worker::batch_toggle(&self.app, "pinned");
+                        } else if let Some((repo, number)) = single {
+                            worker::toggle_field(&self.app, &repo, number, "pinned");
+                        }
+                    }
+                    "1" | "2" | "3" => {
+                        let p: i64 = arg.parse().unwrap();
+                        let keys = {
+                            let a = self.app.lock_recover();
+                            effective_targets(&a)
+                        };
+                        if keys.len() > 1 {
+                            worker::batch_local_update(&self.app, &keys, "priority", p);
+                        } else if let Some((repo, number)) = keys.first().cloned() {
+                            worker::local_update(&self.app, &repo, number, "priority", p);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // 详情面板 tab（含惰性拉取）
+            "tab" => {
+                let t: usize = arg.parse().unwrap_or(0);
+                self.panel_tab = t;
+                self.panel_tab_changed(t);
+            }
+            "panelclose" => {
+                self.app.lock_recover().selected = None;
+                self.panel = None;
+            }
+            "review" => {
+                let sel = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = sel {
+                    let _ = self.cmd_tx.send(Cmd::RunReview { repo, number });
+                }
+            }
+            "copyreview" => {
+                let _ = self.cmd_tx.send(Cmd::CopyReview);
+            }
+            // 批量（作用于多选集合，无多选则当前选中）
+            "batch" => match arg {
+                "pin" => worker::batch_toggle(&self.app, "pinned"),
+                "board" => worker::batch_toggle(&self.app, "on_board"),
+                "skip" => {
+                    let keys = { let a = self.app.lock_recover(); effective_targets(&a) };
+                    worker::batch_local_update(&self.app, &keys, "status", "rejected");
+                }
+                "restore" => {
+                    let keys = { let a = self.app.lock_recover(); effective_targets(&a) };
+                    worker::batch_local_update(&self.app, &keys, "status", "pending");
+                }
+                "links" => {
+                    if let Some(text) = worker::copy_links_text(&self.app) {
+                        let _ = self.cmd_tx.send(Cmd::CopyLinks(text));
+                    }
+                }
+                "review" => {
+                    let keys = { let a = self.app.lock_recover(); effective_targets(&a) };
+                    let n = keys.len();
+                    for (repo, number) in keys {
+                        let _ = self.cmd_tx.send(Cmd::RunReview { repo, number });
+                    }
+                    let lang = self.lang();
+                    worker::send_msg(Msg::Status(trf(&lang, "review_queued", &[&n.to_string()])));
+                }
+                _ => {}
+            },
+            "clearselection" => self.clear_multi_selection(),
+            // Inbox
+            "inboxrow" => {
+                let n: usize = arg.parse().unwrap_or(0);
+                self.inbox_activated(n);
+            }
+            "inboxadd" => {
+                let n: usize = arg.parse().unwrap_or(0);
+                self.inbox_add_review(n);
+            }
+            "inboxbrowser" => self.inbox_open_browser(),
+            "inboxclose" => {
+                self.nd_open = false;
+                self.app.lock_recover().inbox_detail = None;
+            }
+            "markall" => {
+                let _ = self.cmd_tx.send(Cmd::MarkAllNotifsRead);
+            }
+            "loadmore" => {
+                let _ = self.cmd_tx.send(Cmd::FetchInboxMore);
+            }
+            "inboxfilter" => {
+                let mut a = self.app.lock_recover();
+                a.inbox_filter = arg.to_string();
+                a.inbox_view = inbox_filtered(&a);
+            }
+            "unreadonly" => {
+                let mut a = self.app.lock_recover();
+                a.inbox_all = false;
+                a.inbox_page = 1;
+                a.inbox_has_more = false;
+                drop(a);
+                self.inbox_loading = true;
+                let _ = self.cmd_tx.send(Cmd::FetchInbox);
+            }
+            // 设置页
+            "settings" => crate::ui_settings::open_settings(self),
+            "settingssave" => {
+                let _ = crate::ui_settings::save_settings_pub(self);
+            }
+            "settab" => self.settings_tab = arg.parse().unwrap_or(0),
+            // 设置页表单字段直写（验证 proxy_invalid 等校验路径）：setfield proxy|llm_base|llm_model <值>
+            "setfield" => {
+                let val = it.collect::<Vec<_>>().join(" ");
+                match arg {
+                    "proxy" => self.s_proxy = val,
+                    "llm_base" => self.s_llm_base = val,
+                    "llm_model" => self.s_llm_model = val,
+                    "server" => self.s_server = val,
+                    _ => {}
+                }
+            }
+            "fetchmodels" => {
+                let (base, key) = (self.s_llm_base.clone(), self.s_llm_key.clone());
+                let _ = self.cmd_tx.send(Cmd::FetchModels { base, key });
+            }
+            // 档案切换
+            "profile" => {
+                let _ = self.cmd_tx.send(Cmd::SwitchProfile(arg.to_string()));
+            }
+            // 排序 / 快筛 / 组折叠
+            "sort" => self.header_clicked(arg),
+            "highscore" => {
+                let mut a = self.app.lock_recover();
+                a.min_score = if a.min_score > 0.0 { 0.0 } else { 8.0 };
+                recompute_flat(&mut a);
+            }
+            "collapse" => self.group_toggled(arg),
+            // 托盘
+            "hide" => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.save_geometry(ctx);
+            }
+            "trayshow" => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            "quit" => {
+                // 与托盘「退出」同路径（wndproc 菜单 → Msg::TrayQuit）
+                self.allow_close = true;
+                self.save_geometry(ctx);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            "dumpstate" => self.dump_state(),
+            _ => tracing::warn!("未知测试指令: {line}"),
+        }
+        tracing::info!("test-cmd 已处理: {line}");
+    }
+
+    /// F12 / `shot` 指令共用：置位挂起，ui() 里发 ViewportCommand::Screenshot
+    ///（窗口隐藏时 GL surface 尺寸为 0，直接发会让 egui_glow 回读 panic）。
+    pub fn request_shot(&self, ctx: &egui::Context) {
+        if ctx.input(|i| i.viewport().inner_rect.map(|r| r.width() < 2.0 || r.height() < 2.0).unwrap_or(true)) {
+            tracing::warn!("窗口隐藏/零尺寸，跳过截图");
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(|image| {
+            let path = std::env::temp_dir().join("prdesk-shot.png");
+            let img = image::DynamicImage::ImageRgba8(
+                image::RgbaImage::from_raw(
+                    image.width() as u32,
+                    image.height() as u32,
+                    image.as_raw().to_vec(),
+                )
+                .unwrap_or_default(),
+            );
+            match img.save(&path) {
+                Ok(()) => tracing::info!("截图已存 {}", path.display()),
+                Err(e) => tracing::warn!("截图保存失败: {e}"),
+            }
+        })));
+    }
+
+    /// 状态快照（JSON 落盘，供验证脚本断言）。
+    fn dump_state(&self) {
+        let a = self.app.lock_recover();
+        let v = serde_json::json!({
+            "view_mode": self.view_mode,
+            "rows": a.rows.len(),
+            "flat": a.flat.len(),
+            "selected": a.selected,
+            "selection": a.selection,
+            "collapsed": a.collapsed,
+            "filter": a.filter,
+            "sort_col": a.sort_col,
+            "sort_asc": a.sort_asc,
+            "min_score": a.min_score,
+            "panel_open": self.panel.is_some(),
+            "panel_tab": self.panel_tab,
+            "panel_repo": self.panel.as_ref().map(|p| p.repo.clone()),
+            "panel_number": self.panel.as_ref().map(|p| p.number),
+            "panel_review_has": self.panel.as_ref().map(|p| p.review.has),
+            "panel_review_status": self.panel.as_ref().map(|p| p.review_status.clone()),
+            "panel_convo": self.panel.as_ref().map(|p| p.convo.len()),
+            "panel_checks": self.panel.as_ref().map(|p| p.checks_json.len()),
+            "diff_files": self.diff_files.len(),
+            "status_msg": a.status_msg,
+            "gh_refreshing": a.gh_refreshing,
+            "sync_inflight": a.sync_inflight,
+            "inbox": a.inbox.len(),
+            "inbox_view": a.inbox_view.len(),
+            "inbox_has_more": a.inbox_has_more,
+            "inbox_page": a.inbox_page,
+            "inbox_loading": self.inbox_loading,
+            "nd_open": self.nd_open,
+            "nd_loading": self.nd_loading,
+            "nd_convo": self.nd_convo.len(),
+            "settings_open": self.settings_open,
+            "dialog_error": self.dialog_error,
+            "profile_names": self.profile_names,
+            "active_profile": a.cfg.active_profile,
+            "theme": a.cfg.theme,
+            "language": a.cfg.language,
+            "total": a.total,
+        });
+        let path = std::env::temp_dir().join("prdesk-state.json");
+        if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()) {
+            tracing::warn!("状态快照写入失败: {e}");
         }
     }
 
     /// 快捷键分发（无输入框聚焦时）。Esc 分级：设置弹窗 → 关弹窗；
     /// 引导 → 吞掉；Inbox 预览 → 关预览；多选 → 清多选；详情面板 → 关面板；→ 清选中。
-    fn hotkeys(&mut self, ui: &mut egui::Ui) {
-        let ctx = ui.ctx().clone();
+    fn hotkeys(&mut self, ctx: &egui::Context) {
+        let ctx = ctx.clone();
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -727,53 +1066,43 @@ impl EguiApp {
 }
 
 impl eframe::App for EguiApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        // 诊断（临时）：帧计数 + 视口状态，验证「不刷新」是事件循环没醒还是逻辑没跑
+    /// 非绘制逻辑（eframe 0.37：窗口被完全遮挡/隐藏时不跑 ui()，只跑 logic()——
+    /// 消息落地/轮询/托盘还原必须在这里，否则窗口被盖住后 worker 消息全堵死，
+    /// 托盘「显示」也永远不生效）。
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // 诊断（debug 级）：指针/点击事件可见性
         {
-            static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let vp = ctx.input(|i| i.viewport().clone());
             let ptr = ctx.input(|i| i.pointer.latest_pos());
-            let any_click = ctx.input(|i| i.pointer.any_click());
-            tracing::debug!("frame {n} focused={:?} minimized={:?} visible={:?} ptr={:?} click={}", vp.focused, vp.minimized, vp.visible(), ptr, any_click);
+            let click = ctx.input(|i| i.pointer.any_click());
+            if ptr.is_some() || click {
+                tracing::debug!("logic: ptr={ptr:?} click={click}");
+            }
         }
-
         // ── 消息落地 ──
         while let Ok(msg) = self.msg_rx.try_recv() {
-            self.apply_msg(&ctx, msg);
+            self.apply_msg(ctx, msg);
         }
         // F12 = 视口截图存 %TEMP%/prdesk-shot.png（自动化验证读屏用：
         // 回调由 GPU 回读，不受窗口遮挡/多屏 DPI 影响；PostMessage WM_KEYDOWN 可达）
         if ctx.input(|i| i.key_pressed(egui::Key::F12)) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(|image| {
-                let path = std::env::temp_dir().join("prdesk-shot.png");
-                let img = image::DynamicImage::ImageRgba8(
-                    image::RgbaImage::from_raw(
-                        image.width() as u32,
-                        image.height() as u32,
-                        image.as_raw().to_vec(),
-                    )
-                    .unwrap_or_default(),
-                );
-                match img.save(&path) {
-                    Ok(()) => tracing::info!("截图已存 {}", path.display()),
-                    Err(e) => tracing::warn!("截图保存失败: {e}"),
-                }
-            })));
+            self.request_shot(&ctx);
         }
         self.transient_tick();
-        self.poll_tick(&ctx);
+        self.poll_tick(ctx);
 
         // ── 关窗 → 托盘（而非退出）──
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
             tracing::info!("收到 close_requested：隐藏到托盘");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.save_geometry(&ctx);
+            self.save_geometry(ctx);
         }
 
-        self.hotkeys(ui);
+        self.hotkeys(ctx);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
 
         // ── 布局：顶栏 / 状态栏 /（选中条）/ 中央视图 ──
         ui_list::top_bar(self, ui);
@@ -924,11 +1253,32 @@ fn main() -> anyhow::Result<()> {
             // 托盘：左键还原 / 右键菜单「显示 / 退出」
             let lang = cfg.language.clone();
             let tray = tray::Tray::start(
-                msg_tx,
+                msg_tx.clone(),
                 cc.egui_ctx.clone(),
                 tr(&lang, "tray_show"),
                 tr(&lang, "tray_quit"),
             );
+
+            // 自动化验证：指令文件监听（仅显式开启；指令经消息泵走 logic()，与 UI 回调同线程）
+            if std::env::var_os("PR_DESK_TEST").is_some() {
+                let tx = msg_tx.clone();
+                let ctx2 = cc.egui_ctx.clone();
+                std::thread::spawn(move || {
+                    let path = std::env::temp_dir().join("prdesk-cmd.txt");
+                    loop {
+                        if let Ok(text) = std::fs::read_to_string(&path) {
+                            if !text.trim().is_empty() {
+                                let _ = std::fs::write(&path, "");
+                                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                                    let _ = tx.send(Msg::TestCmd(line.trim().to_string()));
+                                }
+                                ctx2.request_repaint();
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                });
+            }
 
             // 启动：初始刷新 + 同步
             let _ = cmd_tx.send(Cmd::RefreshGithub);

@@ -592,3 +592,8 @@ pub fn onboarding_window(app: &mut EguiApp, ctx: &egui::Context) {
             });
         });
 }
+
+/// 测试指令用（与「保存」按钮同函数）。
+pub fn save_settings_pub(app: &mut EguiApp) -> bool {
+    save_settings(app)
+}

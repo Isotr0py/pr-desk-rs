@@ -6,11 +6,9 @@
 #![cfg(windows)]
 
 use std::sync::mpsc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Shell::{Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
@@ -156,18 +154,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 }
 
 pub struct Tray {
-    thread_id: ArcWrapper,
+    hwnd: usize,
     handle: Option<std::thread::JoinHandle<()>>,
 }
-
-// 线程 id 回传用的轻量包装
-struct ArcWrapper(std::sync::Arc<AtomicU32>);
 
 impl Tray {
     /// 启动托盘（图标立刻可见）。show/quit 文案随启动时语言固定（托盘菜单不热切语言）。
     pub fn start(msg_tx: mpsc::Sender<Msg>, ctx: egui::Context, show: &str, quit: &str) -> Tray {
-        let tid = std::sync::Arc::new(AtomicU32::new(0));
-        let tid2 = tid.clone();
+        // hwnd 经 channel 回传（stop 需要 PostMessageW(hwnd, WM_QUIT)——
+        // PostThreadMessage 的线程消息 hwnd=NULL，会被按窗口过滤的 GetMessageW 跳过）
+        let (hwnd_tx, hwnd_rx) = std::sync::mpsc::channel::<usize>();
         let show = show.to_string();
         let quit = quit.to_string();
         let handle = std::thread::spawn(move || unsafe {
@@ -222,7 +218,7 @@ impl Tray {
                 DestroyWindow(hwnd);
                 return;
             }
-            tid2.store(GetCurrentThreadId(), Ordering::Release);
+            let _ = hwnd_tx.send(hwnd as usize);
 
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, hwnd, 0, 0) > 0 {
@@ -235,14 +231,19 @@ impl Tray {
             DestroyWindow(hwnd);
             UnregisterClassW(class_name.as_ptr(), hinst);
         });
-        Tray { thread_id: ArcWrapper(tid), handle: Some(handle) }
+        let hwnd = hwnd_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap_or(0);
+        if hwnd == 0 {
+            tracing::warn!("托盘窗口 hwnd 回传超时/失败");
+        }
+        Tray { hwnd, handle: Some(handle) }
     }
 
     /// 真正退出：停托盘消息循环（图标移除在循环退出后做），join 线程。
     pub fn stop(&mut self) {
-        let tid = self.thread_id.0.load(Ordering::Acquire);
-        if tid != 0 {
-            unsafe { PostThreadMessageW(tid, WM_QUIT, 0, 0) };
+        if self.hwnd != 0 {
+            // PostMessageW(hwnd, WM_QUIT)：GetMessageW(hwnd 过滤）能收到；
+            // PostThreadMessage 的 hwnd=NULL 会被该过滤跳过（僵尸进程的病根）
+            unsafe { PostMessageW(self.hwnd as HWND, WM_QUIT, 0, 0) };
         }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
