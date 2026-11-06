@@ -7,7 +7,7 @@ edition = "2024"
 # UI 层：egui/eframe。关默认特性砍掉 wgpu/naga 栈（体积与编译内存最大来源，
 # 曾在 GNU 链接时 OOM），只带 glow 渲染后端。纯逻辑测试 cargo test --lib 不依赖 UI crate。
 eframe = { version = "0.37", default-features = false, features = [
-    "accesskit", "clipboard", "default_fonts", "links", "glow", "system_fonts",
+    "accesskit", "clipboard", "default_fonts", "links", "glow", "system_fonts", "__screenshot",
 ] }
 egui = "0.37"
 egui_extras = "0.37"
@@ -33,6 +33,13 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["simd
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # 系统剪贴板（复制评审报告到剪贴板）
 arboard = "3"
+
+# Windows 托盘（Shell_NotifyIconW + 消息专用窗口；纯 FFI 绑定，MinGW 可编）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+] }
 
 [profile.release]
 # 二进制瘦身：瘦 LTO + 单编译单元 + 去符号 + abort（panic=abort 会弄坏
