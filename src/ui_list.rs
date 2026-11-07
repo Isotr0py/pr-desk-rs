@@ -336,6 +336,14 @@ pub struct ColSpec {
     pub flex: bool,
 }
 
+/// 表头右缘把手专属区宽度（也用于行内图标列的中心对齐：图标中心 = 收窄文字区中心）
+pub const HANDLE_W: f32 = 16.0;
+
+/// 图标列内容中心 x：与收窄后的表头文字区中心对齐（列中心 - HANDLE_W/2）。
+fn icon_center_x(c: egui::Rect) -> f32 {
+    (c.left() + c.right() - HANDLE_W) / 2.0
+}
+
 pub const COL_SPECS: &[ColSpec] = &[
     ColSpec { id: "priority", label: "P", def_w: 26.0, min_w: 24.0, flex: false },
     ColSpec { id: "num", label: "#", def_w: 60.0, min_w: 44.0, flex: false },
@@ -426,7 +434,7 @@ pub fn priority_badge(p: i64) -> (&'static str, Color32) {
 /// Rev 列语义图标（painter 矢量，扁平风）：approved=绿勾 / changes_requested=红叹号 /
 /// commented=灰气泡 / failed=红叉；未知/空不画。
 fn paint_rev_icon(ui: &Ui, c: egui::Rect, review: &str, _dark: bool) {
-    let ctr = c.center(); // 列内居中（钉死：任何情况下不随内容漂移出列框）
+    let ctr = egui::pos2(icon_center_x(c), c.center().y); // 与表头文字中心同一 x（收窄区中心）
     let p = ui.painter().with_clip_rect(c);
     let stroke = |p: &egui::Painter, pts: [egui::Pos2; 2], color: Color32| {
         p.line_segment(pts, egui::Stroke::new(1.6, color));
@@ -505,6 +513,17 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
     });
 }
 
+/// 表头单元格 → （排序文字区， 拖拽把手术区）：几何上不重叠（把手区是右缘 HANDLE_W）。
+/// 抽成纯函数供测试钉住「点击把手区不触发排序」的几何前提。
+pub fn header_zones(cell: egui::Rect) -> (egui::Rect, Option<egui::Rect>) {
+    let text = egui::Rect::from_min_size(cell.min, egui::vec2((cell.width() - HANDLE_W - 1.0).max(0.0), cell.height())); // 右缘留 1px 间隙：与把手区严格不相交
+    let handle = egui::Rect::from_min_size(
+        egui::pos2(cell.right() - HANDLE_W, cell.top()),
+        egui::vec2(HANDLE_W, cell.height()),
+    );
+    (text, Some(handle))
+}
+
 /// 表头：点击排序（Excel 式）+ 分隔线拖拽调宽 + hover 反馈。
 fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     let (sort_col, sort_asc) = {
@@ -528,10 +547,13 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     for (i, c) in COL_SPECS.iter().enumerate() {
         let (x, w) = layout[i];
         let cell = egui::Rect::from_min_size(egui::pos2(rect.left() + x, rect.top()), egui::vec2(w, rect.height()));
-        let resp = ui.interact(cell, egui::Id::unique(("col-h", c.id)), egui::Sense::click());
-        // hover 反馈：底色 + 手型 + 提示
+        let is_last = i + 1 == COL_SPECS.len();
+        // 文字区/把手区几何：header_zones（最后一列的把手区忽略不用）
+        let (text_cell, handle) = header_zones(cell);
+        // 排序点击只认文字区（把手区点/拖都不触发排序）
+        let resp = ui.interact(text_cell, egui::Id::unique(("col-h", c.id)), egui::Sense::click());
         if resp.hovered() {
-            ui.painter().rect_filled(cell, 2.0, ui.visuals().widgets.hovered.bg_fill);
+            ui.painter().rect_filled(text_cell, 2.0, ui.visuals().widgets.hovered.bg_fill);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         resp.clone().on_hover_text(tr(lang, "tip_sort"));
@@ -540,26 +562,23 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         } else {
             ""
         };
-        // 表头文字水平居中
+        // 表头文字水平居中：宽列在收窄后的文字区内居中；窄列（<64px，如 Turn/Size）
+        // 在整列居中（否则只剩 ~20px 全是省略号——文字压到把手区上方可接受，交互区仍收窄）
+        let paint_cell_r = if text_cell.width() >= 64.0 { text_cell } else { cell };
         let text = format!("{}{arrow}", col_label(c.label, lang));
-        let text = ellipsize(ui, &text, FontId::proportional(11.0), cell.width() - 4.0);
+        let text = ellipsize(ui, &text, FontId::proportional(11.0), paint_cell_r.width() - 4.0);
         ui.painter()
             .with_clip_rect(cell)
-            .text(cell.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.0), ui.visuals().weak_text_color());
-        // 拖拽调宽后松开不得触发排序（拖拽期间/刚松开的 click 被抑制）
+            .text(paint_cell_r.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.0), ui.visuals().weak_text_color());
+        // 拖拽调宽后松开不得触发排序（双保险：文字区已收窄，这里是时间窗守卫）
         let dragging = app.header_drag_at.is_some_and(|t| t.elapsed().as_millis() < 300);
         if resp.clicked() && !dragging {
             app.header_clicked(c.id);
         }
-        // 常驻细分隔线 + grip 指示（列边界；弹性列与最后一列不画右缘）
-        let is_last = i + 1 == COL_SPECS.len();
+        // 把手专属区 + 常驻分隔线 + grip（弹性列与最后一列无把手）
         if !is_last {
             let bx = cell.right();
-            // 把手热区加宽到 16px（±8），hit test 优先于表头点击（后建者优先）
-            let handle = egui::Rect::from_min_size(
-                egui::pos2(bx - 8.0, cell.top()),
-                egui::vec2(16.0, cell.height()),
-            );
+            let handle = handle.unwrap_or(egui::Rect::NOTHING);
             let dresp = if c.flex {
                 None
             } else {
@@ -567,21 +586,22 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
             };
             let hot = dresp.as_ref().is_some_and(|d| d.hovered() || d.dragged());
             if let Some(d) = &dresp {
+                // 把手区专属 hover 反馈：主题色 grip + 双向箭头光标；点击不排序（arm 内不写）
                 if d.hovered() || d.dragged() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    ui.painter().rect_filled(handle, 2.0, sep_hot.gamma_multiply(0.15));
                 }
                 if d.dragged() {
                     let dx = d.drag_delta().x;
                     let new_w = (app.col_widths[i] + dx).max(c.min_w);
                     app.col_widths[i] = new_w;
-                    // 拖拽发生后抑制本列的排序点击（松开不当成 click）
                     app.header_drag_at = Some(std::time::Instant::now());
                 }
                 if d.drag_stopped() {
                     app.header_drag_at = Some(std::time::Instant::now());
                 }
             }
-            // grip：两个竖点（⋮ 风格，painter 画，不依赖字形）；hover 变主题色
+            // grip：三个竖点（painter 画，不依赖字形）；hover 变主题色
             let grip_c = if hot { sep_hot } else { sep_base };
             for dy in [-3.0, 0.0, 3.0] {
                 ui.painter().circle_filled(
@@ -590,7 +610,6 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
                     grip_c,
                 );
             }
-            // 整段分隔线（常驻低对比；hover 变亮变粗）
             ui.painter().rect_filled(
                 egui::Rect::from_min_size(
                     egui::pos2(bx - 1.0, cell.top() + 4.0),
@@ -738,11 +757,20 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
                 );
             }
         }
-        // 组织图标：钉死在列内右缘（不随名字长度漂移），裁进列宽，hover 提示组织名
-        let orgs: Vec<&String> = row.orgs.iter().take(3).collect();
-        let icons_w = orgs.len() as f32 * 14.0;
-        let icons_left = if icons_w > 0.0 { c.right() - 2.0 - icons_w } else { c.right() - 2.0 };
+        // 组织图标：钉死在列内右缘（不随名字长度漂移），严格裁进列宽，hover 提示组织名；
+        // 列宽不足时减少显示个数，全部放不下显示第一个 + 「+N」角标
         let name_x = avatar_r.right() + 4.0;
+        let name_min_w = 30.0_f32;
+        let avail_for_icons = (c.width() - 2.0 - 20.0 - 4.0 - name_min_w - 4.0).max(0.0);
+        let max_icons = (avail_for_icons / 14.0).floor() as usize;
+        let total_orgs = row.orgs.len();
+        let shown = total_orgs.min(3).min(max_icons);
+        let overflow = total_orgs - shown;
+        // 有溢出时给角标留 22px
+        let badge_w = if overflow > 0 && avail_for_icons >= shown as f32 * 14.0 + 22.0 { 22.0 } else { 0.0 };
+        let show_badge = overflow > 0 && badge_w > 0.0;
+        let strip_w = shown as f32 * 14.0 + badge_w;
+        let icons_left = if strip_w > 0.0 { c.right() - 2.0 - strip_w } else { c.right() - 2.0 };
         let name_max_w = (icons_left - 4.0 - name_x).max(0.0);
         let name = ellipsize(ui, &row.author, small.clone(), name_max_w);
         ui.painter().with_clip_rect(c).text(
@@ -753,7 +781,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             weak,
         );
         let cp = ui.painter().with_clip_rect(c);
-        for (oi, org) in orgs.iter().enumerate() {
+        for (oi, org) in row.orgs.iter().take(shown).enumerate() {
             let ir = egui::Rect::from_min_size(
                 egui::pos2(icons_left + oi as f32 * 14.0, c.center().y - 6.0),
                 egui::vec2(12.0, 12.0),
@@ -766,7 +794,22 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
             }
-            resp.on_hover_text((*org).clone());
+            resp.on_hover_text(org.clone());
+        }
+        if show_badge {
+            let br = egui::Rect::from_min_size(
+                egui::pos2(icons_left + shown as f32 * 14.0, c.center().y - 7.0),
+                egui::vec2(20.0, 14.0),
+            );
+            cp.text(
+                br.center(),
+                Align2::CENTER_CENTER,
+                format!("+{overflow}"),
+                FontId::proportional(9.0),
+                weak,
+            );
+            let resp = ui.interact(br, egui::Id::unique(("orgmore", row.key.clone())), egui::Sense::hover());
+            resp.on_hover_text(row.orgs.join(", "));
         }
     }
     // Turn 列：药丸徽章（painter 圆角矩形 + 文字，me=淡蓝/them=灰）
@@ -779,9 +822,9 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
         };
         if !label.is_empty() {
             let p = ui.painter().with_clip_rect(c);
-            // 列内居中（图标列语义）
+            // 与表头文字中心同一 x（收窄区中心）
             let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), small.clone(), fg).rect.width());
-            let pr = egui::Rect::from_center_size(c.center(), egui::vec2(tw + 10.0, 16.0));
+            let pr = egui::Rect::from_center_size(egui::pos2(icon_center_x(c), c.center().y), egui::vec2(tw + 10.0, 16.0));
             p.rect_filled(pr, 8.0, bg);
             p.text(pr.center(), Align2::CENTER_CENTER, label, small.clone(), fg);
         }
@@ -797,7 +840,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     // CI 圆点
     if !row.ci.is_empty() {
         let c = cell(6);
-        ui.painter().circle_filled(c.center(), 3.5, ui_detail::ci_color(&row.ci));
+        ui.painter().circle_filled(egui::pos2(icon_center_x(c), c.center().y), 3.5, ui_detail::ci_color(&row.ci));
     }
     paint_cell(ui, cell(7), &row.size, small.clone(), weak);
     paint_cell(ui, cell(8), &format!("+{}/-{}", row.adds, row.dels), small.clone(), weak);
@@ -806,7 +849,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
         let c = cell(9);
         let t = ellipsize(ui, &format!("{:.1}", row.score), small.clone(), c.width() - 4.0);
         ui.painter().with_clip_rect(c).text(
-            c.center(),
+            egui::pos2(icon_center_x(c), c.center().y),
             Align2::CENTER_CENTER,
             t,
             small.clone(),
@@ -918,5 +961,43 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     if ui.button(format!("{} [Esc]", tr(lang, "ctx_clear_selection"))).clicked() {
         app.clear_multi_selection();
         ui.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_zones_disjoint_and_cover() {
+        let cell = egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(110.0, 22.0));
+        let (text, handle) = header_zones(cell);
+        let handle = handle.unwrap();
+        assert!(!text.intersects(handle), "文字区与把手区必须不重叠");
+        assert!(text.width() + handle.width() >= cell.width() - 1.01, "两区覆盖单元格（允许 1px 防重叠间隙）");
+        assert!((handle.right() - cell.right()).abs() < 0.01, "把手区贴单元格右缘");
+        assert!((handle.width() - HANDLE_W).abs() < 0.01);
+    }
+
+    #[test]
+    fn col_layout_monotonic_and_min_widths() {
+        let widths = default_col_widths();
+        for total in [800.0, 1280.0, 2000.0] {
+            let layout = col_layout(total, &widths);
+            assert_eq!(layout.len(), COL_SPECS.len());
+            for i in 1..layout.len() {
+                assert!(
+                    layout[i].0 >= layout[i - 1].0 + layout[i - 1].1 - 0.01,
+                    "列 {i} 与前列重叠（total={total}）"
+                );
+            }
+            for (i, c) in COL_SPECS.iter().enumerate() {
+                assert!(
+                    layout[i].1 >= c.min_w - 0.01,
+                    "列 {} 宽度 {} 小于最小 {}（total={total}）",
+                    c.id, layout[i].1, c.min_w
+                );
+            }
+        }
     }
 }
