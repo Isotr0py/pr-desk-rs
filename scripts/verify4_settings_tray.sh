@@ -68,8 +68,13 @@ powershell -Command "
 Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class FT8 { [DllImport(\"user32.dll\", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr p, IntPtr c, string cls, string w); [DllImport(\"user32.dll\")] public static extern bool PostMessageW(IntPtr h, uint m, IntPtr w, IntPtr l); }'
 \$t = [FT8]::FindWindowExW([IntPtr]::Zero,[IntPtr]::Zero,'PRDeskTrayWnd',\$null)
 [FT8]::PostMessageW(\$t, 0x0401, [IntPtr]1, [IntPtr]0x0202) | Out-Null"
-sleep 1.5
-W2=$(powershell -ExecutionPolicy Bypass -File /d/Code/pr-desk-rs-egui/scripts/pdrive.ps1 -act info)
+# 还原不是即时的（winit 重建 surface/首帧绘制要数百 ms~数秒）：轮询最多 10s
+W2=""
+for i in $(seq 1 20); do
+  W2=$(powershell -ExecutionPolicy Bypass -File /d/Code/pr-desk-rs-egui/scripts/pdrive.ps1 -act info)
+  echo "$W2" | grep -qE "client=[1-9][0-9]*x[1-9][0-9]*" && break
+  sleep 0.5
+done
 echo "  [还原后] $W2"
 ( echo "$W2" | grep -qE "client=[1-9][0-9]*x[1-9][0-9]*" ) && { echo "  PASS: 托盘左键还原窗口"; PASS=$((PASS+1)); } || { echo "  FAIL: $W2"; FAIL=$((FAIL+1)); }
 
