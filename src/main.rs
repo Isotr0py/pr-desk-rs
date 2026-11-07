@@ -829,13 +829,26 @@ impl EguiApp {
             "collapse" => self.group_toggled(arg),
             // 列宽调整（与表头拖拽同一赋值路径）：colwidth <列idx> <宽>
             "colgrid" => self.show_col_grid = !self.show_col_grid,
-            // 拖拽调宽（与把手 Sense::drag 同语义：调宽 + 记拖拽时刻抑制点击排序）
+            // 拖拽调宽（与把手 Sense::drag 同语义：三分支调宽 + 记拖拽时刻抑制点击排序）
             "coldrag" => {
                 let i: usize = arg.parse().unwrap_or(0);
                 let dx: f32 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+                let n = ui_list::COL_SPECS.len();
                 if let Some(spec) = ui_list::COL_SPECS.get(i) {
-                    if !spec.flex {
+                    let dragged = if spec.flex {
+                        self.col_widths[i + 1] =
+                            (self.col_widths[i + 1] - dx).max(ui_list::COL_SPECS[i + 1].min_w);
+                        true
+                    } else if ui_list::COL_SPECS.get(i + 1).is_some_and(|s| s.flex) {
                         self.col_widths[i] = (self.col_widths[i] + dx).max(spec.min_w);
+                        true
+                    } else if i + 1 < n {
+                        ui_list::apply_pair_drag(&mut self.col_widths, i, dx);
+                        true
+                    } else {
+                        false
+                    };
+                    if dragged {
                         self.header_drag_at = Some(std::time::Instant::now());
                     }
                 }

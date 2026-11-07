@@ -389,6 +389,19 @@ fn col_layout(total_w: f32, widths: &[f32]) -> Vec<(f32, f32)> {
     out
 }
 
+/// 成对调宽：col[i] += dx、col[i+1] -= dx，两列各自钳到 min_w。
+/// dx 先被钳到 [min_i - w_i, w_{i+1} - min_{i+1}]，所以两列总和不变、不会卡死：
+/// 拖到极限后再反向拖，钳制区间随当前宽度重算，自然能拖回来。
+/// 返回实际应用的位移（|返回值| < |dx| 表示有钳制）。
+pub(crate) fn apply_pair_drag(widths: &mut [f32], i: usize, dx: f32) -> f32 {
+    let lo = COL_SPECS[i].min_w - widths[i];
+    let hi = widths[i + 1] - COL_SPECS[i + 1].min_w;
+    let d = dx.clamp(lo, hi);
+    widths[i] += d;
+    widths[i + 1] -= d;
+    d
+}
+
 /// 裁剪 + 省略号画单元格文本（防溢出压到相邻列）。
 fn paint_cell(ui: &Ui, cell: egui::Rect, text: &str, font: FontId, color: Color32) {
     if text.is_empty() {
@@ -608,8 +621,13 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
                     // 弹性列宽度 = 剩余空间，自身不可调：本把手改的是右侧固定列的宽度
                     // （方向取反——拖右 = 右列变窄、边界跟随光标右移）
                     app.col_widths[i + 1] = (app.col_widths[i + 1] - dx).max(COL_SPECS[i + 1].min_w);
-                } else {
+                } else if COL_SPECS[i + 1].flex {
+                    // 右邻是弹性 Title：它自动反向补偿，只调本列即可让边界跟随光标
                     app.col_widths[i] = (app.col_widths[i] + dx).max(c.min_w);
+                } else {
+                    // 成对调宽（Excel 手感）：左列 += dx、右列 -= dx，总量不变，
+                    // Title 不被波及，边界严格跟随光标；任一列到 min_w 即钳住
+                    apply_pair_drag(&mut app.col_widths, i, dx);
                 }
                 app.header_drag_at = Some(std::time::Instant::now());
             }
@@ -1018,6 +1036,34 @@ mod tests {
         assert!(handle.intersect(next_text).area() <= 0.0, "把手区与下一列文字区不得有面积重叠");
         assert!((text.right() - (handle.left())).abs() < 0.01, "文字区右缘 = 把手左缘");
         assert!((next_text.left() - handle.right()).abs() < 0.01, "下区左缘 = 把手右缘");
+    }
+
+    #[test]
+    fn pair_drag_compensates_clamps_and_reverses() {
+        // Rev|CI 边界（i=5）：拖左 = Rev 变窄、CI 变宽，总量不变，其余列不动
+        let mut w = default_col_widths();
+        let before = w.clone();
+        let d = apply_pair_drag(&mut w, 5, -20.0);
+        assert!((d - -20.0).abs() < 0.01);
+        assert!((w[5] - (before[5] - 20.0)).abs() < 0.01);
+        assert!((w[6] - (before[6] + 20.0)).abs() < 0.01);
+        for (j, (&a, &b)) in w.iter().zip(&before).enumerate() {
+            if j != 5 && j != 6 {
+                assert!((a - b).abs() < 0.01, "列 {j} 不应变化");
+            }
+        }
+        // 拖右过极限：CI 只能让出 28px（60→min 32），位移被钳，不穿透
+        let d = apply_pair_drag(&mut w, 5, 1000.0);
+        assert!((d - 28.0).abs() < 0.01);
+        assert!((w[6] - COL_SPECS[6].min_w).abs() < 0.01);
+        // 到极限后反向拖能拖回来（钳制区间按当前宽度重算，无卡死态）
+        let d = apply_pair_drag(&mut w, 5, -25.0);
+        assert!((d - -25.0).abs() < 0.01);
+        assert!((w[6] - (COL_SPECS[6].min_w + 25.0)).abs() < 0.01);
+        // 反向也钳本列 min_w
+        let d = apply_pair_drag(&mut w, 5, -1000.0);
+        assert!((w[5] - COL_SPECS[5].min_w).abs() < 0.01);
+        assert!(d < 0.0 && d > -1000.0, "位移被钳制");
     }
 
     #[test]
