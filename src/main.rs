@@ -41,6 +41,13 @@ pub struct EguiApp {
     pub col_widths: Vec<f32>,
     /// Files tab 的 FetchDiff 去重标记（打开面板已按需拉过则不再补发）
     pub diff_requested: Option<(String, i64)>,
+    /// debug：列边界覆盖层开关（colgrid 指令切换；验证列内容钉死在列框内）
+    pub show_col_grid: bool,
+    /// 列宽拖拽发生时刻（拖拽后松开那一下不得触发表头排序点击）
+    pub header_drag_at: Option<std::time::Instant>,
+    // debug：最近一帧的键盘占用/焦点（dumpstate 导出）
+    pub last_wants_keyboard: bool,
+    pub last_focus_id: String,
     // ── 详情面板 ──
     pub panel: Option<PanelData>,
     pub diff_files: Vec<DiffFileData>,
@@ -214,7 +221,10 @@ impl EguiApp {
 
     /// 列表头点击排序（Excel 式）：同列再点反向；新列按该列的默认方向
     ///（数值/时间列先降序——最新/最大在前；文本列先升序）。
-    pub fn header_clicked(&self, col: &str) {
+    pub fn header_clicked(&mut self, col: &str) {
+        if self.header_drag_at.is_some_and(|t| t.elapsed().as_millis() < 300) {
+            return; // 拖拽调宽刚松开：吞掉这次点击（不当成排序）
+        }
         let mut a = self.app.lock_recover();
         if a.sort_col == col {
             a.sort_asc = !a.sort_asc;
@@ -666,6 +676,7 @@ impl EguiApp {
                                         Some(p) => (p as i64 + delta).clamp(0, n as i64 - 1) as usize,
                                     };
                                     a.selected = Some(a.view_visible[npos].clone());
+                        tracing::debug!("jk: pos={:?} npos={} n={}", pos, npos, n);
                                     a.selected.clone()
                                 }
                             };
@@ -817,6 +828,18 @@ impl EguiApp {
             }
             "collapse" => self.group_toggled(arg),
             // 列宽调整（与表头拖拽同一赋值路径）：colwidth <列idx> <宽>
+            "colgrid" => self.show_col_grid = !self.show_col_grid,
+            // 拖拽调宽（与把手 Sense::drag 同语义：调宽 + 记拖拽时刻抑制点击排序）
+            "coldrag" => {
+                let i: usize = arg.parse().unwrap_or(0);
+                let dx: f32 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
+                if let Some(spec) = ui_list::COL_SPECS.get(i) {
+                    if !spec.flex {
+                        self.col_widths[i] = (self.col_widths[i] + dx).max(spec.min_w);
+                        self.header_drag_at = Some(std::time::Instant::now());
+                    }
+                }
+            }
             "colwidth" => {
                 let i: usize = arg.parse().unwrap_or(0);
                 let w: f32 = it.next().unwrap_or("0").parse().unwrap_or(0.0);
@@ -885,6 +908,10 @@ impl EguiApp {
             "filter": a.filter,
             "sort_col": a.sort_col,
             "sort_asc": a.sort_asc,
+            "col_widths": self.col_widths,
+            "header_drag_age_ms": self.header_drag_at.map(|t| t.elapsed().as_millis() as u64),
+            "wants_keyboard": self.last_wants_keyboard,
+            "focus_id": self.last_focus_id.clone(),
             "min_score": a.min_score,
             "panel_open": self.panel.is_some(),
             "panel_tab": self.panel_tab,
@@ -924,6 +951,17 @@ impl EguiApp {
     /// 引导 → 吞掉；Inbox 预览 → 关预览；多选 → 清多选；详情面板 → 关面板；→ 清选中。
     fn hotkeys(&mut self, ctx: &egui::Context) {
         let ctx = ctx.clone();
+        // debug：按键事件可见性（排查热键被吞）
+        if true {
+            let keys = ctx.input(|i| i.keys_down.iter().map(|k| format!("{k:?}")).collect::<Vec<_>>());
+            let pressed: Vec<String> = ctx.input(|i| i.events.iter().filter_map(|e| match e {
+                egui::Event::Key { key, pressed: true, .. } => Some(format!("{key:?}")),
+                _ => None,
+            }).collect());
+            if !pressed.is_empty() {
+                tracing::debug!("hotkeys: keys_down={keys:?} pressed={pressed:?} wants_kb={}", ctx.egui_wants_keyboard_input());
+            }
+        }
         if ctx.egui_wants_keyboard_input() {
             return;
         }
@@ -978,6 +1016,7 @@ impl EguiApp {
                             Some(p) => (p as i64 + delta).clamp(0, n as i64 - 1) as usize,
                         };
                         a.selected = Some(a.view_visible[npos].clone());
+                        tracing::debug!("jk: pos={:?} npos={} n={}", pos, npos, n);
                         a.selected.clone()
                     }
                 };
@@ -1118,6 +1157,8 @@ impl eframe::App for EguiApp {
             self.save_geometry(ctx);
         }
 
+        self.last_wants_keyboard = ctx.egui_wants_keyboard_input();
+        self.last_focus_id = ctx.memory(|m| m.focused()).map(|id| format!("{id:?}")).unwrap_or_default();
         self.hotkeys(ctx);
     }
 
@@ -1317,6 +1358,10 @@ fn main() -> anyhow::Result<()> {
                 filter_buf: String::new(),
                 col_widths: ui_list::default_col_widths(),
                 diff_requested: None,
+                show_col_grid: false,
+                header_drag_at: None,
+                last_wants_keyboard: false,
+                last_focus_id: String::new(),
                 panel: None,
                 diff_files: Vec::new(),
                 panel_tab: 0,

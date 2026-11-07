@@ -1,6 +1,10 @@
 #!/bin/bash
 # 验证 4：设置页 / 档案 / 主题 / 语言 / 托盘 / 退出
 source /d/Code/pr-desk-rs-egui/scripts/verify.sh "设置+档案+托盘"
+# 前置：确保窗口可见（桌面其它活动可能把窗口最小化/盖住——隐藏窗口不绘制、键鼠语义不同）
+: > "$CMD"
+echo "trayshow" > "$CMD"
+sleep 1
 
 # ── 设置页 ──
 cmd "settings"

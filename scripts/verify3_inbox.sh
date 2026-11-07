@@ -1,6 +1,10 @@
 #!/bin/bash
 # 验证 3：Inbox 全量（拉取/过滤/未读开关/预览/标记已读/+预评审/加载更多）
 source /d/Code/pr-desk-rs-egui/scripts/verify.sh "Inbox"
+# 前置：确保窗口可见（桌面其它活动可能把窗口最小化/盖住——隐藏窗口不绘制、键鼠语义不同）
+: > "$CMD"
+echo "trayshow" > "$CMD"
+sleep 1
 
 cmd "inbox"
 assert "切到 Inbox 视图" "d['view_mode']==1"

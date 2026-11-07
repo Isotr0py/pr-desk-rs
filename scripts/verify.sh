@@ -9,7 +9,8 @@ mkdir -p /tmp/pd-shots
 
 cmd() {
   local before
-  before=$(grep -c "test-cmd 已处理" "$LOG" 2>/dev/null || echo 0)
+  before=$(grep -c "test-cmd 已处理" "$LOG" 2>/dev/null || true)
+  before=${before:-0}
   : > "$CMD"
   echo "$1" > "$CMD"
   # 等本条指令被处理（回执计数增加，防匹配到历史行）
@@ -24,7 +25,8 @@ cmd() {
 
 shot() {
   local before
-  before=$(grep -c "截图已存" "$LOG" 2>/dev/null)
+  before=$(grep -c "截图已存" "$LOG" 2>/dev/null || true)
+  before=${before:-0}
   : > "$CMD"
   echo "shot" > "$CMD"
   for i in $(seq 1 30); do

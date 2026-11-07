@@ -1,6 +1,10 @@
 #!/bin/bash
 # 验证 1：列表 / 导航 / 多选 / 批量 / 快捷键
 source /d/Code/pr-desk-rs-egui/scripts/verify.sh "列表+多选+快捷键"
+# 前置：确保窗口可见（桌面其它活动可能把窗口最小化/盖住——隐藏窗口不绘制、键鼠语义不同）
+: > "$CMD"
+echo "trayshow" > "$CMD"
+sleep 1
 
 # 基线（行数动态读取——Inbox「+ 预评审」会累积入库）
 BASE_ROWS=$(state | python -c "import json,sys; print(json.load(sys.stdin)['rows'])")
