@@ -117,12 +117,31 @@ pub fn inbox_view(app: &mut EguiApp, ui: &mut Ui) {
             return;
         }
 
-        // 表头
-        ui.horizontal(|ui| {
-            ui.weak(tr(&lang, "inbox_col_repo"));
-            ui.add_space(140.0);
-            ui.weak(tr(&lang, "inbox_col_title"));
-        });
+        // 表头（与数据行同一列布局：未读点/仓库/标题/状态/类型/原因/时间）
+        {
+            let total_w = ui.available_width();
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, 20.0), egui::Sense::hover());
+            let cols = inbox_col_layout(total_w);
+            let weak = ui.visuals().weak_text_color();
+            let hf = FontId::proportional(11.0);
+            let labels = [
+                "",
+                tr(&lang, "inbox_col_repo"),
+                tr(&lang, "inbox_col_title"),
+                tr(&lang, "inbox_col_state"),
+                tr(&lang, "inbox_col_type"),
+                tr(&lang, "inbox_col_reason"),
+                tr(&lang, "inbox_col_time"),
+            ];
+            for (i, lab) in labels.iter().enumerate() {
+                if lab.is_empty() {
+                    continue;
+                }
+                let (x, w) = cols[i];
+                let cell = egui::Rect::from_min_size(rect.min + egui::vec2(x, 0.0), egui::vec2(w, rect.height()));
+                crate::ui_list::paint_cell(ui, cell, lab, hf.clone(), weak);
+            }
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("inbox-scroll")
@@ -155,26 +174,45 @@ fn set_repo_filter(app: &EguiApp, f: &str) {
     a.inbox_view = inbox_filtered(&a);
 }
 
+/// Inbox 行/表头共用列布局：[未读点][仓库][标题(弹性)][状态][类型][原因][时间]。
+/// 返回相对行左缘的 (x, w)；标题列吃剩余宽（最小 120），其余列固定宽、互不侵占。
+fn inbox_col_layout(total_w: f32) -> [(f32, f32); 7] {
+    const DOT: f32 = 16.0;
+    const REPO: f32 = 150.0;
+    const STATE: f32 = 52.0;
+    const KIND: f32 = 92.0;
+    const REASON: f32 = 96.0;
+    const TIME: f32 = 48.0;
+    let fixed = DOT + REPO + STATE + KIND + REASON + TIME;
+    let title_w = (total_w - fixed - 4.0).max(120.0);
+    let mut out = [(0.0, 0.0); 7];
+    let mut x = 0.0;
+    for (i, w) in [DOT, REPO, title_w, STATE, KIND, REASON, TIME].into_iter().enumerate() {
+        out[i] = (x, w);
+        x += w;
+    }
+    out
+}
+
 fn inbox_row(app: &mut EguiApp, ui: &mut Ui, n: &serde_json::Value, i: usize, lang: &str) {
     let repo = n["repo"].as_str().unwrap_or("");
     let title = n["title"].as_str().unwrap_or("");
     let kind = n["kind"].as_str().unwrap_or("");
+    let url = n["url"].as_str().unwrap_or("");
     let unread = n["unread"].as_bool().unwrap_or(false);
-    let selected = app.inbox_sel == Some(i)
-        || app
-            .app
-            .lock_recover()
-            .inbox_detail
-            .as_ref()
-            .is_some_and(|(r, num, _, url)| {
-                r == repo && Some(*num) == notif_url_number(url)
-            });
+    // 选中判定：详情面板开着时按稳定身份（repo + 行自身 url）严格单行匹配——旧实现
+    // 比较的是详情自身的 (num, url)（恒等），条件退化成 r == repo，同仓库的行全亮；
+    // 面板关着时（未打开过详情）退到 j/k 导航下标
+    let detail = app.app.lock_recover().inbox_detail.clone();
+    let selected = if let Some((r, _, _, durl)) = &detail {
+        r == repo && !url.is_empty() && *durl == url
+    } else {
+        app.inbox_sel == Some(i)
+    };
 
     let height = 30.0;
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), height),
-        egui::Sense::click(),
-    );
+    let total_w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(total_w, height), egui::Sense::click());
     let visuals = ui.visuals();
     let bg = if selected {
         visuals.selection.bg_fill
@@ -188,34 +226,18 @@ fn inbox_row(app: &mut EguiApp, ui: &mut Ui, n: &serde_json::Value, i: usize, la
     let p = ui.painter();
     let text_color = visuals.text_color();
     let weak = visuals.weak_text_color();
-    // 未读圆点
-    if unread {
-        p.circle_filled(rect.left_center() + egui::vec2(8.0, 0.0), 3.0, visuals.hyperlink_color);
-    }
-    let font = FontId::default();
-    p.text(
-        rect.left_center() + egui::vec2(18.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        repo,
-        font.clone(),
-        weak,
-    );
-    p.text(
-        rect.left_center() + egui::vec2(170.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        title,
-        font.clone(),
-        if unread { text_color } else { weak },
-    );
-    // 右侧：kind 标签 / reason / 相对时间 / 已加入标记
-    let mut rx = rect.right() - 8.0;
-    let put_right = |p: &egui::Painter, rx: &mut f32, s: String, c: egui::Color32| {
-        p.text(egui::pos2(*rx, rect.center().y), egui::Align2::RIGHT_CENTER, s, FontId::proportional(11.0), c);
-        *rx -= 70.0;
+    let small = FontId::proportional(11.0);
+    let cols = inbox_col_layout(total_w);
+    let cell = |idx: usize| -> egui::Rect {
+        let (x, w) = cols[idx];
+        egui::Rect::from_min_size(rect.min + egui::vec2(x, 0.0), egui::vec2(w, rect.height()))
     };
-    put_right(p, &mut rx, rel_time(n["updated_at"].as_str().unwrap_or("")), weak);
-    put_right(p, &mut rx, notif_reason_label(lang, n["reason"].as_str().unwrap_or("")), weak);
-    put_right(p, &mut rx, notif_kind_label(lang, kind), weak);
+    // 未读圆点：独立窄列（列 0），不与仓库文字挤
+    if unread {
+        p.circle_filled(cell(0).center(), 3.0, visuals.hyperlink_color);
+    }
+    crate::ui_list::paint_cell(ui, cell(1), repo, small.clone(), weak);
+    crate::ui_list::paint_cell(ui, cell(2), title, small.clone(), if unread { text_color } else { weak });
     let state = n["state"].as_str().unwrap_or("");
     if !state.is_empty() {
         let (label, color) = match state {
@@ -223,28 +245,28 @@ fn inbox_row(app: &mut EguiApp, ui: &mut Ui, n: &serde_json::Value, i: usize, la
             "closed" => (tr(lang, "inbox_state_closed"), ui_detail::state_color("closed", visuals.dark_mode)),
             _ => (tr(lang, "inbox_state_open"), ui_detail::state_color("open", visuals.dark_mode)),
         };
-        put_right(p, &mut rx, label.to_string(), color);
+        crate::ui_list::paint_cell(ui, cell(3), label, small.clone(), color);
     }
-    // 「已加入」标记：PullRequest 且已在库
-    if kind == "PullRequest"
-        && let Some(num) = notif_url_number(n["url"].as_str().unwrap_or(""))
-    {
-        let added = app
-            .app
-            .lock_recover()
-            .db
-            .pr_exists(repo, num)
-            .unwrap_or(true);
-        if added {
-            p.text(
-                egui::pos2(rx + 30.0, rect.center().y),
-                egui::Align2::RIGHT_CENTER,
-                tr(lang, "inbox_added"),
-                FontId::proportional(11.0),
-                visuals.weak_text_color(),
-            );
-        }
+    // 类型列；「已加入」的 PR 在类型文字后跟一个绿色 ✓（裁在列内）
+    let kind_label = notif_kind_label(lang, kind);
+    let added = kind == "PullRequest"
+        && notif_url_number(url).is_some_and(|num| {
+            app.app.lock_recover().db.pr_exists(repo, num).unwrap_or(true)
+        });
+    crate::ui_list::paint_cell(ui, cell(4), &kind_label, small.clone(), weak);
+    if added {
+        let kw = ui.fonts_mut(|f| f.layout_no_wrap(kind_label.clone(), small.clone(), weak).rect.width());
+        let kc = cell(4);
+        p.with_clip_rect(kc).text(
+            egui::pos2((kc.left() + 2.0 + kw + 4.0).min(kc.right() - 10.0), kc.center().y),
+            egui::Align2::LEFT_CENTER,
+            "✓",
+            small.clone(),
+            ui_detail::state_color("open", visuals.dark_mode),
+        );
     }
+    crate::ui_list::paint_cell(ui, cell(5), &notif_reason_label(lang, n["reason"].as_str().unwrap_or("")), small.clone(), weak);
+    crate::ui_list::paint_cell(ui, cell(6), &rel_time(n["updated_at"].as_str().unwrap_or("")), small.clone(), weak);
 
     if resp.clicked() {
         app.inbox_activated(i);

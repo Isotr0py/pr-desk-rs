@@ -403,7 +403,7 @@ pub(crate) fn apply_pair_drag(widths: &mut [f32], i: usize, dx: f32) -> f32 {
 }
 
 /// 裁剪 + 省略号画单元格文本（防溢出压到相邻列）。
-fn paint_cell(ui: &Ui, cell: egui::Rect, text: &str, font: FontId, color: Color32) {
+pub(crate) fn paint_cell(ui: &Ui, cell: egui::Rect, text: &str, font: FontId, color: Color32) {
     if text.is_empty() {
         return;
     }
@@ -414,7 +414,7 @@ fn paint_cell(ui: &Ui, cell: egui::Rect, text: &str, font: FontId, color: Color3
 }
 
 /// 超出宽度时截断加「…」；按字符步进测量（行数少，成本可忽略）。
-fn ellipsize(ui: &Ui, text: &str, font: FontId, max_w: f32) -> String {
+pub(crate) fn ellipsize(ui: &Ui, text: &str, font: FontId, max_w: f32) -> String {
     let measure = |ui: &Ui, s: String| {
         ui.fonts_mut(|f| f.layout_no_wrap(s, font.clone(), Color32::WHITE).rect.width())
     };
@@ -790,8 +790,8 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
                 );
             }
         }
-        // 组织图标：钉死在列内右缘（不随名字长度漂移），严格裁进列宽，hover 提示组织名；
-        // 列宽不足时减少显示个数，全部放不下显示第一个 + 「+N」角标
+        // 组织图标：紧跟作者名字右侧（固定 4px 间距），名字超长时多截几个字给图标留位；
+        // 列宽不足时减少显示个数，全部放不下显示第一个 + 「+N」角标；整条带严格裁进列宽
         let name_x = avatar_r.right() + 4.0;
         let name_min_w = 30.0_f32;
         let avail_for_icons = (c.width() - 2.0 - 20.0 - 4.0 - name_min_w - 4.0).max(0.0);
@@ -803,9 +803,11 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
         let badge_w = if overflow > 0 && avail_for_icons >= shown as f32 * 14.0 + 22.0 { 22.0 } else { 0.0 };
         let show_badge = overflow > 0 && badge_w > 0.0;
         let strip_w = shown as f32 * 14.0 + badge_w;
-        let icons_left = if strip_w > 0.0 { c.right() - 2.0 - strip_w } else { c.right() - 2.0 };
-        let name_max_w = (icons_left - 4.0 - name_x).max(0.0);
+        // 名字最多画到「给条带留位」为止；条带位置 = 名字实际渲染宽 + 4px（钳在列内）
+        let strip_reserve = if strip_w > 0.0 { strip_w + 4.0 } else { 0.0 };
+        let name_max_w = (c.right() - 2.0 - strip_reserve - name_x).max(0.0);
         let name = ellipsize(ui, &row.author, small.clone(), name_max_w);
+        let name_w = ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), small.clone(), weak).rect.width());
         ui.painter().with_clip_rect(c).text(
             egui::pos2(name_x, c.center().y),
             Align2::LEFT_CENTER,
@@ -813,6 +815,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             small.clone(),
             weak,
         );
+        let icons_left = (name_x + name_w + 4.0).min(c.right() - 2.0 - strip_w).max(name_x);
         let cp = ui.painter().with_clip_rect(c);
         for (oi, org) in row.orgs.iter().take(shown).enumerate() {
             let ir = egui::Rect::from_min_size(
