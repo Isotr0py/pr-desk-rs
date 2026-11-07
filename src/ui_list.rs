@@ -282,6 +282,12 @@ fn batch_run_review(app: &EguiApp) {
 
 // ── PR 列表 ──
 
+/// pr_list_view 的单锁快照项（见 pr_list_view 注释：flat/rows 一致性竞态修复）
+enum ViewItem {
+    Header { key: String, title: String, count: usize, collapsed: bool },
+    Row(RowData),
+}
+
 /// 行渲染用的快照数据（渲染期间不持 App 锁）。
 struct RowData {
     key: (String, i64),
@@ -487,11 +493,26 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
         ui.separator();
 
         // ── 分组 + 行 ──
-        let (flat, selected, selection) = {
+        // 单锁快照整帧数据：flat 与 rows 必须一致——旧实现先克隆 flat、渲染时逐行
+        // 再取锁读 rows，中途换库/刷新把 rows 换短就 rows[idx] 越界 panic
+        //（切换档案时 rows 22→2 实测崩过）。一次性把行数据拷出来，渲染期不再持锁。
+        let (items, selected, selection) = {
             let a = app.app.lock_recover();
-            (a.flat.clone(), a.selected.clone(), a.selection.clone())
+            let mut items: Vec<ViewItem> = Vec::with_capacity(a.flat.len());
+            for item in &a.flat {
+                match item {
+                    FlatItem::Header { key, title, count } => items.push(ViewItem::Header {
+                        key: key.clone(),
+                        title: title.clone(),
+                        count: *count,
+                        collapsed: a.collapsed.contains(key),
+                    }),
+                    FlatItem::Row { rows_idx } => items.push(ViewItem::Row(row_data(&a, *rows_idx))),
+                }
+            }
+            (items, a.selected.clone(), a.selection.clone())
         };
-        if flat.is_empty() {
+        if items.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(48.0);
                 ui.weak(tr(&lang, "empty_no_pr"));
@@ -502,11 +523,10 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
             .id_salt("pr-list-scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for item in &flat {
+                for item in &items {
                     match item {
-                        FlatItem::Header { key, title, count } => {
-                            let collapsed = app.app.lock_recover().collapsed.contains(key);
-                            let arrow = if collapsed { "▶" } else { "▼" };
+                        ViewItem::Header { key, title, count, collapsed } => {
+                            let arrow = if *collapsed { "▶" } else { "▼" };
                             let resp = ui.add(
                                 egui::Label::new(RichText::new(format!("{arrow} {title} ({count})")).strong())
                                     .sense(egui::Sense::click()),
@@ -515,12 +535,8 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
                                 app.group_toggled(key);
                             }
                         }
-                        FlatItem::Row { rows_idx } => {
-                            let row = {
-                                let a = app.app.lock_recover();
-                                row_data(&a, *rows_idx)
-                            };
-                            pr_row(app, ui, &row, selected.as_ref() == Some(&row.key), selection.contains(&row.key), &lang);
+                        ViewItem::Row(row) => {
+                            pr_row(app, ui, row, selected.as_ref() == Some(&row.key), selection.contains(&row.key), &lang);
                         }
                     }
                 }
