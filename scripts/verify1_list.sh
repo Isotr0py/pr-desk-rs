@@ -69,17 +69,22 @@ FIRST=$(state | python -c "import json,sys; d=json.load(sys.stdin); print(d['sel
 cmd "sort title"
 assert "新列 title 默认升序" "d['sort_col']=='title' and d['sort_asc']==True"
 
-# 高分快筛（无评审行 → 全滤掉）
+# 高分快筛（滤掉低分行。库里已存在 ≥8 分行（评审过的 PR 会累积），
+# 不能再断言「全滤掉」；语义守住「严格变少 + 关闭后还原」。
+# 基线现取（刷新可能中途落新行，用套件开头的 BASE_FLAT 会假失败）
+F_HS0=$(state | python -c "import json,sys; print(json.load(sys.stdin)['flat'])")
 cmd "highscore"
-assert "高分快筛：全滤掉（score 全 0）" "d['flat']==0"
+assert "高分快筛：行数严格变少" "d['flat']<$F_HS0"
 cmd "highscore"
-assert "关闭快筛恢复" "d['flat']==$BASE_FLAT"
+assert "关闭快筛恢复" "d['flat']==$F_HS0"
 
-# 组折叠
+# 组折叠（组数随数据漂移——merged/pinned 组会凭空出现；断言「折叠变少 + 展开还原」，
+# 基线现取，不写死组数）
+F_COL0=$(state | python -c "import json,sys; print(json.load(sys.stdin)['flat'])")
 cmd "collapse needs-review"
-assert "折叠后 flat 只剩 header" "d['flat']==1"
+assert "折叠后 flat 变少（行收进组头）" "d['flat']<$F_COL0"
 cmd "collapse needs-review"
-assert "展开恢复" "d['flat']==$BASE_FLAT"
+assert "展开恢复" "d['flat']==$F_COL0"
 
 # Esc：先清多选 → 再清选中
 cmd "rowctrl 1"; cmd "esc"

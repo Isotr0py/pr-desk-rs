@@ -21,14 +21,25 @@ shot "inbox-list"
 
 # 预览：点击第 0 条（自动标记已读：MarkNotifRead 发出 → 重拉）
 UNREAD_BEFORE=$(state | python -c "import json,sys; d=json.load(sys.stdin); print(d['inbox'])")
-cmd "inboxrow 0"; sleep 3
+cmd "inboxrow 0"
+# 详情拉取走网络，sleep 定死在慢网/限流时会假失败——轮询等 loading 关闭（≤10s）
+for i in $(seq 1 20); do
+  L=$(state | python -c "import json,sys; print(json.load(sys.stdin)['nd_loading'])")
+  [ "$L" = "False" ] && break
+  sleep 0.5
+done
 assert "预览面板打开" "d['nd_open']==True"
 assert "预览加载完成（loading 关闭）" "d['nd_loading']==False"
 assert "预览会话内容非空" "d['nd_convo']>0"
 shot "inbox-preview"
 
 # 身份守卫：快速连点两条（旧结果不得覆盖）
-cmd "inboxrow 1"; cmd "inboxrow 2"; sleep 3
+cmd "inboxrow 1"; cmd "inboxrow 2"
+for i in $(seq 1 20); do
+  L=$(state | python -c "import json,sys; print(json.load(sys.stdin)['nd_loading'])")
+  [ "$L" = "False" ] && break
+  sleep 0.5
+done
 assert "连点两条后面板开着且加载完成" "d['nd_open']==True and d['nd_loading']==False"
 
 # 仓库过滤
