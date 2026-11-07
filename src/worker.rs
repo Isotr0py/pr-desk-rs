@@ -1871,16 +1871,24 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 }
                 sync_client = sync::SyncClient::new(&cfg);
                 send(&msg_tx, Msg::Status(tr(&lang, "cfg_reloaded").into()));
-                // 复用现有流程：sync 模式同步服务器列表；本地模式刷新在库行状态
+                // 复用现有流程：sync 模式同步服务器列表；本地模式刷新在库行状态。
+                // 网络部分 spawn 到后台（同 SwitchProfile 先例）：否则 ReloadConfig 期间
+                // 命令队列整体阻塞几十秒，其后的 SwitchProfile 等指令全部排队超时
                 let for_profile = cfg.active_profile.clone();
                 if let Some(g) = &gh {
-                    if sync_client.enabled() {
-                        fetch_inbox(g, &app, &msg_tx).await;
-                        do_sync(&app, &sync_client, &msg_tx, &for_profile).await;
-                    } else {
-                        refresh_from_github(g, &app, &msg_tx, &for_profile).await;
-                        fetch_inbox(g, &app, &msg_tx).await;
-                    }
+                    let g = g.clone();
+                    let sc = sync_client.clone();
+                    let app2 = app.clone();
+                    let msg_tx2 = msg_tx.clone();
+                    tokio::spawn(async move {
+                        if sc.enabled() {
+                            fetch_inbox(&g, &app2, &msg_tx2).await;
+                            do_sync(&app2, &sc, &msg_tx2, &for_profile).await;
+                        } else {
+                            refresh_from_github(&g, &app2, &msg_tx2, &for_profile).await;
+                            fetch_inbox(&g, &app2, &msg_tx2).await;
+                        }
+                    });
                 }
             }
         }
