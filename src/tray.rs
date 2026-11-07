@@ -30,65 +30,30 @@ fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// 程序内生成 32x32 托盘图标（蓝底圆角方块 + 白色 PR 分支图形），BGRA 像素。
+/// 托盘图标：内嵌 PR 形状图标（assets/app-icon-32.png，Slint 版 app.svg 的离线渲染，
+/// 运行时不带 SVG 渲染依赖）。CreateIcon 的 XOR 位图是 BGRA 自底向上。
 fn icon_pixels() -> ([u8; 32 * 32 * 4], [u8; 32 * 32 / 8]) {
-    let mut px = [0u8; 32 * 32 * 4];
+    let png = include_bytes!("../assets/app-icon-32.png");
+    let img = image::load_from_memory(png)
+        .expect("内嵌图标 PNG 解码失败")
+        .to_rgba8();
+    let mut xor = [0u8; 32 * 32 * 4];
     let mut and = [0xFFu8; 32 * 32 / 8]; // AND 掩码：1 = 透明（保底；32bpp alpha 生效时被忽略）
-    let set = |px: &mut [u8; 32 * 32 * 4], and: &mut [u8; 32 * 32 / 8], x: i32, y: i32, r: u8, g: u8, b: u8, a: u8| {
-        if (0..32).contains(&x) && (0..32).contains(&y) {
-            // CreateIcon 的 XOR 位图是自底向上的
+    for y in 0..32u32 {
+        for x in 0..32u32 {
+            let p = img.get_pixel(x, y).0;
             let i = ((31 - y) * 32 + x) as usize * 4;
-            px[i] = b;
-            px[i + 1] = g;
-            px[i + 2] = r;
-            px[i + 3] = a;
-            let bi = ((31 - y) * 32 + x) as usize;
-            and[bi / 8] &= !(1 << (7 - bi % 8));
-        }
-    };
-    // 圆角方块底（r=6）
-    for y in 0..32i32 {
-        for x in 0..32i32 {
-            let in_rect = x >= 2 && x < 30 && y >= 2 && y < 30;
-            let corner = |cx: i32, cy: i32| (x - cx).pow(2) + (y - cy).pow(2) > 36;
-            let clipped = (x < 8 && y < 8 && corner(8, 8))
-                || (x >= 24 && y < 8 && corner(23, 8))
-                || (x < 8 && y >= 24 && corner(8, 23))
-                || (x >= 24 && y >= 24 && corner(23, 23));
-            if in_rect && !clipped {
-                set(&mut px, &mut and, x, y, 45, 125, 255, 255);
+            xor[i] = p[2];
+            xor[i + 1] = p[1];
+            xor[i + 2] = p[0];
+            xor[i + 3] = p[3];
+            if p[3] > 0 {
+                let bi = ((31 - y) * 32 + x) as usize;
+                and[bi / 8] &= !(1 << (7 - bi % 8));
             }
         }
     }
-    // 白色分支图形：左竖线两节点 + 右侧斜线节点（PR glyph）
-    let circle = |px: &mut [u8; 32 * 32 * 4], and: &mut [u8; 32 * 32 / 8], cx: i32, cy: i32| {
-        for dy in -4..=4 {
-            for dx in -4..=4 {
-                let d2 = dx * dx + dy * dy;
-                if d2 <= 16 && d2 >= 7 {
-                    set(px, and, cx + dx, cy + dy, 255, 255, 255, 255);
-                }
-            }
-        }
-    };
-    let line = |px: &mut [u8; 32 * 32 * 4], and: &mut [u8; 32 * 32 / 8], x0: i32, y0: i32, x1: i32, y1: i32| {
-        let steps = ((x1 - x0).abs().max((y1 - y0).abs())) * 2 + 1;
-        for s in 0..=steps {
-            let x = x0 + (x1 - x0) * s / steps;
-            let y = y0 + (y1 - y0) * s / steps;
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    set(px, and, x + dx, y + dy, 255, 255, 255, 255);
-                }
-            }
-        }
-    };
-    line(&mut px, &mut and, 11, 9, 11, 23);
-    line(&mut px, &mut and, 12, 10, 21, 20);
-    circle(&mut px, &mut and, 11, 9);
-    circle(&mut px, &mut and, 11, 23);
-    circle(&mut px, &mut and, 22, 21);
-    (px, and)
+    (xor, and)
 }
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

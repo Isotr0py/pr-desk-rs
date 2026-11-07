@@ -1287,8 +1287,18 @@ fn main() -> anyhow::Result<()> {
         (Some(w), Some(h)) if w >= 900.0 && h >= 480.0 => (w as f32, h as f32),
         _ => (1280.0, 760.0),
     };
+    // 窗口图标：PR 形状 logo（assets/app-icon-256.png，Slint 版 app.svg 的离线渲染）
+    let icon = {
+        let img = image::load_from_memory(include_bytes!("../assets/app-icon-256.png"))
+            .expect("内嵌图标 PNG 解码失败")
+            .to_rgba8();
+        let (iw, ih) = img.dimensions();
+        egui::IconData { rgba: img.into_raw(), width: iw, height: ih }
+    };
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([w, h]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([w, h])
+            .with_icon(icon),
         ..Default::default()
     };
 
