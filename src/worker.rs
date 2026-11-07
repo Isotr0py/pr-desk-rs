@@ -1236,6 +1236,43 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     }
                 }
             }
+            Cmd::CopyToProfile { target, keys } => {
+                // 跨档案复制：目标库文件本进程未持有，外部占用由 busy_timeout(3s) 兜底。
+                // 本地 SQLite 微秒级；源档案列表无需刷新（复制不改源）。
+                let result = {
+                    let a = app.lock_recover();
+                    if target == a.cfg.active_profile {
+                        None // UI 名单已排除当前档案，双保险
+                    } else {
+                        let dst_path = profile_db_path(&pr_desk_rs::data_dir(), &target);
+                        // 与 SwitchProfile 换库同款：profiles/ 子目录可能尚不存在
+                        if let Some(parent) = dst_path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        Some(Db::open(&dst_path).and_then(|dst| Db::copy_prs_to(&a.db, &dst, &keys)))
+                    }
+                };
+                if let Some(r) = result {
+                    match r {
+                        Ok((inserted, skipped, n_reviews)) => {
+                            let msg = if skipped > 0 {
+                                trf(&lang, "copy_done_skipped", &[
+                                    &inserted.to_string(),
+                                    &target,
+                                    &n_reviews.to_string(),
+                                    &skipped.to_string(),
+                                ])
+                            } else {
+                                trf(&lang, "copy_done", &[&inserted.to_string(), &target, &n_reviews.to_string()])
+                            };
+                            send(&msg_tx, Msg::Status(msg));
+                        }
+                        Err(e) => {
+                            send(&msg_tx, Msg::Status(trf(&lang, "copy_failed", &[&e.to_string()])));
+                        }
+                    }
+                }
+            }
             Cmd::CopyLinks(text) => {
                 // 多选「复制链接」：文本在 UI 回调拼好，剪贴板写入在 worker
                 //（与 CopyReview 同理：Windows 剪贴板打开可能重试阻塞）
@@ -1873,7 +1910,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 send(&msg_tx, Msg::Status(tr(&lang, "cfg_reloaded").into()));
                 // 复用现有流程：sync 模式同步服务器列表；本地模式刷新在库行状态。
                 // 网络部分 spawn 到后台（同 SwitchProfile 先例）：否则 ReloadConfig 期间
-                // 命令队列整体阻塞几十秒，其后的 SwitchProfile 等指令全部排队超时
+                // 命令队列整体阻塞几十秒，其后的 SwitchProfile/DeletePrs 等全部排队超时
                 let for_profile = cfg.active_profile.clone();
                 if let Some(g) = &gh {
                     let g = g.clone();

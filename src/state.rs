@@ -43,6 +43,8 @@ pub enum Cmd {
     OpenDrawer { repo: String, number: i64, refetch: bool },
     CopyReview,        // 详情面板「复制评审」：get_review SQL + 剪贴板写入都在 worker
     CopyLinks(String), // 多选「复制链接」：换行拼接的 URL 文本，剪贴板写入在 worker
+    // 右键/操作条「复制到档案…」：当前选择集（多选优先，否则当前行）+ 全部评审复制到目标档案
+    CopyToProfile { target: String, keys: Vec<(String, i64)> },
     LoadReviewPrompt,  // 设置页打开时重读 exe 旁 review_prompt.md（可能被外部编辑过）
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
     SwitchProfile(String),  // 切换数据源档案（"local"/"default"/自定义名）：换库 + 重建同步客户端

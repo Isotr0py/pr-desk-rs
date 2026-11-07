@@ -178,7 +178,7 @@ fn save_settings(app: &mut EguiApp) -> bool {
 }
 
 /// 新增自定义档案：校验名字（非空/字符合法/非保留/不重名）→ 复制 default 档配置入库 + save。
-fn profile_add(app: &mut EguiApp) {
+pub(crate) fn profile_add(app: &mut EguiApp) {
     let name = app.add_profile_name.trim().to_string();
     let lang = app.lang();
     let prev = app.settings_profile.clone();

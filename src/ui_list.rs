@@ -228,6 +228,10 @@ pub fn selection_bar(app: &mut EguiApp, ui: &mut Ui) {
                     let _ = app.cmd_tx.send(Cmd::CopyLinks(text));
                 }
             }
+            // 「复制到档案…」（多选优先，否则当前行；含评审记录，目标已有行整行跳过）
+            if ui.button(tr(&lang, "ctx_copy_to_profile")).clicked() {
+                app.open_copy_picker();
+            }
             if ui.button(tr(&lang, "inbox_open_browser")).clicked() {
                 worker::batch_open_browser(&app.app);
             }
@@ -1027,10 +1031,54 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         }
         ui.close();
     }
+    // 「复制到档案…」（多选优先，否则当前行；含评审记录，目标已有行整行跳过）
+    if ui.button(tr(lang, "ctx_copy_to_profile")).clicked() {
+        app.open_copy_picker();
+        ui.close();
+    }
     ui.separator();
     if ui.button(format!("{} [Esc]", tr(lang, "ctx_clear_selection"))).clicked() {
         app.clear_multi_selection();
         ui.close();
+    }
+}
+
+// ── 模态弹窗：复制目标档案选择 ──
+
+/// 「复制到档案…」目标选择弹层：列出全部档案 − 当前档案；点中即走 worker 复制。
+pub fn copy_picker_window(app: &mut EguiApp, ctx: &egui::Context) {
+    if !app.copy_picker_open {
+        return;
+    }
+    let lang = app.lang();
+    let (names, active) = {
+        let a = app.app.lock_recover();
+        (a.cfg.profile_names(), a.cfg.active_profile.clone())
+    };
+    let targets: Vec<String> = names.into_iter().filter(|n| *n != active).collect();
+    let mut open = true;
+    let mut picked: Option<String> = None;
+    egui::Window::new(tr(&lang, "copy_picker_title"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.weak(tr(&lang, "copy_picker_hint"));
+            ui.add_space(6.0);
+            if targets.is_empty() {
+                ui.weak(tr(&lang, "copy_picker_empty"));
+            }
+            for t in &targets {
+                if ui.button(t).clicked() {
+                    picked = Some(t.clone());
+                }
+            }
+        });
+    if let Some(t) = picked {
+        app.copy_to_profile(&t);
+    } else if !open {
+        app.copy_picker_open = false;
     }
 }
 

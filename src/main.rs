@@ -2,6 +2,9 @@
 //! 纯逻辑在 lib（pr_desk_rs）与本 crate 的 state.rs；worker.rs 是后台命令循环；
 //! 本文件做装配：窗口/字体/主题/托盘/几何记忆/快捷键/消息落地。
 
+// dumpstate 的大 json!{} 字面量会撞默认递归上限
+#![recursion_limit = "256"]
+
 mod avatars;
 mod state;
 mod tray;
@@ -99,6 +102,8 @@ pub struct EguiApp {
     pub allow_close: bool,
     /// j/k 导航后请求列表滚动到该行（渲染时消费）
     pub scroll_to: Option<(String, i64)>,
+    /// 「复制到档案…」目标选择弹层开关（选择集在点中目标时现取，防弹层期间选择变了）
+    pub copy_picker_open: bool,
 }
 
 impl EguiApp {
@@ -315,6 +320,27 @@ impl EguiApp {
                 let _ = self.cmd_tx.send(Cmd::AddNotifReview { repo, number, title, url });
             }
         }
+    }
+
+    // ── 跨档案复制 / 本地删除 ──
+
+    /// 右键/操作条「复制到档案…」：打开目标档案选择弹层（选择集在点中目标时现取，
+    /// 防弹层开着期间用户改了选择）。
+    pub fn open_copy_picker(&mut self) {
+        self.copy_picker_open = true;
+    }
+
+    /// 弹层点中目标档案：当前选择集（多选优先，否则当前行）交给 worker 复制。
+    pub fn copy_to_profile(&mut self, target: &str) {
+        self.copy_picker_open = false;
+        let keys = {
+            let a = self.app.lock_recover();
+            effective_targets(&a)
+        };
+        if keys.is_empty() {
+            return;
+        }
+        let _ = self.cmd_tx.send(Cmd::CopyToProfile { target: target.to_string(), keys });
     }
 
     /// 主题切换：即时持久化到 config.toml。
@@ -819,6 +845,14 @@ impl EguiApp {
             "profile" => {
                 let _ = self.cmd_tx.send(Cmd::SwitchProfile(arg.to_string()));
             }
+            // 新建档案（与设置页「＋」同一处理函数）
+            "addprofile" => {
+                self.add_profile_name = arg.to_string();
+                crate::ui_settings::profile_add(self);
+            }
+            // 跨档案复制 / 本地删除（与弹层按钮同一处理函数）
+            "copypicker" => self.open_copy_picker(),
+            "copyto" => self.copy_to_profile(arg),
             // 排序 / 快筛 / 组折叠
             "sort" => self.header_clicked(arg),
             "highscore" => {
@@ -950,6 +984,7 @@ impl EguiApp {
             "dialog_error": self.dialog_error,
             "profile_names": self.profile_names,
             "active_profile": a.cfg.active_profile,
+            "copy_picker_open": self.copy_picker_open,
             "theme": a.cfg.theme,
             "language": a.cfg.language,
             "total": a.total,
@@ -1196,6 +1231,7 @@ impl eframe::App for EguiApp {
         // ── 弹窗（模态，顶层）──
         ui_settings::settings_window(self, &ctx);
         ui_settings::onboarding_window(self, &ctx);
+        ui_list::copy_picker_window(self, &ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1402,6 +1438,7 @@ fn main() -> anyhow::Result<()> {
                 nd_files: Vec::new(),
                 nd_diff: Vec::new(),
                 mar_confirm: None,
+                copy_picker_open: false,
                 settings_open: unconfigured, // 首启自动打开设置
                 settings_tab: 0,
                 settings_profile: "local".into(),
