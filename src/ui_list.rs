@@ -338,10 +338,12 @@ pub struct ColSpec {
 
 /// 表头右缘把手专属区宽度（也用于行内图标列的中心对齐：图标中心 = 收窄文字区中心）
 pub const HANDLE_W: f32 = 16.0;
+/// 把手区以列边界为中心的半宽（左右对称各 8px）
+pub const HANDLE_HALF: f32 = 8.0;
 
-/// 图标列内容中心 x：与收窄后的表头文字区中心对齐（列中心 - HANDLE_W/2）。
+/// 图标列内容中心 x = 列中心（表头文字区左右对称各让 8px，文字中心即列中心）。
 fn icon_center_x(c: egui::Rect) -> f32 {
-    (c.left() + c.right() - HANDLE_W) / 2.0
+    c.center().x
 }
 
 pub const COL_SPECS: &[ColSpec] = &[
@@ -513,15 +515,25 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
     });
 }
 
-/// 表头单元格 → （排序文字区， 拖拽把手术区）：几何上不重叠（把手区是右缘 HANDLE_W）。
-/// 抽成纯函数供测试钉住「点击把手区不触发排序」的几何前提。
-pub fn header_zones(cell: egui::Rect) -> (egui::Rect, Option<egui::Rect>) {
-    let text = egui::Rect::from_min_size(cell.min, egui::vec2((cell.width() - HANDLE_W - 1.0).max(0.0), cell.height())); // 右缘留 1px 间隙：与把手区严格不相交
-    let handle = egui::Rect::from_min_size(
-        egui::pos2(cell.right() - HANDLE_W, cell.top()),
+/// 表头单元格 → 排序文字区（把手作为独立 widget 单独分配）。
+/// 几何约定（测试钉住）：把手区以列边界为中心左右对称各 8px；排序文字区左侧
+/// 让出前一个把手、右侧让出本列把手的各 8px——排序区 ∩ 把手区 = ∅。
+/// 抽出纯函数供测试钉住「点击把手区不触发排序」的几何前提。
+pub fn header_text_zone(cell: egui::Rect, has_left_handle: bool, has_right_handle: bool) -> egui::Rect {
+    let l = if has_left_handle { HANDLE_HALF } else { 0.0 };
+    let r = if has_right_handle { HANDLE_HALF } else { 0.0 };
+    egui::Rect::from_min_max(
+        egui::pos2(cell.left() + l, cell.top()),
+        egui::pos2(cell.right() - r, cell.bottom()),
+    )
+}
+
+/// 列边界把手区：以边界为中心的对称 16px（±8px）。
+pub fn header_handle_zone(boundary_x: f32, cell: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(boundary_x - HANDLE_HALF, cell.top()),
         egui::vec2(HANDLE_W, cell.height()),
-    );
-    (text, Some(handle))
+    )
 }
 
 /// 表头：点击排序（Excel 式）+ 分隔线拖拽调宽 + hover 反馈。
@@ -548,8 +560,10 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         let (x, w) = layout[i];
         let cell = egui::Rect::from_min_size(egui::pos2(rect.left() + x, rect.top()), egui::vec2(w, rect.height()));
         let is_last = i + 1 == COL_SPECS.len();
-        // 文字区/把手区几何：header_zones（最后一列的把手区忽略不用）
-        let (text_cell, handle) = header_zones(cell);
+        // 文字区/把手区几何互斥（见 header_text_zone 注释）：排序区左让前把手右让本把手
+        let has_left = i > 0;
+        let has_right = !is_last;
+        let text_cell = header_text_zone(cell, has_left, has_right);
         // 排序点击只认文字区（把手区点/拖都不触发排序）
         let resp = ui.interact(text_cell, egui::Id::unique(("col-h", c.id)), egui::Sense::click());
         if resp.hovered() {
@@ -575,31 +589,32 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         if resp.clicked() && !dragging {
             app.header_clicked(c.id);
         }
-        // 把手专属区 + 常驻分隔线 + grip（弹性列与最后一列无把手）
+        // 把手专属区 + 常驻分隔线 + grip（最后一列无把手；弹性列的把手拖动调整右侧固定列宽）
         if !is_last {
             let bx = cell.right();
-            let handle = handle.unwrap_or(egui::Rect::NOTHING);
-            let dresp = if c.flex {
-                None
-            } else {
-                Some(ui.interact(handle, egui::Id::unique(("col-drag", c.id)), egui::Sense::click_and_drag()))
-            };
-            let hot = dresp.as_ref().is_some_and(|d| d.hovered() || d.dragged());
-            if let Some(d) = &dresp {
-                // 把手区专属 hover 反馈：主题色 grip + 双向箭头光标；点击不排序（arm 内不写）
-                if d.hovered() || d.dragged() {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    ui.painter().rect_filled(handle, 2.0, sep_hot.gamma_multiply(0.15));
+            // 把手区以列边界为中心左右对称（±8px）：左半压本列右缘、右半压下一列左缘，
+            // 但下一列的排序文字区左让了这 8px——几何互斥
+            let handle = header_handle_zone(bx, cell);
+            let dresp = ui.interact(handle, egui::Id::unique(("col-drag", c.id)), egui::Sense::click_and_drag());
+            let hot = dresp.hovered() || dresp.dragged();
+            // 把手区专属 hover 反馈：主题色 grip + 双向箭头光标；点击不排序（arm 内不写）
+            if hot {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                ui.painter().rect_filled(handle, 2.0, sep_hot.gamma_multiply(0.15));
+            }
+            if dresp.dragged() {
+                let dx = dresp.drag_delta().x;
+                if c.flex {
+                    // 弹性列宽度 = 剩余空间，自身不可调：本把手改的是右侧固定列的宽度
+                    // （方向取反——拖右 = 右列变窄、边界跟随光标右移）
+                    app.col_widths[i + 1] = (app.col_widths[i + 1] - dx).max(COL_SPECS[i + 1].min_w);
+                } else {
+                    app.col_widths[i] = (app.col_widths[i] + dx).max(c.min_w);
                 }
-                if d.dragged() {
-                    let dx = d.drag_delta().x;
-                    let new_w = (app.col_widths[i] + dx).max(c.min_w);
-                    app.col_widths[i] = new_w;
-                    app.header_drag_at = Some(std::time::Instant::now());
-                }
-                if d.drag_stopped() {
-                    app.header_drag_at = Some(std::time::Instant::now());
-                }
+                app.header_drag_at = Some(std::time::Instant::now());
+            }
+            if dresp.drag_stopped() {
+                app.header_drag_at = Some(std::time::Instant::now());
             }
             // grip：三个竖点（painter 画，不依赖字形）；hover 变主题色
             let grip_c = if hot { sep_hot } else { sep_base };
@@ -864,37 +879,55 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
         app.row_clicked(row.key.clone(), mods.ctrl, mods.shift);
     }
     // hover 快捷按钮：打开 / pin / 看板 / 跳过（行右缘的小按钮区）
+    // painter 绘制 + interact 注册热区：不参与布局——scope_builder/ui.put 会把
+    // 子内容撑进行高（实测 hover 时下面所有行垂直位移的抖动根因）。
     if resp.hovered() {
-        let btn_w = 22.0;
-        let strip = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - btn_w * 4.0 - 4.0, rect.top() + 1.0),
-            egui::vec2(btn_w * 4.0, height - 2.0),
-        );
-        ui.scope_builder(egui::UiBuilder::new().max_rect(strip), |ui| {
-            ui.horizontal(|ui| {
+        let btn = 20.0f32;
+        let y = rect.center().y;
+        let mut bx = rect.right() - 4.0 - btn;
+        let items: [(&str, &str); 4] = [
+            ("↗", "inbox_open_browser"),
+            ("P", "tip_pin"),
+            ("+", "detail_add_board"),
+            ("×", "tip_reject"),
+        ];
+        for (glyph, tip) in items {
+            let br = egui::Rect::from_center_size(egui::pos2(bx + btn / 2.0, y), egui::vec2(btn, btn));
+            let r = ui.interact(br, egui::Id::unique(("row-qa", row.key.clone(), tip)), egui::Sense::click());
+            if r.hovered() {
+                ui.painter().rect_filled(br, 4.0, ui.visuals().widgets.active.bg_fill);
+            } else {
+                ui.painter().rect_filled(br, 4.0, ui.visuals().extreme_bg_color);
+            }
+            ui.painter().text(
+                br.center(),
+                Align2::CENTER_CENTER,
+                glyph,
+                small.clone(),
+                ui.visuals().text_color(),
+            );
+            r.clone().on_hover_text(tr(lang, tip));
+            if r.clicked() {
                 let key = row.key.clone();
-                if ui.small_button("↗").on_hover_text(tr(lang, "inbox_open_browser")).clicked() {
-                    worker::open_pr_url(&app.app, &key.0, &key.1);
+                match tip {
+                    "inbox_open_browser" => worker::open_pr_url(&app.app, &key.0, &key.1),
+                    "tip_pin" => worker::toggle_field(&app.app, &key.0, key.1, "pinned"),
+                    "detail_add_board" => worker::toggle_field(&app.app, &key.0, key.1, "on_board"),
+                    _ => {
+                        // 跳过/恢复：当前 rejected → pending，否则 → rejected
+                        let cur = {
+                            let a = app.app.lock_recover();
+                            find_row(&a, &key.0, key.1)
+                                .and_then(|idx| a.rows[idx]["status"].as_str().map(|s| s.to_string()))
+                                .unwrap_or_else(|| "pending".into())
+                        };
+                        let to = if cur == "rejected" { "pending" } else { "rejected" };
+                        worker::local_update(&app.app, &key.0, key.1, "status", to);
+                    }
                 }
-                if ui.small_button("P").on_hover_text(tr(lang, "tip_pin")).clicked() {
-                    worker::toggle_field(&app.app, &key.0, key.1, "pinned");
-                }
-                if ui.small_button("+").on_hover_text(tr(lang, "detail_add_board")).clicked() {
-                    worker::toggle_field(&app.app, &key.0, key.1, "on_board");
-                }
-                if ui.small_button("×").on_hover_text(tr(lang, "tip_reject")).clicked() {
-                    // 跳过/恢复：当前 rejected → pending，否则 → rejected
-                    let cur = {
-                        let a = app.app.lock_recover();
-                        find_row(&a, &key.0, key.1)
-                            .and_then(|idx| a.rows[idx]["status"].as_str().map(|s| s.to_string()))
-                            .unwrap_or_else(|| "pending".into())
-                    };
-                    let to = if cur == "rejected" { "pending" } else { "rejected" };
-                    worker::local_update(&app.app, &key.0, key.1, "status", to);
-                }
-            });
-        });
+            }
+            bx -= btn + 2.0;
+        }
     }
     // 右键菜单
     resp.context_menu(|ui| {
@@ -969,14 +1002,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn header_zones_disjoint_and_cover() {
+    fn header_zones_symmetric_and_disjoint() {
+        // 中间列（两侧都有把手）：文字区左右各让 8px，把手区以边界为中心对称
         let cell = egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(110.0, 22.0));
-        let (text, handle) = header_zones(cell);
-        let handle = handle.unwrap();
-        assert!(!text.intersects(handle), "文字区与把手区必须不重叠");
-        assert!(text.width() + handle.width() >= cell.width() - 1.01, "两区覆盖单元格（允许 1px 防重叠间隙）");
-        assert!((handle.right() - cell.right()).abs() < 0.01, "把手区贴单元格右缘");
+        let text = header_text_zone(cell, true, true);
+        let handle = header_handle_zone(cell.right(), cell);
+        assert!(text.intersect(handle).area() <= 0.0, "文字区与把手区不得有面积重叠");
+        assert!((handle.center().x - cell.right()).abs() < 0.01, "把手以列边界为中心");
         assert!((handle.width() - HANDLE_W).abs() < 0.01);
+        // 文字区中心 = 列中心（对称让位）
+        assert!((text.center().x - cell.center().x).abs() < 0.01);
+        // 本列文字区右缘 + 把手 + 下一列文字区左缘：链式不重叠
+        let next = egui::Rect::from_min_size(egui::pos2(cell.right(), 0.0), egui::vec2(110.0, 22.0));
+        let next_text = header_text_zone(next, true, true);
+        assert!(handle.intersect(next_text).area() <= 0.0, "把手区与下一列文字区不得有面积重叠");
+        assert!((text.right() - (handle.left())).abs() < 0.01, "文字区右缘 = 把手左缘");
+        assert!((next_text.left() - handle.right()).abs() < 0.01, "下区左缘 = 把手右缘");
     }
 
     #[test]
