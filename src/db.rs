@@ -4,7 +4,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, params};
 
-pub const SCHEMA_VERSION: i32 = 2;
+pub const SCHEMA_VERSION: i32 = 3;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS prs (
@@ -48,6 +48,14 @@ ALTER TABLE prs ADD COLUMN extras_detail TEXT;
 ALTER TABLE prs ADD COLUMN extras_updated_at TEXT;
 "#;
 
+// v3：deleted_prs 墓碑表（local 模式删除 PR 后防刷新/误加复活）。
+// 表随库文件走：每个档案各自的 db 里独立一份，删除只影响本档案。
+const MIGRATE_V3: &str = r#"
+CREATE TABLE IF NOT EXISTS deleted_prs (
+    repo TEXT NOT NULL, number INTEGER NOT NULL, deleted_at TEXT,
+    PRIMARY KEY (repo, number)
+);
+"#;
 
 pub struct Db {
     pub conn: Connection,
@@ -127,6 +135,8 @@ impl Db {
                 conn.execute_batch(MIGRATE_V2)?;
             }
         }
+        // v2 → v3：墓碑表（IF NOT EXISTS 天然幂等）
+        conn.execute_batch(MIGRATE_V3)?;
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Db { conn })
     }
@@ -755,6 +765,68 @@ impl Db {
         Ok((inserted, prs.len() - inserted, reviews.len()))
     }
 
+    // ── 删除 / 墓碑（local 模式） ──
+
+    /// 批量删除 PR：墓碑（防刷新/误加复活）+ prs + reviews + diff_cache 一个事务。
+    /// 返回实际删除的 PR 行数（墓碑对全部 keys 记账——已不存在的键删了也安全）。
+    pub fn delete_prs(&self, keys: &[(String, i64)]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut deleted = 0usize;
+        for (repo, number) in keys {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO deleted_prs(repo, number, deleted_at) VALUES (?1,?2,?3)",
+                params![repo, number, now()],
+            )?;
+            deleted += self.conn.execute(
+                "DELETE FROM prs WHERE repo=?1 AND number=?2",
+                params![repo, number],
+            )?;
+            self.conn.execute(
+                "DELETE FROM reviews WHERE repo=?1 AND number=?2",
+                params![repo, number],
+            )?;
+            self.conn.execute(
+                "DELETE FROM diff_cache WHERE repo=?1 AND number=?2",
+                params![repo, number],
+            )?;
+        }
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// 墓碑查询：该 (repo, number) 是否已被本地删除。
+    /// 所有「自动/半自动」插入 prs 的路径（如 Inbox + 预评审）必须先过这关。
+    pub fn is_tombstoned(&self, repo: &str, number: i64) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM deleted_prs WHERE repo=?1 AND number=?2",
+            params![repo, number],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// 带墓碑守卫的 upsert：已删除的 PR 返回 Ok(false) 不插入（显式复制 copy_prs_to
+    /// 不走这里——跨档案复制是明确的用户意图，允许复活）。
+    pub fn upsert_pr_unless_tombstoned(&self, p: &serde_json::Value) -> Result<bool> {
+        if self.is_tombstoned(p["repo"].as_str().unwrap_or(""), p["number"].as_i64().unwrap_or(0))? {
+            return Ok(false);
+        }
+        self.upsert_pr(p)?;
+        Ok(true)
+    }
+
+    pub fn tombstone_count(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM deleted_prs", [], |r| r.get(0))?)
+    }
+
+    /// 清空墓碑（「清空删除记录」入口）：之后刷新/手动加入可正常回库。
+    /// 返回清掉的条数。
+    pub fn clear_tombstones(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM deleted_prs", [])?)
+    }
+
     // ── diff 缓存 ──
     pub fn get_diff(&self, repo: &str, number: i64) -> Result<Option<String>> {
         let mut stmt = self
@@ -999,6 +1071,42 @@ mod tests {
         let (inserted2, skipped2, n_reviews2) = Db::copy_prs_to(&src, &dst, &keys).unwrap();
         assert_eq!((inserted2, skipped2, n_reviews2), (0, 2, 2));
         assert_eq!(dst.list_reviews_of("o/r", 1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn delete_prs_removes_row_reviews_diff_and_blocks_resurrection() {
+        // 删除 = 墓碑 + prs/reviews/diff_cache 一个事务清掉；
+        // 防复活：删除后走墓碑守卫的插入路径（Inbox + 预评审 / 未来刷新回插）不得复活；
+        // 清空墓碑后可正常回库。
+        let db = Db::open_memory().unwrap();
+        db.upsert_pr(&pr_json("o/r", 1, "t1")).unwrap();
+        db.upsert_pr(&pr_json("o/r", 2, "t2")).unwrap();
+        db.upsert_review(&review_json("o/r", 1, "sha-a", 8.0)).unwrap();
+        db.put_diff("o/r", 1, "diff text").unwrap();
+
+        let keys = vec![("o/r".to_string(), 1)];
+        let deleted = db.delete_prs(&keys).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(!db.pr_exists("o/r", 1).unwrap());
+        assert!(db.pr_exists("o/r", 2).unwrap(), "未删除的行不受影响");
+        assert_eq!(db.list_reviews_of("o/r", 1).unwrap().len(), 0, "评审随删");
+        assert!(db.get_diff("o/r", 1).unwrap().is_none(), "diff 缓存随删");
+        assert!(db.is_tombstoned("o/r", 1).unwrap());
+        assert!(!db.is_tombstoned("o/r", 2).unwrap());
+        assert_eq!(db.tombstone_count().unwrap(), 1);
+
+        // 模拟刷新/误加回插：守卫路径拒绝复活，普通 upsert 也先查墓碑（worker 侧模式）
+        assert!(!db.upsert_pr_unless_tombstoned(&pr_json("o/r", 1, "resurrected")).unwrap());
+        assert!(!db.pr_exists("o/r", 1).unwrap(), "墓碑行不得复活");
+        // 幂等：重复删除不炸，墓碑不翻倍
+        assert_eq!(db.delete_prs(&keys).unwrap(), 0);
+        assert_eq!(db.tombstone_count().unwrap(), 1);
+
+        // 清空删除记录后可恢复
+        assert_eq!(db.clear_tombstones().unwrap(), 1);
+        assert_eq!(db.tombstone_count().unwrap(), 0);
+        assert!(db.upsert_pr_unless_tombstoned(&pr_json("o/r", 1, "back")).unwrap());
+        assert!(db.pr_exists("o/r", 1).unwrap());
     }
 
     #[test]

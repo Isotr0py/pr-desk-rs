@@ -228,9 +228,17 @@ pub fn selection_bar(app: &mut EguiApp, ui: &mut Ui) {
                     let _ = app.cmd_tx.send(Cmd::CopyLinks(text));
                 }
             }
-            // 「复制到档案…」（多选优先，否则当前行；含评审记录，目标已有行整行跳过）
             if ui.button(tr(&lang, "ctx_copy_to_profile")).clicked() {
                 app.open_copy_picker();
+            }
+            // 删除：仅 local 档案可用（远程档案的行归服务端插件管）
+            let is_local = app.app.lock_recover().cfg.active_profile == "local";
+            if ui
+                .add_enabled(is_local, egui::Button::new(tr(&lang, "ctx_delete_prs")))
+                .on_disabled_hover_text(tr(&lang, "tip_delete_local_only"))
+                .clicked()
+            {
+                app.delete_selected();
             }
             if ui.button(tr(&lang, "inbox_open_browser")).clicked() {
                 worker::batch_open_browser(&app.app);
@@ -1036,6 +1044,23 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         app.open_copy_picker();
         ui.close();
     }
+    // 删除：仅 local 档案（远程档案的行归服务端插件管）；墓碑防刷新复活
+    let is_local = app.app.lock_recover().cfg.active_profile == "local";
+    if ui
+        .add_enabled(is_local, egui::Button::new(tr(lang, "ctx_delete_prs")))
+        .on_disabled_hover_text(tr(lang, "tip_delete_local_only"))
+        .clicked()
+    {
+        app.delete_selected();
+        ui.close();
+    }
+    if is_local {
+        let n = app.app.lock_recover().db.tombstone_count().unwrap_or(0);
+        if n > 0 && ui.button(trf(lang, "ctx_clear_tombstones", &[&n.to_string()])).clicked() {
+            app.clear_tombstones();
+            ui.close();
+        }
+    }
     ui.separator();
     if ui.button(format!("{} [Esc]", tr(lang, "ctx_clear_selection"))).clicked() {
         app.clear_multi_selection();
@@ -1043,7 +1068,7 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     }
 }
 
-// ── 模态弹窗：复制目标档案选择 ──
+// ── 模态弹窗：复制目标档案选择 / 删除确认 ──
 
 /// 「复制到档案…」目标选择弹层：列出全部档案 − 当前档案；点中即走 worker 复制。
 pub fn copy_picker_window(app: &mut EguiApp, ctx: &egui::Context) {
@@ -1079,6 +1104,46 @@ pub fn copy_picker_window(app: &mut EguiApp, ctx: &egui::Context) {
         app.copy_to_profile(&t);
     } else if !open {
         app.copy_picker_open = false;
+    }
+}
+
+/// 「删除…」确认框：数量 + 前 5 个标题；删除是不可逆操作，必须显式确认。
+pub fn delete_confirm_window(app: &mut EguiApp, ctx: &egui::Context) {
+    let Some(items) = app.delete_confirm.clone() else { return };
+    let lang = app.lang();
+    let mut open = true;
+    let mut confirm = false;
+    let mut cancel = false;
+    egui::Window::new(tr(&lang, "delete_confirm_title"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(trf(&lang, "delete_confirm_body", &[&items.len().to_string()]));
+            ui.add_space(4.0);
+            for (_, n, t) in items.iter().take(5) {
+                ui.monospace(format!("#{n}  {t}"));
+            }
+            if items.len() > 5 {
+                ui.weak(trf(&lang, "delete_confirm_more", &[&(items.len() - 5).to_string()]));
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let del = egui::Button::new(tr(&lang, "ctx_delete_prs"))
+                    .fill(egui::Color32::from_rgb(0xb8, 0x2e, 0x2e));
+                if ui.add(del).clicked() {
+                    confirm = true;
+                }
+                if ui.button(tr(&lang, "cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    if confirm {
+        app.confirm_delete();
+    } else if !open || cancel {
+        app.delete_confirm = None;
     }
 }
 

@@ -104,6 +104,8 @@ pub struct EguiApp {
     pub scroll_to: Option<(String, i64)>,
     /// 「复制到档案…」目标选择弹层开关（选择集在点中目标时现取，防弹层期间选择变了）
     pub copy_picker_open: bool,
+    /// 「删除…」确认框内容（repo, number, title 快照；仅 local 档案可进入）
+    pub delete_confirm: Option<Vec<(String, i64, String)>>,
 }
 
 impl EguiApp {
@@ -341,6 +343,73 @@ impl EguiApp {
             return;
         }
         let _ = self.cmd_tx.send(Cmd::CopyToProfile { target: target.to_string(), keys });
+    }
+
+    /// 右键/操作条「删除…」（仅 local 档案）：填充确认框（数量 + 前几个标题快照）。
+    pub fn delete_selected(&mut self) {
+        let items = {
+            let a = self.app.lock_recover();
+            if a.cfg.active_profile != "local" {
+                return;
+            }
+            effective_targets(&a)
+                .into_iter()
+                .map(|(repo, number)| {
+                    let title = find_row(&a, &repo, number)
+                        .and_then(|i| a.rows[i]["title"].as_str().map(|s| s.to_string()))
+                        .unwrap_or_default();
+                    (repo, number, title)
+                })
+                .collect::<Vec<_>>()
+        };
+        if !items.is_empty() {
+            self.delete_confirm = Some(items);
+        }
+    }
+
+    /// 确认框「删除」：事务删 PR 行 + 评审 + diff 缓存并记墓碑；关被删 PR 的详情面板；
+    /// 清选择集里的被删身份；刷新列表。SQLite 本地操作微秒级，同步做（同 local_update 先例）。
+    pub fn confirm_delete(&mut self) {
+        let Some(items) = self.delete_confirm.take() else { return };
+        let keys: Vec<(String, i64)> = items.iter().map(|(r, n, _)| (r.clone(), *n)).collect();
+        if let Some(pd) = &self.panel {
+            if keys.iter().any(|(r, n)| *r == pd.repo && *n == pd.number) {
+                self.panel = None;
+            }
+        }
+        let (r, lang) = {
+            let a = self.app.lock_recover();
+            (a.db.delete_prs(&keys), a.cfg.language.clone())
+        };
+        let n = match r {
+            Ok(n) => n,
+            Err(e) => {
+                worker::send_msg(Msg::Status(trf(&lang, "delete_failed", &[&e.to_string()])));
+                return;
+            }
+        };
+        {
+            let mut a = self.app.lock_recover();
+            a.selection.retain(|k| !keys.contains(k));
+            if a.selected.as_ref().is_some_and(|s| keys.contains(s)) {
+                a.selected = None;
+            }
+        }
+        worker::send_msg(Msg::Status(trf(&lang, "delete_done", &[&n.to_string()])));
+        worker::reload_rows_global(&self.app);
+    }
+
+    /// 右键菜单「清空删除记录」（仅 local 且有墓碑时显示）：清掉墓碑，
+    /// 被删 PR 之后刷新/手动加入可正常回库。
+    pub fn clear_tombstones(&mut self) {
+        let (r, lang) = {
+            let a = self.app.lock_recover();
+            (a.db.clear_tombstones(), a.cfg.language.clone())
+        };
+        match r {
+            Ok(n) => worker::send_msg(Msg::Status(trf(&lang, "tombstones_cleared", &[&n.to_string()]))),
+            Err(e) => worker::send_msg(Msg::Status(trf(&lang, "delete_failed", &[&e.to_string()]))),
+        }
     }
 
     /// 主题切换：即时持久化到 config.toml。
@@ -853,6 +922,9 @@ impl EguiApp {
             // 跨档案复制 / 本地删除（与弹层按钮同一处理函数）
             "copypicker" => self.open_copy_picker(),
             "copyto" => self.copy_to_profile(arg),
+            "delpr" => self.delete_selected(),
+            "confirmdel" => self.confirm_delete(),
+            "cleartomb" => self.clear_tombstones(),
             // 排序 / 快筛 / 组折叠
             "sort" => self.header_clicked(arg),
             "highscore" => {
@@ -985,6 +1057,8 @@ impl EguiApp {
             "profile_names": self.profile_names,
             "active_profile": a.cfg.active_profile,
             "copy_picker_open": self.copy_picker_open,
+            "delete_confirm_n": self.delete_confirm.as_ref().map(|v| v.len()),
+            "tombstones": a.db.tombstone_count().unwrap_or(-1),
             "theme": a.cfg.theme,
             "language": a.cfg.language,
             "total": a.total,
@@ -1232,6 +1306,7 @@ impl eframe::App for EguiApp {
         ui_settings::settings_window(self, &ctx);
         ui_settings::onboarding_window(self, &ctx);
         ui_list::copy_picker_window(self, &ctx);
+        ui_list::delete_confirm_window(self, &ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1439,6 +1514,7 @@ fn main() -> anyhow::Result<()> {
                 nd_diff: Vec::new(),
                 mar_confirm: None,
                 copy_picker_open: false,
+                delete_confirm: None,
                 settings_open: unconfigured, // 首启自动打开设置
                 settings_tab: 0,
                 settings_profile: "local".into(),

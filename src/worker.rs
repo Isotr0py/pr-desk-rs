@@ -1315,19 +1315,29 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
             Cmd::AddNotifReview { repo, number, title, url } => {
                 // 已存在则跳过（upsert 会把已有行的 author/head_sha 等覆盖成空）；
                 // 查询失败是错误不是「不存在」：保守按已存在处理（防重复插入）并告警
-                let exists = {
+                let (exists, tombstoned) = {
                     let a = app.lock_recover();
-                    a.db.pr_exists(&repo, number).unwrap_or_else(|e| {
+                    let exists = a.db.pr_exists(&repo, number).unwrap_or_else(|e| {
                         tracing::warn!("查询 PR 是否存在失败 {repo} #{number}: {e}");
                         true
-                    })
+                    });
+                    let tomb = a.db.is_tombstoned(&repo, number).unwrap_or_else(|e| {
+                        tracing::warn!("查询墓碑失败 {repo} #{number}: {e}");
+                        false
+                    });
+                    (exists, tomb)
                 };
-                if exists {
+                if tombstoned {
+                    // 本地删除过的 PR 有墓碑：挡住「加了又删、删了又加」的误回插；
+                    // 想恢复先在列表右键菜单「清空删除记录」
+                    send(&msg_tx, Msg::Status(trf(&lang, "add_blocked_tombstone", &[&repo, &number.to_string()])));
+                } else if exists {
                     send(&msg_tx, Msg::Status(trf(&lang, "already_in_list", &[&repo, &number.to_string()])));
                 } else {
                     let ok = {
                         let a = app.lock_recover();
-                        a.db.upsert_pr(&serde_json::json!({
+                        // 守卫式插入：墓碑判定与落库同一持锁窗口（上面的预检只是提前给文案）
+                        a.db.upsert_pr_unless_tombstoned(&serde_json::json!({
                             "repo": repo, "number": number, "title": title,
                             "author": "", "url": url, "head_sha": "",
                             "status": "pending", "updated_at": db::now(),
