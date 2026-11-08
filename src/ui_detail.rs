@@ -549,7 +549,7 @@ fn checks_tab(ui: &mut Ui, checks: &[(String, String)], lang: &str) {
     }
 }
 
-fn files_tab(ui: &mut Ui, files: &[(String, i64, i64)], lang: &str) {
+pub(crate) fn files_tab(ui: &mut Ui, files: &[(String, i64, i64)], lang: &str) {
     if files.is_empty() {
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);

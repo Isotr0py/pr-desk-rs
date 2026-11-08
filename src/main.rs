@@ -60,6 +60,8 @@ pub struct EguiApp {
     pub inbox_loading: bool,
     pub inbox_sel: Option<usize>, // 当前选中通知在 inbox_view 里的下标
     pub nd_open: bool,
+    pub nd_tab: usize,   // 预览面板 tab：0 会话 / 1 Files（切通知重置为 0，随主面板习惯）
+    pub nd_epoch: u64,   // 每激活一条通知 +1：滚动区 salt 带它 → 重开回顶部
     pub nd_title: String,
     pub nd_kind: String,
     pub nd_kind_label: String,
@@ -339,7 +341,9 @@ impl EguiApp {
             };
         }
         self.inbox_sel = Some(i);
-        // 立即开面板并进加载态（数据由 worker 回送）
+        // 立即开面板并进加载态（数据由 worker 回送）；tab/滚动随通知身份重置（主面板同款习惯）
+        self.nd_tab = 0;
+        self.nd_epoch += 1;
         self.nd_title = title;
         self.nd_kind_label = notif_kind_label(&lang, &kind);
         self.nd_kind = kind.clone();
@@ -1104,6 +1108,7 @@ impl EguiApp {
             "inbox_page": a.inbox_page,
             "inbox_loading": self.inbox_loading,
             "nd_open": self.nd_open,
+            "nd_tab": self.nd_tab,
             "nd_loading": self.nd_loading,
             "nd_convo": self.nd_convo.len(),
             "settings_open": self.settings_open,
@@ -1562,6 +1567,8 @@ fn main() -> anyhow::Result<()> {
                 inbox_loading: false,
                 inbox_sel: None,
                 nd_open: false,
+                nd_tab: 0,
+                nd_epoch: 0,
                 nd_title: String::new(),
                 nd_kind: String::new(),
                 nd_kind_label: String::new(),

@@ -306,92 +306,96 @@ pub fn notif_preview(app: &mut EguiApp, ui: &mut Ui) {
         .default_size(420.0)
         .size_range(300.0..=600.0)
         .show(ui, |ui| {
+            // ── 头部：常驻不滚动（旧版整个面板一个滚动区，重开时停在上次滚动位、
+            // 标题被裁半——用户截图实证）──
+            ui.horizontal(|ui| {
+                let title = if app.nd_title.is_empty() {
+                    tr(&lang, "inbox_not_selected")
+                } else {
+                    &app.nd_title
+                };
+                ui.heading(RichText::new(title).size(15.0));
+                if ui.small_button("✕").clicked() {
+                    app.nd_open = false;
+                    app.app.lock_recover().inbox_detail = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.weak(&app.nd_kind_label);
+                if !app.nd_state.is_empty() {
+                    let (label, color) = match app.nd_state.as_str() {
+                        "merged" => (tr(&lang, "inbox_state_merged"), ui_detail::state_color("merged", ui.visuals().dark_mode)),
+                        "closed" => (tr(&lang, "inbox_state_closed"), ui_detail::state_color("closed", ui.visuals().dark_mode)),
+                        _ => (tr(&lang, "inbox_state_open"), ui_detail::state_color("open", ui.visuals().dark_mode)),
+                    };
+                    ui.colored_label(color, label);
+                }
+            });
+            ui.horizontal(|ui| {
+                if ui.button(tr(&lang, "inbox_open_browser")).clicked() {
+                    app.inbox_open_browser();
+                }
+                let added = app.app.lock_recover().inbox_added;
+                if app.nd_kind == "PullRequest" {
+                    if added {
+                        ui.weak(tr(&lang, "inbox_added"));
+                    } else if ui.button(tr(&lang, "inbox_add_review")).clicked() {
+                        if let Some(i) = app.inbox_sel {
+                            app.inbox_add_review(i);
+                        }
+                    }
+                }
+            });
+            ui.separator();
+            // ── tab 条：会话 / Files（对齐主面板的合并语义：Files tab 内嵌可折叠 diff）──
+            let tabs = [tr(&lang, "tab_conversation"), tr(&lang, "tab_files")];
+            ui.horizontal(|ui| {
+                for (i, t) in tabs.iter().enumerate() {
+                    if ui.selectable_label(app.nd_tab == i, *t).clicked() && app.nd_tab != i {
+                        app.nd_tab = i;
+                    }
+                }
+            });
+            ui.separator();
+            if app.nd_loading {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.weak(tr(&lang, "inbox_loading"));
+                });
+                return;
+            }
+            // 每个 tab 独立滚动区；salt 带 nd_epoch——打开新通知时滚动回到顶部
             egui::ScrollArea::vertical()
-                .id_salt("nd-scroll")
+                .id_salt(("nd-tab", app.nd_epoch, app.nd_tab))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // ── 头部 ──
-                    ui.horizontal(|ui| {
-                        let title = if app.nd_title.is_empty() {
-                            tr(&lang, "inbox_not_selected")
+                    if app.nd_tab == 0 {
+                        // ── 会话 ──
+                        if app.nd_convo.is_empty() {
+                            ui.weak(tr(&lang, "inbox_convo_empty_hint"));
                         } else {
-                            &app.nd_title
-                        };
-                        ui.heading(RichText::new(title).size(15.0));
-                        if ui.small_button("✕").clicked() {
-                            app.nd_open = false;
-                            app.app.lock_recover().inbox_detail = None;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.weak(&app.nd_kind_label);
-                        if !app.nd_state.is_empty() {
-                            let (label, color) = match app.nd_state.as_str() {
-                                "merged" => (tr(&lang, "inbox_state_merged"), ui_detail::state_color("merged", ui.visuals().dark_mode)),
-                                "closed" => (tr(&lang, "inbox_state_closed"), ui_detail::state_color("closed", ui.visuals().dark_mode)),
-                                _ => (tr(&lang, "inbox_state_open"), ui_detail::state_color("open", ui.visuals().dark_mode)),
-                            };
-                            ui.colored_label(color, label);
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button(tr(&lang, "inbox_open_browser")).clicked() {
-                            app.inbox_open_browser();
-                        }
-                        let added = app.app.lock_recover().inbox_added;
-                        if app.nd_kind == "PullRequest" {
-                            if added {
-                                ui.weak(tr(&lang, "inbox_added"));
-                            } else if ui.button(tr(&lang, "inbox_add_review")).clicked() {
-                                if let Some(i) = app.inbox_sel {
-                                    app.inbox_add_review(i);
+                            for e in app.nd_convo.clone() {
+                                ui.horizontal(|ui| {
+                                    ui_detail::avatar_chip(ui, &e.author);
+                                    ui.strong(&e.author);
+                                    ui.weak(&e.time);
+                                });
+                                if !e.text.is_empty() {
+                                    egui_commonmark::CommonMarkViewer::new()
+                                        .show(ui, &mut app.md_cache, &e.text);
                                 }
+                                ui.separator();
                             }
                         }
-                    });
-                    ui.separator();
-                    if app.nd_loading {
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Spinner::new());
-                            ui.weak(tr(&lang, "inbox_loading"));
-                        });
-                        return;
-                    }
-                    // ── 会话 ──
-                    if app.nd_convo.is_empty() {
-                        ui.weak(tr(&lang, "inbox_convo_empty_hint"));
                     } else {
-                        for e in app.nd_convo.clone() {
-                            ui.horizontal(|ui| {
-                                ui_detail::avatar_chip(ui, &e.author);
-                                ui.strong(&e.author);
-                                ui.weak(&e.time);
-                            });
-                            if !e.text.is_empty() {
-                                egui_commonmark::CommonMarkViewer::new()
-                                    .show(ui, &mut app.md_cache, &e.text);
-                            }
-                            ui.separator();
+                        // ── Files（主面板同款：有解析后 diff 用折叠 diff 视图，否则纯清单）──
+                        if !app.nd_diff.is_empty() {
+                            let mut files = std::mem::take(&mut app.nd_diff);
+                            ui_detail::diff_view(ui, &mut files, &lang, "nd");
+                            app.nd_diff = files;
+                        } else {
+                            ui_detail::files_tab(ui, &app.nd_files, &lang);
                         }
-                    }
-                    // ── Files ──
-                    if !app.nd_files.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(tr(&lang, "tab_files"));
-                        for (path, adds, dels) in app.nd_files.clone() {
-                            ui.horizontal(|ui| {
-                                ui.monospace(path);
-                                ui.weak(format!("+{adds}/-{dels}"));
-                            });
-                        }
-                    }
-                    // ── Diff ──
-                    if !app.nd_diff.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(tr(&lang, "tab_diff"));
-                        let mut files = std::mem::take(&mut app.nd_diff);
-                        ui_detail::diff_view(ui, &mut files, &lang, "nd");
-                        app.nd_diff = files;
                     }
                 });
         });
