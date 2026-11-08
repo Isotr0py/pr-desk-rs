@@ -106,11 +106,65 @@ pub struct EguiApp {
     pub copy_picker_open: bool,
     /// 「删除…」确认框内容（repo, number, title 快照；仅 local 档案可进入）
     pub delete_confirm: Option<Vec<(String, i64, String)>>,
+    /// 首帧几何钳制是否已执行（clamp_geometry_once）
+    pub geom_clamped: bool,
 }
 
 impl EguiApp {
     pub fn lang(&self) -> String {
         self.app.lock_recover().cfg.language.clone()
+    }
+
+    /// 首帧几何钳制：记忆的窗口尺寸是在别的（更大）显示器上存的时，窗口下缘会掉出
+    /// 当前屏幕——底部的多选操作条和状态栏整体不可见（用户「下方的功能框没有出现」
+    /// 的主因）。builder 的 clamp_size_to_monitor_size 钳的是「最大的显示器」，窗口
+    /// 实际开在当前显示器上仍可能超高——这里按当前显示器再钳一次并把位置拉回屏内。
+    fn clamp_geometry_once(&mut self, ctx: &egui::Context) {
+        if self.geom_clamped {
+            return;
+        }
+        let (monitor, outer, inner) = ctx.input(|i| {
+            (i.viewport().monitor_size, i.viewport().outer_rect, i.viewport().inner_rect)
+        });
+        let (Some(mon), Some(out), Some(inner)) = (monitor, outer, inner) else { return }; // 首帧可能还没探测到，下帧再试
+        self.geom_clamped = true;
+        // 按外框（含标题栏）钳制：内框目标高 = 显示器 94% − 窗框占用
+        let chrome = (out.height() - inner.height()).max(0.0);
+        let chrome_w = (out.width() - inner.width()).max(0.0);
+        let max_inner_w = mon.x * 0.96 - chrome_w;
+        let max_inner_h = mon.y * 0.94 - chrome;
+        let mut size = egui::vec2(inner.width(), inner.height());
+        let mut pos = egui::pos2(out.left(), out.top());
+        let mut changed = false;
+        if size.x > max_inner_w {
+            size.x = max_inner_w;
+            changed = true;
+        }
+        if size.y > max_inner_h {
+            size.y = max_inner_h;
+            changed = true;
+        }
+        if pos.x + size.x + chrome_w > mon.x {
+            pos.x = (mon.x - size.x - chrome_w).max(0.0);
+            changed = true;
+        }
+        if pos.y + size.y + chrome > mon.y {
+            pos.y = (mon.y - size.y - chrome).max(0.0);
+            changed = true;
+        }
+        if pos.x < 0.0 {
+            pos.x = 0.0;
+            changed = true;
+        }
+        if pos.y < 0.0 {
+            pos.y = 0.0;
+            changed = true;
+        }
+        if changed {
+            tracing::info!("窗口几何钳制到当前显示器: {size:?} @{pos:?}（原外框 {out:?}）");
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(size));
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+        }
     }
 
     /// 状态栏临时消息：覆盖显示，6 秒后自动清除（恢复「已同步 X 前」等常态文本）。
@@ -1251,6 +1305,7 @@ impl eframe::App for EguiApp {
     /// 消息落地/轮询/托盘还原必须在这里，否则窗口被盖住后 worker 消息全堵死，
     /// 托盘「显示」也永远不生效）。
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.clamp_geometry_once(ctx);
         // 诊断（debug 级）：指针/点击事件可见性
         {
             let ptr = ctx.input(|i| i.pointer.latest_pos());
@@ -1422,6 +1477,9 @@ fn main() -> anyhow::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([w, h])
+            // 记忆尺寸若是在更大显示器上存的，钳到当前显示器——否则窗口下缘掉出屏幕，
+            // 底部多选操作条/状态栏整排不可见（用户「下方的功能框没有出现」的主因）
+            .with_clamp_size_to_monitor_size(true)
             .with_icon(icon),
         ..Default::default()
     };
@@ -1515,6 +1573,7 @@ fn main() -> anyhow::Result<()> {
                 mar_confirm: None,
                 copy_picker_open: false,
                 delete_confirm: None,
+                geom_clamped: false,
                 settings_open: unconfigured, // 首启自动打开设置
                 settings_tab: 0,
                 settings_profile: "local".into(),
