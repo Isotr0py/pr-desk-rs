@@ -170,9 +170,28 @@ pub fn status_bar(app: &EguiApp, ui: &mut Ui) {
 // ── 多选操作条 ──
 
 pub fn selection_bar(app: &mut EguiApp, ui: &mut Ui) {
+    // 可见性 = 「存在选中」：多选集合非空，或普通左键单选（主选中行）——单选也出操作条，
+    // 操作目标走 effective_targets（集合空时回退主选中行），详情面板开关不影响。
     let (n, all_pinned, all_on_board, all_rejected) = {
         let a = app.app.lock_recover();
-        selection_summary(&a)
+        let (n, p, b, r) = selection_summary(&a);
+        if n > 0 {
+            (n, p, b, r)
+        } else if let Some((repo, num)) = &a.selected {
+            // 单选：三态标志从该行现读（决定 Pin/看板/跳过按钮的开关文案）
+            let (p, b, r) = find_row(&a, repo, *num)
+                .map(|i| {
+                    (
+                        a.rows[i]["pinned"].as_i64() == Some(1),
+                        a.rows[i]["on_board"].as_i64() == Some(1),
+                        a.rows[i]["status"].as_str() == Some("rejected"),
+                    )
+                })
+                .unwrap_or((false, false, false));
+            (1, p, b, r)
+        } else {
+            (0, p, b, r)
+        }
     };
     if n == 0 {
         return;
