@@ -690,11 +690,17 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
         egui::Sense::click(),
     );
     let visuals = ui.visuals();
+    // 行 hover 用纯几何判定（指针是否落在行 rect 内）：resp.hovered() 在指针移到
+    // 行内快捷按钮（同层 widget）上时会被顶层 widget 抢走 → 按钮出现→行失 hover→
+    // 按钮消失→行得 hover 的帧间振荡（用户实测右缘 4 按钮闪烁抖动）。几何判定与
+    // 「按钮热区 ⊆ 行 rect」配合：移到按钮上行 hover 不丢；弹层是独立 layer，
+    // 指针在弹层上时 rect_contains_pointer 返回 false（不会误 hover）。
+    let row_hovered = ui.rect_contains_pointer(rect);
     let bg = if selected {
         visuals.selection.bg_fill
     } else if multi_selected {
         visuals.selection.bg_fill.gamma_multiply(0.4)
-    } else if resp.hovered() {
+    } else if row_hovered {
         visuals.widgets.hovered.bg_fill
     } else {
         Color32::TRANSPARENT
@@ -930,7 +936,8 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     // hover 快捷按钮：打开 / pin / 看板 / 跳过（行右缘的小按钮区）
     // painter 绘制 + interact 注册热区：不参与布局——scope_builder/ui.put 会把
     // 子内容撑进行高（实测 hover 时下面所有行垂直位移的抖动根因）。
-    if resp.hovered() {
+    // 显隐用 row_hovered（几何判定）：按钮热区在行 rect 内，移到按钮上不闪。
+    if row_hovered {
         let btn = 20.0f32;
         let y = rect.center().y;
         let mut bx = rect.right() - 4.0 - btn;
