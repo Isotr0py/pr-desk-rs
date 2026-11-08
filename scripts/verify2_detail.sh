@@ -60,12 +60,13 @@ shot "detail-diff-tab"
 cmd "copyreview"
 assert "copyreview 无评审时不崩" "d['panel_open']==True"
 
-# 评审触发（LLM 未配置 → llm_not_configured 状态提示，不占槽不崩）
+# 评审触发（两种合法结果都接受：LLM 未配置 → llm_not_configured 提示；
+# 已配置（用户后来配了 LLM）→ 真的起跑，状态栏出「拉取 PR 信息…」进度。语义：有反馈且不崩）
 cmd "review"; sleep 1
-assert "评审触发（LLM 未配置→状态提示，面板不崩）" "d['panel_open']==True"
+assert "评审触发（面板不崩）" "d['panel_open']==True"
 SM=$(state | python -c "import json,sys; print(json.load(sys.stdin)['status_msg'])")
 echo "  [status] $SM"
-echo "$SM" | grep -qE "LLM|未配置" && { echo "  PASS: llm_not_configured 提示"; PASS=$((PASS+1)); } || { echo "  FAIL: 无 LLM 提示: $SM"; FAIL=$((FAIL+1)); }
+echo "$SM" | grep -qE "LLM|未配置|拉取|Fetching" && { echo "  PASS: 评审触发有状态反馈"; PASS=$((PASS+1)); } || { echo "  FAIL: 评审触发无反馈: $SM"; FAIL=$((FAIL+1)); }
 
 # Esc 关面板
 pmkey ESC
