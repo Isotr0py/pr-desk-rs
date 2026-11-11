@@ -79,9 +79,9 @@ Runtime requirements:
 The UI renders with eframe's **glow** backend. The wgpu stack is not
 compiled in (`eframe` default-features off): it was the single largest
 contributor to binary size and build memory (its static link could blow
-the Windows page file). CJK text works via a manually loaded system font
-(`C:/Windows/Fonts/msyh.ttc`, with fallbacks) plus the `system_fonts`
-feature.
+the Windows page file). Text uses native system fonts with Source Han
+Sans/Noto and JetBrains Mono preferred when installed, including correct
+variable-font weight selection.
 
 ## Configuration
 
