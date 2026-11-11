@@ -7,6 +7,7 @@
 
 mod avatars;
 mod state;
+mod system_fonts;
 mod tray;
 mod ui_detail;
 mod ui_inbox;
@@ -102,8 +103,9 @@ pub struct EguiApp {
     #[cfg(windows)]
     pub tray: Option<tray::Tray>,
     pub allow_close: bool,
-    /// j/k 导航后请求列表滚动到该行（渲染时消费）
+    /// 键盘导航后请求列表滚动到该行（渲染时消费）
     pub scroll_to: Option<(String, i64)>,
+    pub inbox_scroll_to: Option<usize>,
     /// 「复制到档案…」目标选择弹层开关（选择集在点中目标时现取，防弹层期间选择变了）
     pub copy_picker_open: bool,
     /// 「删除…」确认框内容（repo, number, title 快照；仅 local 档案可进入）
@@ -809,34 +811,16 @@ impl EguiApp {
                 }
             }
             "key" => {
-                // key j/k/o/p/1/2/3：与 hotkeys 同一处理器语义
+                // key up/down/pageup/pagedown/o/p/1/2/3：与 hotkeys 同一处理器语义
                 match arg {
-                    "j" | "k" => {
-                        let delta = if arg == "j" { 1i64 } else { -1 };
-                        if self.view_mode == 0 {
-                            let sel_key = {
-                                let mut a = self.app.lock_recover();
-                                if a.view_visible.is_empty() {
-                                    None
-                                } else {
-                                    let n = a.view_visible.len();
-                                    let pos = a
-                                        .selected
-                                        .as_ref()
-                                        .and_then(|s| a.view_visible.iter().position(|k2| k2 == s));
-                                    let npos = match pos {
-                                        None => if delta > 0 { 0 } else { n - 1 },
-                                        Some(p) => (p as i64 + delta).clamp(0, n as i64 - 1) as usize,
-                                    };
-                                    a.selected = Some(a.view_visible[npos].clone());
-                        tracing::debug!("jk: pos={:?} npos={} n={}", pos, npos, n);
-                                    a.selected.clone()
-                                }
-                            };
-                            if let Some(k2) = sel_key {
-                                self.scroll_to = Some(k2);
-                            }
-                        }
+                    "up" | "down" | "pageup" | "pagedown" => {
+                        let delta = match arg {
+                            "down" => 1,
+                            "up" => -1,
+                            "pagedown" => 20,
+                            _ => -20,
+                        };
+                        self.move_selection(delta);
                     }
                     "o" => worker::batch_open_browser(&self.app),
                     "p" => {
@@ -1128,6 +1112,47 @@ impl EguiApp {
         }
     }
 
+    fn move_selection(&mut self, delta: i64) {
+        if delta == 0 {
+            return;
+        }
+        if self.view_mode == 0 {
+            let sel_key = {
+                let mut a = self.app.lock_recover();
+                if a.view_visible.is_empty() {
+                    None
+                } else {
+                    let n = a.view_visible.len();
+                    let pos = a
+                        .selected
+                        .as_ref()
+                        .and_then(|s| a.view_visible.iter().position(|key| key == s));
+                    let npos = match pos {
+                        Some(p) => (p as i64 + delta).clamp(0, n as i64 - 1) as usize,
+                        None if delta > 0 => (delta - 1).clamp(0, n as i64 - 1) as usize,
+                        None => (n as i64 + delta).clamp(0, n as i64 - 1) as usize,
+                    };
+                    a.selected = Some(a.view_visible[npos].clone());
+                    a.selected.clone()
+                }
+            };
+            if let Some(key) = sel_key {
+                self.scroll_to = Some(key);
+            }
+        } else {
+            let n = self.app.lock_recover().inbox_view.len();
+            if n > 0 {
+                let npos = match self.inbox_sel {
+                    Some(p) => (p as i64 + delta).clamp(0, n as i64 - 1) as usize,
+                    None if delta > 0 => (delta - 1).clamp(0, n as i64 - 1) as usize,
+                    None => (n as i64 + delta).clamp(0, n as i64 - 1) as usize,
+                };
+                self.inbox_sel = Some(npos);
+                self.inbox_scroll_to = Some(npos);
+            }
+        }
+    }
+
     /// 快捷键分发（无输入框聚焦时）。Esc 分级：设置弹窗 → 关弹窗；
     /// 引导 → 吞掉；Inbox 预览 → 关预览；多选 → 清多选；详情面板 → 关面板；→ 清选中。
     fn hotkeys(&mut self, ctx: &egui::Context) {
@@ -1175,49 +1200,30 @@ impl EguiApp {
             }
             return;
         }
-        // j/k 移动
-        let (j, k) = (ctx.input(|i| i.key_pressed(egui::Key::J)), ctx.input(|i| i.key_pressed(egui::Key::K)));
-        if j || k {
-            let delta = if j { 1i64 } else { -1i64 };
-            if self.view_mode == 0 {
-                let sel_key = {
-                    let mut a = self.app.lock_recover();
-                    if a.view_visible.is_empty() {
-                        None
-                    } else {
-                        let n = a.view_visible.len();
-                        let pos = a
-                            .selected
-                            .as_ref()
-                            .and_then(|s| a.view_visible.iter().position(|k2| k2 == s));
-                        let npos = match pos {
-                            None => {
-                                if delta > 0 { 0 } else { n - 1 }
-                            }
-                            Some(p) => (p as i64 + delta).clamp(0, n as i64 - 1) as usize,
-                        };
-                        a.selected = Some(a.view_visible[npos].clone());
-                        tracing::debug!("jk: pos={:?} npos={} n={}", pos, npos, n);
-                        a.selected.clone()
-                    }
-                };
-                if let Some(k2) = sel_key {
-                    // 滚动到选中行：渲染时由行消费（scroll_to_rect）
-                    self.scroll_to = Some(k2);
-                }
+        let (down, up, page_down, page_up) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::PageDown),
+                i.key_pressed(egui::Key::PageUp),
+            )
+        });
+        if down || up || page_down || page_up {
+            let row_height = if self.view_mode == 0 { 24.0 } else { 30.0 };
+            let viewport_height = ctx.input(|i| {
+                i.viewport().inner_rect.map(|r| r.height()).unwrap_or(600.0)
+            });
+            let page_rows = ((viewport_height - 140.0) / row_height).floor().max(1.0) as i64;
+            let delta = if down {
+                1
+            } else if up {
+                -1
+            } else if page_down {
+                page_rows
             } else {
-                // Inbox：在过滤视图上下标移动
-                let n = self.app.lock_recover().inbox_view.len();
-                if n > 0 {
-                    let pos = self.inbox_sel.unwrap_or(if delta > 0 { usize::MAX } else { 0 });
-                    let npos = if pos == usize::MAX {
-                        0
-                    } else {
-                        (pos as i64 + delta).clamp(0, n as i64 - 1) as usize
-                    };
-                    self.inbox_sel = Some(npos);
-                }
-            }
+                -page_rows
+            };
+            self.move_selection(delta);
             return;
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
@@ -1384,7 +1390,20 @@ impl eframe::App for EguiApp {
 // ── 主题 / 字体 ──
 
 pub fn apply_theme(ctx: &egui::Context, theme: &str) {
-    ctx.set_theme(if theme == "dark" { egui::Theme::Dark } else { egui::Theme::Light });
+    let dark = theme == "dark";
+    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
+    ctx.all_styles_mut(|style| {
+        style.visuals.widgets.noninteractive.fg_stroke.color = if dark {
+            egui::Color32::from_gray(230)
+        } else {
+            egui::Color32::from_gray(32)
+        };
+        style.visuals.weak_text_color = Some(if dark {
+            egui::Color32::from_gray(175)
+        } else {
+            egui::Color32::from_gray(88)
+        });
+    });
 }
 
 /// 字号档位：从 egui 默认基准重算（不累乘，避免多次切换漂移）。
@@ -1397,40 +1416,6 @@ pub fn apply_font_scale(ctx: &egui::Context, scale: f32) {
             .map(|(k, v)| (k.clone(), egui::FontId { size: v.size * scale, ..v.clone() }))
             .collect();
     });
-}
-
-/// 加载 CJK 字体：egui 内置字体不含中文，Windows 上注册微软雅黑（失败再试黑体/宋体）。
-fn install_cjk_fonts(ctx: &egui::Context) {
-    const CANDIDATES: &[&str] = &[
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/msyh.ttf",
-        "C:/Windows/Fonts/simhei.ttf",
-        "C:/Windows/Fonts/simsun.ttc",
-        "C:/Windows/Fonts/Deng.ttf",
-    ];
-    let mut fonts = egui::FontDefinitions::default();
-    for path in CANDIDATES {
-        match std::fs::read(path) {
-            Ok(bytes) => {
-                fonts.font_data.insert("cjk".into(), egui::FontData::from_owned(bytes).into());
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Proportional)
-                    .or_default()
-                    .push("cjk".into());
-                fonts
-                    .families
-                    .entry(egui::FontFamily::Monospace)
-                    .or_default()
-                    .push("cjk".into());
-                tracing::info!("CJK 字体已加载: {path}");
-                ctx.set_fonts(fonts);
-                return;
-            }
-            Err(e) => tracing::debug!("字体不可用 {path}: {e}"),
-        }
-    }
-    tracing::warn!("未找到可用 CJK 字体，中文将显示为方块");
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1499,7 +1484,7 @@ fn main() -> anyhow::Result<()> {
         "PR Desk",
         options,
         Box::new(move |cc| {
-            install_cjk_fonts(&cc.egui_ctx);
+            system_fonts::install(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx, &cfg.theme);
             apply_font_scale(&cc.egui_ctx, cfg.font_scale);
 
@@ -1566,6 +1551,7 @@ fn main() -> anyhow::Result<()> {
                 scroll_to: None,
                 inbox_loading: false,
                 inbox_sel: None,
+                inbox_scroll_to: None,
                 nd_open: false,
                 nd_tab: 0,
                 nd_epoch: 0,

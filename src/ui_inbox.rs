@@ -123,7 +123,7 @@ pub fn inbox_view(app: &mut EguiApp, ui: &mut Ui) {
             let (rect, _) = ui.allocate_exact_size(egui::vec2(total_w, 20.0), egui::Sense::hover());
             let cols = inbox_col_layout(total_w);
             let weak = ui.visuals().weak_text_color();
-            let hf = FontId::proportional(11.0);
+            let hf = FontId::proportional(12.0);
             let labels = [
                 "",
                 tr(&lang, "inbox_col_repo"),
@@ -202,7 +202,7 @@ fn inbox_row(app: &mut EguiApp, ui: &mut Ui, n: &serde_json::Value, i: usize, la
     let unread = n["unread"].as_bool().unwrap_or(false);
     // 选中判定：详情面板开着时按稳定身份（repo + 行自身 url）严格单行匹配——旧实现
     // 比较的是详情自身的 (num, url)（恒等），条件退化成 r == repo，同仓库的行全亮；
-    // 面板关着时（未打开过详情）退到 j/k 导航下标
+    // 面板关着时（未打开过详情）退到键盘导航下标
     let detail = app.app.lock_recover().inbox_detail.clone();
     let selected = if let Some((r, _, _, durl)) = &detail {
         r == repo && !url.is_empty() && *durl == url
@@ -213,6 +213,10 @@ fn inbox_row(app: &mut EguiApp, ui: &mut Ui, n: &serde_json::Value, i: usize, la
     let height = 30.0;
     let total_w = ui.available_width();
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(total_w, height), egui::Sense::click());
+    if app.inbox_scroll_to == Some(i) {
+        resp.scroll_to_me(Some(egui::Align::Center));
+        app.inbox_scroll_to = None;
+    }
     let visuals = ui.visuals();
     let bg = if selected {
         visuals.selection.bg_fill
@@ -226,7 +230,7 @@ fn inbox_row(app: &mut EguiApp, ui: &mut Ui, n: &serde_json::Value, i: usize, la
     let p = ui.painter();
     let text_color = visuals.text_color();
     let weak = visuals.weak_text_color();
-    let small = FontId::proportional(11.0);
+    let small = FontId::proportional(12.0);
     let cols = inbox_col_layout(total_w);
     let cell = |idx: usize| -> egui::Rect {
         let (x, w) = cols[idx];
@@ -308,18 +312,24 @@ pub fn notif_preview(app: &mut EguiApp, ui: &mut Ui) {
         .show(ui, |ui| {
             // ── 头部：常驻不滚动（旧版整个面板一个滚动区，重开时停在上次滚动位、
             // 标题被裁半——用户截图实证）──
-            ui.horizontal(|ui| {
-                let title = if app.nd_title.is_empty() {
-                    tr(&lang, "inbox_not_selected")
-                } else {
-                    &app.nd_title
-                };
-                ui.heading(RichText::new(title).size(15.0));
+            // ✕ 单独一行钉右上；标题独占一行按面板宽度换行（同 detail_panel）。
+            // 不能放回 horizontal：横向布局里 Label 走 TextWrapMode::Extend 不换行，
+            // 超长标题单行溢出会把内容 ui 的 max_rect 撑大（egui 的 Region::
+            // expand_to_include_rect 连 max_rect 一起扩），其后的 ScrollArea/markdown
+            // 全按虚胖宽度排版；Panel 还会把超宽内容重锚到内容右缘，导致面板左缘
+            // 被中央列表盖住、右缘跑出窗口（用户截图实证）。
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::TOP), |ui| {
                 if ui.small_button("✕").clicked() {
                     app.nd_open = false;
                     app.app.lock_recover().inbox_detail = None;
                 }
             });
+            let title = if app.nd_title.is_empty() {
+                tr(&lang, "inbox_not_selected")
+            } else {
+                &app.nd_title
+            };
+            ui.add(egui::Label::new(RichText::new(title).size(15.0).strong()).wrap());
             ui.horizontal(|ui| {
                 ui.weak(&app.nd_kind_label);
                 if !app.nd_state.is_empty() {
@@ -375,7 +385,9 @@ pub fn notif_preview(app: &mut EguiApp, ui: &mut Ui) {
                             ui.weak(tr(&lang, "inbox_convo_empty_hint"));
                         } else {
                             for e in app.nd_convo.clone() {
-                                ui.horizontal(|ui| {
+                                // horizontal_wrapped：超长作者名/时间戳在行内换行而不是溢出
+                                // （单行溢出会撑大内容 ui 的 max_rect，带歪后续所有换行宽度）
+                                ui.horizontal_wrapped(|ui| {
                                     ui_detail::avatar_chip(ui, &e.author);
                                     ui.strong(&e.author);
                                     ui.weak(&e.time);

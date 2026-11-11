@@ -48,8 +48,9 @@ plugin over its sync API (pins / priorities / board / tags / todos).
 **UX**
 
 - Bilingual UI (zh/en) with live switch, light/dark theme, font scaling
-- Keyboard-first: `j`/`k` navigate, `Enter` open, `Esc` close/back,
-  `p` pin, `1`/`2`/`3` priority, `o` open in browser, `PgUp`/`PgDn` scroll
+- Keyboard-first: arrow keys navigate, `PgUp`/`PgDn` move by page,
+  `Enter` open, `Esc` close/back, `p` pin, `1`/`2`/`3` priority,
+  `o` open in browser
 - Window size and panel width persist across restarts
 
 ## Build & run

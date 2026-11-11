@@ -12,15 +12,15 @@ BASE_FLAT=$(state | python -c "import json,sys; print(json.load(sys.stdin)['flat
 echo "  [基线] rows=$BASE_ROWS flat=$BASE_FLAT"
 assert "view_mode==0 且基线行数>0" "d['view_mode']==0 and d['rows']>0"
 
-# j/k 导航（经测试指令，与 hotkeys 同语义；真键盘路径另用 PostMessage 验证）
-cmd "key j"; assert "j → 选中第 0 行" "d['selected'] is not None"
+# 方向键导航（经测试指令，与 hotkeys 同语义；真键盘路径另用 PostMessage 验证）
+cmd "key down"; assert "↓ → 选中第 0 行" "d['selected'] is not None"
 SEL0=$(state | python -c "import json,sys; print(json.load(sys.stdin)['selected'][1])")
-cmd "key j"; cmd "key j"
-assert "j×3 后选中第 2 行（view_visible 序）" "d['selected'] is not None"
+cmd "key down"; cmd "key down"
+assert "↓×3 后选中第 2 行（view_visible 序）" "d['selected'] is not None"
 SEL2=$(state | python -c "import json,sys; print(json.load(sys.stdin)['selected'][1])")
-[ "$SEL0" != "$SEL2" ] && echo "  PASS: j 移动改变了选中（$SEL0 → $SEL2）" && PASS=$((PASS+1)) || { echo "  FAIL: j 未移动"; FAIL=$((FAIL+1)); }
-cmd "key k"; SEL1=$(state | python -c "import json,sys; print(json.load(sys.stdin)['selected'][1])")
-[ "$SEL1" != "$SEL2" ] && echo "  PASS: k 回移（$SEL2 → $SEL1）" && PASS=$((PASS+1)) || { echo "  FAIL: k 未回移"; FAIL=$((FAIL+1)); }
+[ "$SEL0" != "$SEL2" ] && echo "  PASS: ↓ 移动改变了选中（$SEL0 → $SEL2）" && PASS=$((PASS+1)) || { echo "  FAIL: ↓ 未移动"; FAIL=$((FAIL+1)); }
+cmd "key up"; SEL1=$(state | python -c "import json,sys; print(json.load(sys.stdin)['selected'][1])")
+[ "$SEL1" != "$SEL2" ] && echo "  PASS: ↑ 回移（$SEL2 → $SEL1）" && PASS=$((PASS+1)) || { echo "  FAIL: ↑ 未回移"; FAIL=$((FAIL+1)); }
 
 # 多选：Ctrl 点选（空集合时以当前选中为起点扩充 → 选中行 + 点选行 = 2）
 cmd "rowctrl 0"; cmd "rowctrl 2"

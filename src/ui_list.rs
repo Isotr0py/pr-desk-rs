@@ -450,6 +450,73 @@ pub(crate) fn paint_cell(ui: &Ui, cell: egui::Rect, text: &str, font: FontId, co
         .text(egui::pos2(cell.left() + 2.0, cell.center().y), Align2::LEFT_CENTER, text, font, color);
 }
 
+fn size_badge_colors(size: &str, dark: bool) -> Option<(Color32, Color32)> {
+    let fg = match (size, dark) {
+        ("XS", false) => Color32::from_rgb(9, 105, 218),
+        ("S", false) => Color32::from_rgb(26, 127, 55),
+        ("M", false) => Color32::from_rgb(154, 103, 0),
+        ("L", false) => Color32::from_rgb(188, 76, 0),
+        ("XL", false) => Color32::from_rgb(207, 34, 46),
+        ("XS", true) => Color32::from_rgb(88, 166, 255),
+        ("S", true) => Color32::from_rgb(63, 185, 80),
+        ("M", true) => Color32::from_rgb(210, 153, 34),
+        ("L", true) => Color32::from_rgb(240, 136, 62),
+        ("XL", true) => Color32::from_rgb(248, 81, 73),
+        _ => return None,
+    };
+    let bg = fg.gamma_multiply(if dark { 0.22 } else { 0.14 });
+    Some((bg, fg))
+}
+
+fn paint_size_badge(ui: &Ui, cell: egui::Rect, size: &str, font: FontId, weak: Color32, dark: bool) {
+    let Some((bg, fg)) = size_badge_colors(size, dark) else {
+        paint_cell(ui, cell, size, font, weak);
+        return;
+    };
+    let text_w = ui.fonts_mut(|f| f.layout_no_wrap(size.to_string(), font.clone(), fg).rect.width());
+    let rect = egui::Rect::from_center_size(
+        egui::pos2(icon_center_x(cell), cell.center().y),
+        egui::vec2((text_w + 12.0).max(26.0), 16.0),
+    );
+    let painter = ui.painter().with_clip_rect(cell);
+    painter.rect_filled(rect, 8.0, bg);
+    painter.text(rect.center(), Align2::CENTER_CENTER, size, font, fg);
+}
+
+fn diff_count_colors(dark: bool) -> (Color32, Color32) {
+    if dark {
+        (Color32::from_rgb(63, 185, 80), Color32::from_rgb(248, 81, 73))
+    } else {
+        (Color32::from_rgb(26, 127, 55), Color32::from_rgb(207, 34, 46))
+    }
+}
+
+fn paint_diff_count(ui: &Ui, cell: egui::Rect, adds: i64, dels: i64, font: FontId, weak: Color32, dark: bool) {
+    let additions = format!("+{adds}");
+    let deletions = format!("-{dels}");
+    let (adds_w, separator_w, dels_w) = ui.fonts_mut(|f| {
+        (
+            f.layout_no_wrap(additions.clone(), font.clone(), Color32::WHITE).rect.width(),
+            f.layout_no_wrap("/".into(), font.clone(), Color32::WHITE).rect.width(),
+            f.layout_no_wrap(deletions.clone(), font.clone(), Color32::WHITE).rect.width(),
+        )
+    });
+    if adds_w + separator_w + dels_w > cell.width() - 4.0 {
+        paint_cell(ui, cell, &format!("{additions}/{deletions}"), font, weak);
+        return;
+    }
+
+    let (adds_color, dels_color) = diff_count_colors(dark);
+    let painter = ui.painter().with_clip_rect(cell);
+    let y = cell.center().y;
+    let mut x = cell.left() + 2.0;
+    painter.text(egui::pos2(x, y), Align2::LEFT_CENTER, additions, font.clone(), adds_color);
+    x += adds_w;
+    painter.text(egui::pos2(x, y), Align2::LEFT_CENTER, "/", font.clone(), weak);
+    x += separator_w;
+    painter.text(egui::pos2(x, y), Align2::LEFT_CENTER, deletions, font, dels_color);
+}
+
 /// 超出宽度时截断加「…」；按字符步进测量（行数少，成本可忽略）。
 pub(crate) fn ellipsize(ui: &Ui, text: &str, font: FontId, max_w: f32) -> String {
     let measure = |ui: &Ui, s: String| {
@@ -557,10 +624,10 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
                 for item in &items {
                     match item {
                         ViewItem::Header { key, title, count, collapsed } => {
-                            let arrow = if *collapsed { "▶" } else { "▼" };
-                            let resp = ui.add(
-                                egui::Label::new(RichText::new(format!("{arrow} {title} ({count})")).strong())
-                                    .sense(egui::Sense::click()),
+                            let resp = ui_detail::disclosure_header(
+                                ui,
+                                RichText::new(format!("{title} ({count})")).strong(),
+                                !collapsed,
                             );
                             if resp.clicked() {
                                 app.group_toggled(key);
@@ -640,10 +707,10 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         // 在整列居中（否则只剩 ~20px 全是省略号——文字压到把手区上方可接受，交互区仍收窄）
         let paint_cell_r = if text_cell.width() >= 64.0 { text_cell } else { cell };
         let text = format!("{}{arrow}", col_label(c.label, lang));
-        let text = ellipsize(ui, &text, FontId::proportional(11.0), paint_cell_r.width() - 4.0);
+        let text = ellipsize(ui, &text, FontId::proportional(12.0), paint_cell_r.width() - 4.0);
         ui.painter()
             .with_clip_rect(cell)
-            .text(paint_cell_r.center(), Align2::CENTER_CENTER, text, FontId::proportional(11.0), ui.visuals().weak_text_color());
+            .text(paint_cell_r.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.0), ui.visuals().weak_text_color());
         // 拖拽调宽后松开不得触发排序（双保险：文字区已收窄，这里是时间窗守卫）
         let dragging = app.header_drag_at.is_some_and(|t| t.elapsed().as_millis() < 300);
         if resp.clicked() && !dragging {
@@ -726,7 +793,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     };
     ui.painter().rect_filled(rect, 3.0, bg);
 
-    // j/k 导航滚动跟随
+    // 键盘导航滚动跟随
     if app.scroll_to.as_ref() == Some(&row.key) {
         resp.scroll_to_me(Some(egui::Align::Center));
         app.scroll_to = None;
@@ -736,7 +803,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     let text_color = visuals.text_color();
     let weak = visuals.weak_text_color();
     let font = FontId::default();
-    let small = FontId::proportional(11.0);
+    let small = FontId::proportional(12.0);
     let layout = col_layout(rect.width(), &app.col_widths);
     // debug 列边界覆盖层（验证「内容钉死在列框内」用；默认关）
     if app.show_col_grid {
@@ -771,7 +838,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             cell(1),
             egui::Label::new(
                 RichText::new(format!("#{}", key.1))
-                    .size(11.0)
+                    .size(12.0)
                     .color(visuals.hyperlink_color)
                     .underline(),
             )
@@ -931,8 +998,8 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
         let c = cell(6);
         ui.painter().circle_filled(egui::pos2(icon_center_x(c), c.center().y), 3.5, ui_detail::ci_color(&row.ci));
     }
-    paint_cell(ui, cell(7), &row.size, small.clone(), weak);
-    paint_cell(ui, cell(8), &format!("+{}/-{}", row.adds, row.dels), small.clone(), weak);
+    paint_size_badge(ui, cell(7), &row.size, small.clone(), weak, dark);
+    paint_diff_count(ui, cell(8), row.adds, row.dels, small.clone(), weak, dark);
     // ★ 评分列：列内居中（图标列语义）
     if row.score > 0.0 {
         let c = cell(9);
@@ -1222,6 +1289,22 @@ mod tests {
         let d = apply_pair_drag(&mut w, 5, -1000.0);
         assert!((w[5] - COL_SPECS[5].min_w).abs() < 0.01);
         assert!(d < 0.0 && d > -1000.0, "位移被钳制");
+    }
+
+    #[test]
+    fn semantic_colors_cover_all_size_levels_and_themes() {
+        for dark in [false, true] {
+            let colors = ["XS", "S", "M", "L", "XL"].map(|size| size_badge_colors(size, dark).unwrap());
+            for (i, (bg, fg)) in colors.iter().enumerate() {
+                assert_ne!(bg, fg, "标签底色与文字色必须区分");
+                for (_, other_fg) in colors.iter().skip(i + 1) {
+                    assert_ne!(fg, other_fg, "不同体量必须使用不同颜色");
+                }
+            }
+            assert!(size_badge_colors("", dark).is_none());
+            let (adds, dels) = diff_count_colors(dark);
+            assert_ne!(adds, dels);
+        }
     }
 
     #[test]

@@ -466,7 +466,7 @@ pub struct App {
     pub db: Db,
     pub rows: Vec<Value>,                 // 扁平数据行（按身份查找，见 find_row）
     pub flat: Vec<FlatItem>,              // 展示序摊平（过滤+排序+分组+折叠后），渲染与点击映射以此为准
-    pub view_visible: Vec<(String, i64)>, // 可见行的展示序身份；j/k 键盘导航以此为准
+    pub view_visible: Vec<(String, i64)>, // 可见行的展示序身份；键盘导航以此为准
     pub collapsed: HashSet<String>,       // 折叠的组 key；跨刷新保留
     pub filter: String,                   // 当前过滤词（空 = 全量）
     pub sort_col: String,                 // 组内排序列（默认 "upd" = 更新时间降序，即 SQL 输入序）
@@ -572,7 +572,7 @@ pub fn filtered_view(rows: &[Value], filter: &str, min_score: f32) -> Vec<usize>
 
 /// 重算展示序摊平（过滤 → 分组排序 → 折叠）：
 /// - flat：渲染与点击映射的数据源；
-/// - view_visible：可见行身份序列（j/k 导航）；
+/// - view_visible：可见行身份序列（键盘导航）；
 /// - 多选按身份修剪：被过滤/刷新掉的行退出多选；锚点行消失则清锚。
 pub fn recompute_flat(a: &mut App) {
     let view = filtered_view(&a.rows, &a.filter, a.min_score);
@@ -1130,7 +1130,7 @@ mod tests {
             assert!(matches!(a.flat[0], FlatItem::Header { .. }));
             assert_eq!(a.view_visible.len(), 2);
         }
-        // 折叠后只剩 header，j/k 可见行为空
+        // 折叠后只剩 header，键盘可见行为空
         {
             let mut a = app.lock_recover();
             a.collapsed.insert("needs-review".into());

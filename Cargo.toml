@@ -10,6 +10,7 @@ eframe = { version = "0.37", default-features = false, features = [
     "accesskit", "clipboard", "default_fonts", "links", "glow", "system_fonts", "__screenshot",
 ] }
 egui = "0.37"
+fontique = "0.11"
 egui_extras = "0.37"
 # 评审摘要的 markdown 渲染（egui 0.37 兼容版本）
 egui_commonmark = "0.26"

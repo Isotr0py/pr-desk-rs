@@ -2794,6 +2794,7 @@ dependencies = [
  "egui",
  "egui_commonmark",
  "egui_extras",
+ "fontique",
  "hex",
  "hmac",
  "image",

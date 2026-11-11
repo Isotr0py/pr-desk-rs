@@ -36,12 +36,16 @@ pub fn ci_color(ci: &str) -> Color32 {
 }
 
 pub fn score_color(s: f64, dark: bool) -> Color32 {
-    if s >= 7.0 {
-        kind_color(LineKind::Add, dark)
-    } else if s >= 5.0 {
-        Color32::from_rgb(191, 135, 0)
-    } else {
-        kind_color(LineKind::Del, dark)
+    match (s, dark) {
+        (s, false) if s >= 9.0 => Color32::from_rgb(9, 105, 218),
+        (s, false) if s >= 8.0 => Color32::from_rgb(26, 127, 55),
+        (s, false) if s >= 7.0 => Color32::from_rgb(154, 103, 0),
+        (s, false) if s >= 6.0 => Color32::from_rgb(188, 76, 0),
+        (s, true) if s >= 9.0 => Color32::from_rgb(88, 166, 255),
+        (s, true) if s >= 8.0 => Color32::from_rgb(63, 185, 80),
+        (s, true) if s >= 7.0 => Color32::from_rgb(210, 153, 34),
+        (s, true) if s >= 6.0 => Color32::from_rgb(240, 136, 62),
+        _ => kind_color(LineKind::Del, dark),
     }
 }
 
@@ -107,6 +111,36 @@ fn kind_bg(kind: LineKind, dark: bool) -> Option<Color32> {
     }
 }
 
+pub(crate) fn disclosure_header(ui: &mut Ui, text: RichText, expanded: bool) -> egui::Response {
+    let resp = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        let (rect, icon_resp) = ui.allocate_exact_size(egui::vec2(12.0, 24.0), egui::Sense::click());
+        let c = rect.center();
+        let stroke = egui::Stroke::new(1.5, ui.visuals().weak_text_color());
+        let points = if expanded {
+            [
+                c + egui::vec2(-3.0, -1.5),
+                c + egui::vec2(0.0, 1.5),
+                c + egui::vec2(3.0, -1.5),
+            ]
+        } else {
+            [
+                c + egui::vec2(-1.5, -3.0),
+                c + egui::vec2(1.5, 0.0),
+                c + egui::vec2(-1.5, 3.0),
+            ]
+        };
+        ui.painter().line_segment([points[0], points[1]], stroke);
+        ui.painter().line_segment([points[1], points[2]], stroke);
+        let text_resp = ui.add(egui::Label::new(text).sense(egui::Sense::click()));
+        icon_resp.union(text_resp)
+    }).inner;
+    if resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    resp
+}
+
 /// diff 文件列表渲染：折叠头 + 展开文件的行虚拟化绘制（只画可见行，大 diff 不卡）。
 /// 长行不自动换行：内容宽度按最长行估算，横向滚动与纵向滚动解耦。
 pub fn diff_view(ui: &mut Ui, files: &mut [DiffFileData], lang: &str, id_prefix: &str) {
@@ -125,9 +159,8 @@ pub fn diff_view(ui: &mut Ui, files: &mut [DiffFileData], lang: &str, id_prefix:
     for (fi, f) in files.iter_mut().enumerate() {
         let adds = f.lines.iter().filter(|(k, _, _)| *k == LineKind::Add).count();
         let dels = f.lines.iter().filter(|(k, _, _)| *k == LineKind::Del).count();
-        let arrow = if f.expanded { "▼" } else { "▶" };
-        let header = format!("{arrow} {}  (+{adds}/-{dels})", f.path);
-        let resp = ui.add(egui::Label::new(RichText::new(header).monospace().strong()).sense(egui::Sense::click()));
+        let header = format!("{}  (+{adds}/-{dels})", f.path);
+        let resp = disclosure_header(ui, RichText::new(header).monospace().strong(), f.expanded);
         if resp.clicked() {
             f.expanded = !f.expanded;
         }
@@ -252,8 +285,10 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
         }
     });
     ui.add(egui::Label::new(RichText::new(&title).size(15.0).strong()).wrap());
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         // 作者头像（磁盘缓存；miss → 字母降级）
+        // horizontal_wrapped：长 repo/作者名行内换行而非溢出（溢出会撑大
+        // 内容 ui 的 max_rect，毒化后续所有内容的换行宽度）
         avatar_chip(ui, &author);
         ui.label(&repo);
         // #编号：可点超链接（浏览器打开 PR；行 url 缺失时兜底拼接）
@@ -450,7 +485,8 @@ fn review_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
         ui.add_space(4.0);
         ui.label(tr(lang, "review_dimensions"));
         for (label, score) in &rv.dimensions {
-            ui.horizontal(|ui| {
+            // 维度名来自 LLM 输出、长度不可控——行内换行防溢出
+            ui.horizontal_wrapped(|ui| {
                 ui.monospace(format!("{label}"));
                 let frac = (*score / 10.0).clamp(0.0, 1.0);
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 8.0), egui::Sense::hover());
@@ -507,7 +543,7 @@ fn convo_tab(app: &mut EguiApp, ui: &mut Ui, convo: &[PlainConvoEntry], lang: &s
         return;
     }
     for e in convo {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             avatar_chip(ui, &e.author);
             ui.strong(&e.author);
             ui.weak(&e.time);
@@ -537,7 +573,8 @@ fn checks_tab(ui: &mut Ui, checks: &[(String, String)], lang: &str) {
         return;
     }
     for (name, conclusion) in checks {
-        ui.horizontal(|ui| {
+        // CI 检查名可非常长（如 "ci/circleci: build_linux_wheel_..."）——行内换行防溢出
+        ui.horizontal_wrapped(|ui| {
             let (label, color) = match conclusion.as_str() {
                 "success" => (tr(lang, "check_success"), ci_color("success")),
                 "pending" | "" => (tr(lang, "check_pending"), ci_color("pending")),
@@ -559,9 +596,73 @@ pub(crate) fn files_tab(ui: &mut Ui, files: &[(String, i64, i64)], lang: &str) {
         return;
     }
     for (path, adds, dels) in files {
-        ui.horizontal(|ui| {
+        // 文件路径可非常长——行内换行防溢出
+        ui.horizontal_wrapped(|ui| {
             ui.monospace(path);
             ui.weak(format!("+{adds}/-{dels}"));
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header_frame(ctx: &egui::Context, events: Vec<egui::Event>) -> (egui::Rect, bool) {
+        let mut rect = egui::Rect::NOTHING;
+        let mut clicked = false;
+        let output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(400.0, 300.0))),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                let resp = disclosure_header(ui, RichText::new("To Review (11)"), false);
+                rect = resp.rect;
+                clicked = resp.clicked();
+            },
+        );
+        output.drop_without_applying_deltas();
+        (rect, clicked)
+    }
+
+    #[test]
+    fn score_colors_have_five_distinct_tiers() {
+        for dark in [false, true] {
+            let colors = [5.9, 6.0, 7.0, 8.0, 9.0].map(|score| score_color(score, dark));
+            for pair in colors.windows(2) {
+                assert_ne!(pair[0], pair[1], "相邻评分档位必须有不同颜色");
+            }
+            for score in [0.0, 5.0, 5.9] {
+                assert_eq!(score_color(score, dark), kind_color(LineKind::Del, dark));
+            }
+            assert_eq!(score_color(6.9, dark), score_color(6.0, dark));
+            assert_eq!(score_color(7.9, dark), score_color(7.0, dark));
+            assert_eq!(score_color(8.9, dark), score_color(8.0, dark));
+        }
+    }
+
+    #[test]
+    fn disclosure_header_clickable_on_icon_and_text() {
+        for click_icon in [true, false] {
+            let ctx = egui::Context::default();
+            let (rect, _) = header_frame(&ctx, Vec::new());
+            let pos = if click_icon {
+                rect.left_center() + egui::vec2(6.0, 0.0)
+            } else {
+                rect.right_center() - egui::vec2(4.0, 0.0)
+            };
+            let _ = header_frame(&ctx, vec![egui::Event::PointerMoved(pos)]);
+            let button = |pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let (_, pressed) = header_frame(&ctx, vec![button(true)]);
+            let (_, released) = header_frame(&ctx, vec![button(false)]);
+            assert!(pressed || released, "click_icon={click_icon}");
+        }
     }
 }
