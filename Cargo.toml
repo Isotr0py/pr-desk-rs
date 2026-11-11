@@ -3,21 +3,17 @@ name = "pr-desk-rs"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = ["ui"]
-# Slint UI（windows 大 crate 编译吃内存；纯逻辑测试可用 --no-default-features 跳过）
-ui = ["dep:slint", "dep:slint-build"]
-
 [dependencies]
-# 关默认特性砍掉 skia（约 30MB）。
-# 渲染器：只带 software（CPU 光栅 + 局部重绘）。wgpu/femtovg 栈已砍——它是体积和
-# 编译内存的最大来源（naga/wgpu 静态链接曾把页面文件撑爆，链接 OOM），且本 app 的
-# 内容形态（文本行 + 小图）是软件渲染器的最优场景。要 GPU 渲染就把
-# renderer-femtovg-wgpu 加回 features 并设 SLINT_BACKEND=winit-femtovg。
-slint = { version = "1", optional = true, default-features = false, features = [
-    "std", "backend-winit", "renderer-software",
-    "accessibility", "compat-1-2",
+# UI 层：egui/eframe。关默认特性砍掉 wgpu/naga 栈（体积与编译内存最大来源，
+# 曾在 GNU 链接时 OOM），只带 glow 渲染后端。纯逻辑测试 cargo test --lib 不依赖 UI crate。
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit", "clipboard", "default_fonts", "links", "glow", "system_fonts", "__screenshot",
 ] }
+egui = "0.37"
+fontique = "0.11"
+egui_extras = "0.37"
+# 评审摘要的 markdown 渲染（egui 0.37 兼容版本）
+egui_commonmark = "0.26"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # socks feature：支持 socks5:// 代理（Clash 等常见代理同时提供 http/socks5 端口）；
 # 注意没开 system-proxy——系统代理/环境变量一律不生效，只认配置里的显式 proxy 字段
@@ -34,10 +30,17 @@ open = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 pulldown-cmark = { version = "0.12", default-features = false, features = ["simd"] }
-# 头像 JPEG→PNG 归一化（i-slint-core 已拉入 image 0.25，无额外编译开销）
+# 头像 JPEG→PNG 归一化 / 圆形预裁（lib::circle_crop 用）
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # 系统剪贴板（复制评审报告到剪贴板）
 arboard = "3"
+
+# Windows 托盘（Shell_NotifyIconW + 消息专用窗口；纯 FFI 绑定，MinGW 可编）
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+] }
 
 [profile.release]
 # 二进制瘦身：瘦 LTO + 单编译单元 + 去符号 + abort（panic=abort 会弄坏
@@ -52,6 +55,3 @@ opt-level = "s"
 [profile.dev]
 # 开发构建瘦身：行级调试信息（IDE 断点不受影响），显著降低 target 体积与 rustc 内存
 debug = "line-tables-only"
-
-[build-dependencies]
-slint-build = { version = "1", optional = true }

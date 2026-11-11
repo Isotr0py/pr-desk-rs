@@ -1,4 +1,4 @@
-//! GitHub 评论 Markdown → 结构化块数组（供 Slint UI 按块渲染）。
+//! GitHub 评论 Markdown → 结构化块数组（供 UI 按块渲染）。
 //! kind 约定：h1..h6 / p / code / bullet / num / table / quote / hr。
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};

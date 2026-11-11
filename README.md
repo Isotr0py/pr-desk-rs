@@ -1,6 +1,12 @@
 # PR Desk (pr-desk-rs)
 
-A high-density GitHub PR pre-review workbench for the desktop (Rust + Slint).
+A high-density GitHub PR pre-review workbench for the desktop (Rust + egui).
+
+> **NOTE**: the UI layer is being rewritten from Slint to egui/eframe on this
+> branch. The egui version is currently a skeleton: PR list + detail panel
+> (review + diff) + refresh + search + theme toggle. Inbox, settings page,
+> multi-select/batch actions, review triggers and tray are not yet ported
+> (see `TODO(egui):` markers in `src/main.rs`).
 
 Pairs with the AstrBot plugin
 [`astrbot_plugin_github_pr_review`](../astrbot_plugin_github_pr_review):
@@ -42,14 +48,15 @@ plugin over its sync API (pins / priorities / board / tags / todos).
 **UX**
 
 - Bilingual UI (zh/en) with live switch, light/dark theme, font scaling
-- Keyboard-first: `j`/`k` navigate, `Enter` open, `Esc` close/back,
-  `p` pin, `1`/`2`/`3` priority, `o` open in browser, `PgUp`/`PgDn` scroll
+- Keyboard-first: arrow keys navigate, `PgUp`/`PgDn` move by page,
+  `Enter` open, `Esc` close/back, `p` pin, `1`/`2`/`3` priority,
+  `o` open in browser
 - Window size and panel width persist across restarts
 
 ## Build & run
 
 - Toolchain: **x86_64-pc-windows-gnu** (pure Rust, no MSVC/OpenSSL)
-- Stack: reqwest + rustls, rusqlite (bundled), Slint (software renderer)
+- Stack: reqwest + rustls, rusqlite (bundled), egui/eframe (glow renderer)
 
 ```bash
 cargo run --release
@@ -69,13 +76,12 @@ Runtime requirements:
 
 ### Renderer note
 
-The UI renders with Slint's **software renderer** (CPU raster + partial
-redraws) — the only renderer compiled in. The wgpu/femtovg GPU stack was
-dropped: it was the single largest contributor to binary size and build
-memory (its static link could blow the Windows page file), and this app's
-content (text rows + small avatar images) is the software renderer's best
-case. To bring GPU rendering back, re-add `renderer-femtovg-wgpu` to the
-slint features in `Cargo.toml` and set `SLINT_BACKEND=winit-femtovg`.
+The UI renders with eframe's **glow** backend. The wgpu stack is not
+compiled in (`eframe` default-features off): it was the single largest
+contributor to binary size and build memory (its static link could blow
+the Windows page file). Text uses native system fonts with Source Han
+Sans/Noto and JetBrains Mono preferred when installed, including correct
+variable-font weight selection.
 
 ## Configuration
 
@@ -111,8 +117,8 @@ poll_interval_min = 5                  # auto-sync interval (minutes)
 ## Testing
 
 ```bash
-cargo test                                # full suite (compiles the Slint UI)
-cargo test --no-default-features --lib    # fast: logic only, skips Slint
+cargo test --lib                          # logic suite (no UI dependency)
+cargo test                                # full suite (compiles the egui UI)
 ```
 
 Coverage includes: sync merge semantics (server-wins / applied not
@@ -129,5 +135,4 @@ async deliveries.
 
 ## License
 
-[GPLv3](LICENSE) (Slint is dual-licensed GPLv3/commercial; this project
-follows the GPLv3 path).
+[GPLv3](LICENSE).

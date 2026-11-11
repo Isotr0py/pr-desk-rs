@@ -2,7 +2,7 @@
 //!
 //! 行为移植自 astrbot_plugin_github_pr_review 的 reviewer.py / plugin_metadata.py：
 //! diff 按文件分块、跳过 lock/生成文件、超限截断并注明；要求模型输出严格 JSON，
-//! 解析失败把 RETRY_SUFFIX 追加到 user prompt 重试一次，仍失败则报错。
+//! 解析失败带上原始 prompt、上一轮回复和 RETRY_SUFFIX 重试一次，仍失败则报错。
 
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -73,7 +73,7 @@ PR：#{{number}} {{title}}
 - flagged_files 只列出确有问题的文件，没有问题则为空数组。
 ";
 
-/// JSON 解析失败后的重试提示词追加（plugin_metadata.py RETRY_SUFFIX 原样移植）
+/// JSON 解析失败后的重试纠正消息（plugin_metadata.py RETRY_SUFFIX 文案移植）
 pub const RETRY_SUFFIX: &str =
     "\n\n你上一次的回复无法被解析为 JSON。请严格只输出一个 JSON 对象，不要包含任何解释文字或 markdown 代码块标记。";
 
@@ -395,15 +395,28 @@ fn diff_line_stats(diff_text: &str) -> (i64, i64) {
     (adds, dels)
 }
 
-/// 调用 OpenAI 兼容 chat/completions，返回 assistant 文本。
-async fn chat_completion(llm: &LlmSettings, user_prompt: &str) -> Result<String> {
+fn chat_messages(user_prompt: &str, previous_reply: Option<&str>) -> Value {
+    let mut messages = vec![
+        json!({"role": "system", "content": DEFAULT_REVIEWER_PERSONA}),
+        json!({"role": "user", "content": user_prompt}),
+    ];
+    if let Some(reply) = previous_reply {
+        messages.push(json!({"role": "assistant", "content": reply}));
+        messages.push(json!({"role": "user", "content": RETRY_SUFFIX.trim()}));
+    }
+    Value::Array(messages)
+}
+
+/// 调用 OpenAI 兼容 chat/completions，返回 assistant 文本；重试时带上上一轮回复。
+async fn chat_completion(
+    llm: &LlmSettings,
+    user_prompt: &str,
+    previous_reply: Option<&str>,
+) -> Result<String> {
     let url = format!("{}/chat/completions", llm.base_url.trim_end_matches('/'));
     let body = json!({
         "model": llm.model,
-        "messages": [
-            {"role": "system", "content": DEFAULT_REVIEWER_PERSONA},
-            {"role": "user", "content": user_prompt},
-        ],
+        "messages": chat_messages(user_prompt, previous_reply),
         "temperature": 0.2,
     });
     let resp = llm
@@ -509,13 +522,13 @@ pub async fn run_review(
     progress(tr(lang, "prog_llm_review").into());
     let mut last_raw = String::new();
     let mut parsed = None;
-    for attempt in 0..2 {
-        let p = if attempt == 0 {
-            prompt.clone()
+    for _ in 0..2 {
+        let previous_reply = if last_raw.is_empty() {
+            None
         } else {
-            format!("{prompt}{RETRY_SUFFIX}")
+            Some(last_raw.as_str())
         };
-        let raw = chat_completion(llm, &p).await?;
+        let raw = chat_completion(llm, &prompt, previous_reply).await?;
         let raw = raw.trim().to_string();
         if raw.is_empty() {
             continue;
@@ -712,6 +725,26 @@ index 555..666 100644
         assert!(p.contains("overall_score"));
         assert!(p.contains("dimensions 必须完整包含"));
         assert!(!p.contains("{{")); // 变量已替换
+    }
+
+    #[test]
+    fn retry_messages_include_previous_reply() {
+        let initial = chat_messages("评审这个 PR", None);
+        let initial = initial.as_array().unwrap();
+        assert_eq!(initial.len(), 2);
+        assert_eq!(initial[0]["role"].as_str(), Some("system"));
+        assert_eq!(initial[1]["role"].as_str(), Some("user"));
+        assert_eq!(initial[1]["content"].as_str(), Some("评审这个 PR"));
+
+        let malformed = r#"{overall_score": 7.2}"#;
+        let retry = chat_messages("评审这个 PR", Some(malformed));
+        let retry = retry.as_array().unwrap();
+        assert_eq!(retry.len(), 4);
+        assert_eq!(retry[1]["content"].as_str(), Some("评审这个 PR"));
+        assert_eq!(retry[2]["role"].as_str(), Some("assistant"));
+        assert_eq!(retry[2]["content"].as_str(), Some(malformed));
+        assert_eq!(retry[3]["role"].as_str(), Some("user"));
+        assert_eq!(retry[3]["content"].as_str(), Some(RETRY_SUFFIX.trim()));
     }
 
     #[test]
