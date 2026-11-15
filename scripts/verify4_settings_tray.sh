@@ -1,6 +1,7 @@
 #!/bin/bash
 # 验证 4：设置页 / 档案 / 主题 / 语言 / 托盘 / 退出
-source /d/Code/pr-desk-rs-egui/scripts/verify.sh "设置+档案+托盘"
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+source "$ROOT/scripts/verify.sh" "设置+档案+托盘"
 # 前置：确保窗口可见（桌面其它活动可能把窗口最小化/盖住——隐藏窗口不绘制、键鼠语义不同）
 : > "$CMD"
 echo "trayshow" > "$CMD"
@@ -46,16 +47,24 @@ assert "切换被拒后仍在 local" "d['active_profile']=='local'"
 cmd "profile local"; sleep 1
 assert "同档重选无操作（行数不变）" "d['active_profile']=='local' and d['rows']>=8"
 
-# ── 主题（配置写回）──
+# ── 主题（四种风格 / 配置写回 / 实际 Visuals）──
 T0=$(state | python -c "import json,sys; print(json.load(sys.stdin)['theme'])")
-cmd "theme"
-sleep 0.5
-T1=$(state | python -c "import json,sys; print(json.load(sys.stdin)['theme'])")
-CT=$(grep '^theme' /d/Code/pr-desk-rs-egui/config.toml)
-echo "  [theme] $T0 → $T1 / config: $CT"
-{ [ "$T0" != "$T1" ] && echo "$CT" | grep -q "$T1"; } && { echo "  PASS: 主题切换 + 写回 config.toml"; PASS=$((PASS+1)); } || { echo "  FAIL: theme=$T0→$T1 cfg=$CT"; FAIL=$((FAIL+1)); }
-shot "theme-toggled"
-cmd "theme"  # 还原
+for T in glass-light glass-dark; do
+  cmd "theme $T"
+  WANT_DARK=False
+  [ "$T" = "glass-dark" ] && WANT_DARK=True
+  assert "$T 配置与实际样式同步" "d['theme']=='$T' and d['visual_dark_mode']==$WANT_DARK and d['panel_alpha']<255 and d['window_alpha']<255 and ((d['backdrop_mode']=='Native' and d['clear_alpha']==0) or (d['backdrop_mode']=='Gradient' and d['clear_alpha']==255))"
+  CT=$(grep '^theme' "$ROOT/config.toml")
+  echo "$CT" | grep -q "$T" && { echo "  PASS: $T 写回 config.toml"; PASS=$((PASS+1)); } || { echo "  FAIL: $T cfg=$CT"; FAIL=$((FAIL+1)); }
+  shot "theme-$T"
+  cmd "settings"; cmd "settab 1"; shot "settings-$T"; cmd "esc"
+done
+cmd "theme light"
+assert "Glass 切回浅色无样式残留" "d['theme']=='light' and d['visual_dark_mode']==False and d['panel_alpha']==255 and d['window_alpha']==255 and d['backdrop_mode']=='Opaque' and d['clear_alpha']==255"
+cmd "theme dark"
+assert "Glass 切回深色无样式残留" "d['theme']=='dark' and d['visual_dark_mode']==True and d['panel_alpha']==255 and d['window_alpha']==255 and d['backdrop_mode']=='Opaque' and d['clear_alpha']==255"
+cmd "theme $T0"
+assert "恢复初始主题" "d['theme']=='$T0'"
 
 # ── 托盘 ──
 TRAY=$(powershell -Command "Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public class FT9 { [DllImport(\"user32.dll\", CharSet=CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr p, IntPtr c, string cls, string w); }'; [FT9]::FindWindowExW([IntPtr]::Zero,[IntPtr]::Zero,'PRDeskTrayWnd',\$null)")
@@ -63,7 +72,7 @@ echo "  [tray hwnd] $TRAY"
 [ "$TRAY" != "0" ] && { echo "  PASS: 托盘消息窗口存在"; PASS=$((PASS+1)); } || { echo "  FAIL: 无托盘窗口"; FAIL=$((FAIL+1)); }
 
 cmd "hide"; sleep 1
-W1=$(powershell -ExecutionPolicy Bypass -File /d/Code/pr-desk-rs-egui/scripts/pdrive.ps1 -act info)
+W1=$(powershell -ExecutionPolicy Bypass -File "$ROOT"/scripts/pdrive.ps1 -act info)
 echo "  [hide 后] $W1"
 echo "$W1" | grep -qE "client=0x0|winrect=0,0" && { echo "  PASS: 关窗隐藏（0x0）"; PASS=$((PASS+1)); } || { echo "  FAIL: $W1"; FAIL=$((FAIL+1)); }
 
@@ -75,7 +84,7 @@ Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; pu
 # 还原不是即时的（winit 重建 surface/首帧绘制要数百 ms~数秒）：轮询最多 10s
 W2=""
 for i in $(seq 1 20); do
-  W2=$(powershell -ExecutionPolicy Bypass -File /d/Code/pr-desk-rs-egui/scripts/pdrive.ps1 -act info)
+  W2=$(powershell -ExecutionPolicy Bypass -File "$ROOT"/scripts/pdrive.ps1 -act info)
   echo "$W2" | grep -qE "client=[1-9][0-9]*x[1-9][0-9]*" && break
   sleep 0.5
 done

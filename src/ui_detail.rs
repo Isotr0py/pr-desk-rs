@@ -734,7 +734,8 @@ fn pr_agent_card(
     workspace: &pr_desk_rs::deep_review::DeepWorkspaceData,
     lang: &str,
 ) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    let theme = app.app.lock_recover().cfg.theme.clone();
+    crate::theme::card_frame(ui, &theme).show(ui, |ui| {
         ui.strong(tr(lang, "deep_ask_pr"));
         ui.weak(tr(lang, "deep_ask_pr_hint"));
         if !workspace.qa.is_empty() {
@@ -826,7 +827,8 @@ fn readonly_diff(ui: &mut Ui, text: &str, expanded: bool) {
 }
 
 fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, lang: &str) {
-    egui::Frame::group(ui.style()).show(ui, |ui| {
+    let theme = app.app.lock_recover().cfg.theme.clone();
+    crate::theme::card_frame(ui, &theme).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.colored_label(
                 severity_color(&finding.severity, ui.visuals().dark_mode),

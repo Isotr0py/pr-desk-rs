@@ -138,12 +138,18 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
             }
             ui.separator();
             // 主题切换
-            let dark = app.app.lock_recover().cfg.theme == "dark";
-            let label = if dark { tr(&lang, "tb_theme_light") } else { tr(&lang, "tb_theme_dark") };
-            let tip = if dark { tr(&lang, "theme_tooltip_light") } else { tr(&lang, "theme_tooltip_dark") };
-            if ui.button(label).on_hover_text(tip).clicked() {
-                app.theme_toggled(ui.ctx());
-            }
+            let current_theme = app.app.lock_recover().cfg.theme.clone();
+            egui::ComboBox::from_id_salt("theme-switcher")
+                .selected_text(tr(&lang, crate::theme::label_key(&current_theme)))
+                .show_ui(ui, |ui| {
+                    for name in crate::theme::THEMES {
+                        if ui.selectable_label(current_theme == name, tr(&lang, crate::theme::label_key(name))).clicked() {
+                            app.theme_changed(ui.ctx(), name);
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(tr(&lang, "theme_menu_tooltip"));
             // 设置
             if ui
                 .button("⚙")

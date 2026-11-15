@@ -6,8 +6,10 @@
 #![recursion_limit = "256"]
 
 mod avatars;
+mod native_backdrop;
 mod state;
 mod system_fonts;
+mod theme;
 mod tray;
 mod ui_detail;
 mod ui_inbox;
@@ -49,6 +51,7 @@ pub struct EguiApp {
     pub md_cache: egui_commonmark::CommonMarkCache,
     pub last_poll: Instant,
     pub cfg_path: PathBuf,
+    pub backdrop: native_backdrop::NativeBackdrop,
     // ── 视图 ──
     pub view_mode: usize, // 0 列表 / 1 Inbox
     pub profile_names: Vec<String>,
@@ -777,15 +780,23 @@ impl EguiApp {
     }
 
     /// 主题切换：即时持久化到 config.toml。
-    pub fn theme_toggled(&self, ctx: &egui::Context) {
+    pub fn theme_changed(&self, ctx: &egui::Context, name: &str) {
+        let theme = theme::normalize(name).to_string();
         let mut a = self.app.lock_recover();
-        a.cfg.theme = if a.cfg.theme == "dark" { "light".into() } else { "dark".into() };
-        let theme = a.cfg.theme.clone();
+        if a.cfg.theme == theme {
+            return;
+        }
+        a.cfg.theme = theme.clone();
         if let Err(e) = a.cfg.save(&self.cfg_path) {
             tracing::warn!("主题写入 config.toml 失败: {e}");
         }
         drop(a);
         apply_theme(ctx, &theme);
+    }
+
+    pub fn theme_toggled(&self, ctx: &egui::Context) {
+        let current = self.app.lock_recover().cfg.theme.clone();
+        self.theme_changed(ctx, theme::next(&current));
     }
 
     /// 语言切换：持久化到 config.toml，并重算行视图（组标题语言跟随）。
@@ -1226,7 +1237,13 @@ impl EguiApp {
                     let _ = self.cmd_tx.send(Cmd::Sync);
                 }
             }
-            "theme" => self.theme_toggled(ctx),
+            "theme" => {
+                if arg.is_empty() {
+                    self.theme_toggled(ctx);
+                } else {
+                    self.theme_changed(ctx, arg);
+                }
+            }
             // row <n> [ctrl|shift]：点可见行（view_visible 序）
             // 按身份直接打开详情（测试指令；等价于点行 + Enter）
             "openpr" => {
@@ -1666,7 +1683,7 @@ impl EguiApp {
                 self.save_geometry(ctx);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
-            "dumpstate" => self.dump_state(),
+            "dumpstate" => self.dump_state(ctx),
             _ => tracing::warn!("未知测试指令: {line}"),
         }
         tracing::info!("test-cmd 已处理: {line}");
@@ -1697,7 +1714,8 @@ impl EguiApp {
     }
 
     /// 状态快照（JSON 落盘，供验证脚本断言）。
-    fn dump_state(&self) {
+    fn dump_state(&self, ctx: &egui::Context) {
+        let visuals = ctx.global_style().visuals.clone();
         let a = self.app.lock_recover();
         let deep_editors = self
             .deep_editors
@@ -1777,6 +1795,13 @@ impl EguiApp {
             "delete_confirm_n": self.delete_confirm.as_ref().map(|v| v.len()),
             "tombstones": a.db.tombstone_count().unwrap_or(-1),
             "theme": a.cfg.theme,
+            "visual_dark_mode": visuals.dark_mode,
+            "panel_alpha": visuals.panel_fill.a(),
+            "window_alpha": visuals.window_fill.a(),
+            "backdrop_mode": format!("{:?}", self.backdrop.mode()),
+            "backdrop_backend": self.backdrop.backend_name(),
+            "backdrop_diagnostic": self.backdrop.diagnostic(),
+            "clear_alpha": self.backdrop.clear_alpha(),
             "language": a.cfg.language,
             "total": a.total,
         });
@@ -1999,7 +2024,13 @@ impl eframe::App for EguiApp {
     /// 非绘制逻辑（eframe 0.37：窗口被完全遮挡/隐藏时不跑 ui()，只跑 logic()——
     /// 消息落地/轮询/托盘还原必须在这里，否则窗口被盖住后 worker 消息全堵死，
     /// 托盘「显示」也永远不生效）。
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let (current_theme, visible) = {
+            let theme = self.app.lock_recover().cfg.theme.clone();
+            let visible = ctx.input(|input| input.viewport().visible().unwrap_or(true));
+            (theme, visible)
+        };
+        self.backdrop.sync(frame, &current_theme, visible);
         self.clamp_geometry_once(ctx);
         // 诊断（debug 级）：指针/点击事件可见性
         {
@@ -2034,8 +2065,21 @@ impl eframe::App for EguiApp {
         self.hotkeys(ctx);
     }
 
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        if self.backdrop.mode() == native_backdrop::BackdropMode::Native {
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        let fill = visuals.panel_fill;
+        egui::Color32::from_rgba_unmultiplied(fill.r(), fill.g(), fill.b(), 255)
+            .to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let current_theme = self.app.lock_recover().cfg.theme.clone();
+        if self.backdrop.mode() == native_backdrop::BackdropMode::Gradient {
+            theme::paint_background(&ctx, &current_theme);
+        }
 
         // ── 布局：顶栏 / 状态栏 /（选中条）/ 中央视图 ──
         ui_list::top_bar(self, ui);
@@ -2075,20 +2119,7 @@ impl eframe::App for EguiApp {
 // ── 主题 / 字体 ──
 
 pub fn apply_theme(ctx: &egui::Context, theme: &str) {
-    let dark = theme == "dark";
-    ctx.set_theme(if dark { egui::Theme::Dark } else { egui::Theme::Light });
-    ctx.all_styles_mut(|style| {
-        style.visuals.widgets.noninteractive.fg_stroke.color = if dark {
-            egui::Color32::from_gray(230)
-        } else {
-            egui::Color32::from_gray(32)
-        };
-        style.visuals.weak_text_color = Some(if dark {
-            egui::Color32::from_gray(175)
-        } else {
-            egui::Color32::from_gray(88)
-        });
-    });
+    theme::apply(ctx, theme);
 }
 
 /// 字号档位：从 egui 默认基准重算（不累乘，避免多次切换漂移）。
@@ -2151,6 +2182,7 @@ fn main() -> anyhow::Result<()> {
     };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_transparent(true)
             .with_inner_size([w, h])
             // 记忆尺寸若是在更大显示器上存的，钳到当前显示器——否则窗口下缘掉出屏幕，
             // 底部多选操作条/状态栏整排不可见（用户「下方的功能框没有出现」的主因）
@@ -2172,6 +2204,7 @@ fn main() -> anyhow::Result<()> {
             system_fonts::install(&cc.egui_ctx);
             apply_theme(&cc.egui_ctx, &cfg.theme);
             apply_font_scale(&cc.egui_ctx, cfg.font_scale);
+            let backdrop = native_backdrop::NativeBackdrop::new(cc, &cfg.theme);
 
             let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
             let app = Arc::new(Mutex::new(App::new(cfg.clone(), db)));
@@ -2220,6 +2253,7 @@ fn main() -> anyhow::Result<()> {
                 md_cache: egui_commonmark::CommonMarkCache::default(),
                 last_poll: Instant::now(),
                 cfg_path,
+                backdrop,
                 view_mode: 0,
                 profile_names,
                 filter_buf: String::new(),

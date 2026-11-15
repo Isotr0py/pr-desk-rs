@@ -463,6 +463,17 @@ fn tab_general(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     field(ui, tr(lang, "settings_poll_interval"), |ui| {
         ui.add(egui::DragValue::new(&mut app.s_poll).range(1..=120));
     });
+    // 主题：四种风格；切换即时生效并持久化
+    field(ui, tr(lang, "settings_theme"), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let cur = app.app.lock_recover().cfg.theme.clone();
+            for name in crate::theme::THEMES {
+                if ui.selectable_label(cur == name, tr(lang, crate::theme::label_key(name))).clicked() {
+                    app.theme_changed(ui.ctx(), name);
+                }
+            }
+        });
+    });
     // 语言：分段控件；切换即时生效并持久化
     field(ui, tr(lang, "settings_language"), |ui| {
         ui.horizontal(|ui| {

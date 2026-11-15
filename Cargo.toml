@@ -8,8 +8,10 @@ edition = "2024"
 # 曾在 GNU 链接时 OOM），只带 glow 渲染后端。纯逻辑测试 cargo test --lib 不依赖 UI crate。
 eframe = { version = "0.37", default-features = false, features = [
     "accesskit", "clipboard", "default_fonts", "links", "glow", "system_fonts", "__screenshot",
+    "x11", "wayland",
 ] }
 egui = "0.37"
+raw-window-handle = "0.6"
 fontique = "0.11"
 egui_extras = "0.37"
 # 评审摘要的 markdown 渲染（egui 0.37 兼容版本）
@@ -38,8 +40,14 @@ arboard = "3"
 # Windows 托盘（Shell_NotifyIconW + 消息专用窗口；纯 FFI 绑定，MinGW 可编）
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
-    "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell",
+    "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell",
     "Win32_System_LibraryLoader",
+] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std", "NSAppearance", "NSGraphics", "NSResponder", "NSView", "NSVisualEffectView",
 ] }
 
 [profile.release]

@@ -23,7 +23,7 @@ proxy = ""
 repos = ["owner/repo"]
 # 轮询/自动同步间隔（分钟）
 poll_interval_min = 5
-# 界面主题：light 或 dark
+# 界面主题：light / dark / glass-light / glass-dark
 theme = "light"
 # 界面语言：zh 或 en
 language = "zh"
@@ -83,7 +83,7 @@ pub struct Config {
     pub proxy: String,
     pub repos: Vec<String>,
     pub poll_interval_min: u64,
-    /// 界面主题："light" | "dark"
+    /// 界面主题："light" | "dark" | "glass-light" | "glass-dark"
     pub theme: String,
     /// 界面语言："zh" | "en"
     pub language: String,
@@ -235,7 +235,7 @@ impl Config {
 
     /// 当前是否深色主题。
     pub fn is_dark(&self) -> bool {
-        self.theme == "dark"
+        matches!(self.theme.as_str(), "dark" | "glass-dark")
     }
 
     /// GitHub token：环境变量 GITHUB_TOKEN 优先于 config.toml。
@@ -350,9 +350,12 @@ impl Config {
             } else if let Some(v) = parse_value(line, "poll_interval_min") {
                 cfg.poll_interval_min = v.trim().parse().unwrap_or(5);
             } else if let Some(v) = parse_value(line, "theme") {
-                // 只认 light/dark，其它值（老配置、手写错误）回退默认
+                // 只认四种主题，其它值（老配置、手写错误）回退默认
                 let v = unquote(v);
-                cfg.theme = if v == "dark" { "dark".into() } else { "light".into() };
+                cfg.theme = match v.as_str() {
+                    "dark" | "glass-light" | "glass-dark" => v,
+                    _ => "light".into(),
+                };
             } else if let Some(v) = parse_value(line, "language") {
                 // 只认 zh/en，其它值（老配置、手写错误）回退默认
                 let v = unquote(v);
@@ -536,6 +539,31 @@ mod tests {
         assert_eq!(cfg2.language, "zh");
         assert_eq!(cfg2.renderer, ""); // 模板默认渲染器
         assert_eq!(cfg2.proxy, ""); // 模板默认直连
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn glass_themes_parse_and_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-glass-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, dark) in [
+            ("light", false),
+            ("dark", true),
+            ("glass-light", false),
+            ("glass-dark", true),
+        ] {
+            std::fs::write(&path, format!("theme = \"{name}\"\n")).unwrap();
+            let cfg = Config::load(&path).unwrap();
+            assert_eq!(cfg.theme, name);
+            assert_eq!(cfg.is_dark(), dark);
+            cfg.save(&path).unwrap();
+            let reloaded = Config::load(&path).unwrap();
+            assert_eq!(reloaded.theme, name);
+            assert_eq!(reloaded.is_dark(), dark);
+        }
+        std::fs::write(&path, "theme = \"glass\"\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().theme, "light");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
