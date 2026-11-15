@@ -1,10 +1,10 @@
-//! 详情面板：头部 + 五个 tab（评审/会话/Checks/Files/Diff，按 tab 惰性拉取）+
-//! 行虚拟化 diff 渲染（shared with Inbox 预览面板）。
+//! 详情面板：头部 + 评审/会话/Checks/Files/Deep Review tabs + 行虚拟化 diff 渲染。
 
 use egui::{Color32, FontId, RichText, Ui};
 
+use pr_desk_rs::deep_review::{DeepFindingData, DeepQaMessage, finding_level};
 use pr_desk_rs::diffview::LineKind;
-use pr_desk_rs::i18n::tr;
+use pr_desk_rs::i18n::{tr, trf};
 
 use crate::state::*;
 use crate::{avatars, EguiApp};
@@ -407,8 +407,9 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
         tr(&lang, "tab_checks"),
         // Files 与 Diff 合并：文件清单（路径+增删计数）可折叠展开看行内容
         tr(&lang, "tab_files"),
+        tr(&lang, "tab_deep_review"),
     ];
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         for (i, t) in tabs.iter().enumerate() {
             if ui.selectable_label(app.panel_tab == i, *t).clicked() && app.panel_tab != i {
                 app.panel_tab = i;
@@ -424,13 +425,15 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
         2 => checks_tab(ui, &checks, &lang),
         // 合并的 Files changed：有解析后 diff 用折叠 diff 视图；
         // 没有（缓存缺失且实时 files 已到）退回纯文件清单
-        _ => {
+        3 => {
             if !app.diff_files.is_empty() {
                 diff_view(ui, &mut app.diff_files, &lang, "detail");
             } else {
                 files_tab(ui, &files, &lang);
             }
         }
+        4 => deep_review_tab(app, ui, &lang),
+        _ => review_tab(app, ui, &review, &lang),
     }
 }
 
@@ -531,6 +534,459 @@ fn review_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
             ui.label(&c.content);
         }
     }
+}
+
+fn elapsed_text(seconds: u64) -> String {
+    let hours = seconds / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+fn format_elapsed(started: std::time::Instant) -> String {
+    elapsed_text(started.elapsed().as_secs())
+}
+
+fn deep_review_tab(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
+    let (status, progress, error, current_head, workspace) = {
+        let Some(panel) = app.panel.as_ref() else { return };
+        (
+            panel.deep_status.clone(),
+            panel.deep_progress.clone(),
+            panel.deep_error.clone(),
+            panel.head_sha.clone(),
+            panel.deep.clone(),
+        )
+    };
+    let running = status == "running";
+    let cancelling = status == "cancelling";
+    let active_run = running || cancelling;
+    ui.horizontal_wrapped(|ui| {
+        if active_run {
+            if ui
+                .add_enabled(running, egui::Button::new(tr(lang, "deep_cancel")))
+                .clicked()
+            {
+                app.cancel_deep_review();
+            }
+        } else if ui.button(tr(lang, "deep_run")).clicked() {
+            app.start_deep_review();
+        }
+        if !active_run && workspace.is_some() {
+            if ui.button(tr(lang, "deep_refresh")).clicked() {
+                app.refresh_deep_findings();
+            }
+        }
+        if workspace.as_ref().is_some_and(|w| w.findings.iter().any(|f| !f.discarded)) {
+            if ui.button(tr(lang, "deep_copy_all")).clicked() {
+                app.copy_all_deep_findings();
+            }
+        }
+    });
+    ui.weak(tr(lang, "deep_read_only"));
+    if active_run {
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Spinner::new());
+            let progress = if progress.is_empty() {
+                tr(lang, "deep_starting").into()
+            } else {
+                progress.clone()
+            };
+            ui.weak(format!(
+                "{} · {}",
+                progress,
+                app.deep_run_started.map(format_elapsed).unwrap_or_default()
+            ));
+        });
+        ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+    } else if !progress.is_empty() {
+        ui.weak(&progress);
+    }
+    if !error.is_empty() {
+        ui.colored_label(kind_color(LineKind::Del, ui.visuals().dark_mode), &error);
+    }
+    let Some(workspace) = workspace else {
+        if !active_run {
+            ui.add_space(20.0);
+            ui.vertical_centered(|ui| {
+                ui.weak(tr(lang, "deep_empty_title"));
+                ui.weak(tr(lang, "deep_empty_hint"));
+            });
+        }
+        return;
+    };
+
+    let short_head = workspace.head_sha.chars().take(12).collect::<String>();
+    ui.weak(trf(lang, "deep_based_on", &[&short_head]));
+    if !current_head.is_empty() && current_head != workspace.head_sha {
+        ui.colored_label(
+            Color32::from_rgb(191, 135, 0),
+            trf(lang, "deep_stale", &[&short_head]),
+        );
+    }
+    let active = workspace.findings.iter().filter(|f| !f.discarded).count();
+    let discarded = workspace.findings.len() - active;
+    ui.strong(trf(
+        lang,
+        "deep_suggested_count",
+        &[&active.to_string(), &discarded.to_string()],
+    ));
+    pr_agent_card(app, ui, &workspace, lang);
+    if workspace.findings.is_empty() {
+        ui.add_space(12.0);
+        ui.weak(tr(lang, "deep_no_findings"));
+        return;
+    }
+    ui.add_space(6.0);
+    for finding in workspace.findings.iter().filter(|f| !f.discarded).cloned() {
+        deep_finding_card(app, ui, &finding, lang);
+    }
+    let resolved = workspace
+        .findings
+        .iter()
+        .filter(|f| f.discarded && !f.resolution.is_empty() && f.resolution != "manual")
+        .count();
+    if resolved > 0 {
+        egui::CollapsingHeader::new(format!("{} · {resolved}", tr(lang, "deep_resolved")))
+            .id_salt("deep-resolved-findings")
+            .default_open(false)
+            .show(ui, |ui| {
+                for finding in workspace
+                    .findings
+                    .iter()
+                    .filter(|f| f.discarded && !f.resolution.is_empty() && f.resolution != "manual")
+                    .cloned()
+                {
+                    deep_finding_card(app, ui, &finding, lang);
+                }
+            });
+    }
+    if discarded > resolved {
+        egui::CollapsingHeader::new(format!("{} · {}", tr(lang, "deep_discarded"), discarded - resolved))
+            .id_salt("deep-manual-discarded-findings")
+            .default_open(false)
+            .show(ui, |ui| {
+                for finding in workspace
+                    .findings
+                    .iter()
+                    .filter(|f| f.discarded && matches!(f.resolution.as_str(), "" | "manual"))
+                    .cloned()
+                {
+                    deep_finding_card(app, ui, &finding, lang);
+                }
+            });
+    }
+}
+
+fn qa_message(
+    app: &mut EguiApp,
+    ui: &mut Ui,
+    message: &DeepQaMessage,
+    lang: &str,
+    viewer_id: egui::Id,
+) {
+    let user = message.role == "user";
+    let color = if user {
+        Color32::from_rgb(59, 130, 246)
+    } else {
+        Color32::from_rgb(16, 145, 110)
+    };
+    ui.horizontal(|ui| {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
+        ui.painter().circle_filled(rect.center(), 13.0, color);
+        ui.painter().text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            if user { "U" } else { "AI" },
+            FontId::proportional(if user { 11.0 } else { 9.0 }),
+            Color32::WHITE,
+        );
+        ui.add_space(6.0);
+        ui.vertical(|ui| {
+            ui.strong(tr(lang, if user { "deep_user" } else { "deep_assistant" }));
+            if user {
+                ui.add(egui::Label::new(&message.content).wrap());
+            } else {
+                egui_commonmark::CommonMarkViewer::new().show_with_id(
+                    viewer_id,
+                    ui,
+                    &mut app.md_cache,
+                    &message.content,
+                );
+            }
+        });
+    });
+    ui.add_space(6.0);
+}
+
+fn enter_submit(ui: &mut Ui, id: egui::Id) -> bool {
+    let focused = ui.memory(|memory| memory.focused() == Some(id));
+    focused && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+}
+
+fn pr_agent_card(
+    app: &mut EguiApp,
+    ui: &mut Ui,
+    workspace: &pr_desk_rs::deep_review::DeepWorkspaceData,
+    lang: &str,
+) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.strong(tr(lang, "deep_ask_pr"));
+        ui.weak(tr(lang, "deep_ask_pr_hint"));
+        if !workspace.qa.is_empty() {
+            egui::CollapsingHeader::new(format!("{} · {}", tr(lang, "deep_agent_work"), workspace.qa.len()))
+                .id_salt("deep-pr-agent")
+                .default_open(true)
+                .show(ui, |ui| {
+                    for (index, message) in workspace.qa.iter().enumerate() {
+                        qa_message(
+                            app,
+                            ui,
+                            message,
+                            lang,
+                            ui.make_persistent_id(("deep-pr-qa", index)),
+                        );
+                    }
+                });
+        }
+        let pending = app.deep_pr_pending.is_some();
+        let input_id = egui::Id::unique("deep-pr-question");
+        let enter_send = enter_submit(ui, input_id);
+        ui.add_enabled(
+            !pending,
+            egui::TextEdit::multiline(&mut app.deep_pr_question)
+                .id(input_id)
+                .hint_text(tr(lang, "deep_pr_question_placeholder"))
+                .desired_width(f32::INFINITY)
+                .desired_rows(2),
+        );
+        ui.weak(tr(lang, "deep_enter_hint"));
+        if pending {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.weak(tr(lang, "deep_pr_pending"));
+            });
+        }
+        if !app.deep_pr_error.is_empty() {
+            let error = app.deep_pr_error.clone();
+            ui.colored_label(kind_color(LineKind::Del, ui.visuals().dark_mode), error);
+        }
+        let can_ask = !pending && !app.deep_pr_question.trim().is_empty();
+        if (ui
+            .add_enabled(can_ask, egui::Button::new(tr(lang, "deep_ask_pr")))
+            .clicked()
+            || enter_send)
+            && can_ask
+        {
+            app.ask_deep_pr();
+        }
+    });
+    ui.add_space(6.0);
+}
+
+fn readonly_code(ui: &mut Ui, text: &str, rows: usize) {
+    let mut text = text.to_string();
+    ui.add(
+        egui::TextEdit::multiline(&mut text)
+            .desired_width(f32::INFINITY)
+            .desired_rows(rows)
+            .interactive(false),
+    );
+}
+
+fn readonly_diff(ui: &mut Ui, text: &str, expanded: bool) {
+    egui::Frame::new()
+        .fill(ui.visuals().extreme_bg_color)
+        .corner_radius(4.0)
+        .inner_margin(6.0)
+        .show(ui, |ui| {
+            egui::ScrollArea::both()
+                .id_salt(("deep-finding-diff", text))
+                .max_height(if expanded { f32::INFINITY } else { 560.0 })
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    for line in text.lines() {
+                        let kind = pr_desk_rs::diffview::classify_line(line);
+                        let color = kind_color(kind, ui.visuals().dark_mode);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(if line.is_empty() { " " } else { line })
+                                    .monospace()
+                                    .color(color),
+                            )
+                            .selectable(true),
+                        );
+                    }
+                });
+        });
+}
+
+fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, lang: &str) {
+    egui::Frame::group(ui.style()).show(ui, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(
+                severity_color(&finding.severity, ui.visuals().dark_mode),
+                finding_level(&finding.severity),
+            );
+            if !finding.category.is_empty() {
+                ui.weak(&finding.category);
+            }
+            ui.monospace(finding.location());
+        });
+        ui.add(egui::Label::new(&finding.content).wrap());
+        if finding.discarded {
+            if !finding.resolution.is_empty() && finding.resolution != "manual" {
+                ui.weak(tr(
+                    lang,
+                    if finding.resolution == "superseded" {
+                        "deep_superseded"
+                    } else {
+                        "deep_not_found"
+                    },
+                ));
+            }
+            if ui.button(tr(lang, "deep_restore")).clicked() {
+                app.discard_deep_finding(finding.id);
+            }
+            return;
+        }
+
+        egui::CollapsingHeader::new(tr(lang, "deep_evidence"))
+            .id_salt(("deep-evidence", finding.id))
+            .default_open(false)
+            .show(ui, |ui| {
+                if !finding.existing_code.trim().is_empty() {
+                    ui.weak(tr(lang, "deep_existing_code"));
+                    readonly_code(ui, &finding.existing_code, 3);
+                }
+                if !finding.suggestion_code.trim().is_empty() {
+                    ui.weak(tr(lang, "deep_suggestion_code"));
+                    readonly_code(ui, &finding.suggestion_code, 3);
+                }
+                if !finding.diff_chunk.trim().is_empty() {
+                    let expanded = app.deep_diff_expanded.contains(&finding.id);
+                    ui.horizontal(|ui| {
+                        ui.weak(tr(lang, "deep_diff"));
+                        let label = tr(lang, if expanded { "deep_collapse" } else { "deep_expand" });
+                        if ui.small_button(label).clicked() {
+                            if expanded {
+                                app.deep_diff_expanded.remove(&finding.id);
+                            } else {
+                                app.deep_diff_expanded.insert(finding.id);
+                            }
+                        }
+                    });
+                    readonly_diff(ui, &finding.diff_chunk, expanded);
+                }
+            });
+
+        let Some(mut editor) = app.deep_editors.remove(&finding.id) else {
+            return;
+        };
+        let pending = editor.pending.map(|(action, _)| action);
+        ui.add_enabled(
+            pending.is_none(),
+            egui::TextEdit::multiline(&mut editor.draft)
+                .id_salt(("deep-draft", finding.id))
+                .desired_width(f32::INFINITY)
+                .desired_rows(5),
+        );
+        let mut save = false;
+        let mut copy = false;
+        let mut discard = false;
+        let mut rewrite = None;
+        ui.horizontal_wrapped(|ui| {
+            save = ui.add_enabled(pending.is_none(), egui::Button::new(tr(lang, "deep_save"))).clicked();
+            copy = ui.button(tr(lang, "deep_copy")).clicked();
+            discard = ui
+                .add_enabled(pending.is_none(), egui::Button::new(tr(lang, "deep_discard")))
+                .clicked();
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(tr(lang, "deep_rewrite"));
+            for (style, key) in [
+                ("shorter", "deep_shorter"),
+                ("question", "deep_question_style"),
+                ("direct", "deep_direct"),
+            ] {
+                if ui
+                    .add_enabled(pending.is_none(), egui::Button::new(tr(lang, key)))
+                    .clicked()
+                {
+                    rewrite = Some(style);
+                }
+            }
+        });
+        if let Some(action) = pending {
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new());
+                ui.weak(tr(
+                    lang,
+                    if action == DeepAction::Ask {
+                        "deep_pending_ask"
+                    } else {
+                        "deep_pending_rewrite"
+                    },
+                ));
+            });
+        }
+        if !editor.error.is_empty() {
+            ui.colored_label(kind_color(LineKind::Del, ui.visuals().dark_mode), &editor.error);
+        }
+
+        let mut enter_ask = false;
+        egui::CollapsingHeader::new(format!("{} · {}", tr(lang, "deep_agent_work"), finding.qa.len()))
+            .id_salt(("deep-finding-agent", finding.id))
+            .default_open(!finding.qa.is_empty())
+            .show(ui, |ui| {
+                for (index, message) in finding.qa.iter().enumerate() {
+                    qa_message(
+                        app,
+                        ui,
+                        message,
+                        lang,
+                        ui.make_persistent_id(("deep-finding-qa", finding.id, index)),
+                    );
+                }
+                let input_id = egui::Id::unique(("deep-question", finding.id));
+                enter_ask = enter_submit(ui, input_id);
+                ui.add(
+                    egui::TextEdit::multiline(&mut editor.question)
+                        .id(input_id)
+                        .hint_text(tr(lang, "deep_ask_placeholder"))
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(2),
+                );
+                ui.weak(tr(lang, "deep_enter_hint"));
+            });
+        let can_ask = pending.is_none() && !editor.question.trim().is_empty();
+        let ask = (ui
+            .add_enabled(can_ask, egui::Button::new(tr(lang, "deep_ask")))
+            .on_hover_text(tr(lang, "deep_ask_about"))
+            .clicked()
+            || enter_ask)
+            && can_ask;
+        app.deep_editors.insert(finding.id, editor);
+
+        if save {
+            app.save_deep_draft(finding.id);
+        } else if let Some(style) = rewrite {
+            app.rewrite_deep_finding(finding.id, style);
+        } else if ask {
+            app.ask_deep_finding(finding.id);
+        }
+        if copy {
+            app.copy_deep_finding(finding.id);
+        }
+        if discard {
+            app.discard_deep_finding(finding.id);
+        }
+    });
+    ui.add_space(6.0);
 }
 
 fn convo_tab(app: &mut EguiApp, ui: &mut Ui, convo: &[PlainConvoEntry], lang: &str) {
@@ -664,5 +1120,13 @@ mod tests {
             let (_, released) = header_frame(&ctx, vec![button(false)]);
             assert!(pressed || released, "click_icon={click_icon}");
         }
+    }
+
+    #[test]
+    fn elapsed_text_uses_compact_clock_format() {
+        assert_eq!(elapsed_text(0), "00:00");
+        assert_eq!(elapsed_text(65), "01:05");
+        assert_eq!(elapsed_text(3599), "59:59");
+        assert_eq!(elapsed_text(3661), "01:01:01");
     }
 }

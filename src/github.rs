@@ -425,6 +425,29 @@ fn valid_repo_part(s: &str) -> bool {
             .all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
 }
 
+/// 解析 GitHub PR 页面地址，返回 owner/repo 与正整数编号。
+pub fn parse_pr_url(input: &str) -> Option<(String, i64)> {
+    let url = reqwest::Url::parse(input.trim()).ok()?;
+    if url.scheme() != "https" || !matches!(url.host_str(), Some("github.com") | Some("www.github.com")) {
+        return None;
+    }
+    let mut parts = url.path_segments()?;
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if !valid_repo_part(owner) || !valid_repo_part(repo) || parts.next()? != "pull" {
+        return None;
+    }
+    let number = parts.next()?;
+    if number.is_empty() || !number.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let number = number.parse::<i64>().ok().filter(|n| *n > 0)?;
+    if parts.next().is_some_and(|s| !matches!(s, "" | "files" | "commits" | "checks" | "changes")) {
+        return None;
+    }
+    Some((format!("{owner}/{repo}"), number))
+}
+
 /// 构造批量状态查询的 GraphQL：每个条目一个 repository 别名块（r{i}），
 /// 内嵌 pullRequest/issue 字段（n{i}）。owner/name 先过白名单，非法直接报错。
 fn build_states_query(items: &[(String, i64, bool)]) -> Result<String> {
@@ -476,6 +499,40 @@ mod tests {
         // 斜杠不得穿透成路径分隔
         assert_eq!(encode_path_segment("a/b"), "a%2Fb");
         assert_eq!(encode_path_segment(""), "");
+    }
+
+    #[test]
+    fn parse_pr_url_accepts_github_pr_pages() {
+        for (url, expected) in [
+            ("https://github.com/octocat/Hello-World/pull/42", ("octocat/Hello-World", 42)),
+            ("  https://www.github.com/A.b/C-d_e.f/pull/7/?tab=diff#discussion  ", ("A.b/C-d_e.f", 7)),
+            ("https://github.com/octocat/Hello-World/pull/123/files", ("octocat/Hello-World", 123)),
+            ("https://github.com/octocat/Hello-World/pull/123/commits/deadbeef", ("octocat/Hello-World", 123)),
+            ("https://github.com/octocat/Hello-World/pull/123/checks", ("octocat/Hello-World", 123)),
+        ] {
+            assert_eq!(parse_pr_url(url), Some((expected.0.to_string(), expected.1)), "应接受 {url}");
+        }
+    }
+
+    #[test]
+    fn parse_pr_url_rejects_non_pr_and_malformed_urls() {
+        for url in [
+            "",
+            "not a url",
+            "http://github.com/octocat/Hello-World/pull/42",
+            "https://gitlab.com/octocat/Hello-World/pull/42",
+            "https://github.com/octocat/Hello-World/issues/42",
+            "https://github.com/octocat/Hello-World/pull/",
+            "https://github.com/octocat/Hello-World/pull/0",
+            "https://github.com/octocat/Hello-World/pull/-1",
+            "https://github.com/octocat/Hello-World/pull/+1",
+            "https://github.com/octocat/Hello-World/pull/abc",
+            "https://github.com/octocat/Hello-World/pull/42/unknown",
+            "https://github.com/octocat//pull/42",
+            "https://github.com/octocat/Hello-World/pull/999999999999999999999",
+        ] {
+            assert_eq!(parse_pr_url(url), None, "应拒绝 {url}");
+        }
     }
 
     fn run(status: &str, conclusion: Option<&str>) -> Value {

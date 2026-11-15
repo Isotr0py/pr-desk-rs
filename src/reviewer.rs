@@ -407,16 +407,11 @@ fn chat_messages(user_prompt: &str, previous_reply: Option<&str>) -> Value {
     Value::Array(messages)
 }
 
-/// 调用 OpenAI 兼容 chat/completions，返回 assistant 文本；重试时带上上一轮回复。
-async fn chat_completion(
-    llm: &LlmSettings,
-    user_prompt: &str,
-    previous_reply: Option<&str>,
-) -> Result<String> {
+async fn chat_completion_messages(llm: &LlmSettings, messages: Value) -> Result<String> {
     let url = format!("{}/chat/completions", llm.base_url.trim_end_matches('/'));
     let body = json!({
         "model": llm.model,
-        "messages": chat_messages(user_prompt, previous_reply),
+        "messages": messages,
         "temperature": 0.2,
     });
     let resp = llm
@@ -437,6 +432,24 @@ async fn chat_completion(
         .as_str()
         .map(|s| s.to_string())
         .context("LLM 响应缺少 choices[0].message.content")
+}
+
+/// Deep Review 改写与 Finding 问答共用的单发文本补全。
+pub async fn complete_text(llm: &LlmSettings, system: &str, user: &str) -> Result<String> {
+    let messages = json!([
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]);
+    chat_completion_messages(llm, messages).await
+}
+
+/// 调用 OpenAI 兼容 chat/completions，返回 assistant 文本；重试时带上上一轮回复。
+async fn chat_completion(
+    llm: &LlmSettings,
+    user_prompt: &str,
+    previous_reply: Option<&str>,
+) -> Result<String> {
+    chat_completion_messages(llm, chat_messages(user_prompt, previous_reply)).await
 }
 
 /// 本地预评审主流程：拉 PR 元信息 + diff → 过滤 → LLM 评审 → 组装结果 JSON。

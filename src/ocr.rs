@@ -6,13 +6,16 @@
 //! LLM 配置不落 ocr 全局配置：在临时目录写 config.json，子进程用
 //! 环境变量 OCR_CONFIG_PATH 指向它（未配置 LLM 时不设，ocr 用自家全局配置）。
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use crate::config::Config;
@@ -215,6 +218,87 @@ async fn fetch_files_chunk(
     Ok(out)
 }
 
+fn check_cancel(cancel: Option<&Arc<AtomicBool>>, lang: &str) -> Result<()> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        anyhow::bail!("{}", crate::i18n::tr(lang, "err_ocr_cancelled"));
+    }
+    Ok(())
+}
+
+fn ocr_progress_text(line: &str) -> Option<String> {
+    let text = line.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(240).collect())
+}
+
+async fn run_streaming_process(
+    cmd: &mut Command,
+    lang: &str,
+    progress: &mut (dyn FnMut(String) + Send),
+    cancel: Option<Arc<AtomicBool>>,
+) -> Result<()> {
+    use crate::i18n::{tr, trf};
+    check_cancel(cancel.as_ref(), lang)?;
+    let program = cmd.as_std().get_program().to_string_lossy().to_string();
+    let mut child = cmd
+        .spawn()
+        .context(trf(lang, "err_ocr_spawn", &[&program]))?;
+    let stderr = child
+        .stderr
+        .take()
+        .context(tr(lang, "err_ocr_no_stderr"))?;
+    let mut lines = BufReader::new(stderr).lines();
+    let mut tail = VecDeque::<String>::new();
+    let deadline = tokio::time::Instant::now() + OCR_TIMEOUT;
+    let status = loop {
+        tokio::select! {
+            status = child.wait() => break status.context(tr(lang, "err_ocr_wait"))?,
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if let Some(text) = ocr_progress_text(&line) {
+                            if tail.len() == 12 {
+                                tail.pop_front();
+                            }
+                            tail.push_back(text.clone());
+                            progress(format!("OCR · {text}"));
+                        }
+                    }
+                    Ok(None) => break child.wait().await.context(tr(lang, "err_ocr_wait"))?,
+                    Err(e) => {
+                        let _ = child.kill().await;
+                        let _ = child.wait().await;
+                        return Err(e).context(tr(lang, "err_ocr_read_progress"));
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                anyhow::bail!("{}", tr(lang, "err_ocr_timeout"));
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                if cancel.as_ref().is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    anyhow::bail!("{}", tr(lang, "err_ocr_cancelled"));
+                }
+            }
+        }
+    };
+    if !status.success() {
+        let detail = tail.into_iter().collect::<Vec<_>>().join("\n");
+        let detail = detail.chars().rev().take(500).collect::<String>().chars().rev().collect::<String>();
+        match status.code() {
+            Some(code) => anyhow::bail!("{}", trf(lang, "err_ocr_exit", &[&code.to_string(), detail.trim()])),
+            None => anyhow::bail!("{}", trf(lang, "err_ocr_terminated", &[detail.trim()])),
+        }
+    }
+    Ok(())
+}
+
 /// 本地预评审主流程：重建临时 git 仓库 → 跑 ocr → 解析行级评论。
 /// meta 为 GitHub::fetch_pr_meta 的原始返回（取 base.sha / head.sha / title / body）。
 /// lang："zh"/"en"，进度回调与错误文案语言。
@@ -227,6 +311,23 @@ pub async fn run_ocr_review(
     progress: &mut (dyn FnMut(String) + Send),
     lang: &str,
 ) -> Result<OcrRunOutcome> {
+    progress(crate::i18n::tr(lang, "prog_fetch_pr_diff").into());
+    let diff = gh.fetch_diff(repo, number).await?;
+    run_ocr_review_with_diff(cfg, gh, repo, meta, &diff, progress, lang, None, None).await
+}
+
+/// Deep Review 入口：OCR 与 Finding 证据共用调用方固定的同一份 Diff 快照。
+pub async fn run_ocr_review_with_diff(
+    cfg: &Config,
+    gh: &GitHub,
+    repo: &str,
+    meta: &Value,
+    diff: &str,
+    progress: &mut (dyn FnMut(String) + Send),
+    lang: &str,
+    cancel: Option<Arc<AtomicBool>>,
+    refresh_background: Option<&str>,
+) -> Result<OcrRunOutcome> {
     use crate::i18n::{tr, trf};
     let base_sha = meta["base"]["sha"].as_str().unwrap_or("").to_string();
     let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
@@ -235,18 +336,22 @@ pub async fn run_ocr_review(
     }
     let title = meta["title"].as_str().unwrap_or("");
     let body = meta["body"].as_str().unwrap_or("");
-    let background: String = format!("{title}\n{body}")
+    let mut background: String = format!("{title}\n{body}")
         .chars()
         .take(BACKGROUND_MAX_CHARS)
         .collect();
+    if let Some(context) = refresh_background.filter(|s| !s.trim().is_empty()) {
+        background.push_str("\n\n<review-discussion>\n");
+        background.push_str(context);
+        background.push_str("\n</review-discussion>");
+    }
 
+    check_cancel(cancel.as_ref(), lang)?;
     progress(tr(lang, "prog_create_repo").into());
     let tmp = TempDir::new()?;
     git(&tmp.0, &["init", "--quiet"]).await?;
 
-    progress(tr(lang, "prog_fetch_pr_diff").into());
-    let diff = gh.fetch_diff(repo, number).await?;
-    let files = reviewer::split_diff_files(&diff);
+    let files = reviewer::split_diff_files(diff);
     if files.is_empty() {
         anyhow::bail!("{}", tr(lang, "err_empty_diff"));
     }
@@ -256,6 +361,7 @@ pub async fn run_ocr_review(
     // 二进制/超大文件两边都跳过，ocr 反正会排除）。分批并发拉取（批内 8 并发）。
     let mut done = 0usize;
     for chunk in files.chunks(FETCH_CONCURRENCY) {
+        check_cancel(cancel.as_ref(), lang)?;
         let paths: Vec<String> = chunk.iter().map(|(p, _)| p.clone()).collect();
         for (path, bytes) in fetch_files_chunk(gh, repo, &base_sha, &paths).await? {
             done += 1;
@@ -281,6 +387,7 @@ pub async fn run_ocr_review(
         }
     }
     for batch in to_fetch.chunks(FETCH_CONCURRENCY) {
+        check_cancel(cancel.as_ref(), lang)?;
         for (path, bytes) in fetch_files_chunk(gh, repo, &head_sha, batch).await? {
             done += 1;
             progress(trf(lang, "prog_rebuild_head", &[&done.to_string(), &total.to_string()]));
@@ -304,7 +411,7 @@ pub async fn run_ocr_review(
         .arg("--format")
         .arg("json")
         .arg("--audience")
-        .arg("agent")
+        .arg("human")
         .arg("--output")
         .arg(tmp.0.join("result.json"))
         .arg("--background")
@@ -321,20 +428,7 @@ pub async fn run_ocr_review(
     }
 
     progress(tr(lang, "prog_ocr_running").into());
-    // 超时：output() future 被 drop → kill_on_drop 杀掉子进程
-    let out = match tokio::time::timeout(OCR_TIMEOUT, cmd.output()).await {
-        Ok(r) => r.context(trf(lang, "err_ocr_spawn", &[&ocr_bin.display().to_string()]))?,
-        Err(_) => anyhow::bail!("{}", tr(lang, "err_ocr_timeout")),
-    };
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let tail: String = stderr.chars().rev().take(500).collect::<String>().chars().rev().collect();
-        match out.status.code() {
-            Some(code) => anyhow::bail!("{}", trf(lang, "err_ocr_exit", &[&code.to_string(), tail.trim()])),
-            // 无退出码 = 进程被信号终止（kill 等），不往错误里拼 Some/None
-            None => anyhow::bail!("{}", trf(lang, "err_ocr_terminated", &[tail.trim()])),
-        }
-    }
+    run_streaming_process(&mut cmd, lang, progress, cancel).await?;
 
     progress(tr(lang, "prog_parse_ocr").into());
     let text = std::fs::read_to_string(tmp.0.join("result.json"))
@@ -512,5 +606,50 @@ mod tests {
             resolve_ocr_path_in("ocr", None, &fx.cwd),
             PathBuf::from("ocr")
         );
+    }
+
+    #[test]
+    fn progress_text_trims_and_bounds_lines() {
+        assert_eq!(ocr_progress_text("  file-a.rs  \r"), Some("file-a.rs".into()));
+        assert_eq!(ocr_progress_text(" \r\n"), None);
+        assert_eq!(ocr_progress_text(&"x".repeat(300)).unwrap().chars().count(), 240);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn streaming_process_forwards_stderr_lines() {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "echo first-line 1>&2& echo second-line 1>&2"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut seen = Vec::new();
+        let mut progress = |text: String| seen.push(text);
+        run_streaming_process(&mut cmd, "zh", &mut progress, None)
+            .await
+            .unwrap();
+        assert!(seen.iter().any(|line| line.contains("first-line")));
+        assert!(seen.iter().any(|line| line.contains("second-line")));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn streaming_process_cancel_kills_child_promptly() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut cmd = Command::new("powershell");
+        cmd.args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let flag = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = std::time::Instant::now();
+        let mut progress = |_| {};
+        let err = run_streaming_process(&mut cmd, "zh", &mut progress, Some(cancel))
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(err.to_string().contains("取消"));
     }
 }

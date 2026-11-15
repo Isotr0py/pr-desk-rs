@@ -4,6 +4,7 @@
 pub mod circle_crop;
 pub mod config;
 pub mod db;
+pub mod deep_review;
 pub mod diffview;
 pub mod github;
 pub mod i18n;

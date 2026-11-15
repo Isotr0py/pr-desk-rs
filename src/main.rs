@@ -15,6 +15,7 @@ mod ui_list;
 mod ui_settings;
 mod worker;
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -24,9 +25,20 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::Db;
+use pr_desk_rs::deep_review::{
+    DeepFindingData, DeepWorkspaceData, comments_markdown, merge_refreshed_findings,
+};
 use pr_desk_rs::i18n::{tr, trf};
 
 use state::*;
+
+pub struct DeepFindingEditor {
+    pub draft: String,
+    pub question: String,
+    pub revision: i64,
+    pub pending: Option<(DeepAction, u64)>,
+    pub error: String,
+}
 
 /// UI 侧即时状态（App 是业务状态；这里是面板/弹窗/表单等展示态）。
 pub struct EguiApp {
@@ -57,6 +69,14 @@ pub struct EguiApp {
     pub diff_files: Vec<DiffFileData>,
     pub panel_tab: usize,
     pub panel_width_cur: f32,
+    pub deep_editors: HashMap<i64, DeepFindingEditor>,
+    pub deep_diff_expanded: HashSet<i64>,
+    pub deep_run: Option<(String, String, i64, u64)>,
+    pub deep_run_started: Option<Instant>,
+    pub deep_pr_question: String,
+    pub deep_pr_pending: Option<u64>,
+    pub deep_pr_error: String,
+    pub next_deep_request_id: u64,
     // ── Inbox ──
     pub inbox_loading: bool,
     pub inbox_sel: Option<usize>, // 当前选中通知在 inbox_view 里的下标
@@ -99,6 +119,9 @@ pub struct EguiApp {
     pub gh_token_from_env: bool,
     // ── 引导 ──
     pub onboarding_dismissed: bool,
+    // ── URL 导入 ──
+    pub import_url_open: bool,
+    pub import_url_buf: String,
     // ── 托盘 ──
     #[cfg(windows)]
     pub tray: Option<tray::Tray>,
@@ -319,6 +342,254 @@ impl EguiApp {
         }
     }
 
+    fn next_deep_request(&mut self) -> u64 {
+        self.next_deep_request_id = self.next_deep_request_id.wrapping_add(1).max(1);
+        self.next_deep_request_id
+    }
+
+    fn current_deep_key(&self) -> Option<DeepKey> {
+        let profile = self.app.lock_recover().cfg.active_profile.clone();
+        let panel = self.panel.as_ref()?;
+        let workspace = panel.deep.as_ref()?;
+        Some(DeepKey {
+            profile,
+            repo: panel.repo.clone(),
+            number: panel.number,
+            head_sha: workspace.head_sha.clone(),
+        })
+    }
+
+    fn sync_deep_editors(&mut self) {
+        let findings = self
+            .panel
+            .as_ref()
+            .and_then(|p| p.deep.as_ref())
+            .map(|w| {
+                w.findings
+                    .iter()
+                    .map(|f| (f.id, f.draft_text.clone(), f.revision))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        self.deep_editors.retain(|id, _| findings.iter().any(|(fid, _, _)| fid == id));
+        for (id, draft, revision) in findings {
+            self.deep_editors.entry(id).or_insert(DeepFindingEditor {
+                draft,
+                question: String::new(),
+                revision,
+                pending: None,
+                error: String::new(),
+            });
+        }
+    }
+
+    pub fn start_deep_review(&mut self) {
+        let (profile, repo, number) = {
+            let a = self.app.lock_recover();
+            let Some((repo, number)) = a.selected.clone() else {
+                return;
+            };
+            (a.cfg.active_profile.clone(), repo, number)
+        };
+        let request_id = self.next_deep_request();
+        let starting = tr(&self.lang(), "deep_starting").into();
+        self.deep_run = Some((profile.clone(), repo.clone(), number, request_id));
+        self.deep_run_started = Some(Instant::now());
+        if let Some(panel) = self.panel.as_mut() {
+            panel.deep_status = "running".into();
+            panel.deep_progress = starting;
+            panel.deep_error.clear();
+        }
+        let _ = self.cmd_tx.send(Cmd::RunDeepReview {
+            profile,
+            repo,
+            number,
+            request_id,
+        });
+    }
+
+    pub fn refresh_deep_findings(&mut self) {
+        let Some(key) = self.current_deep_key() else { return };
+        if self.deep_run.is_some() {
+            return;
+        }
+        let request_id = self.next_deep_request();
+        self.deep_run = Some((key.profile.clone(), key.repo.clone(), key.number, request_id));
+        self.deep_run_started = Some(Instant::now());
+        let starting = tr(&self.lang(), "deep_refresh_start").into();
+        if let Some(panel) = self.panel.as_mut() {
+            panel.deep_status = "running".into();
+            panel.deep_progress = starting;
+            panel.deep_error.clear();
+        }
+        let _ = self.cmd_tx.send(Cmd::RefreshDeepFindings { key, request_id });
+    }
+
+    pub fn cancel_deep_review(&mut self) {
+        let Some((repo, number)) = self.panel.as_ref().map(|p| (p.repo.clone(), p.number)) else {
+            return;
+        };
+        let active = self.deep_run.as_ref().is_some_and(|(_, r, n, _)| *r == repo && *n == number);
+        if !active {
+            return;
+        }
+        let cancelling = tr(&self.lang(), "deep_cancelling").into();
+        if let Some(panel) = self.panel.as_mut() {
+            panel.deep_status = "cancelling".into();
+            panel.deep_progress = cancelling;
+        }
+        let _ = self.cmd_tx.send(Cmd::CancelDeepReview { repo, number });
+    }
+
+    pub fn save_deep_draft(&mut self, finding_id: i64) {
+        let Some(key) = self.current_deep_key() else { return };
+        let Some(editor) = self.deep_editors.get(&finding_id) else { return };
+        if editor.pending.is_some() {
+            return;
+        }
+        let text = editor.draft.clone();
+        let expected_revision = editor.revision;
+        let request_id = self.next_deep_request();
+        self.deep_editors.get_mut(&finding_id).unwrap().pending = Some((DeepAction::Save, request_id));
+        let _ = self.cmd_tx.send(Cmd::SaveDeepDraft {
+            key,
+            finding_id,
+            request_id,
+            expected_revision,
+            text,
+        });
+    }
+
+    pub fn rewrite_deep_finding(&mut self, finding_id: i64, style: &str) {
+        let Some(key) = self.current_deep_key() else { return };
+        let Some(editor) = self.deep_editors.get(&finding_id) else { return };
+        if editor.pending.is_some() {
+            return;
+        }
+        let base_text = editor.draft.clone();
+        let expected_revision = editor.revision;
+        let request_id = self.next_deep_request();
+        self.deep_editors.get_mut(&finding_id).unwrap().pending = Some((DeepAction::Rewrite, request_id));
+        let _ = self.cmd_tx.send(Cmd::RewriteDeepFinding {
+            key,
+            finding_id,
+            request_id,
+            expected_revision,
+            base_text,
+            style: style.to_string(),
+        });
+    }
+
+    pub fn discard_deep_finding(&mut self, finding_id: i64) {
+        let Some(key) = self.current_deep_key() else { return };
+        let Some(editor) = self.deep_editors.get(&finding_id) else { return };
+        if editor.pending.is_some() {
+            return;
+        }
+        let Some(discarded) = self
+            .panel
+            .as_ref()
+            .and_then(|p| p.deep.as_ref())
+            .and_then(|w| w.findings.iter().find(|f| f.id == finding_id))
+            .map(|f| !f.discarded)
+        else {
+            return;
+        };
+        let expected_revision = editor.revision;
+        let request_id = self.next_deep_request();
+        self.deep_editors.get_mut(&finding_id).unwrap().pending = Some((DeepAction::Discard, request_id));
+        let _ = self.cmd_tx.send(Cmd::SetDeepFindingDiscarded {
+            key,
+            finding_id,
+            request_id,
+            expected_revision,
+            discarded,
+        });
+    }
+
+    pub fn ask_deep_finding(&mut self, finding_id: i64) {
+        let Some(key) = self.current_deep_key() else { return };
+        let Some(editor) = self.deep_editors.get(&finding_id) else { return };
+        if editor.pending.is_some() || editor.question.trim().is_empty() {
+            return;
+        }
+        let question = editor.question.clone();
+        let current_draft = editor.draft.clone();
+        let request_id = self.next_deep_request();
+        self.deep_editors.get_mut(&finding_id).unwrap().pending = Some((DeepAction::Ask, request_id));
+        let _ = self.cmd_tx.send(Cmd::AskDeepFinding {
+            key,
+            finding_id,
+            request_id,
+            question,
+            current_draft,
+        });
+    }
+
+    pub fn ask_deep_pr(&mut self) {
+        let Some(key) = self.current_deep_key() else { return };
+        if self.deep_pr_pending.is_some() || self.deep_pr_question.trim().is_empty() {
+            return;
+        }
+        let request_id = self.next_deep_request();
+        let question = self.deep_pr_question.clone();
+        self.deep_pr_pending = Some(request_id);
+        self.deep_pr_error.clear();
+        let _ = self.cmd_tx.send(Cmd::AskDeepPr {
+            key,
+            request_id,
+            question,
+        });
+    }
+
+    pub fn copy_deep_finding(&self, finding_id: i64) {
+        if let Some(editor) = self.deep_editors.get(&finding_id) {
+            let _ = self.cmd_tx.send(Cmd::CopyDeepText(editor.draft.clone()));
+        }
+    }
+
+    pub fn copy_all_deep_findings(&self) {
+        let Some(mut workspace) = self.panel.as_ref().and_then(|p| p.deep.clone()) else {
+            return;
+        };
+        for finding in &mut workspace.findings {
+            if let Some(editor) = self.deep_editors.get(&finding.id) {
+                finding.draft_text = editor.draft.clone();
+            }
+        }
+        let text = comments_markdown(&workspace.findings);
+        if !text.is_empty() {
+            let _ = self.cmd_tx.send(Cmd::CopyDeepText(text));
+        }
+    }
+
+    fn deep_run_matches(&self, key: &DeepKey, request_id: u64) -> bool {
+        self.deep_run.as_ref().is_some_and(|(profile, repo, number, id)| {
+            *id == request_id
+                && *profile == key.profile
+                && *repo == key.repo
+                && *number == key.number
+                && self.app.lock_recover().cfg.active_profile == key.profile
+        })
+    }
+
+    fn deep_panel_matches(&self, key: &DeepKey) -> bool {
+        self.app.lock_recover().cfg.active_profile == key.profile
+            && self.panel.as_ref().is_some_and(|panel| {
+                panel.repo == key.repo
+                    && panel.number == key.number
+                    && panel.deep.as_ref().is_some_and(|w| w.head_sha == key.head_sha)
+            })
+    }
+
+    fn replace_deep_finding(&mut self, finding: &pr_desk_rs::deep_review::DeepFindingData) {
+        if let Some(workspace) = self.panel.as_mut().and_then(|p| p.deep.as_mut()) {
+            if let Some(current) = workspace.findings.iter_mut().find(|f| f.id == finding.id) {
+                *current = finding.clone();
+            }
+        }
+    }
+
     /// Inbox 行点击 / Enter：选中 + 展开右侧预览面板（发 FetchNotifDetail），并标记已读
     ///（下标对仓库过滤后的视图 inbox_view）。
     pub fn inbox_activated(&mut self, i: usize) {
@@ -380,6 +651,39 @@ impl EguiApp {
             let url = n["url"].as_str().unwrap_or("").to_string();
             if let Some(number) = notif_url_number(&url) {
                 let _ = self.cmd_tx.send(Cmd::AddNotifReview { repo, number, title, url });
+            }
+        }
+    }
+
+    pub fn open_import_url(&mut self) {
+        self.import_url_buf.clear();
+        self.import_url_open = true;
+    }
+
+    /// URL 弹窗与剪贴板快捷键共用的导入入口。
+    pub fn import_pr_url(&mut self, input: &str) -> bool {
+        let lang = self.lang();
+        let Some((repo, number)) = pr_desk_rs::github::parse_pr_url(input) else {
+            self.set_transient_status(tr(&lang, "import_invalid_url").into());
+            return false;
+        };
+        let url = format!("https://github.com/{repo}/pull/{number}");
+        let _ = self.cmd_tx.send(Cmd::AddNotifReview { repo, number, title: String::new(), url });
+        self.import_url_buf.clear();
+        self.import_url_open = false;
+        self.view_mode = 0;
+        true
+    }
+
+    pub fn import_pr_from_clipboard(&mut self) {
+        let lang = self.lang();
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) if !text.trim().is_empty() => {
+                self.import_pr_url(&text);
+            }
+            Ok(_) => self.set_transient_status(tr(&lang, "import_clipboard_empty").into()),
+            Err(e) => {
+                self.set_transient_status(trf(&lang, "import_clipboard_failed", &[&e.to_string()]));
             }
         }
     }
@@ -591,7 +895,29 @@ impl EguiApp {
             }
             Msg::Panel(pd) => {
                 self.diff_requested = None;
+                let reset = self.panel.as_ref().is_none_or(|old| {
+                    old.repo != pd.repo
+                        || old.number != pd.number
+                        || old.deep.as_ref().map(|w| &w.head_sha)
+                            != pd.deep.as_ref().map(|w| &w.head_sha)
+                });
                 self.panel = Some(*pd);
+                if reset {
+                    self.deep_editors.clear();
+                    self.deep_pr_question.clear();
+                    self.deep_pr_pending = None;
+                    self.deep_pr_error.clear();
+                }
+                self.sync_deep_editors();
+                if let Some((profile, repo, number, _)) = &self.deep_run {
+                    let running = self.app.lock_recover().cfg.active_profile == *profile
+                        && self.panel.as_ref().is_some_and(|p| p.repo == *repo && p.number == *number);
+                    if running {
+                        if let Some(panel) = self.panel.as_mut() {
+                            panel.deep_status = "running".into();
+                        }
+                    }
+                }
             }
             Msg::ClosePanel => self.panel = None,
             Msg::ReviewProgress { repo, number, text } => {
@@ -629,6 +955,130 @@ impl EguiApp {
                 if panel_matches(&self.app, &repo, number) {
                     if let Some(p) = self.panel.as_mut() {
                         p.review_status = "failed".into();
+                    }
+                }
+            }
+            Msg::DeepProgress { key, request_id, text } => {
+                if !self.deep_run_matches(&key, request_id) {
+                    return;
+                }
+                if panel_matches(&self.app, &key.repo, key.number) {
+                    if let Some(panel) = self.panel.as_mut() {
+                        panel.deep_status = "running".into();
+                        panel.deep_progress = text;
+                        panel.deep_error.clear();
+                    }
+                }
+            }
+            Msg::DeepLoaded { key, request_id, workspace } => {
+                if !self.deep_run_matches(&key, request_id) {
+                    return;
+                }
+                self.deep_run = None;
+                self.deep_run_started = None;
+                if !panel_matches(&self.app, &key.repo, key.number) {
+                    return;
+                }
+                let changed = self.panel.as_ref().is_some_and(|p| {
+                    p.deep.as_ref().map(|w| &w.head_sha) != Some(&workspace.head_sha)
+                });
+                let finding_count = workspace.findings.len();
+                let done_text = trf(&self.lang(), "deep_done_count", &[&finding_count.to_string()]);
+                if let Some(panel) = self.panel.as_mut() {
+                    panel.deep = Some(*workspace);
+                    panel.deep_status = "done".into();
+                    panel.deep_progress = done_text;
+                    panel.deep_error.clear();
+                }
+                if changed {
+                    self.deep_editors.clear();
+                    self.deep_pr_question.clear();
+                    self.deep_pr_pending = None;
+                    self.deep_pr_error.clear();
+                }
+                self.sync_deep_editors();
+            }
+            Msg::DeepPrUpdated { key, request_id, qa } => {
+                if !self.deep_panel_matches(&key) || self.deep_pr_pending != Some(request_id) {
+                    return;
+                }
+                self.deep_pr_pending = None;
+                self.deep_pr_question.clear();
+                self.deep_pr_error.clear();
+                if let Some(workspace) = self.panel.as_mut().and_then(|p| p.deep.as_mut()) {
+                    workspace.qa = qa;
+                }
+            }
+            Msg::DeepFindingUpdated {
+                key,
+                finding_id,
+                request_id,
+                action,
+                finding,
+                conflict,
+            } => {
+                if !self.deep_panel_matches(&key) {
+                    return;
+                }
+                let matches = self.deep_editors.get(&finding_id).is_some_and(|editor| {
+                    editor.pending == Some((action, request_id))
+                });
+                if !matches {
+                    return;
+                }
+                self.replace_deep_finding(&finding);
+                let conflict_text = tr(&self.lang(), "deep_conflict").into();
+                if let Some(editor) = self.deep_editors.get_mut(&finding_id) {
+                    editor.pending = None;
+                    editor.revision = finding.revision;
+                    if conflict {
+                        editor.error = conflict_text;
+                    } else {
+                        editor.error.clear();
+                        match action {
+                            DeepAction::Save | DeepAction::Rewrite => {
+                                editor.draft = finding.draft_text.clone();
+                            }
+                            DeepAction::Ask => editor.question.clear(),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Msg::DeepFailed { key, finding_id, request_id, action, err } => {
+                if action == DeepAction::Run {
+                    if !self.deep_run_matches(&key, request_id) {
+                        return;
+                    }
+                    self.deep_run = None;
+                    self.deep_run_started = None;
+                    if panel_matches(&self.app, &key.repo, key.number) {
+                        if let Some(panel) = self.panel.as_mut() {
+                            panel.deep_status = "failed".into();
+                            panel.deep_progress.clear();
+                            panel.deep_error = err;
+                        }
+                    }
+                    return;
+                }
+                if !self.deep_panel_matches(&key) {
+                    return;
+                }
+                if action == DeepAction::Ask && finding_id == Some(0) {
+                    if self.deep_pr_pending == Some(request_id) {
+                        self.deep_pr_pending = None;
+                        self.deep_pr_error = err;
+                    }
+                    return;
+                }
+                let Some(finding_id) = finding_id else { return };
+                let matches = self.deep_editors.get(&finding_id).is_some_and(|editor| {
+                    editor.pending == Some((action, request_id))
+                });
+                if matches {
+                    if let Some(editor) = self.deep_editors.get_mut(&finding_id) {
+                        editor.pending = None;
+                        editor.error = err;
                     }
                 }
             }
@@ -684,7 +1134,7 @@ impl EguiApp {
                 self.s_review_prompt = text;
                 self.s_prompt_loading = false;
             }
-            Msg::PanelLive { repo, number, ci, state: st, updated, convo, checks_json, files_json } => {
+            Msg::PanelLive { repo, number, ci, state: st, updated, head_sha, convo, checks_json, files_json } => {
                 // 实时数据只刷当前打开的面板；None 的区块本次未拉取，保持不动。
                 // 面板已切走/关闭则丢弃（列表行已随落库 reload 更新）
                 if panel_matches(&self.app, &repo, number) {
@@ -697,6 +1147,9 @@ impl EguiApp {
                         }
                         if let Some(updated) = updated {
                             p.updated = updated;
+                        }
+                        if let Some(head_sha) = head_sha {
+                            p.head_sha = head_sha;
                         }
                         if let Some(convo) = convo {
                             p.convo = convo;
@@ -752,6 +1205,11 @@ impl EguiApp {
                 let _ = self.cmd_tx.send(Cmd::FetchInbox);
             }
             "list" => self.view_mode = 0,
+            "importopen" => self.open_import_url(),
+            "importurl" => {
+                self.import_pr_url(arg);
+            }
+            "importclip" => self.import_pr_from_clipboard(),
             "refresh" => {
                 let mut a = self.app.lock_recover();
                 if !a.gh_refreshing {
@@ -867,6 +1325,188 @@ impl EguiApp {
             }
             "copyreview" => {
                 let _ = self.cmd_tx.send(Cmd::CopyReview);
+            }
+            "deeprun" => self.start_deep_review(),
+            "deeprunning" => {
+                let selected = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = selected {
+                    let profile = self.app.lock_recover().cfg.active_profile.clone();
+                    let request_id = self.next_deep_request();
+                    self.deep_run = Some((profile, repo.clone(), number, request_id));
+                    self.deep_run_started = Some(Instant::now());
+                    if let Some(panel) = self.panel.as_mut() {
+                        panel.deep_status = "running".into();
+                        panel.deep_progress = "OCR · test-file.rs".into();
+                        panel.deep_error.clear();
+                    }
+                }
+            }
+            "deepcancel" => self.cancel_deep_review(),
+            "deepcancelresult" => {
+                let Some((profile, repo, number, request_id)) = self.deep_run.clone() else {
+                    return;
+                };
+                let head_sha = self
+                    .panel
+                    .as_ref()
+                    .and_then(|p| p.deep.as_ref().map(|w| w.head_sha.clone()))
+                    .unwrap_or_default();
+                let err = tr(&self.lang(), "err_ocr_cancelled").into();
+                self.apply_msg(ctx, Msg::DeepFailed {
+                    key: DeepKey { profile, repo, number, head_sha },
+                    finding_id: None,
+                    request_id,
+                    action: DeepAction::Run,
+                    err,
+                });
+            }
+            "deepseed" => {
+                let seeded = {
+                    let a = self.app.lock_recover();
+                    a.selected.clone().map(|(repo, number)| {
+                        let head_sha = a
+                            .db
+                            .pr_head_sha(&repo, number)
+                            .ok()
+                            .flatten()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| "test-head".into());
+                        let now = pr_desk_rs::db::now();
+                        let workspace = DeepWorkspaceData {
+                            repo: repo.clone(),
+                            number,
+                            base_sha: "test-base".into(),
+                            head_sha,
+                            title: "Deep Review desktop fixture".into(),
+                            created_at: now.clone(),
+                            body: "Fixture PR description for whole-PR questions.".into(),
+                            diff: "diff --git a/src/lib.rs b/src/lib.rs\n+if size == 0 { reject() }".into(),
+                            qa: Vec::new(),
+                            findings: vec![DeepFindingData {
+                                fingerprint: "desktop-fixture".into(),
+                                ordinal: 1,
+                                path: "src/lib.rs".into(),
+                                start_line: 42,
+                                end_line: 42,
+                                severity: "high".into(),
+                                category: "bug".into(),
+                                content: "The new boundary check can reject a valid request.".into(),
+                                existing_code: "if size == 0 { reject() }".into(),
+                                suggestion_code: "if size == 0 && required { reject() }".into(),
+                                diff_chunk: "diff --git a/src/lib.rs b/src/lib.rs\n+if size == 0 { reject() }".into(),
+                                suggested_text: "This rejects an empty but valid request.".into(),
+                                draft_text: "This rejects an empty but valid request.".into(),
+                                updated_at: now,
+                                ..Default::default()
+                            }],
+                        };
+                        let _ = a.db.create_deep_workspace(&workspace);
+                        (repo, number)
+                    })
+                };
+                if let Some((repo, number)) = seeded {
+                    let _ = self.cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: false });
+                }
+            }
+            "deeprefreshfixture" => {
+                let refreshed = {
+                    let a = self.app.lock_recover();
+                    a.selected.clone().and_then(|(repo, number)| {
+                        let workspace = a.db.get_latest_deep_workspace(&repo, number).ok().flatten()?;
+                        let now = pr_desk_rs::db::now();
+                        let new_finding = DeepFindingData {
+                            fingerprint: "refresh-new-finding".into(),
+                            ordinal: 1,
+                            path: "src/new.rs".into(),
+                            start_line: 8,
+                            end_line: 8,
+                            severity: "medium".into(),
+                            category: "test".into(),
+                            content: "A new finding discovered after discussion.".into(),
+                            suggested_text: "Add a regression test for this path.".into(),
+                            draft_text: "Add a regression test for this path.".into(),
+                            updated_at: now,
+                            ..Default::default()
+                        };
+                        let merged = merge_refreshed_findings(
+                            &workspace.findings,
+                            std::slice::from_ref(&new_finding),
+                        );
+                        a.db.replace_deep_findings(&repo, number, &workspace.head_sha, &merged)
+                            .ok()?;
+                        Some((repo, number))
+                    })
+                };
+                if let Some((repo, number)) = refreshed {
+                    let _ = self.cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: false });
+                }
+            }
+            "deepdraft" => {
+                if let Ok(id) = arg.parse::<i64>() {
+                    if let Some(editor) = self.deep_editors.get_mut(&id) {
+                        editor.draft = it.collect::<Vec<_>>().join(" ");
+                    }
+                }
+            }
+            "deepquestion" => {
+                if let Ok(id) = arg.parse::<i64>() {
+                    if let Some(editor) = self.deep_editors.get_mut(&id) {
+                        editor.question = it.collect::<Vec<_>>().join(" ");
+                    }
+                }
+            }
+            "deepsave" => {
+                if let Ok(id) = arg.parse() {
+                    self.save_deep_draft(id);
+                }
+            }
+            "deeprewrite" => {
+                if let Ok(id) = arg.parse() {
+                    self.rewrite_deep_finding(id, it.next().unwrap_or("shorter"));
+                }
+            }
+            "deepdiscard" => {
+                if let Ok(id) = arg.parse() {
+                    self.discard_deep_finding(id);
+                }
+            }
+            "deepask" => {
+                if let Ok(id) = arg.parse() {
+                    self.ask_deep_finding(id);
+                }
+            }
+            "deepprquestion" => {
+                self.deep_pr_question = std::iter::once(arg)
+                    .chain(it)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+            }
+            "deepprfocus" => {
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::unique("deep-pr-question")));
+            }
+            "deepprask" => self.ask_deep_pr(),
+            "deepclearfindings" => {
+                if let Some(workspace) = self.panel.as_mut().and_then(|p| p.deep.as_mut()) {
+                    workspace.findings.clear();
+                }
+            }
+            "deepcopy" => {
+                if let Ok(id) = arg.parse() {
+                    self.copy_deep_finding(id);
+                }
+            }
+            "deepcopyall" => self.copy_all_deep_findings(),
+            "deepstale" => {
+                let selected = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = selected {
+                    let a = self.app.lock_recover();
+                    let _ = a.db.conn.execute(
+                        "UPDATE prs SET head_sha='newer-test-head' WHERE repo=?1 AND number=?2",
+                        rusqlite::params![repo, number],
+                    );
+                    drop(a);
+                    let _ = self.cmd_tx.send(Cmd::OpenDrawer { repo, number, refetch: false });
+                }
             }
             // 批量（作用于多选集合，无多选则当前选中）
             "batch" => match arg {
@@ -1059,6 +1699,20 @@ impl EguiApp {
     /// 状态快照（JSON 落盘，供验证脚本断言）。
     fn dump_state(&self) {
         let a = self.app.lock_recover();
+        let deep_editors = self
+            .deep_editors
+            .iter()
+            .map(|(id, editor)| {
+                serde_json::json!({
+                    "id": id,
+                    "draft": editor.draft,
+                    "question": editor.question,
+                    "revision": editor.revision,
+                    "pending": editor.pending.map(|(action, request)| format!("{action:?}:{request}")),
+                    "error": editor.error,
+                })
+            })
+            .collect::<Vec<_>>();
         let v = serde_json::json!({
             "view_mode": self.view_mode,
             "rows": a.rows.len(),
@@ -1080,6 +1734,24 @@ impl EguiApp {
             "panel_number": self.panel.as_ref().map(|p| p.number),
             "panel_review_has": self.panel.as_ref().map(|p| p.review.has),
             "panel_review_status": self.panel.as_ref().map(|p| p.review_status.clone()),
+            "deep_status": self.panel.as_ref().map(|p| p.deep_status.clone()),
+            "deep_progress": self.panel.as_ref().map(|p| p.deep_progress.clone()),
+            "deep_elapsed_secs": self.deep_run_started.map(|started| started.elapsed().as_secs()),
+            "deep_error": self.panel.as_ref().map(|p| p.deep_error.clone()),
+            "deep_head": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.head_sha.clone())),
+            "deep_current_head": self.panel.as_ref().map(|p| p.head_sha.clone()),
+            "deep_findings": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.findings.len())),
+            "deep_active": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.findings.iter().filter(|f| !f.discarded).count())),
+            "deep_qa": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.findings.iter().map(|f| f.qa.len()).sum::<usize>())),
+            "deep_pr_qa": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.qa.len())),
+            "deep_resolved": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.findings.iter().filter(|f| f.discarded && !f.resolution.is_empty() && f.resolution != "manual").count())),
+            "deep_resolutions": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.findings.iter().map(|f| serde_json::json!({"id": f.id, "resolution": f.resolution})).collect::<Vec<_>>())),
+            "deep_diff_chars": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.diff.chars().count())),
+            "deep_pr_question": self.deep_pr_question,
+            "deep_pr_pending": self.deep_pr_pending,
+            "deep_pr_error": self.deep_pr_error,
+            "deep_editors": deep_editors,
+            "deep_run": self.deep_run,
             "panel_convo": self.panel.as_ref().map(|p| p.convo.len()),
             "panel_checks": self.panel.as_ref().map(|p| p.checks_json.len()),
             "diff_files": self.diff_files.len(),
@@ -1096,6 +1768,8 @@ impl EguiApp {
             "nd_loading": self.nd_loading,
             "nd_convo": self.nd_convo.len(),
             "settings_open": self.settings_open,
+            "import_url_open": self.import_url_open,
+            "import_url_buf": self.import_url_buf,
             "dialog_error": self.dialog_error,
             "profile_names": self.profile_names,
             "active_profile": a.cfg.active_profile,
@@ -1153,7 +1827,7 @@ impl EguiApp {
         }
     }
 
-    /// 快捷键分发（无输入框聚焦时）。Esc 分级：设置弹窗 → 关弹窗；
+    /// 快捷键分发（无输入框聚焦时）。Esc 分级：URL 导入/设置弹窗 → 关弹窗；
     /// 引导 → 吞掉；Inbox 预览 → 关预览；多选 → 清多选；详情面板 → 关面板；→ 清选中。
     fn hotkeys(&mut self, ctx: &egui::Context) {
         let ctx = ctx.clone();
@@ -1168,12 +1842,18 @@ impl EguiApp {
                 tracing::debug!("hotkeys: keys_down={keys:?} pressed={pressed:?} wants_kb={}", ctx.egui_wants_keyboard_input());
             }
         }
+        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
+        if self.import_url_open {
+            if esc {
+                self.import_url_open = false;
+            }
+            return;
+        }
         if ctx.egui_wants_keyboard_input() {
             return;
         }
         let settings_or_onboarding = self.settings_open
             || (self.app.lock_recover().cfg.is_unconfigured() && !self.onboarding_dismissed);
-        let esc = ctx.input(|i| i.key_pressed(egui::Key::Escape));
         if settings_or_onboarding {
             if esc && self.settings_open {
                 self.settings_open = false;
@@ -1198,6 +1878,10 @@ impl EguiApp {
             } else {
                 self.app.lock_recover().selected = None;
             }
+            return;
+        }
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::V)) {
+            self.import_pr_from_clipboard();
             return;
         }
         let (down, up, page_down, page_up) = ctx.input(|i| {
@@ -1371,6 +2055,7 @@ impl eframe::App for EguiApp {
         // ── 弹窗（模态，顶层）──
         ui_settings::settings_window(self, &ctx);
         ui_settings::onboarding_window(self, &ctx);
+        ui_list::import_url_window(self, &ctx);
         ui_list::copy_picker_window(self, &ctx);
         ui_list::delete_confirm_window(self, &ctx);
     }
@@ -1548,6 +2233,14 @@ fn main() -> anyhow::Result<()> {
                 diff_files: Vec::new(),
                 panel_tab: 0,
                 panel_width_cur: cfg.panel_width.unwrap_or(420.0).max(320.0) as f32,
+                deep_editors: HashMap::new(),
+                deep_diff_expanded: HashSet::new(),
+                deep_run: None,
+                deep_run_started: None,
+                deep_pr_question: String::new(),
+                deep_pr_pending: None,
+                deep_pr_error: String::new(),
+                next_deep_request_id: 0,
                 scroll_to: None,
                 inbox_loading: false,
                 inbox_sel: None,
@@ -1592,6 +2285,8 @@ fn main() -> anyhow::Result<()> {
                 del_confirm: None,
                 gh_token_from_env,
                 onboarding_dismissed: false,
+                import_url_open: false,
+                import_url_buf: String::new(),
                 allow_close: false,
                 tray: Some(tray),
             }))

@@ -60,7 +60,7 @@ fn save_settings(app: &mut EguiApp) -> bool {
         .filter(|l| !l.is_empty() && l.contains('/'))
         .collect();
     let poll = app.s_poll.max(1) as u64;
-    let review_concurrency = app.s_review_conc.clamp(1, 8) as u64;
+    let review_concurrency = app.s_review_conc.clamp(1, 16) as u64;
     let ocr_path = app.s_ocr_path.trim();
     let proxy = app.s_proxy.trim().to_string();
     let lang = app.lang();
@@ -546,7 +546,7 @@ fn tab_llm(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     });
     field(ui, tr(lang, "settings_review_concurrency"), |ui| {
         ui.horizontal(|ui| {
-            ui.add(egui::DragValue::new(&mut app.s_review_conc).range(1..=8));
+            ui.add(egui::DragValue::new(&mut app.s_review_conc).range(1..=16));
             ui.weak(tr(lang, "settings_concurrency_hint"));
         });
     });

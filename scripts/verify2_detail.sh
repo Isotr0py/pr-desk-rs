@@ -46,15 +46,16 @@ cmd "tab 2"; sleep 2.5
 assert "Checks tab 打开" "d['panel_tab']==2"
 shot "detail-checks-tab"
 
-# Files
+# Files + Diff（虚拟化）
 cmd "tab 3"; sleep 2.5
 assert "Files tab 打开" "d['panel_tab']==3"
+assert "Files tab：已解析文件数 >0" "d['diff_files']>0"
 shot "detail-files-tab"
 
-# Diff（虚拟化）
+# Deep Review（独立工作区，不影响原 Files/Diff）
 cmd "tab 4"; sleep 1
-assert "Diff tab：已解析文件数 >0" "d['diff_files']>0"
-shot "detail-diff-tab"
+assert "Deep Review tab 打开" "d['panel_tab']==4 and 'deep_status' in d"
+shot "detail-deep-review-tab"
 
 # 复制评审（无评审记录 → 不应崩；剪贴板不变即正确跳过）
 cmd "copyreview"

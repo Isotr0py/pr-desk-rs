@@ -37,8 +37,8 @@ llm_api_key = ""
 llm_model = ""
 # open-code-review CLI 路径（行级评论评审引擎；留空或 "ocr" = 自动查找：优先随包 bin/ 目录，其次 PATH）
 ocr_path = "ocr"
-# 预评审并发数（1-8；每个 PR 评审 = 评分 + OCR 多次 LLM 调用，配额紧张时调低）
-review_concurrency = 3
+# 预评审并发数（1-16；每个 PR 评审 = 评分 + OCR 多次 LLM 调用，配额紧张时调低）
+review_concurrency = 16
 # 多数据源：active_profile 选择当前数据源（"local" = 本地库 / "default" = 顶层键 / 自定义档案名）
 # 自定义远程档案三段式（name 仅允许 a-z0-9_-）：
 # profile.<name>.server_url / profile.<name>.sync_token / profile.<name>.api_key
@@ -129,7 +129,7 @@ impl Default for Config {
             llm_api_key: None,
             llm_model: String::new(),
             ocr_path: "ocr".into(),
-            review_concurrency: 3,
+            review_concurrency: 16,
             profiles: Vec::new(),
             active_profile: "local".into(),
             window_width: None,
@@ -387,10 +387,10 @@ impl Config {
                     cfg.ocr_path = v;
                 }
             } else if let Some(v) = parse_value(line, "review_concurrency") {
-                // 1-8，超出范围回退默认 3
+                // 1-16，超出范围回退默认 16
                 cfg.review_concurrency = match v.trim().parse::<u64>() {
-                    Ok(n) if (1..=8).contains(&n) => n,
-                    _ => 3,
+                    Ok(n) if (1..=16).contains(&n) => n,
+                    _ => 16,
                 };
             } else if let Some(v) = parse_value(line, "active_profile") {
                 active = Some(unquote(v)).filter(|s| !s.is_empty());

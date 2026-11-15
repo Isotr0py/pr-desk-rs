@@ -64,6 +64,14 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
             if syncing {
                 ui.add(egui::Spinner::new());
             }
+            if ui
+                .button(tr(&lang, "tb_import_url"))
+                .on_hover_text(tr(&lang, "import_url_tooltip"))
+                .clicked()
+            {
+                app.open_import_url();
+                ui.memory_mut(|m| m.request_focus(egui::Id::unique("import-url")));
+            }
             ui.separator();
             // 搜索（编辑即重算过滤视图）
             let filter_resp = ui.add(
@@ -1161,7 +1169,50 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     }
 }
 
-// ── 模态弹窗：复制目标档案选择 / 删除确认 ──
+// ── 模态弹窗：URL 导入 / 复制目标档案选择 / 删除确认 ──
+
+pub fn import_url_window(app: &mut EguiApp, ctx: &egui::Context) {
+    if !app.import_url_open {
+        return;
+    }
+    let lang = app.lang();
+    let mut open = true;
+    let mut submit = false;
+    let mut cancel = false;
+    egui::Window::new(tr(&lang, "import_url_title"))
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.weak(tr(&lang, "import_url_hint"));
+            ui.add_space(6.0);
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.import_url_buf)
+                    .id(egui::Id::unique("import-url"))
+                    .hint_text(tr(&lang, "import_url_placeholder"))
+                    .desired_width(480.0),
+            );
+            let enter = (response.has_focus() || response.lost_focus())
+                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(tr(&lang, "import_url_submit")).clicked() || enter {
+                    submit = true;
+                }
+                if ui.button(tr(&lang, "cancel")).clicked() {
+                    cancel = true;
+                }
+            });
+        });
+    if submit {
+        let input = app.import_url_buf.clone();
+        app.import_pr_url(&input);
+    }
+    if !open || cancel {
+        app.import_url_open = false;
+    }
+}
 
 /// 「复制到档案…」目标选择弹层：列出全部档案 − 当前档案；点中即走 worker 复制。
 pub fn copy_picker_window(app: &mut EguiApp, ctx: &egui::Context) {

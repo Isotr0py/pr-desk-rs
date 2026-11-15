@@ -25,11 +25,25 @@ plugin over its sync API (pins / priorities / board / tags / todos).
   with avatars, org icons, review scores, CI state, size and +/- columns
 - Excel-style column sorting, high-score quick filter, `/` search
 - Detail panel with tabs: Review (dimension scores, summary, flagged files,
-  line-level comments), Conversation, Checks, Files, Diff
+  line-level comments), Conversation, Checks, Files/Diff, and Deep Review
 - Diff viewer with real line numbers (parsed from hunk headers), per-file
   collapse, and GitHub-style whole-table horizontal scrolling
 - One-click LLM pre-review with concurrency slots and live progress;
   copy the review report as Markdown
+- On-demand Deep Review turns OCR findings into editable suggested-comment
+  drafts with code/diff evidence, rewrite styles, drop/restore, and finding-level
+  agent Q&A. `Ask about this PR` separately answers whole-PR questions using the
+  description, full saved diff, findings, and PR-level conversation history.
+  Both agent inputs wrap long questions (`Enter` sends, `Shift+Enter` inserts a
+  newline), and user/agent messages have distinct avatar roles.
+  `Refresh findings` reruns analysis with PR/finding discussion context and
+  conservatively merges results: edited drafts and Q&A survive, missing findings
+  move to a resolved group, and manually dropped findings stay dropped.
+  Workspaces and drafts persist locally per head SHA; GitHub stays read-only,
+  so comments are copied for manual publication instead of sent.
+  OCR stage logs stream into the detail panel with elapsed time and a cancel
+  action that terminates the child process instead of waiting for the 30-minute
+  timeout
 
 **Inbox**
 
@@ -48,6 +62,8 @@ plugin over its sync API (pins / priorities / board / tags / todos).
 **UX**
 
 - Bilingual UI (zh/en) with live switch, light/dark theme, font scaling
+- Import a GitHub PR directly from its URL with the `+ URL` dialog, or press
+  `Ctrl+V` (`Cmd+V` on macOS) to import the PR URL currently on the clipboard
 - Keyboard-first: arrow keys navigate, `PgUp`/`PgDn` move by page,
   `Enter` open, `Esc` close/back, `p` pin, `1`/`2`/`3` priority,
   `o` open in browser
@@ -125,8 +141,9 @@ Coverage includes: sync merge semantics (server-wins / applied not
 overwritten / outbox merge / pull upsert), idempotent local upserts,
 cursor/outbox/diff cache, diff parsing (hunk line numbers, file splitting),
 config round-trip (escapes, inline comments, atomic writes), review-comment
-preservation on re-review, and UI-side identity guards against stale
-async deliveries.
+preservation on re-review, Deep Review draft revision conflicts and per-SHA
+persistence, finding rewrite/Q&A tasks, and UI-side identity guards against
+stale async deliveries.
 
 ## Roadmap
 

@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::Db;
+use pr_desk_rs::deep_review::{DeepFindingData, DeepQaMessage, DeepWorkspaceData};
 use pr_desk_rs::i18n::{tr, trf};
 use pr_desk_rs::{diffview, selection, sync};
 
@@ -27,6 +28,23 @@ impl<T> LockRecover<T> for Mutex<T> {
 }
 
 // ── 后台命令 / 回送消息 ──
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DeepKey {
+    pub profile: String,
+    pub repo: String,
+    pub number: i64,
+    pub head_sha: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeepAction {
+    Run,
+    Save,
+    Discard,
+    Rewrite,
+    Ask,
+}
 
 pub enum Cmd {
     RefreshGithub,
@@ -49,6 +67,15 @@ pub enum Cmd {
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
     SwitchProfile(String),  // 切换数据源档案（"local"/"default"/自定义名）：换库 + 重建同步客户端
     RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
+    RunDeepReview { profile: String, repo: String, number: i64, request_id: u64 },
+    RefreshDeepFindings { key: DeepKey, request_id: u64 },
+    CancelDeepReview { repo: String, number: i64 },
+    SaveDeepDraft { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, text: String },
+    SetDeepFindingDiscarded { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, discarded: bool },
+    RewriteDeepFinding { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, base_text: String, style: String },
+    AskDeepFinding { key: DeepKey, finding_id: i64, request_id: u64, question: String, current_draft: String },
+    AskDeepPr { key: DeepKey, request_id: u64, question: String },
+    CopyDeepText(String),
     FetchModels { base: String, key: String },  // 设置页「获取」：拉 OpenAI 兼容端点的模型列表
     FetchPrMeta { repo: String, number: i64 },  // 补齐残缺行的 author/url/head_sha（Inbox 入库的行缺这些）
     FetchPrLive { repo: String, number: i64, parts: u8 },  // 面板实时拉取（parts 位标志：1=会话+评审 2=Files 4=Checks+meta；按 tab 惰性拉取）
@@ -92,6 +119,28 @@ pub enum Msg {
     ReviewProgress { repo: String, number: i64, text: String },
     ReviewDone { repo: String, number: i64 },
     ReviewFailed { repo: String, number: i64, err: String },
+    DeepProgress { key: DeepKey, request_id: u64, text: String },
+    DeepLoaded { key: DeepKey, request_id: u64, workspace: Box<DeepWorkspaceData> },
+    DeepFindingUpdated {
+        key: DeepKey,
+        finding_id: i64,
+        request_id: u64,
+        action: DeepAction,
+        finding: Box<DeepFindingData>,
+        conflict: bool,
+    },
+    DeepPrUpdated {
+        key: DeepKey,
+        request_id: u64,
+        qa: Vec<DeepQaMessage>,
+    },
+    DeepFailed {
+        key: DeepKey,
+        finding_id: Option<i64>,
+        request_id: u64,
+        action: DeepAction,
+        err: String,
+    },
     // diff 的结构化解析结果（worker 解析完成，大 PR 几万行不占 UI 线程）。
     // 携带身份：面板已切走则不上屏（diff 缓存已在 worker 落库，下次打开能用）
     DiffParsed { repo: String, number: i64, files: Vec<DiffFileData> },
@@ -124,6 +173,7 @@ pub enum Msg {
         ci: Option<String>,
         state: Option<String>,
         updated: Option<String>,
+        head_sha: Option<String>,
         convo: Option<Vec<PlainConvoEntry>>,
         checks_json: Option<String>,
         files_json: Option<String>,
@@ -200,6 +250,11 @@ pub struct PanelData {
     // 评审三态："" = 无活动；"running" / "failed" / "done"
     pub review_status: String,
     pub review_progress: String,
+    pub head_sha: String,
+    pub deep: Option<DeepWorkspaceData>,
+    pub deep_status: String,
+    pub deep_progress: String,
+    pub deep_error: String,
 }
 
 /// 评审分项键名 → 界面语言名（未知键原样展示）。
@@ -394,61 +449,97 @@ pub fn review_props(review: Option<&Value>, lang: &str) -> ReviewProps {
 
 // ── 预评审并发槽 ──
 
-/// 预评审并发槽位（纯逻辑，可单测）：限制同时在跑的评审数，并防止同一 PR 重入。
+/// 预评审并发槽位：普通与 Deep 各允许同 PR 一个任务，总并发仍受容量限制。
 /// 容量来自配置 review_concurrency（设置页可改，保存即时生效）。
 pub struct ReviewSlots {
     pub capacity: usize,
-    inflight: HashSet<(String, i64)>,
+    standard_inflight: HashSet<(String, i64)>,
+    deep_inflight: HashSet<(String, i64)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SlotError {
-    AlreadyRunning, // 同一 PR 已有评审在跑
+    AlreadyRunning, // 同一 PR 已有同类型评审在跑
     AtCapacity,     // 槽位已满
 }
 
 impl ReviewSlots {
     pub fn new(capacity: usize) -> Self {
-        Self { capacity, inflight: HashSet::new() }
+        Self {
+            capacity,
+            standard_inflight: HashSet::new(),
+            deep_inflight: HashSet::new(),
+        }
     }
 
-    /// 占用一个槽位；同一 PR 重入报 AlreadyRunning，超额报 AtCapacity。
+    fn at_capacity(&self) -> bool {
+        self.standard_inflight.len() + self.deep_inflight.len() >= self.capacity
+    }
+
+    /// 普通预审阅：同 PR 允许与一个 Deep Review 并行，但禁止同类重入。
     pub fn try_acquire(&mut self, repo: &str, number: i64) -> Result<(), SlotError> {
-        if self.inflight.contains(&(repo.to_string(), number)) {
+        if self.standard_inflight.contains(&(repo.to_string(), number)) {
             return Err(SlotError::AlreadyRunning);
         }
-        if self.inflight.len() >= self.capacity {
+        if self.at_capacity() {
             return Err(SlotError::AtCapacity);
         }
-        self.inflight.insert((repo.to_string(), number));
+        self.standard_inflight.insert((repo.to_string(), number));
+        Ok(())
+    }
+
+    /// Deep Review：与普通预审阅独立防重入，并共享全局容量。
+    pub fn try_acquire_deep(&mut self, repo: &str, number: i64) -> Result<(), SlotError> {
+        if self.deep_inflight.contains(&(repo.to_string(), number)) {
+            return Err(SlotError::AlreadyRunning);
+        }
+        if self.at_capacity() {
+            return Err(SlotError::AtCapacity);
+        }
+        self.deep_inflight.insert((repo.to_string(), number));
         Ok(())
     }
 
     pub fn release(&mut self, repo: &str, number: i64) {
-        self.inflight.remove(&(repo.to_string(), number));
+        self.standard_inflight.remove(&(repo.to_string(), number));
     }
 
-    /// 面板打开时查询：该 PR 是否正在评审。
+    pub fn release_deep(&mut self, repo: &str, number: i64) {
+        self.deep_inflight.remove(&(repo.to_string(), number));
+    }
+
+    /// 面板打开时查询：该 PR 是否有任一评审任务。
     pub fn is_running(&self, repo: &str, number: i64) -> bool {
-        self.inflight.contains(&(repo.to_string(), number))
+        self.standard_inflight.contains(&(repo.to_string(), number))
+            || self.deep_inflight.contains(&(repo.to_string(), number))
+    }
+
+    pub fn is_standard_review_running(&self, repo: &str, number: i64) -> bool {
+        self.standard_inflight.contains(&(repo.to_string(), number))
     }
 
     /// 设置页调整并发数（不影响已占用的槽位）。
     pub fn set_capacity(&mut self, capacity: usize) {
-        self.capacity = capacity.max(1);
+        self.capacity = capacity.clamp(1, 16);
     }
 }
 
-/// 槽位 RAII 守卫：评审任务结束（无论成败）自动释放，不泄漏槽位。
+/// 槽位 RAII 守卫：只释放本任务类型，不影响同 PR 的另一类型任务。
 pub struct SlotGuard {
     pub slots: Arc<Mutex<ReviewSlots>>,
     pub repo: String,
     pub number: i64,
+    pub deep: bool,
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        self.slots.lock_recover().release(&self.repo, self.number);
+        let mut slots = self.slots.lock_recover();
+        if self.deep {
+            slots.release_deep(&self.repo, self.number);
+        } else {
+            slots.release(&self.repo, self.number);
+        }
     }
 }
 
@@ -1017,6 +1108,31 @@ mod tests {
     }
 
     #[test]
+    fn review_slots_allow_standard_and_deep_for_same_pr_but_block_same_type() {
+        let mut s = ReviewSlots::new(2);
+        s.try_acquire_deep("o/r", 1).unwrap();
+        assert!(s.is_running("o/r", 1));
+        assert!(!s.is_standard_review_running("o/r", 1));
+        assert_eq!(s.try_acquire_deep("o/r", 1), Err(SlotError::AlreadyRunning));
+
+        s.try_acquire("o/r", 1).unwrap();
+        assert!(s.is_running("o/r", 1));
+        assert!(s.is_standard_review_running("o/r", 1));
+        assert_eq!(s.try_acquire("o/r", 1), Err(SlotError::AlreadyRunning));
+        assert_eq!(s.try_acquire("o/r", 2), Err(SlotError::AtCapacity));
+
+        s.release("o/r", 1);
+        assert!(s.is_running("o/r", 1));
+        assert!(!s.is_standard_review_running("o/r", 1));
+        s.try_acquire("o/r", 1).unwrap();
+
+        s.release_deep("o/r", 1);
+        assert!(s.is_running("o/r", 1));
+        assert!(s.is_standard_review_running("o/r", 1));
+        assert!(s.try_acquire_deep("o/r", 1).is_ok());
+    }
+
+    #[test]
     fn review_slots_reject_duplicate_acquire() {
         let mut s = ReviewSlots::new(3);
         s.try_acquire("o/r", 1).unwrap();
@@ -1056,7 +1172,7 @@ mod tests {
         let slots = Arc::new(Mutex::new(ReviewSlots::new(1)));
         slots.lock_recover().try_acquire("o/r", 1).unwrap();
         {
-            let _g = SlotGuard { slots: slots.clone(), repo: "o/r".into(), number: 1 };
+            let _g = SlotGuard { slots: slots.clone(), repo: "o/r".into(), number: 1, deep: false };
         }
         assert!(!slots.lock_recover().is_running("o/r", 1));
         assert!(slots.lock_recover().try_acquire("o/r", 1).is_ok());
