@@ -1,6 +1,7 @@
 //! 设置弹窗 + 首启引导。保存语义逐条对照旧 Slint 版（代理校验拒绝保存、
 //! 档案三字段按编辑档案写回、并发数即时生效、模板回填竞态防护）。
 
+use std::path::Path;
 use std::time::Instant;
 
 use egui::RichText;
@@ -33,6 +34,8 @@ pub fn open_settings(app: &mut EguiApp) {
     app.s_llm_model = cfg.llm_model.clone();
     app.s_ocr_path = cfg.ocr_path.clone();
     app.s_review_conc = cfg.review_concurrency as i64;
+    app.s_auto_review_on_insert = cfg.auto_review_on_insert;
+    app.s_kimi_cli_path = cfg.kimi_cli_path.clone();
     // 弹窗内联错误行清空（上一次失败的残留不带进本次会话）
     app.dialog_error.clear();
     // 自定义评审模板每次打开重读（可能被外部编辑过）：
@@ -140,6 +143,11 @@ fn save_settings(app: &mut EguiApp) -> bool {
         llm_model: app.s_llm_model.trim().to_string(),
         ocr_path: if ocr_path.is_empty() { "ocr".into() } else { ocr_path.to_string() },
         review_concurrency,
+        auto_review_on_insert: app.s_auto_review_on_insert,
+        kimi_cli_path: {
+            let path = app.s_kimi_cli_path.trim();
+            if path.is_empty() { "kimi".into() } else { path.into() }
+        },
         profiles,
         active_profile,
         window_width,
@@ -338,6 +346,33 @@ pub fn settings_window(app: &mut EguiApp, ctx: &egui::Context) {
     }
 }
 
+fn default_import_profile_name(source: &Path) -> String {
+    let stem = source.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+    let mut cleaned = String::new();
+    let mut invalid = false;
+    for ch in stem.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '_' | '-') {
+            cleaned.push(ch);
+            invalid = false;
+        } else if !cleaned.is_empty() && !invalid {
+            cleaned.push('-');
+            invalid = true;
+        }
+    }
+    while cleaned.ends_with('-') {
+        cleaned.pop();
+    }
+    if cleaned.is_empty() {
+        return "import-db".into();
+    }
+    let mut name = format!("import-{cleaned}");
+    name.truncate(64);
+    while name.ends_with('-') {
+        name.pop();
+    }
+    name
+}
+
 fn tab_source(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     // ── 档案选择行：服务器地址 / sync_token / AstrBot Key 三字段按档案独立保存 ──
     ui.horizontal(|ui| {
@@ -429,6 +464,82 @@ fn tab_source(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     });
     if editing_local {
         ui.weak(tr(lang, "source_local_hint"));
+    }
+    database_management(app, ui, lang);
+}
+
+fn database_management(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
+    ui.separator();
+    ui.heading(tr(lang, "db_management"));
+    ui.weak(tr(lang, "db_management_hint"));
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(!app.database_busy, egui::Button::new(tr(lang, "db_export")))
+            .clicked()
+        {
+            let active = app.app.lock_recover().cfg.active_profile.clone();
+            let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+            let filename = format!("pr-desk-{active}-{timestamp}.db");
+            let destination = rfd::FileDialog::new()
+                .add_filter(tr(lang, "db_file_filter"), &["db", "sqlite", "sqlite3"])
+                .set_file_name(filename)
+                .save_file();
+            if let Some(destination) = destination {
+                app.export_database_to(destination);
+            }
+        }
+        if app.database_busy {
+            ui.add(egui::Spinner::new());
+            ui.weak(tr(lang, "db_busy"));
+        }
+    });
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .add_enabled(!app.database_busy, egui::Button::new(tr(lang, "db_import_pick")))
+            .clicked()
+        {
+            let source = rfd::FileDialog::new()
+                .add_filter(tr(lang, "db_file_filter"), &["db", "sqlite", "sqlite3"])
+                .pick_file();
+            if let Some(source) = source {
+                app.import_profile_name = default_import_profile_name(&source);
+                app.import_database_source = Some(source);
+                app.dialog_error.clear();
+            }
+        }
+        ui.label(tr(lang, "db_import_name"));
+        ui.add_enabled(
+            !app.database_busy && app.import_database_source.is_some(),
+            egui::TextEdit::singleline(&mut app.import_profile_name)
+                .hint_text(tr(lang, "db_import_name"))
+                .desired_width(160.0),
+        );
+        if ui
+            .add_enabled(
+                !app.database_busy && app.import_database_source.is_some(),
+                egui::Button::new(tr(lang, "db_import")),
+            )
+            .clicked()
+            && let Some(source) = app.import_database_source.clone()
+        {
+            app.import_database_from(source, app.import_profile_name.clone());
+        }
+    });
+    if let Some(source) = &app.import_database_source {
+        ui.add(egui::Label::new(source.to_string_lossy()).wrap());
+    }
+    if let Some(path) = app.last_database_export.clone() {
+        ui.add_space(4.0);
+        ui.label(tr(lang, "db_last_export"));
+        ui.add(egui::Label::new(path.to_string_lossy()).wrap());
+        if ui.button(tr(lang, "db_open_parent")).clicked()
+            && let Some(parent) = path.parent()
+            && let Err(e) = open::that(parent)
+        {
+            let msg = trf(lang, "db_open_dir_failed", &[&e.to_string()]);
+            app.dialog_error = msg.clone();
+            crate::worker::send_msg(Msg::Status(msg));
+        }
     }
 }
 
@@ -561,6 +672,18 @@ fn tab_llm(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
             ui.weak(tr(lang, "settings_concurrency_hint"));
         });
     });
+    ui.checkbox(
+        &mut app.s_auto_review_on_insert,
+        tr(lang, "settings_auto_review_on_insert"),
+    );
+    ui.weak(tr(lang, "settings_auto_review_on_insert_hint"));
+    field(ui, tr(lang, "settings_kimi_cli_path"), |ui| {
+        ui.add(egui::TextEdit::singleline(&mut app.s_kimi_cli_path)
+            .hint_text("kimi")
+            .desired_width(f32::INFINITY));
+    });
+    ui.weak(tr(lang, "settings_kimi_cli_hint"));
+    ui.add_space(6.0);
     field(ui, tr(lang, "settings_review_prompt"), |ui| {
         ui.add_enabled(
             !app.s_prompt_loading,

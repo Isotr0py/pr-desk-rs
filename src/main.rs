@@ -6,6 +6,8 @@
 #![recursion_limit = "256"]
 
 mod avatars;
+mod deep_acp;
+mod kimi_acp;
 mod native_backdrop;
 mod state;
 mod system_fonts;
@@ -42,6 +44,10 @@ pub struct DeepFindingEditor {
     pub error: String,
 }
 
+fn deep_status_after_progress(current: &str) -> &str {
+    if current == "cancelling" { "cancelling" } else { "running" }
+}
+
 /// UI 侧即时状态（App 是业务状态；这里是面板/弹窗/表单等展示态）。
 pub struct EguiApp {
     pub app: Arc<Mutex<App>>,
@@ -76,9 +82,11 @@ pub struct EguiApp {
     pub deep_diff_expanded: HashSet<i64>,
     pub deep_run: Option<(String, String, i64, u64)>,
     pub deep_run_started: Option<Instant>,
+    pub review_run_started: Option<Instant>,
     pub deep_pr_question: String,
     pub deep_pr_pending: Option<u64>,
     pub deep_pr_error: String,
+    pub deep_assist_cancelling: HashSet<u64>,
     pub next_deep_request_id: u64,
     // ── Inbox ──
     pub inbox_loading: bool,
@@ -111,6 +119,8 @@ pub struct EguiApp {
     pub s_llm_model: String,
     pub s_ocr_path: String,
     pub s_review_conc: i64,
+    pub s_auto_review_on_insert: bool,
+    pub s_kimi_cli_path: String,
     pub s_review_prompt: String,
     pub s_prompt_loading: bool,
     pub dialog_error: String,
@@ -119,6 +129,10 @@ pub struct EguiApp {
     pub adding_profile: bool,
     pub add_profile_name: String,
     pub del_confirm: Option<(String, Instant)>, // 档案删除两步确认（3s 超时还原）
+    pub database_busy: bool,
+    pub last_database_export: Option<PathBuf>,
+    pub import_database_source: Option<PathBuf>,
+    pub import_profile_name: String,
     pub gh_token_from_env: bool,
     // ── 引导 ──
     pub onboarding_dismissed: bool,
@@ -386,7 +400,26 @@ impl EguiApp {
         }
     }
 
+    pub fn deep_run_active_for_current(&self) -> bool {
+        self.panel.as_ref().is_some_and(|panel| {
+            self.deep_run.as_ref().is_some_and(|(profile, repo, number, _)| {
+                *repo == panel.repo
+                    && *number == panel.number
+                    && self.app.lock_recover().cfg.active_profile == *profile
+            })
+        })
+    }
+
+    fn deep_run_blocks(&self, key: &DeepKey) -> bool {
+        self.deep_run.as_ref().is_some_and(|(profile, repo, number, _)| {
+            *profile == key.profile && *repo == key.repo && *number == key.number
+        })
+    }
+
     pub fn start_deep_review(&mut self) {
+        if self.deep_run.is_some() {
+            return;
+        }
         let (profile, repo, number) = {
             let a = self.app.lock_recover();
             let Some((repo, number)) = a.selected.clone() else {
@@ -432,20 +465,47 @@ impl EguiApp {
         let Some((repo, number)) = self.panel.as_ref().map(|p| (p.repo.clone(), p.number)) else {
             return;
         };
-        let active = self.deep_run.as_ref().is_some_and(|(_, r, n, _)| *r == repo && *n == number);
-        if !active {
+        let Some(request_id) = self.deep_run.as_ref().and_then(|(_, r, n, request_id)| {
+            (*r == repo && *n == number).then_some(*request_id)
+        }) else {
             return;
-        }
+        };
         let cancelling = tr(&self.lang(), "deep_cancelling").into();
         if let Some(panel) = self.panel.as_mut() {
             panel.deep_status = "cancelling".into();
             panel.deep_progress = cancelling;
         }
-        let _ = self.cmd_tx.send(Cmd::CancelDeepReview { repo, number });
+        let _ = self.cmd_tx.send(Cmd::CancelDeepReview { request_id });
+    }
+
+    fn cancel_deep_assist_request(&mut self, request_id: u64) {
+        if self.deep_assist_cancelling.insert(request_id) {
+            let _ = self.cmd_tx.send(Cmd::CancelDeepReview { request_id });
+        }
+    }
+
+    pub fn cancel_deep_finding_assist(&mut self, finding_id: i64) {
+        let request_id = self.deep_editors.get(&finding_id).and_then(|editor| {
+            editor.pending.and_then(|(action, request_id)| {
+                matches!(action, DeepAction::Rewrite | DeepAction::Ask).then_some(request_id)
+            })
+        });
+        if let Some(request_id) = request_id {
+            self.cancel_deep_assist_request(request_id);
+        }
+    }
+
+    pub fn cancel_deep_pr_assist(&mut self) {
+        if let Some(request_id) = self.deep_pr_pending {
+            self.cancel_deep_assist_request(request_id);
+        }
     }
 
     pub fn save_deep_draft(&mut self, finding_id: i64) {
         let Some(key) = self.current_deep_key() else { return };
+        if self.deep_run_blocks(&key) {
+            return;
+        }
         let Some(editor) = self.deep_editors.get(&finding_id) else { return };
         if editor.pending.is_some() {
             return;
@@ -465,6 +525,9 @@ impl EguiApp {
 
     pub fn rewrite_deep_finding(&mut self, finding_id: i64, style: &str) {
         let Some(key) = self.current_deep_key() else { return };
+        if self.deep_run_blocks(&key) {
+            return;
+        }
         let Some(editor) = self.deep_editors.get(&finding_id) else { return };
         if editor.pending.is_some() {
             return;
@@ -485,6 +548,9 @@ impl EguiApp {
 
     pub fn discard_deep_finding(&mut self, finding_id: i64) {
         let Some(key) = self.current_deep_key() else { return };
+        if self.deep_run_blocks(&key) {
+            return;
+        }
         let Some(editor) = self.deep_editors.get(&finding_id) else { return };
         if editor.pending.is_some() {
             return;
@@ -512,6 +578,9 @@ impl EguiApp {
 
     pub fn ask_deep_finding(&mut self, finding_id: i64) {
         let Some(key) = self.current_deep_key() else { return };
+        if self.deep_run_blocks(&key) {
+            return;
+        }
         let Some(editor) = self.deep_editors.get(&finding_id) else { return };
         if editor.pending.is_some() || editor.question.trim().is_empty() {
             return;
@@ -531,7 +600,10 @@ impl EguiApp {
 
     pub fn ask_deep_pr(&mut self) {
         let Some(key) = self.current_deep_key() else { return };
-        if self.deep_pr_pending.is_some() || self.deep_pr_question.trim().is_empty() {
+        if self.deep_run_blocks(&key)
+            || self.deep_pr_pending.is_some()
+            || self.deep_pr_question.trim().is_empty()
+        {
             return;
         }
         let request_id = self.next_deep_request();
@@ -850,6 +922,47 @@ impl EguiApp {
         }
     }
 
+    /// 导出当前档案数据库；文件选择由设置页或测试指令完成。
+    pub fn export_database_to(&mut self, destination: PathBuf) {
+        if self.database_busy {
+            return;
+        }
+        self.dialog_error.clear();
+        self.database_busy = true;
+        if let Err(e) = self.cmd_tx.send(Cmd::ExportDatabase { destination }) {
+            self.database_busy = false;
+            self.dialog_error = trf(&self.lang(), "db_export_failed", &[&e.to_string()]);
+        }
+    }
+
+    /// 导入数据库为新档案；UI 先校验，worker 落盘前会再次复验。
+    pub fn import_database_from(&mut self, source: PathBuf, name: String) {
+        if self.database_busy {
+            return;
+        }
+        self.dialog_error.clear();
+        let lang = self.lang();
+        let name = name.trim().to_string();
+        if !pr_desk_rs::config::valid_profile_name(&name) {
+            self.dialog_error = tr(&lang, "profile_invalid_name").into();
+            return;
+        }
+        if pr_desk_rs::config::is_reserved_profile_name(&name) {
+            self.dialog_error = trf(&lang, "profile_reserved", &[&name]);
+            return;
+        }
+        if self.app.lock_recover().cfg.has_profile(&name) {
+            self.dialog_error = trf(&lang, "profile_exists", &[&name]);
+            return;
+        }
+        self.import_profile_name = name.clone();
+        self.database_busy = true;
+        if let Err(e) = self.cmd_tx.send(Cmd::ImportDatabase { source, name }) {
+            self.database_busy = false;
+            self.dialog_error = trf(&lang, "db_import_failed", &[&e.to_string()]);
+        }
+    }
+
     fn apply_msg(&mut self, ctx: &egui::Context, msg: Msg) {
         match msg {
             Msg::Status(s) => self.set_transient_status(s),
@@ -868,6 +981,41 @@ impl EguiApp {
                 self.model_list = models;
                 // 拉取成功：清掉「正在拉取模型列表…」内联提示
                 self.dialog_error.clear();
+            }
+            Msg::DatabaseExportFinished(result) => {
+                self.database_busy = false;
+                let lang = self.lang();
+                match result {
+                    Ok(path) => {
+                        self.dialog_error.clear();
+                        let display = path.to_string_lossy().into_owned();
+                        self.last_database_export = Some(path);
+                        self.set_transient_status(trf(&lang, "db_export_success", &[&display]));
+                    }
+                    Err(e) => {
+                        let msg = trf(&lang, "db_export_failed", &[&e]);
+                        self.dialog_error = msg.clone();
+                        self.set_transient_status(msg);
+                    }
+                }
+            }
+            Msg::DatabaseImportFinished(result) => {
+                self.database_busy = false;
+                let lang = self.lang();
+                match result {
+                    Ok(name) => {
+                        self.dialog_error.clear();
+                        self.settings_profile = name.clone();
+                        self.import_profile_name = name.clone();
+                        self.import_database_source = None;
+                        self.set_transient_status(trf(&lang, "db_import_success", &[&name]));
+                    }
+                    Err(e) => {
+                        let msg = trf(&lang, "db_import_failed", &[&e]);
+                        self.dialog_error = msg.clone();
+                        self.set_transient_status(msg);
+                    }
+                }
             }
             Msg::Profiles { names, active: _ } => {
                 self.profile_names = names;
@@ -914,7 +1062,8 @@ impl EguiApp {
                 });
                 self.panel = Some(*pd);
                 if reset {
-                    self.deep_editors.clear();
+                    self.review_run_started = None;
+                                self.deep_editors.clear();
                     self.deep_pr_question.clear();
                     self.deep_pr_pending = None;
                     self.deep_pr_error.clear();
@@ -925,12 +1074,15 @@ impl EguiApp {
                         && self.panel.as_ref().is_some_and(|p| p.repo == *repo && p.number == *number);
                     if running {
                         if let Some(panel) = self.panel.as_mut() {
-                            panel.deep_status = "running".into();
+                            panel.deep_status = deep_status_after_progress(&panel.deep_status).into();
                         }
                     }
                 }
             }
-            Msg::ClosePanel => self.panel = None,
+            Msg::ClosePanel => {
+                self.panel = None;
+                self.review_run_started = None;
+                    }
             Msg::ReviewProgress { repo, number, text } => {
                 {
                     // 直写 status_msg 也要推序号，否则在途的 6s 自动清除会误清这条
@@ -940,6 +1092,9 @@ impl EguiApp {
                     a.status_msg_at = Some(Instant::now());
                 }
                 if panel_matches(&self.app, &repo, number) {
+                    if self.review_run_started.is_none() {
+                        self.review_run_started = Some(Instant::now());
+                    }
                     if let Some(p) = self.panel.as_mut() {
                         p.review_status = "running".into();
                         p.review_progress = text;
@@ -952,6 +1107,7 @@ impl EguiApp {
                 // 评审分数进列表 Rev 列：重载行
                 worker::reload_rows_global(&self.app);
                 if panel_matches(&self.app, &repo, number) {
+                    self.review_run_started = None;
                     let rv = { self.app.lock_recover().db.get_review(&repo, number).ok().flatten() };
                     if let Some(p) = self.panel.as_mut() {
                         p.review = review_props(rv.as_ref(), &lang);
@@ -964,6 +1120,7 @@ impl EguiApp {
                 let lang = self.lang();
                 self.set_transient_status(trf(&lang, "review_failed", &[&repo, &number.to_string(), &err]));
                 if panel_matches(&self.app, &repo, number) {
+                    self.review_run_started = None;
                     if let Some(p) = self.panel.as_mut() {
                         p.review_status = "failed".into();
                     }
@@ -975,9 +1132,11 @@ impl EguiApp {
                 }
                 if panel_matches(&self.app, &key.repo, key.number) {
                     if let Some(panel) = self.panel.as_mut() {
-                        panel.deep_status = "running".into();
-                        panel.deep_progress = text;
-                        panel.deep_error.clear();
+                        panel.deep_status = deep_status_after_progress(&panel.deep_status).into();
+                        if panel.deep_status == "running" {
+                            panel.deep_progress = text;
+                            panel.deep_error.clear();
+                        }
                     }
                 }
             }
@@ -1013,6 +1172,7 @@ impl EguiApp {
                 if !self.deep_panel_matches(&key) || self.deep_pr_pending != Some(request_id) {
                     return;
                 }
+                self.deep_assist_cancelling.remove(&request_id);
                 self.deep_pr_pending = None;
                 self.deep_pr_question.clear();
                 self.deep_pr_error.clear();
@@ -1037,6 +1197,7 @@ impl EguiApp {
                 if !matches {
                     return;
                 }
+                self.deep_assist_cancelling.remove(&request_id);
                 self.replace_deep_finding(&finding);
                 let conflict_text = tr(&self.lang(), "deep_conflict").into();
                 if let Some(editor) = self.deep_editors.get_mut(&finding_id) {
@@ -1077,6 +1238,7 @@ impl EguiApp {
                 }
                 if action == DeepAction::Ask && finding_id == Some(0) {
                     if self.deep_pr_pending == Some(request_id) {
+                        self.deep_assist_cancelling.remove(&request_id);
                         self.deep_pr_pending = None;
                         self.deep_pr_error = err;
                     }
@@ -1087,6 +1249,7 @@ impl EguiApp {
                     editor.pending == Some((action, request_id))
                 });
                 if matches {
+                    self.deep_assist_cancelling.remove(&request_id);
                     if let Some(editor) = self.deep_editors.get_mut(&finding_id) {
                         editor.pending = None;
                         editor.error = err;
@@ -1358,6 +1521,7 @@ impl EguiApp {
                     }
                 }
             }
+            "deeprefresh" => self.refresh_deep_findings(),
             "deepcancel" => self.cancel_deep_review(),
             "deepcancelresult" => {
                 let Some((profile, repo, number, request_id)) = self.deep_run.clone() else {
@@ -1399,6 +1563,7 @@ impl EguiApp {
                             body: "Fixture PR description for whole-PR questions.".into(),
                             diff: "diff --git a/src/lib.rs b/src/lib.rs\n+if size == 0 { reject() }".into(),
                             qa: Vec::new(),
+                            agent_session_id: None,
                             findings: vec![DeepFindingData {
                                 fingerprint: "desktop-fixture".into(),
                                 ordinal: 1,
@@ -1502,6 +1667,12 @@ impl EguiApp {
                 ctx.memory_mut(|memory| memory.request_focus(egui::Id::unique("deep-pr-question")));
             }
             "deepprask" => self.ask_deep_pr(),
+            "deepprcancel" => self.cancel_deep_pr_assist(),
+            "deepfindingcancel" => {
+                if let Ok(id) = arg.parse() {
+                    self.cancel_deep_finding_assist(id);
+                }
+            }
             "deepclearfindings" => {
                 if let Some(workspace) = self.panel.as_mut().and_then(|p| p.deep.as_mut()) {
                     workspace.findings.clear();
@@ -1594,6 +1765,14 @@ impl EguiApp {
                 let _ = crate::ui_settings::save_settings_pub(self);
             }
             "settab" => self.settings_tab = arg.parse().unwrap_or(0),
+            "exportdb" => {
+                let path = std::iter::once(arg).chain(it).collect::<Vec<_>>().join(" ");
+                self.export_database_to(PathBuf::from(path));
+            }
+            "importdb" => {
+                let name = it.next().unwrap_or("").to_string();
+                self.import_database_from(PathBuf::from(arg), name);
+            }
             // 设置页表单字段直写（验证 proxy_invalid 等校验路径）：setfield proxy|llm_base|llm_model <值>
             "setfield" => {
                 let val = it.collect::<Vec<_>>().join(" ");
@@ -1752,6 +1931,8 @@ impl EguiApp {
             "panel_number": self.panel.as_ref().map(|p| p.number),
             "panel_review_has": self.panel.as_ref().map(|p| p.review.has),
             "panel_review_status": self.panel.as_ref().map(|p| p.review_status.clone()),
+            "panel_review_progress": self.panel.as_ref().map(|p| p.review_progress.clone()),
+            "review_elapsed_secs": self.review_run_started.map(|started| started.elapsed().as_secs()),
             "deep_status": self.panel.as_ref().map(|p| p.deep_status.clone()),
             "deep_progress": self.panel.as_ref().map(|p| p.deep_progress.clone()),
             "deep_elapsed_secs": self.deep_run_started.map(|started| started.elapsed().as_secs()),
@@ -1767,6 +1948,7 @@ impl EguiApp {
             "deep_diff_chars": self.panel.as_ref().and_then(|p| p.deep.as_ref().map(|w| w.diff.chars().count())),
             "deep_pr_question": self.deep_pr_question,
             "deep_pr_pending": self.deep_pr_pending,
+            "deep_assist_cancelling": self.deep_assist_cancelling,
             "deep_pr_error": self.deep_pr_error,
             "deep_editors": deep_editors,
             "deep_run": self.deep_run,
@@ -1776,6 +1958,8 @@ impl EguiApp {
             "status_msg": a.status_msg,
             "gh_refreshing": a.gh_refreshing,
             "sync_inflight": a.sync_inflight,
+            "database_busy": self.database_busy,
+            "last_database_export": self.last_database_export.as_ref().map(|p| p.to_string_lossy().into_owned()),
             "inbox": a.inbox.len(),
             "inbox_view": a.inbox_view.len(),
             "inbox_has_more": a.inbox_has_more,
@@ -2271,9 +2455,11 @@ fn main() -> anyhow::Result<()> {
                 deep_diff_expanded: HashSet::new(),
                 deep_run: None,
                 deep_run_started: None,
+                review_run_started: None,
                 deep_pr_question: String::new(),
                 deep_pr_pending: None,
                 deep_pr_error: String::new(),
+                deep_assist_cancelling: HashSet::new(),
                 next_deep_request_id: 0,
                 scroll_to: None,
                 inbox_loading: false,
@@ -2309,6 +2495,8 @@ fn main() -> anyhow::Result<()> {
                 s_llm_model: String::new(),
                 s_ocr_path: String::new(),
                 s_review_conc: 3,
+                s_auto_review_on_insert: false,
+                s_kimi_cli_path: "kimi".into(),
                 s_review_prompt,
                 s_prompt_loading: false,
                 dialog_error: String::new(),
@@ -2317,6 +2505,10 @@ fn main() -> anyhow::Result<()> {
                 adding_profile: false,
                 add_profile_name: String::new(),
                 del_confirm: None,
+                database_busy: false,
+                last_database_export: None,
+                import_database_source: None,
+                import_profile_name: String::new(),
                 gh_token_from_env,
                 onboarding_dismissed: false,
                 import_url_open: false,
@@ -2329,4 +2521,16 @@ fn main() -> anyhow::Result<()> {
     // eframe 的错误类型不保证 Send+Sync，转字符串收敛进 anyhow
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deep_progress_does_not_move_cancelling_back_to_running() {
+        assert_eq!(deep_status_after_progress("cancelling"), "cancelling");
+        assert_eq!(deep_status_after_progress("running"), "running");
+        assert_eq!(deep_status_after_progress(""), "running");
+    }
 }

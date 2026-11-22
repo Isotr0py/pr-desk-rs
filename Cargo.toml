@@ -36,6 +36,8 @@ pulldown-cmark = { version = "0.12", default-features = false, features = ["simd
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 # 系统剪贴板（复制评审报告到剪贴板）
 arboard = "3"
+# 数据库导入/导出的系统原生文件选择器
+rfd = "0.18"
 
 # Windows 托盘（Shell_NotifyIconW + 消息专用窗口；纯 FFI 绑定，MinGW 可编）
 [target.'cfg(windows)'.dependencies]

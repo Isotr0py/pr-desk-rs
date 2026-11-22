@@ -2,7 +2,7 @@
 //! 注释里标明的竞态守卫（档案切换串库防护、节流标记乐观记账、在飞去重、
 //! 身份守卫）都是踩坑换来的，不得简化。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -13,11 +13,8 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::{self, Db};
-use pr_desk_rs::deep_review::{
-    DeepQaMessage, DeepWorkspaceData, build_finding_qa_prompt, build_pr_qa_prompt,
-    build_refresh_discussion, build_rewrite_prompt, merge_refreshed_findings,
-    normalize_findings, prepare_pr_context,
-};
+#[cfg(test)]
+use pr_desk_rs::deep_review::DeepWorkspaceData;
 use pr_desk_rs::diffview;
 use pr_desk_rs::i18n::{tr, trf};
 use pr_desk_rs::reviewer::LlmSettings;
@@ -481,9 +478,10 @@ async fn run_review_task(
     g: &github::GitHub,
     app: &Arc<Mutex<App>>,
     msg_tx: &mpsc::Sender<Msg>,
+    profile: &str,
     repo: &str,
     number: i64,
-) {
+) -> bool {
     let lang = cfg.language.as_str();
     send(msg_tx, Msg::ReviewProgress {
         repo: repo.to_string(),
@@ -533,15 +531,18 @@ async fn run_review_task(
                     send(msg_tx, Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])));
                 }
             }
-            let ok = { app.lock_recover().db.upsert_review(&v).is_ok() };
+            let ok = lock_for_profile(app, profile)
+                .is_some_and(|a| a.db.upsert_review(&v).is_ok());
             if ok {
                 send(msg_tx, Msg::ReviewDone { repo: repo.to_string(), number });
+                true
             } else {
                 send(msg_tx, Msg::ReviewFailed {
                     repo: repo.to_string(),
                     number,
                     err: tr(lang, "review_save_failed").into(),
                 });
+                false
             }
         }
         Err(e) => {
@@ -550,6 +551,7 @@ async fn run_review_task(
                 number,
                 err: format!("{e}"),
             });
+            false
         }
     }
 }
@@ -573,23 +575,74 @@ fn deep_fail(
     });
 }
 
-fn deep_finding_context(
-    app: &Arc<Mutex<App>>,
+type DeepCancelFlags = Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>;
+
+struct DeepCancelGuard {
+    flags: DeepCancelFlags,
+    request_id: u64,
+    cancel: Arc<AtomicBool>,
+}
+
+impl Drop for DeepCancelGuard {
+    fn drop(&mut self) {
+        let mut flags = self.flags.lock_recover();
+        if flags
+            .get(&self.request_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.cancel))
+        {
+            flags.remove(&self.request_id);
+        }
+    }
+}
+
+fn register_deep_cancel(flags: &DeepCancelFlags, request_id: u64) -> Arc<AtomicBool> {
+    debug_assert_ne!(request_id, 0);
+    let cancel = Arc::new(AtomicBool::new(false));
+    flags.lock_recover().insert(request_id, cancel.clone());
+    cancel
+}
+
+async fn wait_deep_cancel(cancel: Arc<AtomicBool>) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+async fn run_deep_cancellable<T>(
+    msg_tx: &mpsc::Sender<Msg>,
     key: &DeepKey,
-    finding_id: i64,
-) -> anyhow::Result<Option<(DeepWorkspaceData, pr_desk_rs::deep_review::DeepFindingData)>> {
-    let Some(a) = lock_for_profile(app, &key.profile) else {
-        return Ok(None);
-    };
-    let Some(workspace) = a.db.get_deep_workspace(&key.repo, key.number, &key.head_sha)? else {
-        return Ok(None);
-    };
-    Ok(workspace
-        .findings
-        .iter()
-        .find(|f| f.id == finding_id)
-        .cloned()
-        .map(|finding| (workspace, finding)))
+    finding_id: Option<i64>,
+    request_id: u64,
+    action: DeepAction,
+    lang: &str,
+    cancel: Arc<AtomicBool>,
+    task: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        _ = wait_deep_cancel(cancel) => {
+            deep_fail(
+                msg_tx,
+                key,
+                finding_id,
+                request_id,
+                action,
+                tr(lang, "err_ocr_cancelled"),
+            );
+            None
+        }
+        output = task => Some(output),
+    }
+}
+
+fn deep_assist_running_for_pr(
+    inflight: &Mutex<HashSet<(DeepKey, i64)>>,
+    key: &DeepKey,
+) -> bool {
+    inflight.lock_recover().iter().any(|(running_key, _)| {
+        running_key.profile == key.profile
+            && running_key.repo == key.repo
+            && running_key.number == key.number
+    })
 }
 
 async fn run_deep_review_task(
@@ -602,105 +655,205 @@ async fn run_deep_review_task(
     number: i64,
     request_id: u64,
     cancel: Arc<AtomicBool>,
-) {
-    let mut key = DeepKey {
-        profile: profile.to_string(),
-        repo: repo.to_string(),
+) -> bool {
+    crate::deep_acp::run_deep_review_task(
+        cfg,
+        g,
+        app,
+        msg_tx,
+        profile,
+        repo,
         number,
-        head_sha: String::new(),
-    };
-    send(msg_tx, Msg::DeepProgress {
-        key: key.clone(),
         request_id,
-        text: tr(&cfg.language, "prog_fetch_pr").into(),
-    });
-    let result: anyhow::Result<DeepWorkspaceData> = async {
-        if cancel.load(Ordering::Relaxed) {
-            anyhow::bail!("{}", tr(&cfg.language, "err_ocr_cancelled"));
-        }
-        let meta = g.fetch_pr_meta(repo, number).await?;
-        let base_sha = meta["base"]["sha"].as_str().unwrap_or("").to_string();
-        let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
-        if base_sha.is_empty() || head_sha.is_empty() {
-            anyhow::bail!("{}", tr(&cfg.language, "err_missing_sha"));
-        }
-        key.head_sha = head_sha.clone();
-        if let Some(existing) = {
-            let Some(a) = lock_for_profile(app, profile) else {
-                anyhow::bail!("profile changed")
-            };
-            a.db.get_deep_workspace(repo, number, &head_sha)?
-        } {
-            return Ok(existing);
-        }
+        cancel,
+    )
+    .await
+}
 
-        send(msg_tx, Msg::DeepProgress {
-            key: key.clone(),
-            request_id,
-            text: tr(&cfg.language, "prog_fetch_pr_diff").into(),
-        });
-        let diff = g.fetch_diff(repo, number).await?;
-        if cancel.load(Ordering::Relaxed) {
-            anyhow::bail!("{}", tr(&cfg.language, "err_ocr_cancelled"));
-        }
-        let tx = msg_tx.clone();
-        let progress_key = key.clone();
-        let mut progress = move |text: String| {
-            send(&tx, Msg::DeepProgress {
-                key: progress_key.clone(),
-                request_id,
-                text,
-            });
-        };
-        let outcome = ocr::run_ocr_review_with_diff(
-            cfg,
-            g,
-            repo,
-            &meta,
-            &diff,
-            &mut progress,
-            &cfg.language,
-            Some(cancel),
-            None,
-        )
-        .await?;
-        let created_at = db::now();
-        let (body, pr_diff) = prepare_pr_context(
-            meta["body"].as_str().unwrap_or(""),
-            &diff,
-        );
-        let workspace = DeepWorkspaceData {
-            repo: repo.to_string(),
-            number,
-            base_sha,
-            head_sha,
-            title: meta["title"].as_str().unwrap_or("").to_string(),
-            created_at: created_at.clone(),
-            body,
-            diff: pr_diff,
-            qa: Vec::new(),
-            findings: normalize_findings(&outcome.comments, &diff, &created_at),
-        };
-        let saved = {
-            let Some(a) = lock_for_profile(app, profile) else {
-                anyhow::bail!("profile changed")
-            };
-            a.db.create_deep_workspace(&workspace)?
-        };
-        Ok(saved)
+type AutoReviewKey = (String, String, i64);
+
+#[derive(Default)]
+struct AutoReviewQueue {
+    pending: VecDeque<AutoReviewJob>,
+    enrolled: HashSet<AutoReviewKey>,
+    running: HashSet<AutoReviewKey>,
+}
+
+impl AutoReviewQueue {
+    fn key(job: &AutoReviewJob) -> AutoReviewKey {
+        (job.profile.clone(), job.repo.clone(), job.number)
     }
-    .await;
 
-    match result {
-        Ok(workspace) => {
-            key.head_sha = workspace.head_sha.clone();
-            send(msg_tx, Msg::DeepLoaded {
-                key,
-                request_id,
-                workspace: Box::new(workspace),
-            });
+    fn enqueue(&mut self, profile: String, keys: Vec<(String, i64)>) {
+        for (repo, number) in keys {
+            let job = AutoReviewJob {
+                profile: profile.clone(),
+                repo,
+                number,
+                stage: AutoReviewStage::Standard,
+            };
+            if self.enrolled.insert(Self::key(&job)) {
+                self.pending.push_back(job);
+            }
         }
-        Err(e) => deep_fail(msg_tx, &key, None, request_id, DeepAction::Run, e.to_string()),
+    }
+
+    fn settle(&mut self, job: AutoReviewJob, continue_deep: bool) {
+        self.running.remove(&Self::key(&job));
+        if job.stage == AutoReviewStage::Standard && continue_deep {
+            self.pending.push_back(AutoReviewJob {
+                stage: AutoReviewStage::Deep,
+                ..job
+            });
+        } else {
+            self.enrolled.remove(&Self::key(&job));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.pending.clear();
+        self.enrolled.retain(|key| self.running.contains(key));
+    }
+}
+
+fn spawn_auto_review(
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    cmd_tx: &UnboundedSender<Cmd>,
+    cfg: Config,
+    llm: LlmSettings,
+    slots: Arc<Mutex<ReviewSlots>>,
+    job: AutoReviewJob,
+) {
+    let app2 = app.clone();
+    let tx = msg_tx.clone();
+    let cmd2 = cmd_tx.clone();
+    tokio::spawn(async move {
+        let deep = job.stage == AutoReviewStage::Deep;
+        let guard = SlotGuard {
+            slots,
+            repo: job.repo.clone(),
+            number: job.number,
+            deep,
+        };
+        let success = match github::GitHub::new(cfg.token(), &cfg.proxy) {
+            Ok(g) => {
+                let rate = g.rate_limit_handle();
+                let success = if deep {
+                    run_deep_review_task(
+                        &cfg,
+                        &g,
+                        &app2,
+                        &tx,
+                        &job.profile,
+                        &job.repo,
+                        job.number,
+                        0,
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                    .await
+                } else {
+                    run_review_task(
+                        &cfg,
+                        &llm,
+                        &g,
+                        &app2,
+                        &tx,
+                        &job.profile,
+                        &job.repo,
+                        job.number,
+                    )
+                    .await
+                };
+                if let Some(n) = *rate.lock_recover() {
+                    *app2.lock_recover().rate_limit.lock_recover() = Some(n);
+                }
+                success
+            }
+            Err(e) => {
+                if deep {
+                    let key = DeepKey {
+                        profile: job.profile.clone(),
+                        repo: job.repo.clone(),
+                        number: job.number,
+                        head_sha: String::new(),
+                    };
+                    deep_fail(
+                        &tx,
+                        &key,
+                        None,
+                        0,
+                        DeepAction::Run,
+                        trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
+                    );
+                } else {
+                    send(&tx, Msg::ReviewFailed {
+                        repo: job.repo.clone(),
+                        number: job.number,
+                        err: trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
+                    });
+                }
+                false
+            }
+        };
+        if deep {
+            let text_key = if success { "auto_deep_done" } else { "auto_deep_failed" };
+            send(&tx, Msg::Status(trf(
+                &cfg.language,
+                text_key,
+                &[&job.repo, &job.number.to_string()],
+            )));
+        }
+        drop(guard);
+        let _ = cmd2.send(Cmd::AutoReviewSettled { job, success });
+    });
+}
+
+fn pump_auto_reviews(
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    cmd_tx: &UnboundedSender<Cmd>,
+    queue: &mut AutoReviewQueue,
+) {
+    let (cfg, slots) = {
+        let a = app.lock_recover();
+        (a.cfg.clone(), a.review_slots.clone())
+    };
+    if !cfg.auto_review_on_insert {
+        queue.clear();
+        return;
+    }
+    let mut index = 0;
+    let mut warned_llm = false;
+    while index < queue.pending.len() {
+        let job = queue.pending[index].clone();
+        if job.profile != cfg.active_profile || queue.running.contains(&AutoReviewQueue::key(&job)) {
+            index += 1;
+            continue;
+        }
+        let Some(llm) = LlmSettings::from_config(&cfg) else {
+            if !warned_llm {
+                send(msg_tx, Msg::Status(tr(&cfg.language, "llm_not_configured").into()));
+                warned_llm = true;
+            }
+            let job = queue.pending.remove(index).expect("queue index checked");
+            queue.running.insert(AutoReviewQueue::key(&job));
+            queue.settle(job, true);
+            continue;
+        };
+        let acquired = match job.stage {
+            AutoReviewStage::Standard => slots.lock_recover().try_acquire(&job.repo, job.number),
+            AutoReviewStage::Deep => slots.lock_recover().try_acquire_deep(&job.repo, job.number),
+        };
+        match acquired {
+            Ok(()) => {
+                let job = queue.pending.remove(index).expect("queue index checked");
+                queue.running.insert(AutoReviewQueue::key(&job));
+                spawn_auto_review(app, msg_tx, cmd_tx, cfg.clone(), llm, slots.clone(), job);
+            }
+            Err(SlotError::AlreadyRunning) => index += 1,
+            Err(SlotError::AtCapacity) => break,
+        }
     }
 }
 
@@ -713,77 +866,16 @@ async fn run_deep_refresh_task(
     request_id: u64,
     cancel: Arc<AtomicBool>,
 ) {
-    send(msg_tx, Msg::DeepProgress {
-        key: key.clone(),
+    let _ = crate::deep_acp::run_deep_refresh_task(
+        cfg,
+        g,
+        app,
+        msg_tx,
+        key,
         request_id,
-        text: tr(&cfg.language, "deep_refresh_start").into(),
-    });
-    let result: anyhow::Result<DeepWorkspaceData> = async {
-        if cancel.load(Ordering::Relaxed) {
-            anyhow::bail!("{}", tr(&cfg.language, "err_ocr_cancelled"));
-        }
-        let workspace = {
-            let Some(a) = lock_for_profile(app, &key.profile) else {
-                anyhow::bail!("profile changed")
-            };
-            a.db.get_deep_workspace(&key.repo, key.number, &key.head_sha)?
-        };
-        let Some(workspace) = workspace else {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_finding_missing"));
-        };
-        let meta = g.fetch_pr_meta(&key.repo, key.number).await?;
-        if meta["head"]["sha"].as_str().unwrap_or("") != key.head_sha {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_pr_context_stale"));
-        }
-        let diff = g.fetch_diff(&key.repo, key.number).await?;
-        if cancel.load(Ordering::Relaxed) {
-            anyhow::bail!("{}", tr(&cfg.language, "err_ocr_cancelled"));
-        }
-        let discussion = build_refresh_discussion(&workspace);
-        let tx = msg_tx.clone();
-        let progress_key = key.clone();
-        let mut progress = move |text: String| {
-            send(&tx, Msg::DeepProgress {
-                key: progress_key.clone(),
-                request_id,
-                text,
-            });
-        };
-        let outcome = ocr::run_ocr_review_with_diff(
-            cfg,
-            g,
-            &key.repo,
-            &meta,
-            &diff,
-            &mut progress,
-            &cfg.language,
-            Some(cancel.clone()),
-            Some(discussion.as_str()),
-        )
-        .await?;
-        let refreshed = normalize_findings(&outcome.comments, &diff, &db::now());
-        let merged = merge_refreshed_findings(&workspace.findings, &refreshed);
-        let saved = {
-            let Some(a) = lock_for_profile(app, &key.profile) else {
-                anyhow::bail!("profile changed")
-            };
-            a.db.replace_deep_findings(&key.repo, key.number, &key.head_sha, &merged)?
-        };
-        Ok(saved)
-    }
+        cancel,
+    )
     .await;
-    match result {
-        Ok(workspace) => send(msg_tx, Msg::DeepLoaded {
-            key: key.clone(),
-            request_id,
-            workspace: Box::new(workspace),
-        }),
-        Err(e) => deep_fail(msg_tx, key, None, request_id, DeepAction::Run, e.to_string()),
-    }
-}
-
-fn llm_timeout(lang: &str) -> anyhow::Error {
-    anyhow::anyhow!("{}", tr(lang, "deep_llm_timeout"))
 }
 
 async fn run_deep_rewrite_task(
@@ -797,71 +889,22 @@ async fn run_deep_rewrite_task(
     expected_revision: i64,
     base_text: &str,
     style: &str,
+    cancel: Arc<AtomicBool>,
 ) {
-    let result: anyhow::Result<()> = async {
-        let Some((_workspace, finding)) = deep_finding_context(app, key, finding_id)? else {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_finding_missing"));
-        };
-        let prompt = build_rewrite_prompt(&finding, base_text, style);
-        let rewritten = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            reviewer::complete_text(
-                llm,
-                "你是 pr-desk 的只读代码评审助手，只改写评论文本，不执行 GitHub 操作。",
-                &prompt,
-            ),
-        )
-        .await
-        .map_err(|_| llm_timeout(&cfg.language))??;
-        let rewritten = rewritten.trim().chars().take(12_000).collect::<String>();
-        if rewritten.is_empty() {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_llm_empty"));
-        }
-        let mutation = {
-            let Some(a) = lock_for_profile(app, &key.profile) else {
-                return Ok(());
-            };
-            a.db.update_deep_draft(
-                &key.repo,
-                key.number,
-                &key.head_sha,
-                finding_id,
-                expected_revision,
-                &rewritten,
-            )?
-        };
-        if let Some(finding) = mutation.finding {
-            send(msg_tx, Msg::DeepFindingUpdated {
-                key: key.clone(),
-                finding_id,
-                request_id,
-                action: DeepAction::Rewrite,
-                finding: Box::new(finding),
-                conflict: mutation.conflict,
-            });
-        } else {
-            deep_fail(
-                msg_tx,
-                key,
-                Some(finding_id),
-                request_id,
-                DeepAction::Rewrite,
-                tr(&cfg.language, "deep_finding_missing"),
-            );
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(e) = result {
-        deep_fail(
-            msg_tx,
-            key,
-            Some(finding_id),
-            request_id,
-            DeepAction::Rewrite,
-            e.to_string(),
-        );
-    }
+    crate::deep_acp::run_deep_rewrite_task(
+        cfg,
+        llm,
+        app,
+        msg_tx,
+        key,
+        finding_id,
+        request_id,
+        expected_revision,
+        base_text,
+        style,
+        cancel,
+    )
+    .await
 }
 
 async fn run_deep_ask_task(
@@ -874,80 +917,21 @@ async fn run_deep_ask_task(
     request_id: u64,
     question: &str,
     current_draft: &str,
+    cancel: Arc<AtomicBool>,
 ) {
-    let result: anyhow::Result<()> = async {
-        let Some((workspace, finding)) = deep_finding_context(app, key, finding_id)? else {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_finding_missing"));
-        };
-        let question = question.trim().chars().take(4_000).collect::<String>();
-        if question.is_empty() {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_question_empty"));
-        }
-        let prompt = build_finding_qa_prompt(&workspace, &finding, current_draft, &question);
-        let answer = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            reviewer::complete_text(
-                llm,
-                "你是 pr-desk 的只读代码评审助手，只根据给定证据回答，不执行 GitHub 操作。",
-                &prompt,
-            ),
-        )
-        .await
-        .map_err(|_| llm_timeout(&cfg.language))??;
-        let answer = answer.trim().chars().take(6_000).collect::<String>();
-        if answer.is_empty() {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_llm_empty"));
-        }
-        let messages = [
-            DeepQaMessage {
-                role: "user".into(),
-                content: question,
-                created_at: db::now(),
-            },
-            DeepQaMessage {
-                role: "assistant".into(),
-                content: answer,
-                created_at: db::now(),
-            },
-        ];
-        let updated = {
-            let Some(a) = lock_for_profile(app, &key.profile) else {
-                return Ok(());
-            };
-            a.db.append_deep_qa(&key.repo, key.number, &key.head_sha, finding_id, &messages)?
-        };
-        if let Some(finding) = updated {
-            send(msg_tx, Msg::DeepFindingUpdated {
-                key: key.clone(),
-                finding_id,
-                request_id,
-                action: DeepAction::Ask,
-                finding: Box::new(finding),
-                conflict: false,
-            });
-        } else {
-            deep_fail(
-                msg_tx,
-                key,
-                Some(finding_id),
-                request_id,
-                DeepAction::Ask,
-                tr(&cfg.language, "deep_finding_missing"),
-            );
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(e) = result {
-        deep_fail(
-            msg_tx,
-            key,
-            Some(finding_id),
-            request_id,
-            DeepAction::Ask,
-            e.to_string(),
-        );
-    }
+    crate::deep_acp::run_deep_ask_task(
+        cfg,
+        llm,
+        app,
+        msg_tx,
+        key,
+        finding_id,
+        request_id,
+        question,
+        current_draft,
+        cancel,
+    )
+    .await
 }
 
 async fn run_deep_ask_pr_task(
@@ -959,106 +943,20 @@ async fn run_deep_ask_pr_task(
     key: &DeepKey,
     request_id: u64,
     question: &str,
+    cancel: Arc<AtomicBool>,
 ) {
-    let result: anyhow::Result<()> = async {
-        let mut workspace = {
-            let Some(a) = lock_for_profile(app, &key.profile) else {
-                return Ok(());
-            };
-            a.db.get_deep_workspace(&key.repo, key.number, &key.head_sha)?
-        };
-        if workspace.as_ref().is_none_or(|w| w.diff.trim().is_empty()) {
-            let meta = g.fetch_pr_meta(&key.repo, key.number).await?;
-            if meta["head"]["sha"].as_str().unwrap_or("") != key.head_sha {
-                anyhow::bail!("{}", tr(&cfg.language, "deep_pr_context_stale"));
-            }
-            let diff = g.fetch_diff(&key.repo, key.number).await?;
-            let (body, diff) = prepare_pr_context(
-                meta["body"].as_str().unwrap_or(""),
-                &diff,
-            );
-            workspace = {
-                let Some(a) = lock_for_profile(app, &key.profile) else {
-                    return Ok(());
-                };
-                a.db.fill_deep_context_if_empty(
-                    &key.repo,
-                    key.number,
-                    &key.head_sha,
-                    &body,
-                    &diff,
-                )?
-            };
-        }
-        let Some(workspace) = workspace else {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_finding_missing"));
-        };
-        let question = question.trim().chars().take(4_000).collect::<String>();
-        if question.is_empty() {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_question_empty"));
-        }
-        let prompt = build_pr_qa_prompt(&workspace, &question);
-        let answer = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            reviewer::complete_text(
-                llm,
-                "你是 pr-desk 的只读 PR 审查助手，只根据给定证据回答，不执行 GitHub 操作。",
-                &prompt,
-            ),
-        )
-        .await
-        .map_err(|_| llm_timeout(&cfg.language))??;
-        let answer = answer.trim().chars().take(6_000).collect::<String>();
-        if answer.is_empty() {
-            anyhow::bail!("{}", tr(&cfg.language, "deep_llm_empty"));
-        }
-        let messages = [
-            DeepQaMessage {
-                role: "user".into(),
-                content: question,
-                created_at: db::now(),
-            },
-            DeepQaMessage {
-                role: "assistant".into(),
-                content: answer,
-                created_at: db::now(),
-            },
-        ];
-        let updated = {
-            let Some(a) = lock_for_profile(app, &key.profile) else {
-                return Ok(());
-            };
-            a.db.append_deep_pr_qa(&key.repo, key.number, &key.head_sha, &messages)?
-        };
-        if let Some(qa) = updated {
-            send(msg_tx, Msg::DeepPrUpdated {
-                key: key.clone(),
-                request_id,
-                qa,
-            });
-        } else {
-            deep_fail(
-                msg_tx,
-                key,
-                Some(0),
-                request_id,
-                DeepAction::Ask,
-                tr(&cfg.language, "deep_finding_missing"),
-            );
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(e) = result {
-        deep_fail(
-            msg_tx,
-            key,
-            Some(0),
-            request_id,
-            DeepAction::Ask,
-            e.to_string(),
-        );
-    }
+    crate::deep_acp::run_deep_ask_pr_task(
+        cfg,
+        llm,
+        g,
+        app,
+        msg_tx,
+        key,
+        request_id,
+        question,
+        cancel,
+    )
+    .await
 }
 
 fn mutate_deep_command(
@@ -1295,7 +1193,13 @@ fn lock_for_profile<'a>(app: &'a Mutex<App>, for_profile: &str) -> Option<std::s
 /// 一次 sync_pull → 本地应用 → outbox/reviews push 流程（Cmd::Sync 与 sync 模式下的
 /// RefreshGithub/ReloadConfig 共用）。sync 未启用时静默跳过。
 /// for_profile：发起时的档案名——任何写库阶段发现当前档案已切换则中止（防串库）。
-pub async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_tx: &mpsc::Sender<Msg>, for_profile: &str) {
+pub async fn do_sync(
+    app: &Arc<Mutex<App>>,
+    sync_client: &sync::SyncClient,
+    msg_tx: &mpsc::Sender<Msg>,
+    cmd_tx: &UnboundedSender<Cmd>,
+    for_profile: &str,
+) {
     if !sync_client.enabled() {
         // 本地模式：静默跳过，状态栏由 UI 侧显示「本地模式」
         return;
@@ -1304,7 +1208,7 @@ pub async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_
     // 每次加锁都经 lock_for_profile 校验档案未切换——网络在途期间用户切走档案则
     // 中止写库（Ok(None)），否则在途结果会灌进切后的库（曾把服务器列表写进本地库）。
     // 被丢弃的拉取不丢数据：该档案的游标未前进，下次同步会重新拉。
-    let result: anyhow::Result<Option<((usize, usize, usize), sync::PushSummary)>> = async {
+    let result: anyhow::Result<Option<(sync::PullSummary, sync::PushSummary)>> = async {
         let since = {
             let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
             a.db.get_cursor()?
@@ -1314,6 +1218,12 @@ pub async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_
             let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
             sync::apply_pull(&a.db, &body)?
         };
+        if !pulled.new_pr_keys.is_empty() {
+            let _ = cmd_tx.send(Cmd::QueueAutoReviews {
+                profile: for_profile.to_string(),
+                keys: pulled.new_pr_keys.clone(),
+            });
+        }
         let outbox = {
             let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
             a.db.outbox_drain()?
@@ -1348,7 +1258,7 @@ pub async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_
     }
     .await;
     match result {
-        Ok(Some(((p, r, t), push))) => {
+        Ok(Some((pulled, push))) => {
             // 记入「已同步 X 前」共享状态（状态栏组合读取）
             let (last_sync, lang) = {
                 let a = app.lock_recover();
@@ -1359,9 +1269,9 @@ pub async fn do_sync(app: &Arc<Mutex<App>>, sync_client: &sync::SyncClient, msg_
                 &lang,
                 "sync_done",
                 &[
-                    &p.to_string(),
-                    &r.to_string(),
-                    &t.to_string(),
+                    &pulled.pr_count.to_string(),
+                    &pulled.review_count.to_string(),
+                    &pulled.todo_count.to_string(),
                     &push.applied.to_string(),
                     &push.conflicts.to_string(),
                 ],
@@ -1607,7 +1517,8 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
     let meta_healed: Arc<Mutex<std::collections::HashMap<(String, i64), std::time::Instant>>> =
         Default::default();
     let deep_assist_inflight: Arc<Mutex<HashSet<(DeepKey, i64)>>> = Default::default();
-    let deep_cancel_flags: Arc<Mutex<HashMap<(String, i64), Arc<AtomicBool>>>> = Default::default();
+    let deep_cancel_flags: DeepCancelFlags = Default::default();
+    let mut auto_reviews = AutoReviewQueue::default();
 
     // unbounded channel + recv().await：不在 tokio 工作线程上做 std 阻塞 recv；
     // 所有发送端 drop（UI 退出）或收到 Shutdown 时循环退出——进程不再做僵尸
@@ -1640,12 +1551,13 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     let sc = sync_client.clone();
                     let app2 = app.clone();
                     let tx = msg_tx.clone();
+                    let cmd2 = cmd_tx.clone();
                     tokio::spawn(async move {
                         if sc.enabled() {
                             // sync 模式：列表来自服务器插件数据库（sync_pull）+ 手动预评审，
                             // 不再把配置仓库的全部 open PR 灌进列表库；通知仍从 GitHub 拉
                             fetch_inbox(&g, &app2, &tx).await;
-                            do_sync(&app2, &sc, &tx, &for_profile).await;
+                            do_sync(&app2, &sc, &tx, &cmd2, &for_profile).await;
                         } else {
                             refresh_from_github(&g, &app2, &tx, &for_profile).await;
                             // 顺便拉一次通知
@@ -1666,12 +1578,13 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 let sc = sync_client.clone();
                 let app2 = app.clone();
                 let tx = msg_tx.clone();
+                let cmd2 = cmd_tx.clone();
                 tokio::spawn(async move {
                     // 通知与同步服务器无关，先顺手拉一次
                     if let Some(g) = &g {
                         fetch_inbox(g, &app2, &tx).await;
                     }
-                    do_sync(&app2, &sc, &tx, &for_profile).await;
+                    do_sync(&app2, &sc, &tx, &cmd2, &for_profile).await;
                     // 收尾：复位去重标志 + 停顶栏转圈（结果文案由 do_sync 自己的 Status 负责；
                     // 本地模式 sync 未启用时 do_sync 静默跳过，这里也不打扰状态栏）
                     app2.lock_recover().sync_inflight = false;
@@ -1926,56 +1839,64 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 }
             }
             Cmd::AddNotifReview { repo, number, title, url } => {
-                // 已存在则跳过（upsert 会把已有行的 author/head_sha 等覆盖成空）；
-                // 查询失败是错误不是「不存在」：保守按已存在处理（防重复插入）并告警
-                let (exists, tombstoned) = {
+                let (outcome, profile) = {
                     let a = app.lock_recover();
-                    let exists = a.db.pr_exists(&repo, number).unwrap_or_else(|e| {
-                        tracing::warn!("查询 PR 是否存在失败 {repo} #{number}: {e}");
-                        true
-                    });
-                    let tomb = a.db.is_tombstoned(&repo, number).unwrap_or_else(|e| {
-                        tracing::warn!("查询墓碑失败 {repo} #{number}: {e}");
-                        false
-                    });
-                    (exists, tomb)
-                };
-                if tombstoned {
-                    // 本地删除过的 PR 有墓碑：挡住「加了又删、删了又加」的误回插；
-                    // 想恢复先在列表右键菜单「清空删除记录」
-                    send(&msg_tx, Msg::Status(trf(&lang, "add_blocked_tombstone", &[&repo, &number.to_string()])));
-                } else if exists {
-                    send(&msg_tx, Msg::Status(trf(&lang, "already_in_list", &[&repo, &number.to_string()])));
-                } else {
-                    let ok = {
-                        let a = app.lock_recover();
-                        // 守卫式插入：墓碑判定与落库同一持锁窗口（上面的预检只是提前给文案）
-                        a.db.upsert_pr_unless_tombstoned(&serde_json::json!({
-                            "repo": repo, "number": number, "title": title,
-                            "author": "", "url": url, "head_sha": "",
-                            "status": "pending", "updated_at": db::now(),
-                            "source": "inbox",
-                        })).is_ok()
-                    };
-                    send(&msg_tx, Msg::Status(if ok {
-                        trf(&lang, "added_review", &[&repo, &number.to_string()])
-                    } else {
-                        trf(&lang, "add_review_failed", &[&repo, &number.to_string()])
+                    let outcome = a.db.insert_pr_from_inbox(&serde_json::json!({
+                        "repo": repo, "number": number, "title": title,
+                        "author": "", "url": url, "head_sha": "",
+                        "status": "pending", "updated_at": db::now(),
+                        "source": "inbox",
                     }));
-                    if ok {
+                    (outcome, a.cfg.active_profile.clone())
+                };
+                match outcome {
+                    Ok(db::InsertPrOutcome::Inserted) => {
+                        send(&msg_tx, Msg::Status(trf(&lang, "added_review", &[&repo, &number.to_string()])));
                         reload_rows(&app, &msg_tx);
                         // 通知只带 title/url：补拉 author/head_sha 等元数据（入库即补齐，不留残缺行）
                         let _ = cmd_tx.send(Cmd::FetchPrMeta { repo: repo.clone(), number });
+                        let _ = cmd_tx.send(Cmd::QueueAutoReviews {
+                            profile,
+                            keys: vec![(repo.clone(), number)],
+                        });
+                    }
+                    Ok(db::InsertPrOutcome::AlreadyExists) => {
+                        send(&msg_tx, Msg::Status(trf(&lang, "already_in_list", &[&repo, &number.to_string()])));
+                    }
+                    Ok(db::InsertPrOutcome::Tombstoned) => {
+                        send(&msg_tx, Msg::Status(trf(&lang, "add_blocked_tombstone", &[&repo, &number.to_string()])));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Inbox PR 入库失败 {repo} #{number}: {e}");
+                        send(&msg_tx, Msg::Status(trf(&lang, "add_review_failed", &[&repo, &number.to_string()])));
                     }
                 }
                 // 重发当前通知行：apply 重新计算「已加入」标记
                 let rows = app.lock_recover().inbox.clone();
                 send(&msg_tx, Msg::InboxRows(rows));
             }
+            Cmd::QueueAutoReviews { profile, keys } => {
+                if app.lock_recover().cfg.auto_review_on_insert {
+                    auto_reviews.enqueue(profile, keys);
+                }
+            }
+            Cmd::AutoReviewSettled { job, success } => {
+                if !success {
+                    tracing::warn!(
+                        "自动评审阶段失败 {} #{} {:?}",
+                        job.repo,
+                        job.number,
+                        job.stage
+                    );
+                }
+                let enabled = app.lock_recover().cfg.auto_review_on_insert;
+                auto_reviews.settle(job, enabled);
+            }
+            Cmd::ReviewSlotReleased => {}
             Cmd::RunReview { repo, number } => {
-                let (cfg, slots) = {
+                let (cfg, slots, profile) = {
                     let a = app.lock_recover();
-                    (a.cfg.clone(), a.review_slots.clone())
+                    (a.cfg.clone(), a.review_slots.clone(), a.cfg.active_profile.clone())
                 };
                 // LLM 配置缺失：立即提示，不占并发槽
                 let Some(llm) = LlmSettings::from_config(&cfg) else {
@@ -2001,12 +1922,13 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 // 每个任务自建 GitHub 客户端，结束后把配额合并回 app.rate_limit。
                 let app2 = app.clone();
                 let tx = msg_tx.clone();
+                let cmd2 = cmd_tx.clone();
                 tokio::spawn(async move {
-                    let _guard = SlotGuard { slots, repo: repo.clone(), number, deep: false };
+                    let guard = SlotGuard { slots, repo: repo.clone(), number, deep: false };
                     let rl = match github::GitHub::new(cfg.token(), &cfg.proxy) {
                         Ok(g) => {
                             let h = g.rate_limit_handle();
-                            run_review_task(&cfg, &llm, &g, &app2, &tx, &repo, number).await;
+                            run_review_task(&cfg, &llm, &g, &app2, &tx, &profile, &repo, number).await;
                             Some(h)
                         }
                         Err(e) => {
@@ -2023,6 +1945,8 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             *app2.lock_recover().rate_limit.lock_recover() = Some(n);
                         }
                     }
+                    drop(guard);
+                    let _ = cmd2.send(Cmd::ReviewSlotReleased);
                 });
             }
             Cmd::RunDeepReview { profile, repo, number, request_id } => {
@@ -2047,6 +1971,17 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     );
                     continue;
                 };
+                if deep_assist_running_for_pr(&deep_assist_inflight, &key) {
+                    deep_fail(
+                        &msg_tx,
+                        &key,
+                        None,
+                        request_id,
+                        DeepAction::Run,
+                        tr(&lang, "deep_assist_busy"),
+                    );
+                    continue;
+                }
                 match slots.lock_recover().try_acquire_deep(&repo, number) {
                     Ok(()) => {}
                     Err(SlotError::AlreadyRunning) => {
@@ -2073,30 +2008,41 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         continue;
                     }
                 }
-                let cancel = Arc::new(AtomicBool::new(false));
-                deep_cancel_flags
-                    .lock_recover()
-                    .insert((repo.clone(), number), cancel.clone());
+                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
                 let app2 = app.clone();
                 let tx = msg_tx.clone();
-                let task_cancel = cancel.clone();
+                let cmd2 = cmd_tx.clone();
                 let flags = deep_cancel_flags.clone();
                 tokio::spawn(async move {
-                    let _guard = SlotGuard { slots, repo: repo.clone(), number, deep: true };
-                    let run_key = (repo.clone(), number);
+                    let _cancel_guard = DeepCancelGuard {
+                        flags,
+                        request_id,
+                        cancel: cancel.clone(),
+                    };
+                    let guard = SlotGuard { slots, repo: repo.clone(), number, deep: true };
                     match github::GitHub::new(cfg.token(), &cfg.proxy) {
                         Ok(g) => {
                             let rate = g.rate_limit_handle();
-                            run_deep_review_task(
-                                &cfg,
-                                &g,
-                                &app2,
+                            let task_cancel = cancel.clone();
+                            run_deep_cancellable(
                                 &tx,
-                                &profile,
-                                &repo,
-                                number,
+                                &key,
+                                None,
                                 request_id,
-                                task_cancel,
+                                DeepAction::Run,
+                                &cfg.language,
+                                cancel,
+                                run_deep_review_task(
+                                    &cfg,
+                                    &g,
+                                    &app2,
+                                    &tx,
+                                    &profile,
+                                    &repo,
+                                    number,
+                                    request_id,
+                                    task_cancel,
+                                ),
                             )
                             .await;
                             if let Some(n) = *rate.lock_recover() {
@@ -2104,12 +2050,6 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             }
                         }
                         Err(e) => {
-                            let key = DeepKey {
-                                profile,
-                                repo,
-                                number,
-                                head_sha: String::new(),
-                            };
                             deep_fail(
                                 &tx,
                                 &key,
@@ -2120,7 +2060,8 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             );
                         }
                     }
-                    flags.lock_recover().remove(&run_key);
+                    drop(guard);
+                    let _ = cmd2.send(Cmd::ReviewSlotReleased);
                 });
             }
             Cmd::RefreshDeepFindings { key, request_id } => {
@@ -2139,11 +2080,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     );
                     continue;
                 }
-                if deep_assist_inflight
-                    .lock_recover()
-                    .iter()
-                    .any(|(running_key, _)| *running_key == key)
-                {
+                if deep_assist_running_for_pr(&deep_assist_inflight, &key) {
                     deep_fail(
                         &msg_tx,
                         &key,
@@ -2180,32 +2117,44 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         continue;
                     }
                 }
-                let cancel = Arc::new(AtomicBool::new(false));
-                deep_cancel_flags
-                    .lock_recover()
-                    .insert((key.repo.clone(), key.number), cancel.clone());
+                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
                 let app2 = app.clone();
                 let tx = msg_tx.clone();
+                let cmd2 = cmd_tx.clone();
                 let flags = deep_cancel_flags.clone();
                 tokio::spawn(async move {
-                    let _guard = SlotGuard {
+                    let _cancel_guard = DeepCancelGuard {
+                        flags,
+                        request_id,
+                        cancel: cancel.clone(),
+                    };
+                    let guard = SlotGuard {
                         slots,
                         repo: key.repo.clone(),
                         number: key.number,
                         deep: true,
                     };
-                    let run_key = (key.repo.clone(), key.number);
                     match github::GitHub::new(cfg.token(), &cfg.proxy) {
                         Ok(g) => {
                             let rate = g.rate_limit_handle();
-                            run_deep_refresh_task(
-                                &cfg,
-                                &g,
-                                &app2,
+                            let task_cancel = cancel.clone();
+                            run_deep_cancellable(
                                 &tx,
                                 &key,
+                                None,
                                 request_id,
+                                DeepAction::Run,
+                                &cfg.language,
                                 cancel,
+                                run_deep_refresh_task(
+                                    &cfg,
+                                    &g,
+                                    &app2,
+                                    &tx,
+                                    &key,
+                                    request_id,
+                                    task_cancel,
+                                ),
                             )
                             .await;
                             if let Some(n) = *rate.lock_recover() {
@@ -2221,11 +2170,12 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
                         ),
                     }
-                    flags.lock_recover().remove(&run_key);
+                    drop(guard);
+                    let _ = cmd2.send(Cmd::ReviewSlotReleased);
                 });
             }
-            Cmd::CancelDeepReview { repo, number } => {
-                if let Some(flag) = deep_cancel_flags.lock_recover().get(&(repo, number)) {
+            Cmd::CancelDeepReview { request_id } => {
+                if let Some(flag) = deep_cancel_flags.lock_recover().get(&request_id) {
                     flag.store(true, Ordering::Relaxed);
                 }
             }
@@ -2269,7 +2219,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 base_text,
                 style,
             } => {
-                let cfg = app.lock_recover().cfg.clone();
+                let (cfg, slots) = {
+                    let a = app.lock_recover();
+                    (a.cfg.clone(), a.review_slots.clone())
+                };
                 let Some(llm) = LlmSettings::from_config(&cfg) else {
                     deep_fail(
                         &msg_tx,
@@ -2281,6 +2234,17 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     );
                     continue;
                 };
+                if slots.lock_recover().is_deep_review_running(&key.repo, key.number) {
+                    deep_fail(
+                        &msg_tx,
+                        &key,
+                        Some(finding_id),
+                        request_id,
+                        DeepAction::Rewrite,
+                        tr(&lang, "deep_review_busy"),
+                    );
+                    continue;
+                }
                 if !deep_assist_inflight.lock_recover().insert((key.clone(), finding_id)) {
                     deep_fail(
                         &msg_tx,
@@ -2292,32 +2256,53 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     );
                     continue;
                 }
+                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
                 let app2 = app.clone();
                 let tx = msg_tx.clone();
                 let inflight = deep_assist_inflight.clone();
+                let flags = deep_cancel_flags.clone();
                 tokio::spawn(async move {
+                    let _cancel_guard = DeepCancelGuard {
+                        flags,
+                        request_id,
+                        cancel: cancel.clone(),
+                    };
                     let _guard = DeepAssistGuard {
                         inflight,
                         key: key.clone(),
                         finding_id,
                     };
-                    run_deep_rewrite_task(
-                        &cfg,
-                        &llm,
-                        &app2,
+                    let task_cancel = cancel.clone();
+                    run_deep_cancellable(
                         &tx,
                         &key,
-                        finding_id,
+                        Some(finding_id),
                         request_id,
-                        expected_revision,
-                        &base_text,
-                        &style,
+                        DeepAction::Rewrite,
+                        &cfg.language,
+                        cancel,
+                        run_deep_rewrite_task(
+                            &cfg,
+                            &llm,
+                            &app2,
+                            &tx,
+                            &key,
+                            finding_id,
+                            request_id,
+                            expected_revision,
+                            &base_text,
+                            &style,
+                            task_cancel,
+                        ),
                     )
                     .await;
                 });
             }
             Cmd::AskDeepFinding { key, finding_id, request_id, question, current_draft } => {
-                let cfg = app.lock_recover().cfg.clone();
+                let (cfg, slots) = {
+                    let a = app.lock_recover();
+                    (a.cfg.clone(), a.review_slots.clone())
+                };
                 let Some(llm) = LlmSettings::from_config(&cfg) else {
                     deep_fail(
                         &msg_tx,
@@ -2329,6 +2314,17 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     );
                     continue;
                 };
+                if slots.lock_recover().is_deep_review_running(&key.repo, key.number) {
+                    deep_fail(
+                        &msg_tx,
+                        &key,
+                        Some(finding_id),
+                        request_id,
+                        DeepAction::Ask,
+                        tr(&lang, "deep_review_busy"),
+                    );
+                    continue;
+                }
                 if !deep_assist_inflight.lock_recover().insert((key.clone(), finding_id)) {
                     deep_fail(
                         &msg_tx,
@@ -2340,31 +2336,52 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     );
                     continue;
                 }
+                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
                 let app2 = app.clone();
                 let tx = msg_tx.clone();
                 let inflight = deep_assist_inflight.clone();
+                let flags = deep_cancel_flags.clone();
                 tokio::spawn(async move {
+                    let _cancel_guard = DeepCancelGuard {
+                        flags,
+                        request_id,
+                        cancel: cancel.clone(),
+                    };
                     let _guard = DeepAssistGuard {
                         inflight,
                         key: key.clone(),
                         finding_id,
                     };
-                    run_deep_ask_task(
-                        &cfg,
-                        &llm,
-                        &app2,
+                    let task_cancel = cancel.clone();
+                    run_deep_cancellable(
                         &tx,
                         &key,
-                        finding_id,
+                        Some(finding_id),
                         request_id,
-                        &question,
-                        &current_draft,
+                        DeepAction::Ask,
+                        &cfg.language,
+                        cancel,
+                        run_deep_ask_task(
+                            &cfg,
+                            &llm,
+                            &app2,
+                            &tx,
+                            &key,
+                            finding_id,
+                            request_id,
+                            &question,
+                            &current_draft,
+                            task_cancel,
+                        ),
                     )
                     .await;
                 });
             }
             Cmd::AskDeepPr { key, request_id, question } => {
-                let cfg = app.lock_recover().cfg.clone();
+                let (cfg, slots) = {
+                    let a = app.lock_recover();
+                    (a.cfg.clone(), a.review_slots.clone())
+                };
                 let Some(llm) = LlmSettings::from_config(&cfg) else {
                     deep_fail(
                         &msg_tx,
@@ -2376,6 +2393,17 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     );
                     continue;
                 };
+                if slots.lock_recover().is_deep_review_running(&key.repo, key.number) {
+                    deep_fail(
+                        &msg_tx,
+                        &key,
+                        Some(0),
+                        request_id,
+                        DeepAction::Ask,
+                        tr(&lang, "deep_review_busy"),
+                    );
+                    continue;
+                }
                 if !deep_assist_inflight.lock_recover().insert((key.clone(), 0)) {
                     deep_fail(
                         &msg_tx,
@@ -2387,10 +2415,17 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     );
                     continue;
                 }
+                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
                 let app2 = app.clone();
                 let tx = msg_tx.clone();
                 let inflight = deep_assist_inflight.clone();
+                let flags = deep_cancel_flags.clone();
                 tokio::spawn(async move {
+                    let _cancel_guard = DeepCancelGuard {
+                        flags,
+                        request_id,
+                        cancel: cancel.clone(),
+                    };
                     let _guard = DeepAssistGuard {
                         inflight,
                         key: key.clone(),
@@ -2398,15 +2433,26 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     };
                     match github::GitHub::new(cfg.token(), &cfg.proxy) {
                         Ok(g) => {
-                            run_deep_ask_pr_task(
-                                &cfg,
-                                &llm,
-                                &g,
-                                &app2,
+                            let task_cancel = cancel.clone();
+                            run_deep_cancellable(
                                 &tx,
                                 &key,
+                                Some(0),
                                 request_id,
-                                &question,
+                                DeepAction::Ask,
+                                &cfg.language,
+                                cancel,
+                                run_deep_ask_pr_task(
+                                    &cfg,
+                                    &llm,
+                                    &g,
+                                    &app2,
+                                    &tx,
+                                    &key,
+                                    request_id,
+                                    &question,
+                                    task_cancel,
+                                ),
                             )
                             .await;
                         }
@@ -2836,6 +2882,79 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     });
                 }
             }
+            Cmd::ExportDatabase { destination } => {
+                let profile = app.lock_recover().cfg.active_profile.clone();
+                let source = profile_db_path(&pr_desk_rs::data_dir(), &profile);
+                let tx = msg_tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = db::backup_database(&source, &destination)
+                        .map(|_| destination)
+                        .map_err(|e| e.to_string());
+                    send(&tx, Msg::DatabaseExportFinished(result));
+                });
+            }
+            Cmd::ImportDatabase { source, name } => {
+                let name = name.trim().to_string();
+                let destination = profile_db_path(&pr_desk_rs::data_dir(), &name);
+                let validation_error = {
+                    let a = app.lock_recover();
+                    if pr_desk_rs::config::is_reserved_profile_name(&name) {
+                        Some(trf(&lang, "profile_reserved", &[&name]))
+                    } else if !pr_desk_rs::config::valid_profile_name(&name) {
+                        Some(tr(&lang, "profile_invalid_name").into())
+                    } else if a.cfg.has_profile(&name) {
+                        Some(trf(&lang, "profile_exists", &[&name]))
+                    } else if destination.exists() {
+                        Some(trf(&lang, "db_import_target_exists", &[&destination.to_string_lossy()]))
+                    } else {
+                        None
+                    }
+                };
+                if let Some(err) = validation_error {
+                    send(&msg_tx, Msg::DatabaseImportFinished(Err(err)));
+                    continue;
+                }
+                let app2 = app.clone();
+                let tx = msg_tx.clone();
+                let cmd2 = cmd_tx.clone();
+                let cfg_path2 = cfg_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    let result = (|| -> Result<String, String> {
+                        db::validate_database(&source).map_err(|e| e.to_string())?;
+                        db::backup_database(&source, &destination).map_err(|e| e.to_string())?;
+                        let mut a = app2.lock_recover();
+                        if a.cfg.has_profile(&name) {
+                            let _ = std::fs::remove_file(&destination);
+                            return Err(trf(&lang, "profile_exists", &[&name]));
+                        }
+                        a.cfg.profiles.push(pr_desk_rs::config::Profile {
+                            name: name.clone(),
+                            server_url: String::new(),
+                            sync_token: String::new(),
+                            api_key: String::new(),
+                        });
+                        if let Err(e) = a.cfg.save(&cfg_path2) {
+                            a.cfg.profiles.retain(|p| p.name != name);
+                            let _ = std::fs::remove_file(&destination);
+                            return Err(e.to_string());
+                        }
+                        drop(a);
+                        Ok(name)
+                    })();
+                    match result {
+                        Ok(name) => {
+                            send(&tx, Msg::DatabaseImportFinished(Ok(name.clone())));
+                            let (names, active) = {
+                                let a = app2.lock_recover();
+                                (a.cfg.profile_names(), a.cfg.active_profile.clone())
+                            };
+                            send(&tx, Msg::Profiles { names, active });
+                            let _ = cmd2.send(Cmd::SwitchProfile(name));
+                        }
+                        Err(e) => send(&tx, Msg::DatabaseImportFinished(Err(e))),
+                    }
+                });
+            }
             Cmd::SwitchProfile(name) => {
                 // 校验：档案必须存在且名字合法（防路径穿越）；非法则回填纠正 UI 选中
                 let valid = {
@@ -2918,11 +3037,12 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     let sc = sync_client.clone();
                     let app2 = app.clone();
                     let msg_tx2 = msg_tx.clone();
+                    let cmd2 = cmd_tx.clone();
                     let prof = name.clone(); // 任务归属档案：在途结果只许写回该档案的库
                     tokio::spawn(async move {
                         if sc.enabled() {
                             fetch_inbox(&g, &app2, &msg_tx2).await;
-                            do_sync(&app2, &sc, &msg_tx2, &prof).await;
+                            do_sync(&app2, &sc, &msg_tx2, &cmd2, &prof).await;
                         } else {
                             refresh_from_github(&g, &app2, &msg_tx2, &prof).await;
                             fetch_inbox(&g, &app2, &msg_tx2).await;
@@ -2933,6 +3053,9 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
             Cmd::ReloadConfig => {
                 // 设置保存后热生效：按新配置重建客户端，随后立即刷新 + 同步
                 let cfg = app.lock_recover().cfg.clone();
+                if !cfg.auto_review_on_insert {
+                    auto_reviews.clear();
+                }
                 match github::GitHub::new(cfg.token(), &cfg.proxy) {
                     Ok(g) => {
                         // 重建客户端后替换配额共享句柄
@@ -2954,10 +3077,11 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     let sc = sync_client.clone();
                     let app2 = app.clone();
                     let msg_tx2 = msg_tx.clone();
+                    let cmd2 = cmd_tx.clone();
                     tokio::spawn(async move {
                         if sc.enabled() {
                             fetch_inbox(&g, &app2, &msg_tx2).await;
-                            do_sync(&app2, &sc, &msg_tx2, &for_profile).await;
+                            do_sync(&app2, &sc, &msg_tx2, &cmd2, &for_profile).await;
                         } else {
                             refresh_from_github(&g, &app2, &msg_tx2, &for_profile).await;
                             fetch_inbox(&g, &app2, &msg_tx2).await;
@@ -2966,6 +3090,7 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 }
             }
         }
+        pump_auto_reviews(&app, &msg_tx, &cmd_tx, &mut auto_reviews);
     }
     tracing::info!("worker 退出（Shutdown / 命令通道断开）");
 }
@@ -2974,6 +3099,59 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
 mod tests {
     use super::*;
     use pr_desk_rs::deep_review::DeepFindingData;
+
+    #[test]
+    fn auto_review_queue_deduplicates_and_runs_standard_before_deep() {
+        let mut queue = AutoReviewQueue::default();
+        queue.enqueue("local".into(), vec![("o/r".into(), 1), ("o/r".into(), 1), ("o/r".into(), 2)]);
+        assert_eq!(queue.pending.len(), 2);
+
+        let first = queue.pending.pop_front().unwrap();
+        queue.running.insert(AutoReviewQueue::key(&first));
+        queue.settle(first, true);
+        assert_eq!(queue.pending.back().unwrap().stage, AutoReviewStage::Deep);
+        assert_eq!(queue.pending.back().unwrap().number, 1);
+
+        let deep = queue.pending.pop_back().unwrap();
+        queue.running.insert(AutoReviewQueue::key(&deep));
+        queue.settle(deep, true);
+        assert!(!queue.enrolled.contains(&("local".to_string(), "o/r".to_string(), 1)));
+        assert!(queue.enrolled.contains(&("local".to_string(), "o/r".to_string(), 2)));
+    }
+
+    #[test]
+    fn auto_review_queue_disable_discards_waiting_but_not_running() {
+        let mut queue = AutoReviewQueue::default();
+        queue.enqueue("local".into(), vec![("o/r".into(), 1), ("o/r".into(), 2)]);
+        let running = queue.pending.pop_front().unwrap();
+        queue.running.insert(AutoReviewQueue::key(&running));
+        queue.clear();
+        assert!(queue.pending.is_empty());
+        assert_eq!(queue.enrolled.len(), 1);
+        queue.settle(running, false);
+        assert!(queue.enrolled.is_empty());
+        assert!(queue.running.is_empty());
+    }
+
+    #[test]
+    fn auto_review_pump_waits_for_manual_slot() {
+        let app = Arc::new(Mutex::new(App::new(Config::default(), Db::open_memory().unwrap())));
+        {
+            let mut a = app.lock_recover();
+            a.cfg.auto_review_on_insert = true;
+            a.cfg.llm_api_key = Some("test".into());
+            a.cfg.llm_model = "test".into();
+            a.review_slots = Arc::new(Mutex::new(ReviewSlots::new(1)));
+            a.review_slots.lock_recover().try_acquire("o/r", 1).unwrap();
+        }
+        let mut queue = AutoReviewQueue::default();
+        queue.enqueue("local".into(), vec![("o/r".into(), 1)]);
+        let (msg_tx, _msg_rx) = mpsc::channel();
+        let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+        pump_auto_reviews(&app, &msg_tx, &cmd_tx, &mut queue);
+        assert_eq!(queue.pending.len(), 1);
+        assert!(queue.running.is_empty());
+    }
 
     struct FakeOpenAi {
         base_url: String,
@@ -3037,7 +3215,7 @@ mod tests {
                 response_body.len(),
                 response_body
             );
-            stream.write_all(response.as_bytes()).unwrap();
+            let _ = stream.write_all(response.as_bytes());
         });
         FakeOpenAi {
             base_url: format!("http://{addr}/v1"),
@@ -3057,6 +3235,7 @@ mod tests {
             body: "whole PR body".into(),
             diff: "diff --git a/src/a.rs b/src/a.rs".into(),
             qa: Vec::new(),
+            agent_session_id: None,
             findings: vec![DeepFindingData {
                 fingerprint: "fp-1".into(),
                 ordinal: 1,
@@ -3079,6 +3258,9 @@ mod tests {
         let workspace = db.create_deep_workspace(&deep_workspace()).unwrap();
         let finding_id = workspace.findings[0].id;
         let mut cfg = Config::default();
+        cfg.kimi_cli_path = crate::kimi_acp::test_support::fake_acp_path()
+            .to_string_lossy()
+            .into_owned();
         cfg.llm_base_url = base_url.into();
         cfg.llm_api_key = Some("sk-test".into());
         cfg.llm_model = "test-model".into();
@@ -3110,6 +3292,7 @@ mod tests {
             0,
             "draft before rewrite",
             "direct",
+            Arc::new(AtomicBool::new(false)),
         ));
 
         let request = server
@@ -3172,6 +3355,7 @@ mod tests {
             42,
             "  Why is this risky?  ",
             "initial draft",
+            Arc::new(AtomicBool::new(false)),
         ));
 
         let request = server
@@ -3238,6 +3422,7 @@ mod tests {
             &key,
             44,
             "  What does this PR change?  ",
+            Arc::new(AtomicBool::new(false)),
         ));
 
         let request = server
@@ -3276,6 +3461,368 @@ mod tests {
         assert!(msg_rx.try_recv().is_err());
     }
 
+    fn assert_deep_cancelled(
+        msg_rx: &mpsc::Receiver<Msg>,
+        request_id: u64,
+        finding_id: Option<i64>,
+        action: DeepAction,
+    ) {
+        match msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
+            Msg::DeepFailed {
+                request_id: failed_request,
+                finding_id: failed_finding,
+                action: failed_action,
+                ..
+            } => {
+                assert_eq!(failed_request, request_id);
+                assert_eq!(failed_finding, finding_id);
+                assert_eq!(failed_action, action);
+            }
+            _ => panic!("取消任务未回送匹配的 DeepFailed"),
+        }
+        assert!(msg_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn delayed_deep_rewrite_can_cancel_without_db_write_and_retry() {
+        let server = fake_openai_server("cancelled rewrite", true);
+        let (app, key, finding_id) = deep_test_app(&server.base_url);
+        let cfg = app.lock_recover().cfg.clone();
+        let llm = LlmSettings::from_config(&cfg).unwrap();
+        let flags = DeepCancelFlags::default();
+        let cancel = register_deep_cancel(&flags, 51);
+        let (msg_tx, msg_rx) = mpsc::channel();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let app2 = app.clone();
+            let key2 = key.clone();
+            let flags2 = flags.clone();
+            let msg_tx = msg_tx.clone();
+            let task = tokio::spawn(async move {
+                let _guard = DeepCancelGuard {
+                    flags: flags2,
+                    request_id: 51,
+                    cancel: cancel.clone(),
+                };
+                let task_cancel = cancel.clone();
+                run_deep_cancellable(
+                    &msg_tx,
+                    &key2,
+                    Some(finding_id),
+                    51,
+                    DeepAction::Rewrite,
+                    &cfg.language,
+                    cancel,
+                    run_deep_rewrite_task(
+                        &cfg,
+                        &llm,
+                        &app2,
+                        &msg_tx,
+                        &key2,
+                        finding_id,
+                        51,
+                        0,
+                        "initial draft",
+                        "direct",
+                        task_cancel,
+                    ),
+                )
+                .await;
+            });
+            server.request.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            flags.lock_recover().get(&51).unwrap().store(true, Ordering::Relaxed);
+            task.await.unwrap();
+            assert!(flags.lock_recover().is_empty());
+        });
+        server.release.as_ref().unwrap().send(()).unwrap();
+        assert_deep_cancelled(&msg_rx, 51, Some(finding_id), DeepAction::Rewrite);
+        let workspace = app
+            .lock_recover()
+            .db
+            .get_deep_workspace("o/r", 7, "head-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.findings[0].draft_text, "initial draft");
+        assert_eq!(workspace.findings[0].revision, 0);
+        assert!(workspace.findings[0].qa.is_empty());
+
+        let retry_server = fake_openai_server("rewrite after retry", false);
+        let retry_cfg = {
+            let mut a = app.lock_recover();
+            a.cfg.llm_base_url = retry_server.base_url.clone();
+            a.cfg.clone()
+        };
+        let retry_llm = LlmSettings::from_config(&retry_cfg).unwrap();
+        let retry_cancel = register_deep_cancel(&flags, 52);
+        let retry_guard = DeepCancelGuard {
+            flags: flags.clone(),
+            request_id: 52,
+            cancel: retry_cancel.clone(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_cancellable(
+            &msg_tx,
+            &key,
+            Some(finding_id),
+            52,
+            DeepAction::Rewrite,
+            &retry_cfg.language,
+            retry_cancel.clone(),
+            run_deep_rewrite_task(
+                &retry_cfg,
+                &retry_llm,
+                &app,
+                &msg_tx,
+                &key,
+                finding_id,
+                52,
+                0,
+                "initial draft",
+                "direct",
+                retry_cancel,
+            ),
+        ));
+        drop(retry_guard);
+        assert!(flags.lock_recover().is_empty());
+        assert!(matches!(
+            msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            Msg::DeepFindingUpdated { request_id: 52, action: DeepAction::Rewrite, .. }
+        ));
+        let workspace = app
+            .lock_recover()
+            .db
+            .get_deep_workspace("o/r", 7, "head-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.findings[0].draft_text, "rewrite after retry");
+        assert_eq!(workspace.findings[0].revision, 1);
+    }
+
+    #[test]
+    fn delayed_deep_finding_ask_can_cancel_without_db_write_and_retry() {
+        let server = fake_openai_server("cancelled finding answer", true);
+        let (app, key, finding_id) = deep_test_app(&server.base_url);
+        let cfg = app.lock_recover().cfg.clone();
+        let llm = LlmSettings::from_config(&cfg).unwrap();
+        let flags = DeepCancelFlags::default();
+        let cancel = register_deep_cancel(&flags, 53);
+        let (msg_tx, msg_rx) = mpsc::channel();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let app2 = app.clone();
+            let key2 = key.clone();
+            let flags2 = flags.clone();
+            let msg_tx = msg_tx.clone();
+            let task = tokio::spawn(async move {
+                let _guard = DeepCancelGuard {
+                    flags: flags2,
+                    request_id: 53,
+                    cancel: cancel.clone(),
+                };
+                let task_cancel = cancel.clone();
+                run_deep_cancellable(
+                    &msg_tx,
+                    &key2,
+                    Some(finding_id),
+                    53,
+                    DeepAction::Ask,
+                    &cfg.language,
+                    cancel,
+                    run_deep_ask_task(
+                        &cfg,
+                        &llm,
+                        &app2,
+                        &msg_tx,
+                        &key2,
+                        finding_id,
+                        53,
+                        "cancel this question",
+                        "initial draft",
+                        task_cancel,
+                    ),
+                )
+                .await;
+            });
+            server.request.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            flags.lock_recover().get(&53).unwrap().store(true, Ordering::Relaxed);
+            task.await.unwrap();
+            assert!(flags.lock_recover().is_empty());
+        });
+        server.release.as_ref().unwrap().send(()).unwrap();
+        assert_deep_cancelled(&msg_rx, 53, Some(finding_id), DeepAction::Ask);
+        let workspace = app
+            .lock_recover()
+            .db
+            .get_deep_workspace("o/r", 7, "head-1")
+            .unwrap()
+            .unwrap();
+        assert!(workspace.findings[0].qa.is_empty());
+        assert_eq!(workspace.findings[0].draft_text, "initial draft");
+        assert_eq!(workspace.findings[0].revision, 0);
+
+        let retry_server = fake_openai_server("finding answer after retry", false);
+        let retry_cfg = {
+            let mut a = app.lock_recover();
+            a.cfg.llm_base_url = retry_server.base_url.clone();
+            a.cfg.clone()
+        };
+        let retry_llm = LlmSettings::from_config(&retry_cfg).unwrap();
+        let retry_cancel = register_deep_cancel(&flags, 54);
+        let retry_guard = DeepCancelGuard {
+            flags: flags.clone(),
+            request_id: 54,
+            cancel: retry_cancel.clone(),
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_cancellable(
+            &msg_tx,
+            &key,
+            Some(finding_id),
+            54,
+            DeepAction::Ask,
+            &retry_cfg.language,
+            retry_cancel.clone(),
+            run_deep_ask_task(
+                &retry_cfg,
+                &retry_llm,
+                &app,
+                &msg_tx,
+                &key,
+                finding_id,
+                54,
+                "retry this question",
+                "initial draft",
+                retry_cancel,
+            ),
+        ));
+        drop(retry_guard);
+        assert!(flags.lock_recover().is_empty());
+        assert!(matches!(
+            msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            Msg::DeepFindingUpdated { request_id: 54, action: DeepAction::Ask, .. }
+        ));
+        let workspace = app
+            .lock_recover()
+            .db
+            .get_deep_workspace("o/r", 7, "head-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.findings[0].qa.len(), 2);
+        assert_eq!(workspace.findings[0].qa[0].content, "retry this question");
+        assert_eq!(workspace.findings[0].qa[1].content, "finding answer after retry");
+    }
+
+    #[test]
+    fn delayed_deep_pr_ask_can_cancel_without_db_write_and_retry() {
+        let server = fake_openai_server("cancelled PR answer", true);
+        let (app, key, _) = deep_test_app(&server.base_url);
+        let cfg = app.lock_recover().cfg.clone();
+        let llm = LlmSettings::from_config(&cfg).unwrap();
+        let flags = DeepCancelFlags::default();
+        let cancel = register_deep_cancel(&flags, 55);
+        let (msg_tx, msg_rx) = mpsc::channel();
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let app2 = app.clone();
+            let key2 = key.clone();
+            let flags2 = flags.clone();
+            let msg_tx = msg_tx.clone();
+            let task = tokio::spawn(async move {
+                let _guard = DeepCancelGuard {
+                    flags: flags2,
+                    request_id: 55,
+                    cancel: cancel.clone(),
+                };
+                let task_cancel = cancel.clone();
+                let gh = github::GitHub::new(None, "").unwrap();
+                run_deep_cancellable(
+                    &msg_tx,
+                    &key2,
+                    Some(0),
+                    55,
+                    DeepAction::Ask,
+                    &cfg.language,
+                    cancel,
+                    run_deep_ask_pr_task(
+                        &cfg,
+                        &llm,
+                        &gh,
+                        &app2,
+                        &msg_tx,
+                        &key2,
+                        55,
+                        "cancel this PR question",
+                        task_cancel,
+                    ),
+                )
+                .await;
+            });
+            server.request.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            flags.lock_recover().get(&55).unwrap().store(true, Ordering::Relaxed);
+            task.await.unwrap();
+            assert!(flags.lock_recover().is_empty());
+        });
+        server.release.as_ref().unwrap().send(()).unwrap();
+        assert_deep_cancelled(&msg_rx, 55, Some(0), DeepAction::Ask);
+        let workspace = app
+            .lock_recover()
+            .db
+            .get_deep_workspace("o/r", 7, "head-1")
+            .unwrap()
+            .unwrap();
+        assert!(workspace.qa.is_empty());
+        assert!(workspace.findings[0].qa.is_empty());
+
+        let retry_server = fake_openai_server("PR answer after retry", false);
+        let retry_cfg = {
+            let mut a = app.lock_recover();
+            a.cfg.llm_base_url = retry_server.base_url.clone();
+            a.cfg.clone()
+        };
+        let retry_llm = LlmSettings::from_config(&retry_cfg).unwrap();
+        let retry_cancel = register_deep_cancel(&flags, 56);
+        let retry_guard = DeepCancelGuard {
+            flags: flags.clone(),
+            request_id: 56,
+            cancel: retry_cancel.clone(),
+        };
+        let gh = github::GitHub::new(None, "").unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_cancellable(
+            &msg_tx,
+            &key,
+            Some(0),
+            56,
+            DeepAction::Ask,
+            &retry_cfg.language,
+            retry_cancel.clone(),
+            run_deep_ask_pr_task(
+                &retry_cfg,
+                &retry_llm,
+                &gh,
+                &app,
+                &msg_tx,
+                &key,
+                56,
+                "retry this PR question",
+                retry_cancel,
+            ),
+        ));
+        drop(retry_guard);
+        assert!(flags.lock_recover().is_empty());
+        assert!(matches!(
+            msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
+            Msg::DeepPrUpdated { request_id: 56, .. }
+        ));
+        let workspace = app
+            .lock_recover()
+            .db
+            .get_deep_workspace("o/r", 7, "head-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(workspace.qa.len(), 2);
+        assert_eq!(workspace.qa[0].content, "retry this PR question");
+        assert_eq!(workspace.qa[1].content, "PR answer after retry");
+        assert!(workspace.findings[0].qa.is_empty());
+    }
+
     #[test]
     fn inflight_deep_rewrite_must_not_write_into_switched_profile_db() {
         let server = fake_openai_server("must not cross profiles", true);
@@ -3299,6 +3846,7 @@ mod tests {
                     0,
                     "initial draft",
                     "shorter",
+                    Arc::new(AtomicBool::new(false)),
                 )
                 .await;
             });
@@ -3388,7 +3936,8 @@ mod tests {
         rt.block_on(async {
             let app2 = app.clone();
             let (msg_tx, _rx) = mpsc::channel::<Msg>();
-            let h = tokio::spawn(async move { do_sync(&app2, &sc, &msg_tx, "default").await });
+            let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+            let h = tokio::spawn(async move { do_sync(&app2, &sc, &msg_tx, &cmd_tx, "default").await });
             // 拉取在途：用户切回 local —— 换库
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             {

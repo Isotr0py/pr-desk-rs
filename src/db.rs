@@ -2,11 +2,11 @@
 //! + diff_cache + 仅本地的 Deep Review 工作区。迁移用 PRAGMA user_version。
 
 use anyhow::Result;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::deep_review::{DeepFindingData, DeepQaMessage, DeepWorkspaceData};
 
-pub const SCHEMA_VERSION: i32 = 5;
+pub const SCHEMA_VERSION: i32 = 6;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS prs (
@@ -94,6 +94,13 @@ pub struct DeepMutation {
     pub conflict: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InsertPrOutcome {
+    Inserted,
+    AlreadyExists,
+    Tombstoned,
+}
+
 pub struct Db {
     pub conn: Connection,
 }
@@ -102,6 +109,43 @@ pub struct Db {
 /// 字符串字典序即时间序（list_prs / 最新评审靠 ORDER BY 文本排序）。
 pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+pub fn validate_database(path: &std::path::Path) -> Result<()> {
+    anyhow::ensure!(path.is_file(), "数据库文件不存在：{}", path.display());
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    anyhow::ensure!(integrity.eq_ignore_ascii_case("ok"), "SQLite 完整性检查失败：{integrity}");
+    let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    anyhow::ensure!(
+        version <= SCHEMA_VERSION,
+        "数据库版本 {version} 高于当前支持的版本 {SCHEMA_VERSION}"
+    );
+    let has_prs: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='prs'",
+        [],
+        |r| r.get(0),
+    )?;
+    anyhow::ensure!(has_prs == 1, "不是有效的 PR Desk 数据库：缺少 prs 表");
+    Ok(())
+}
+
+/// 用 SQLite 在线备份生成包含 WAL 内容的单文件快照，目标已存在时绝不覆盖。
+pub fn backup_database(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+    anyhow::ensure!(source.is_file(), "数据库文件不存在：{}", source.display());
+    anyhow::ensure!(!destination.exists(), "目标文件已存在：{}", destination.display());
+    if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let result = (|| -> Result<()> {
+        let conn = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.execute("VACUUM INTO ?1", params![destination.to_string_lossy()])?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(destination);
+    }
+    result
 }
 
 impl Db {
@@ -185,6 +229,8 @@ impl Db {
             ("body", "ALTER TABLE deep_reviews ADD COLUMN body TEXT NOT NULL DEFAULT ''"),
             ("diff", "ALTER TABLE deep_reviews ADD COLUMN diff TEXT NOT NULL DEFAULT ''"),
             ("qa_json", "ALTER TABLE deep_reviews ADD COLUMN qa_json TEXT NOT NULL DEFAULT '[]'"),
+            // v5 → v6：Kimi ACP 会话 ID，旧工作区为空表示尚未接入 ACP。
+            ("agent_session_id", "ALTER TABLE deep_reviews ADD COLUMN agent_session_id TEXT"),
         ] {
             if !deep_cols.iter().any(|c| c == column) {
                 conn.execute_batch(ddl)?;
@@ -543,7 +589,8 @@ impl Db {
         let run = self
             .conn
             .query_row(
-                "SELECT base_sha, title, created_at, body, diff, qa_json FROM deep_reviews
+                "SELECT base_sha, title, created_at, body, diff, qa_json, agent_session_id
+                 FROM deep_reviews
                  WHERE repo=?1 AND number=?2 AND head_sha=?3",
                 params![repo, number, head_sha],
                 |r| {
@@ -562,11 +609,12 @@ impl Db {
                         r.get::<_, String>(3)?,
                         r.get::<_, String>(4)?,
                         qa,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((base_sha, title, created_at, body, diff, qa)) = run else {
+        let Some((base_sha, title, created_at, body, diff, qa, agent_session_id)) = run else {
             return Ok(None);
         };
         let mut stmt = self.conn.prepare(
@@ -589,6 +637,7 @@ impl Db {
             body,
             diff,
             qa,
+            agent_session_id,
             findings,
         }))
     }
@@ -622,8 +671,8 @@ impl Db {
         let tx = self.conn.unchecked_transaction()?;
         self.conn.execute(
             "INSERT OR IGNORE INTO deep_reviews(
-                repo, number, head_sha, base_sha, title, created_at, body, diff, qa_json)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                repo, number, head_sha, base_sha, title, created_at, body, diff, qa_json, agent_session_id)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
                 workspace.repo,
                 workspace.number,
@@ -634,6 +683,7 @@ impl Db {
                 workspace.body,
                 workspace.diff,
                 serde_json::to_string(&workspace.qa)?,
+                workspace.agent_session_id,
             ],
         )?;
         for finding in &workspace.findings {
@@ -659,6 +709,21 @@ impl Db {
         tx.commit()?;
         self.get_deep_workspace(&workspace.repo, workspace.number, &workspace.head_sha)?
             .ok_or_else(|| anyhow::anyhow!("Deep Review 工作区创建后读取失败"))
+    }
+
+    pub fn set_deep_agent_session(
+        &self,
+        repo: &str,
+        number: i64,
+        head_sha: &str,
+        session_id: &str,
+    ) -> Result<DeepWorkspaceData> {
+        self.conn.execute(
+            "UPDATE deep_reviews SET agent_session_id=?4 WHERE repo=?1 AND number=?2 AND head_sha=?3",
+            params![repo, number, head_sha, session_id],
+        )?;
+        self.get_deep_workspace(repo, number, head_sha)?
+            .ok_or_else(|| anyhow::anyhow!("Deep Review 工作区不存在，无法保存 ACP 会话"))
     }
 
     /// 用刷新合并后的集合替换 Findings；匹配项 ID 保持不变，PR 上下文不动。
@@ -1259,6 +1324,24 @@ impl Db {
         Ok(true)
     }
 
+    /// Inbox / URL 入库：墓碑检查与“不存在才插入”放在同一事务，返回真实新增结果。
+    pub fn insert_pr_from_inbox(&self, p: &serde_json::Value) -> Result<InsertPrOutcome> {
+        let tx = self.conn.unchecked_transaction()?;
+        if self.is_tombstoned(
+            p["repo"].as_str().unwrap_or(""),
+            p["number"].as_i64().unwrap_or(0),
+        )? {
+            return Ok(InsertPrOutcome::Tombstoned);
+        }
+        let inserted = self.insert_pr_if_absent(p)?;
+        tx.commit()?;
+        Ok(if inserted {
+            InsertPrOutcome::Inserted
+        } else {
+            InsertPrOutcome::AlreadyExists
+        })
+    }
+
     pub fn tombstone_count(&self) -> Result<i64> {
         Ok(self
             .conn
@@ -1377,6 +1460,55 @@ mod tests {
         assert_eq!(rows[0]["title"], "srv");
         // 无匹配来源
         assert_eq!(db.list_prs(&["nope"]).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn backup_captures_wal_and_never_overwrites() {
+        let dir = std::env::temp_dir().join(format!("prdesk-db-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source_path = dir.join("source.db");
+        let backup_path = dir.join("nested").join("backup.db");
+        let source = Db::open(&source_path).unwrap();
+        source.upsert_pr(&pr_json("o/r", 1, "wal row")).unwrap();
+        source.upsert_review(&review_json("o/r", 1, "h1", 8.0)).unwrap();
+        source.create_deep_workspace(&deep_workspace("h1")).unwrap();
+
+        backup_database(&source_path, &backup_path).unwrap();
+        validate_database(&backup_path).unwrap();
+        let backup = Db::open(&backup_path).unwrap();
+        assert!(backup.pr_exists("o/r", 1).unwrap());
+        assert_eq!(backup.list_reviews_of("o/r", 1).unwrap()[0]["head_sha"], "h1");
+        assert!(backup.get_deep_workspace("o/r", 7, "h1").unwrap().is_some());
+        let integrity: String = backup.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(integrity, "ok");
+
+        source.upsert_pr(&pr_json("o/r", 2, "after backup")).unwrap();
+        assert!(!backup.pr_exists("o/r", 2).unwrap());
+        assert!(backup_database(&source_path, &backup_path).is_err());
+        assert!(backup.pr_exists("o/r", 1).unwrap());
+        drop(backup);
+        drop(source);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_future_and_non_pr_desk_databases() {
+        let dir = std::env::temp_dir().join(format!("prdesk-db-validate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let text_path = dir.join("not-sqlite.db");
+        std::fs::write(&text_path, "not a database").unwrap();
+        assert!(validate_database(&text_path).is_err());
+
+        let future_path = dir.join("future.db");
+        Connection::open(&future_path).unwrap().execute_batch("PRAGMA user_version=999").unwrap();
+        assert!(validate_database(&future_path).is_err());
+
+        let empty_path = dir.join("empty.db");
+        Connection::open(&empty_path).unwrap();
+        assert!(validate_database(&empty_path).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1515,6 +1647,25 @@ mod tests {
         let (inserted2, skipped2, n_reviews2) = Db::copy_prs_to(&src, &dst, &keys).unwrap();
         assert_eq!((inserted2, skipped2, n_reviews2), (0, 2, 2));
         assert_eq!(dst.list_reviews_of("o/r", 1).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn inbox_insert_reports_inserted_existing_and_tombstoned() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(
+            db.insert_pr_from_inbox(&pr_json("o/r", 1, "first")).unwrap(),
+            InsertPrOutcome::Inserted
+        );
+        assert_eq!(
+            db.insert_pr_from_inbox(&pr_json("o/r", 1, "overwrite")).unwrap(),
+            InsertPrOutcome::AlreadyExists
+        );
+        assert_eq!(db.get_pr_full("o/r", 1).unwrap().unwrap()["title"], "first");
+        db.delete_prs(&[("o/r".to_string(), 1)]).unwrap();
+        assert_eq!(
+            db.insert_pr_from_inbox(&pr_json("o/r", 1, "blocked")).unwrap(),
+            InsertPrOutcome::Tombstoned
+        );
     }
 
     #[test]
@@ -1817,6 +1968,7 @@ mod tests {
             body: "whole PR body".into(),
             diff: "diff --git a/src/a.rs b/src/a.rs".into(),
             qa: Vec::new(),
+            agent_session_id: None,
             findings: vec![DeepFindingData {
                 fingerprint: format!("fp-{head_sha}"),
                 ordinal: 1,
@@ -1838,6 +1990,9 @@ mod tests {
     fn deep_workspace_roundtrip_preserves_drafts_and_rejects_stale_writes() {
         let db = Db::open_memory().unwrap();
         let created = db.create_deep_workspace(&deep_workspace("h1")).unwrap();
+        assert!(created.agent_session_id.is_none());
+        let created = db.set_deep_agent_session("o/r", 7, "h1", "acp-session-1").unwrap();
+        assert_eq!(created.agent_session_id.as_deref(), Some("acp-session-1"));
         let id = created.findings[0].id;
         assert!(id > 0);
 

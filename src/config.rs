@@ -39,6 +39,10 @@ llm_model = ""
 ocr_path = "ocr"
 # 预评审并发数（1-16；每个 PR 评审 = 评分 + OCR 多次 LLM 调用，配额紧张时调低）
 review_concurrency = 16
+# PR 入库时自动评审：新入库 PR 自动执行预评审 + Deep Review，会消耗 LLM/OCR 配额
+auto_review_on_insert = false
+# Kimi CLI 路径（Deep Review 通过 ACP 使用；需要已安装并登录 Kimi CLI）
+kimi_cli_path = "kimi"
 # 多数据源：active_profile 选择当前数据源（"local" = 本地库 / "default" = 顶层键 / 自定义档案名）
 # 自定义远程档案三段式（name 仅允许 a-z0-9_-）：
 # profile.<name>.server_url / profile.<name>.sync_token / profile.<name>.api_key
@@ -101,6 +105,10 @@ pub struct Config {
     pub ocr_path: String,
     /// 预评审并发数（1-8）
     pub review_concurrency: u64,
+    /// 新入库 PR 自动执行预评审 + Deep Review（消耗 LLM/OCR 配额）
+    pub auto_review_on_insert: bool,
+    /// Kimi CLI 路径（Deep Review 通过 ACP 使用）
+    pub kimi_cli_path: String,
     /// 远程数据源档案列表（自定义档；"default" 档由顶层键合成，见 load 的兼容迁移）
     pub profiles: Vec<Profile>,
     /// 当前数据源："local" = 本地模式；"default" = 顶层 server_url/sync_token；其它 = profiles 里的档案名
@@ -130,6 +138,8 @@ impl Default for Config {
             llm_model: String::new(),
             ocr_path: "ocr".into(),
             review_concurrency: 16,
+            auto_review_on_insert: false,
+            kimi_cli_path: "kimi".into(),
             profiles: Vec::new(),
             active_profile: "local".into(),
             window_width: None,
@@ -395,6 +405,17 @@ impl Config {
                     Ok(n) if (1..=16).contains(&n) => n,
                     _ => 16,
                 };
+            } else if let Some(v) = parse_value(line, "auto_review_on_insert") {
+                cfg.auto_review_on_insert = match v.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => false,
+                };
+            } else if let Some(v) = parse_value(line, "kimi_cli_path") {
+                let v = unquote(v);
+                if !v.is_empty() {
+                    cfg.kimi_cli_path = v;
+                }
             } else if let Some(v) = parse_value(line, "active_profile") {
                 active = Some(unquote(v)).filter(|s| !s.is_empty());
             } else if let Some(v) = parse_value(line, "window_width") {
@@ -452,6 +473,8 @@ impl Config {
             ("llm_model", quote(&self.llm_model)),
             ("ocr_path", quote(&self.ocr_path)),
             ("review_concurrency", self.review_concurrency.to_string()),
+            ("auto_review_on_insert", self.auto_review_on_insert.to_string()),
+            ("kimi_cli_path", quote(&self.kimi_cli_path)),
             ("active_profile", quote(&self.active_profile)),
         ];
         // 几何记忆：仅在记录过时写（None 不往配置里添键）
@@ -528,6 +551,7 @@ mod tests {
         assert!(path.exists());
         assert_eq!(cfg.poll_interval_min, 5);
         assert!(cfg.repos.is_empty()); // 生成模板的路径返回默认值（模板未解析）
+        assert!(!cfg.auto_review_on_insert);
         // 再次加载：解析模板内容
         let cfg2 = Config::load(&path).unwrap();
         assert_eq!(cfg2.repos, vec!["owner/repo".to_string()]);
@@ -539,6 +563,42 @@ mod tests {
         assert_eq!(cfg2.language, "zh");
         assert_eq!(cfg2.renderer, ""); // 模板默认渲染器
         assert_eq!(cfg2.proxy, ""); // 模板默认直连
+        assert!(!cfg2.auto_review_on_insert);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auto_review_on_insert_parses_strict_booleans() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-auto-review-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert!(!Config::load(&path).unwrap().auto_review_on_insert);
+        for (value, want) in [
+            ("true", true),
+            ("false", false),
+            ("1", false),
+            ("TRUE", false),
+            ("\"true\"", false),
+            ("yes", false),
+        ] {
+            std::fs::write(&path, format!("auto_review_on_insert = {value}\n")).unwrap();
+            assert_eq!(Config::load(&path).unwrap().auto_review_on_insert, want);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn kimi_cli_path_parse_and_default() {
+        let dir = std::env::temp_dir().join(format!("prdesk-cfg-kimi-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(Config::load(&path).unwrap().kimi_cli_path, "kimi");
+        std::fs::write(&path, "kimi_cli_path = \"/opt/kimi/bin/kimi\"\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().kimi_cli_path, "/opt/kimi/bin/kimi");
+        std::fs::write(&path, "kimi_cli_path = \"\"\n").unwrap();
+        assert_eq!(Config::load(&path).unwrap().kimi_cli_path, "kimi");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -613,6 +673,8 @@ mod tests {
             llm_model: "qwen3-coder".into(),
             ocr_path: "D:/tools/ocr.exe".into(),
             review_concurrency: 5,
+            auto_review_on_insert: true,
+            kimi_cli_path: "/opt/kimi/bin/kimi".into(),
             profiles: Vec::new(),
             active_profile: "local".into(),
             window_width: Some(1440.0),
@@ -638,6 +700,8 @@ mod tests {
         assert_eq!(loaded.llm_model, "qwen3-coder");
         assert_eq!(loaded.ocr_path, "D:/tools/ocr.exe");
         assert_eq!(loaded.review_concurrency, 5);
+        assert!(loaded.auto_review_on_insert);
+        assert_eq!(loaded.kimi_cli_path, "/opt/kimi/bin/kimi");
         assert_eq!(loaded.window_width, Some(1440.0));
         assert_eq!(loaded.window_height, Some(810.0));
         assert_eq!(loaded.panel_width, Some(460.0));

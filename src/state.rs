@@ -46,6 +46,20 @@ pub enum DeepAction {
     Ask,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AutoReviewStage {
+    Standard,
+    Deep,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AutoReviewJob {
+    pub profile: String,
+    pub repo: String,
+    pub number: i64,
+    pub stage: AutoReviewStage,
+}
+
 pub enum Cmd {
     RefreshGithub,
     Sync,
@@ -63,13 +77,18 @@ pub enum Cmd {
     CopyLinks(String), // 多选「复制链接」：换行拼接的 URL 文本，剪贴板写入在 worker
     // 右键/操作条「复制到档案…」：当前选择集（多选优先，否则当前行）+ 全部评审复制到目标档案
     CopyToProfile { target: String, keys: Vec<(String, i64)> },
+    ExportDatabase { destination: PathBuf },
+    ImportDatabase { source: PathBuf, name: String },
     LoadReviewPrompt,  // 设置页打开时重读 exe 旁 review_prompt.md（可能被外部编辑过）
     ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
     SwitchProfile(String),  // 切换数据源档案（"local"/"default"/自定义名）：换库 + 重建同步客户端
     RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
     RunDeepReview { profile: String, repo: String, number: i64, request_id: u64 },
+    QueueAutoReviews { profile: String, keys: Vec<(String, i64)> },
+    AutoReviewSettled { job: AutoReviewJob, success: bool },
+    ReviewSlotReleased,
     RefreshDeepFindings { key: DeepKey, request_id: u64 },
-    CancelDeepReview { repo: String, number: i64 },
+    CancelDeepReview { request_id: u64 },
     SaveDeepDraft { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, text: String },
     SetDeepFindingDiscarded { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, discarded: bool },
     RewriteDeepFinding { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, base_text: String, style: String },
@@ -161,6 +180,8 @@ pub enum Msg {
     InboxLoading(bool),      // Inbox 首次加载态
     ModelsLoaded(Vec<String>),
     Profiles { names: Vec<String>, active: String },
+    DatabaseExportFinished(Result<PathBuf, String>),
+    DatabaseImportFinished(Result<String, String>),
     // 设置页档案名校正：新增档案非法时把 settings_profile 写回之前的有效值
     SettingsProfile(String),
     // 行元数据补齐完成：若面板正开着该 PR，重新装载面板（worker 只在成功补齐后发）
@@ -516,6 +537,10 @@ impl ReviewSlots {
 
     pub fn is_standard_review_running(&self, repo: &str, number: i64) -> bool {
         self.standard_inflight.contains(&(repo.to_string(), number))
+    }
+
+    pub fn is_deep_review_running(&self, repo: &str, number: i64) -> bool {
+        self.deep_inflight.contains(&(repo.to_string(), number))
     }
 
     /// 设置页调整并发数（不影响已占用的槽位）。
@@ -1112,6 +1137,7 @@ mod tests {
         let mut s = ReviewSlots::new(2);
         s.try_acquire_deep("o/r", 1).unwrap();
         assert!(s.is_running("o/r", 1));
+        assert!(s.is_deep_review_running("o/r", 1));
         assert!(!s.is_standard_review_running("o/r", 1));
         assert_eq!(s.try_acquire_deep("o/r", 1), Err(SlotError::AlreadyRunning));
 
@@ -1128,6 +1154,7 @@ mod tests {
 
         s.release_deep("o/r", 1);
         assert!(s.is_running("o/r", 1));
+        assert!(!s.is_deep_review_running("o/r", 1));
         assert!(s.is_standard_review_running("o/r", 1));
         assert!(s.try_acquire_deep("o/r", 1).is_ok());
     }

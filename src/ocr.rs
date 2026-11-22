@@ -22,6 +22,9 @@ use crate::config::Config;
 use crate::github::GitHub;
 use crate::reviewer::{self, LlmSettings};
 
+#[path = "review_delegate.rs"]
+pub mod review_delegate;
+
 /// ocr 子进程总超时（超时 kill 后报错）。
 const OCR_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -62,6 +65,23 @@ impl TempDir {
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// 普通 OCR 与 delegate 共用的 base/head 临时 git 仓库；guard 存活期间目录有效。
+pub struct OcrGitSnapshot {
+    _temp_dir: TempDir,
+    head_sha: String,
+}
+
+impl OcrGitSnapshot {
+    pub fn path(&self) -> &Path {
+        &self._temp_dir.0
+    }
+
+    /// 临时仓库中 head commit 的 SHA，不是 GitHub PR 的原始 head SHA。
+    pub fn head_sha(&self) -> &str {
+        &self.head_sha
     }
 }
 
@@ -107,7 +127,7 @@ fn file_status(chunk: &str) -> &'static str {
 }
 
 /// 在临时仓库里跑 git（失败带 stderr 尾部报错）。
-async fn git(repo: &Path, args: &[&str]) -> Result<()> {
+async fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output> {
     let out = Command::new("git")
         .args(args)
         .current_dir(repo)
@@ -119,7 +139,19 @@ async fn git(repo: &Path, args: &[&str]) -> Result<()> {
         let tail: String = stderr.chars().rev().take(300).collect::<String>().chars().rev().collect();
         anyhow::bail!("git {:?} 失败：{}", args, tail.trim());
     }
-    Ok(())
+    Ok(out)
+}
+
+async fn git(repo: &Path, args: &[&str]) -> Result<()> {
+    git_output(repo, args).await.map(|_| ())
+}
+
+async fn git_head_sha(repo: &Path) -> Result<String> {
+    let out = git_output(repo, &["rev-parse", "HEAD"]).await?;
+    let sha = String::from_utf8(out.stdout).context("git rev-parse HEAD 输出不是 UTF-8")?;
+    let sha = sha.trim();
+    anyhow::ensure!(!sha.is_empty(), "git rev-parse HEAD 返回空 SHA");
+    Ok(sha.to_string())
 }
 
 async fn git_commit_all(repo: &Path, message: &str) -> Result<()> {
@@ -316,9 +348,8 @@ pub async fn run_ocr_review(
     run_ocr_review_with_diff(cfg, gh, repo, meta, &diff, progress, lang, None, None).await
 }
 
-/// Deep Review 入口：OCR 与 Finding 证据共用调用方固定的同一份 Diff 快照。
-pub async fn run_ocr_review_with_diff(
-    cfg: &Config,
+/// 按固定 diff 重建 base/head 两个 commit，供普通 OCR 与 delegate 共用。
+pub async fn build_ocr_git_snapshot(
     gh: &GitHub,
     repo: &str,
     meta: &Value,
@@ -326,24 +357,12 @@ pub async fn run_ocr_review_with_diff(
     progress: &mut (dyn FnMut(String) + Send),
     lang: &str,
     cancel: Option<Arc<AtomicBool>>,
-    refresh_background: Option<&str>,
-) -> Result<OcrRunOutcome> {
+) -> Result<OcrGitSnapshot> {
     use crate::i18n::{tr, trf};
     let base_sha = meta["base"]["sha"].as_str().unwrap_or("").to_string();
     let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
     if base_sha.is_empty() || head_sha.is_empty() {
         anyhow::bail!("{}", tr(lang, "err_missing_sha"));
-    }
-    let title = meta["title"].as_str().unwrap_or("");
-    let body = meta["body"].as_str().unwrap_or("");
-    let mut background: String = format!("{title}\n{body}")
-        .chars()
-        .take(BACKGROUND_MAX_CHARS)
-        .collect();
-    if let Some(context) = refresh_background.filter(|s| !s.trim().is_empty()) {
-        background.push_str("\n\n<review-discussion>\n");
-        background.push_str(context);
-        background.push_str("\n</review-discussion>");
     }
 
     check_cancel(cancel.as_ref(), lang)?;
@@ -397,6 +416,45 @@ pub async fn run_ocr_review_with_diff(
         }
     }
     git_commit_all(&tmp.0, "head").await?;
+    let head_sha = git_head_sha(&tmp.0).await?;
+    Ok(OcrGitSnapshot { _temp_dir: tmp, head_sha })
+}
+
+/// Deep Review 入口：OCR 与 Finding 证据共用调用方固定的同一份 Diff 快照。
+pub async fn run_ocr_review_with_diff(
+    cfg: &Config,
+    gh: &GitHub,
+    repo: &str,
+    meta: &Value,
+    diff: &str,
+    progress: &mut (dyn FnMut(String) + Send),
+    lang: &str,
+    cancel: Option<Arc<AtomicBool>>,
+    refresh_background: Option<&str>,
+) -> Result<OcrRunOutcome> {
+    use crate::i18n::{tr, trf};
+    let title = meta["title"].as_str().unwrap_or("");
+    let body = meta["body"].as_str().unwrap_or("");
+    let mut background: String = format!("{title}\n{body}")
+        .chars()
+        .take(BACKGROUND_MAX_CHARS)
+        .collect();
+    if let Some(context) = refresh_background.filter(|s| !s.trim().is_empty()) {
+        background.push_str("\n\n<review-discussion>\n");
+        background.push_str(context);
+        background.push_str("\n</review-discussion>");
+    }
+
+    let snapshot = build_ocr_git_snapshot(
+        gh,
+        repo,
+        meta,
+        diff,
+        progress,
+        lang,
+        cancel.clone(),
+    )
+    .await?;
 
     // LLM 配置：经环境变量传给 ocr 子进程（OCR_CONFIG_PATH 只对 ocr 的 config 子命令生效，
     // review 的 LLM resolver 只认 OCR_LLM_* 环境变量和 ~/.opencodereview/config.json——后者不动）。
@@ -405,7 +463,7 @@ pub async fn run_ocr_review_with_diff(
     let mut cmd = Command::new(&ocr_bin);
     cmd.arg("review")
         .arg("--repo")
-        .arg(&tmp.0)
+        .arg(snapshot.path())
         .arg("--commit")
         .arg("HEAD")
         .arg("--format")
@@ -413,10 +471,10 @@ pub async fn run_ocr_review_with_diff(
         .arg("--audience")
         .arg("human")
         .arg("--output")
-        .arg(tmp.0.join("result.json"))
+        .arg(snapshot.path().join("result.json"))
         .arg("--background")
         .arg(&background)
-        .current_dir(&tmp.0)
+        .current_dir(snapshot.path())
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -431,7 +489,7 @@ pub async fn run_ocr_review_with_diff(
     run_streaming_process(&mut cmd, lang, progress, cancel).await?;
 
     progress(tr(lang, "prog_parse_ocr").into());
-    let text = std::fs::read_to_string(tmp.0.join("result.json"))
+    let text = std::fs::read_to_string(snapshot.path().join("result.json"))
         .context(tr(lang, "err_ocr_no_result"))?;
     let outcome = parse_ocr_result(&text, lang)?;
     progress(trf(

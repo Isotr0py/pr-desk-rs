@@ -178,7 +178,7 @@ pub fn diff_view(ui: &mut Ui, files: &mut [DiffFileData], lang: &str, id_prefix:
         let content_w = (max_disp as f32 + 8.0) * char_w + 56.0; // 56 = 行号 gutter
         egui::ScrollArea::horizontal()
             .id_salt(format!("{id_prefix}-diff-h-{fi}"))
-            .auto_shrink([false, false])
+            .auto_shrink([false, true])
             .show(ui, |ui| {
                 let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(content_w.max(ui.available_width()), n as f32 * DIFF_LINE_H),
@@ -459,6 +459,26 @@ pub fn avatar_chip(ui: &mut Ui, author: &str) {
 }
 
 fn review_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
+    let (running, progress) = app
+        .panel
+        .as_ref()
+        .map(|p| (p.review_status == "running", p.review_progress.clone()))
+        .unwrap_or_default();
+    if running {
+        ui.vertical_centered(|ui| {
+            ui.add_space(24.0);
+            ui.add(egui::Spinner::new());
+            ui.label(tr(lang, "review_running"));
+            if !progress.is_empty() {
+                ui.weak(progress);
+            }
+            if let Some(started) = app.review_run_started {
+                ui.weak(format_elapsed(started));
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        });
+        return;
+    }
     if !rv.has {
         ui.vertical_centered(|ui| {
             ui.add_space(24.0);
@@ -695,6 +715,7 @@ fn qa_message(
     } else {
         Color32::from_rgb(16, 145, 110)
     };
+    let content_width = (ui.available_width() - 26.0 - 6.0 - ui.spacing().item_spacing.x).max(1.0);
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(egui::vec2(26.0, 26.0), egui::Sense::hover());
         ui.painter().circle_filled(rect.center(), 13.0, color);
@@ -707,6 +728,7 @@ fn qa_message(
         );
         ui.add_space(6.0);
         ui.vertical(|ui| {
+            ui.set_width(content_width);
             ui.strong(tr(lang, if user { "deep_user" } else { "deep_assistant" }));
             if user {
                 ui.add(egui::Label::new(&message.content).wrap());
@@ -755,10 +777,14 @@ fn pr_agent_card(
                 });
         }
         let pending = app.deep_pr_pending.is_some();
+        let deep_running = app.deep_run_active_for_current();
+        let cancelling = app.deep_pr_pending.is_some_and(|request_id| {
+            app.deep_assist_cancelling.contains(&request_id)
+        });
         let input_id = egui::Id::unique("deep-pr-question");
         let enter_send = enter_submit(ui, input_id);
         ui.add_enabled(
-            !pending,
+            !pending && !deep_running,
             egui::TextEdit::multiline(&mut app.deep_pr_question)
                 .id(input_id)
                 .hint_text(tr(lang, "deep_pr_question_placeholder"))
@@ -770,13 +796,22 @@ fn pr_agent_card(
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new());
                 ui.weak(tr(lang, "deep_pr_pending"));
+                if ui
+                    .add_enabled(
+                        !cancelling,
+                        egui::Button::new(tr(lang, if cancelling { "deep_cancelling" } else { "deep_cancel" })),
+                    )
+                    .clicked()
+                {
+                    app.cancel_deep_pr_assist();
+                }
             });
         }
         if !app.deep_pr_error.is_empty() {
             let error = app.deep_pr_error.clone();
             ui.colored_label(kind_color(LineKind::Del, ui.visuals().dark_mode), error);
         }
-        let can_ask = !pending && !app.deep_pr_question.trim().is_empty();
+        let can_ask = !pending && !deep_running && !app.deep_pr_question.trim().is_empty();
         if (ui
             .add_enabled(can_ask, egui::Button::new(tr(lang, "deep_ask_pr")))
             .clicked()
@@ -828,6 +863,7 @@ fn readonly_diff(ui: &mut Ui, text: &str, expanded: bool) {
 
 fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, lang: &str) {
     let theme = app.app.lock_recover().cfg.theme.clone();
+    let deep_running = app.deep_run_active_for_current();
     crate::theme::card_frame(ui, &theme).show(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             ui.colored_label(
@@ -851,8 +887,18 @@ fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, 
                     },
                 ));
             }
-            if ui.button(tr(lang, "deep_restore")).clicked() {
+            let pending = app.deep_editors.get(&finding.id).and_then(|editor| editor.pending);
+            if ui
+                .add_enabled(pending.is_none() && !deep_running, egui::Button::new(tr(lang, "deep_restore")))
+                .clicked()
+            {
                 app.discard_deep_finding(finding.id);
+            }
+            if pending.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add(egui::Spinner::new());
+                    ui.weak(tr(lang, "deep_pending_discard"));
+                });
             }
             return;
         }
@@ -890,6 +936,7 @@ fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, 
             return;
         };
         let pending = editor.pending.map(|(action, _)| action);
+        let pending_request = editor.pending.map(|(_, request_id)| request_id);
         ui.add_enabled(
             pending.is_none(),
             egui::TextEdit::multiline(&mut editor.draft)
@@ -902,10 +949,12 @@ fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, 
         let mut discard = false;
         let mut rewrite = None;
         ui.horizontal_wrapped(|ui| {
-            save = ui.add_enabled(pending.is_none(), egui::Button::new(tr(lang, "deep_save"))).clicked();
+            save = ui
+                .add_enabled(pending.is_none() && !deep_running, egui::Button::new(tr(lang, "deep_save")))
+                .clicked();
             copy = ui.button(tr(lang, "deep_copy")).clicked();
             discard = ui
-                .add_enabled(pending.is_none(), egui::Button::new(tr(lang, "deep_discard")))
+                .add_enabled(pending.is_none() && !deep_running, egui::Button::new(tr(lang, "deep_discard")))
                 .clicked();
         });
         ui.horizontal_wrapped(|ui| {
@@ -916,7 +965,7 @@ fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, 
                 ("direct", "deep_direct"),
             ] {
                 if ui
-                    .add_enabled(pending.is_none(), egui::Button::new(tr(lang, key)))
+                    .add_enabled(pending.is_none() && !deep_running, egui::Button::new(tr(lang, key)))
                     .clicked()
                 {
                     rewrite = Some(style);
@@ -924,16 +973,30 @@ fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, 
             }
         });
         if let Some(action) = pending {
+            let cancelling = pending_request.is_some_and(|request_id| {
+                app.deep_assist_cancelling.contains(&request_id)
+            });
             ui.horizontal(|ui| {
                 ui.add(egui::Spinner::new());
                 ui.weak(tr(
                     lang,
-                    if action == DeepAction::Ask {
-                        "deep_pending_ask"
-                    } else {
-                        "deep_pending_rewrite"
+                    match action {
+                        DeepAction::Ask => "deep_pending_ask",
+                        DeepAction::Rewrite => "deep_pending_rewrite",
+                        DeepAction::Save => "deep_pending_save",
+                        DeepAction::Discard | DeepAction::Run => "deep_pending_discard",
                     },
                 ));
+                if matches!(action, DeepAction::Rewrite | DeepAction::Ask)
+                    && ui
+                        .add_enabled(
+                            !cancelling,
+                            egui::Button::new(tr(lang, if cancelling { "deep_cancelling" } else { "deep_cancel" })),
+                        )
+                        .clicked()
+                {
+                    app.cancel_deep_finding_assist(finding.id);
+                }
             });
         }
         if !editor.error.is_empty() {
@@ -956,7 +1019,8 @@ fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, 
                 }
                 let input_id = egui::Id::unique(("deep-question", finding.id));
                 enter_ask = enter_submit(ui, input_id);
-                ui.add(
+                ui.add_enabled(
+                    pending.is_none() && !deep_running,
                     egui::TextEdit::multiline(&mut editor.question)
                         .id(input_id)
                         .hint_text(tr(lang, "deep_ask_placeholder"))
@@ -965,7 +1029,7 @@ fn deep_finding_card(app: &mut EguiApp, ui: &mut Ui, finding: &DeepFindingData, 
                 );
                 ui.weak(tr(lang, "deep_enter_hint"));
             });
-        let can_ask = pending.is_none() && !editor.question.trim().is_empty();
+        let can_ask = pending.is_none() && !deep_running && !editor.question.trim().is_empty();
         let ask = (ui
             .add_enabled(can_ask, egui::Button::new(tr(lang, "deep_ask")))
             .on_hover_text(tr(lang, "deep_ask_about"))

@@ -14,7 +14,6 @@ const MAX_METADATA_CHARS: usize = 4_000;
 const MAX_PR_BODY_CHARS: usize = 12_000;
 const MAX_PR_DIFF_FILES: usize = 80;
 const MAX_PR_DIFF_CHARS: usize = 120_000;
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DeepWorkspaceData {
     pub repo: String,
@@ -30,6 +29,8 @@ pub struct DeepWorkspaceData {
     pub diff: String,
     #[serde(default)]
     pub qa: Vec<DeepQaMessage>,
+    #[serde(default)]
+    pub agent_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

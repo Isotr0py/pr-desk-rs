@@ -254,16 +254,40 @@ fn normalize_row_ts(row: &mut Value, fields: &[&str]) {
     }
 }
 
-/// 应用 pull 响应到本地。返回 (prs, reviews, todos) 行数。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PullSummary {
+    pub pr_count: usize,
+    pub review_count: usize,
+    pub todo_count: usize,
+    pub new_pr_keys: Vec<(String, i64)>,
+}
+
+/// 应用 pull 响应到本地，并返回本次事务真正新插入的 PR 键。
 /// prs 行注入 source="server"：标记为服务器插件数据库跟踪的 PR（列表按来源过滤）。
 /// 整批 upsert 包在一个事务里：否则每行一次隐式提交（WAL fsync），首次全量拉时
 /// 调用方持有的全局锁会被占住几十秒乃至分钟级，UI 全程无响应（曾表现为卡死）。
-pub fn apply_pull(db: &Db, body: &Value) -> Result<(usize, usize, usize)> {
+pub fn apply_pull(db: &Db, body: &Value) -> Result<PullSummary> {
     let prs = body["prs"].as_array().cloned().unwrap_or_default();
     let reviews = body["reviews"].as_array().cloned().unwrap_or_default();
     let todos = body["todos"].as_array().cloned().unwrap_or_default();
+    let keys: Vec<(String, i64)> = prs
+        .iter()
+        .map(|p| {
+            (
+                p["repo"].as_str().unwrap_or("").to_string(),
+                p["number"].as_i64().unwrap_or(0),
+            )
+        })
+        .collect();
     db.conn.execute_batch("BEGIN IMMEDIATE")?;
-    let applied = (|| -> Result<()> {
+    let applied = (|| -> Result<Vec<(String, i64)>> {
+        let existing = db.existing_pr_keys(&keys)?;
+        let mut seen = std::collections::HashSet::new();
+        let new_pr_keys = keys
+            .iter()
+            .filter(|key| !existing.contains(key) && seen.insert((*key).clone()))
+            .cloned()
+            .collect();
         for p in &prs {
             let mut p = p.clone();
             p["source"] = Value::from("server");
@@ -285,12 +309,17 @@ pub fn apply_pull(db: &Db, body: &Value) -> Result<(usize, usize, usize)> {
         if let Some(ts) = body["server_time"].as_str() {
             db.set_cursor(ts)?;
         }
-        Ok(())
+        Ok(new_pr_keys)
     })();
     match applied {
-        Ok(()) => {
+        Ok(new_pr_keys) => {
             db.conn.execute_batch("COMMIT")?;
-            Ok((prs.len(), reviews.len(), todos.len()))
+            Ok(PullSummary {
+                pr_count: prs.len(),
+                review_count: reviews.len(),
+                todo_count: todos.len(),
+                new_pr_keys,
+            })
         }
         Err(e) => {
             let _ = db.conn.execute_batch("ROLLBACK");
@@ -471,19 +500,37 @@ mod tests {
     #[test]
     fn apply_pull_upserts() {
         let db = Db::open_memory().unwrap();
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "prs": [{"repo": "o/r", "number": 1, "title": "t", "status": "pending"}],
             "reviews": [{"repo": "o/r", "number": 1, "head_sha": "s", "score": 8.5, "reviewed_at": "t"}],
             "todos": [{"id": 1, "text": "x", "done": 0, "priority": 0, "updated_at": "t"}],
             "server_time": "2026-01-01T00:00:00",
         });
-        let (p, r, t) = apply_pull(&db, &body).unwrap();
-        assert_eq!((p, r, t), (1, 1, 1));
+        let summary = apply_pull(&db, &body).unwrap();
+        assert_eq!((summary.pr_count, summary.review_count, summary.todo_count), (1, 1, 1));
+        assert_eq!(summary.new_pr_keys, vec![("o/r".to_string(), 1)]);
         assert_eq!(db.get_cursor().unwrap().as_deref(), Some("2026-01-01T00:00:00"));
         let rows = db.list_prs(&[]).unwrap();
         assert_eq!(rows.len(), 1);
         // pull 下来的行标记为 server 来源（sync 模式列表过滤依据）
         assert_eq!(rows[0]["source"], "server");
+        assert!(apply_pull(&db, &body).unwrap().new_pr_keys.is_empty());
+        body["prs"][0]["head_sha"] = Value::from("new-head");
+        assert!(apply_pull(&db, &body).unwrap().new_pr_keys.is_empty());
+    }
+
+    #[test]
+    fn apply_pull_deduplicates_new_keys_within_batch() {
+        let db = Db::open_memory().unwrap();
+        let body = serde_json::json!({
+            "prs": [
+                {"repo": "o/r", "number": 1, "title": "first"},
+                {"repo": "o/r", "number": 1, "title": "second"}
+            ]
+        });
+        let summary = apply_pull(&db, &body).unwrap();
+        assert_eq!(summary.pr_count, 2);
+        assert_eq!(summary.new_pr_keys, vec![("o/r".to_string(), 1)]);
     }
 
     #[test]
