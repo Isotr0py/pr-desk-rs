@@ -2,11 +2,8 @@
 
 A high-density GitHub PR pre-review workbench for the desktop (Rust + egui).
 
-> **NOTE**: the UI layer is being rewritten from Slint to egui/eframe on this
-> branch. The egui version is currently a skeleton: PR list + detail panel
-> (review + diff) + refresh + search + theme toggle. Inbox, settings page,
-> multi-select/batch actions, review triggers and tray are not yet ported
-> (see `TODO(egui):` markers in `src/main.rs`).
+The desktop UI uses egui/eframe and includes PR management, review, inbox,
+settings, batch actions, and tray integration.
 
 Pairs with the AstrBot plugin
 [`astrbot_plugin_github_pr_review`](../astrbot_plugin_github_pr_review):
@@ -25,25 +22,17 @@ plugin over its sync API (pins / priorities / board / tags / todos).
   with avatars, org icons, review scores, CI state, size and +/- columns
 - Excel-style column sorting, high-score quick filter, `/` search
 - Detail panel with tabs: Review (dimension scores, summary, flagged files,
-  line-level comments), Conversation, Checks, Files/Diff, and Deep Review
+  line-level comments), Conversation, Checks, Files/Diff, and an embedded Kimi
+  CLI session
 - Diff viewer with real line numbers (parsed from hunk headers), per-file
-  collapse, and GitHub-style whole-table horizontal scrolling
-- One-click LLM pre-review with concurrency slots and live progress;
-  copy the review report as Markdown
-- On-demand Deep Review turns OCR findings into editable suggested-comment
-  drafts with code/diff evidence, rewrite styles, drop/restore, and finding-level
-  agent Q&A. `Ask about this PR` separately answers whole-PR questions using the
-  description, full saved diff, findings, and PR-level conversation history.
-  Both agent inputs wrap long questions (`Enter` sends, `Shift+Enter` inserts a
-  newline), and user/agent messages have distinct avatar roles.
-  `Refresh findings` reruns analysis with PR/finding discussion context and
-  conservatively merges results: edited drafts and Q&A survive, missing findings
-  move to a resolved group, and manually dropped findings stay dropped.
-  Workspaces and drafts persist locally per head SHA; GitHub stays read-only,
-  so comments are copied for manual publication instead of sent.
-  OCR stage logs stream into the detail panel with elapsed time and a cancel
-  action that terminates the child process instead of waiting for the 30-minute
-  timeout
+  collapse, compact variable-height files, and GitHub-style horizontal scrolling
+- One-click LLM pre-review with concurrency slots, live progress and cancellation;
+  optionally run pre-review automatically when a PR is added
+- Embedded Kimi CLI provides the full terminal experience, including plugins,
+  slash commands and session resume. Each PR receives a persistent complete Git
+  worktree with base/head history, the PR description and diff, so reviews are
+  not limited to the changed hunks. The workspace root is configurable, and the
+  terminal follows the app's light/dark and Glass themes.
 
 **Inbox**
 
@@ -82,8 +71,11 @@ scripts/build-release.sh   # = CARGO_INCREMENTAL=0 cargo build --release -j2
 
 Runtime requirements:
 
-- `git` on PATH — local pre-review (line-level comments) rebuilds the PR's
-  base/head commits in a temp dir (see `src/ocr.rs`)
+- `git` on PATH — local pre-review and Kimi sessions use a persistent PR
+  worktree containing the base/head commits and their history (see `src/ocr.rs`)
+- An installed, signed-in `kimi` CLI — required only for the embedded terminal;
+  configure a custom executable with `kimi_cli_path` and a durable workspace
+  location with `kimi_workspace_root`
 - `bin/ocr.exe` (open-code-review CLI, bundled sidecar) — the line-comment
   review engine. Lookup order: `ocr_path` config (when non-default) →
   `bin/ocr.exe` next to the exe → `bin/ocr.exe` in the working directory →
@@ -141,9 +133,9 @@ Coverage includes: sync merge semantics (server-wins / applied not
 overwritten / outbox merge / pull upsert), idempotent local upserts,
 cursor/outbox/diff cache, diff parsing (hunk line numbers, file splitting),
 config round-trip (escapes, inline comments, atomic writes), review-comment
-preservation on re-review, Deep Review draft revision conflicts and per-SHA
-persistence, finding rewrite/Q&A tasks, and UI-side identity guards against
-stale async deliveries.
+preservation on re-review, legacy database compatibility, automatic pre-review
+queueing, persistent Kimi workspace paths, real terminal I/O, and UI-side
+identity guards against stale async deliveries.
 
 ## Roadmap
 

@@ -1,7 +1,7 @@
 //! 本地预评审引擎：open-code-review（ocr CLI）。
 //!
-//! 流程：用 GitHub API 按需重建临时 git 仓库（base / head 两个 commit）
-//! → `ocr review --commit HEAD --format json` → 解析 JSON 拿行级评论。
+//! 流程：按 PR base/head 准备可复用的完整 Git 工作树
+//! → `ocr review --from <base> --to <head> --format json` → 解析 JSON 拿行级评论。
 //! 评分仍由 reviewer.rs 的 LLM 调用负责，本模块只产出行级评论。
 //! LLM 配置不落 ocr 全局配置：在临时目录写 config.json，子进程用
 //! 环境变量 OCR_CONFIG_PATH 指向它（未配置 LLM 时不设，ocr 用自家全局配置）。
@@ -22,17 +22,11 @@ use crate::config::Config;
 use crate::github::GitHub;
 use crate::reviewer::{self, LlmSettings};
 
-#[path = "review_delegate.rs"]
-pub mod review_delegate;
-
 /// ocr 子进程总超时（超时 kill 后报错）。
 const OCR_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// --background 注入的 PR 标题+正文截断长度。
 const BACKGROUND_MAX_CHARS: usize = 2000;
-
-/// 重建临时仓库时拉取文件内容的并发度（GitHub API 友好上限）。
-const FETCH_CONCURRENCY: usize = 8;
 
 /// 单次 ocr 评审结果：行级评论（原样保留 ocr schema）+ 已评审文件数 + 状态。
 #[derive(Debug)]
@@ -42,88 +36,161 @@ pub struct OcrRunOutcome {
     pub status: String,
 }
 
-/// 临时目录守卫：Drop 时整树删除（成功/失败/超时都清理）。
-struct TempDir(PathBuf);
+struct StagingDir {
+    path: PathBuf,
+    publish: bool,
+}
 
-impl TempDir {
-    fn new() -> Result<Self> {
+impl StagingDir {
+    fn new(root: &Path) -> Result<Self> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let uniq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "prdesk-ocr-{}-{nanos:x}-{uniq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&path).context("创建临时仓库目录失败")?;
-        Ok(Self(path))
+        let path = root.join(format!(".staging-{}-{nanos:x}-{uniq}", std::process::id()));
+        std::fs::create_dir_all(&path).context("创建评审工作区 staging 失败")?;
+        Ok(Self {
+            path,
+            publish: false,
+        })
     }
 }
 
-impl Drop for TempDir {
+impl Drop for StagingDir {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        if !self.publish {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
     }
 }
 
-/// 普通 OCR 与 delegate 共用的 base/head 临时 git 仓库；guard 存活期间目录有效。
+#[derive(Clone)]
+struct ContextIdentity {
+    repo: String,
+    number: i64,
+    base_sha: String,
+    head_sha: String,
+    base_repo: String,
+    head_repo: String,
+}
+
+impl ContextIdentity {
+    fn manifest(&self) -> Value {
+        serde_json::json!({
+            "version": 2,
+            "ready": true,
+            "repo": self.repo,
+            "number": self.number,
+            "base_sha": self.base_sha,
+            "head_sha": self.head_sha,
+            "base_repo": self.base_repo,
+            "head_repo": self.head_repo,
+        })
+    }
+}
+
+pub fn context_dir_for(
+    repo: &str,
+    number: i64,
+    base_sha: &str,
+    head_sha: &str,
+    root: &Path,
+) -> PathBuf {
+    use sha2::Digest as _;
+    let identity = format!("{repo}#{number}@{base_sha}..{head_sha}");
+    let hash = format!("{:x}", sha2::Sha256::digest(identity.as_bytes()));
+    root.join(format!("pr-desk-acp-context-v2-{}", &hash[..16]))
+}
+
+pub fn context_manifest_matches(
+    repo: &str,
+    number: i64,
+    base_sha: &str,
+    head_sha: &str,
+    root: &Path,
+) -> bool {
+    let Ok(text) = std::fs::read_to_string(root.join("context.json")) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    value["version"].as_i64() == Some(2)
+        && value["ready"].as_bool() == Some(true)
+        && value["repo"].as_str() == Some(repo)
+        && value["number"].as_i64() == Some(number)
+        && value["base_sha"].as_str() == Some(base_sha)
+        && value["head_sha"].as_str() == Some(head_sha)
+}
+
+/// 普通 OCR 与内嵌 Kimi CLI 共用的持久 Git 工作树。
+#[derive(Debug)]
 pub struct OcrGitSnapshot {
-    _temp_dir: TempDir,
+    path: PathBuf,
+    base_sha: String,
     head_sha: String,
 }
 
 impl OcrGitSnapshot {
     pub fn path(&self) -> &Path {
-        &self._temp_dir.0
+        &self.path
     }
 
-    /// 临时仓库中 head commit 的 SHA，不是 GitHub PR 的原始 head SHA。
+    pub fn base_sha(&self) -> &str {
+        &self.base_sha
+    }
+
     pub fn head_sha(&self) -> &str {
         &self.head_sha
     }
+
+    pub fn context_root(&self) -> &Path {
+        self.path.parent().unwrap_or(&self.path)
+    }
 }
 
-/// 拼接临时仓库内的文件路径；含 `..` / 盘符 / 反斜杠等可疑成分的拒绝（防逃逸）。
-fn safe_join(root: &Path, rel: &str) -> Option<PathBuf> {
-    if rel.is_empty() || rel.starts_with('/') {
-        return None;
-    }
-    let mut p = root.to_path_buf();
-    for comp in rel.split('/') {
-        if comp.is_empty() || comp == "." || comp == ".." || comp.contains('\\') || comp.contains(':') {
-            return None;
-        }
-        p.push(comp);
-    }
-    Some(p)
-}
-
-/// 写文件到临时仓库，保持目录结构。
-fn write_file(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
-    let Some(path) = safe_join(root, rel) else {
-        tracing::warn!("跳过可疑路径 {rel}");
-        return Ok(());
+async fn valid_context(path: &Path, identity: &ContextIdentity) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return false;
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
     }
-    std::fs::write(&path, bytes)?;
-    Ok(())
-}
-
-/// 从 diff chunk 头部判断文件状态：added / deleted / modified。
-fn file_status(chunk: &str) -> &'static str {
-    for line in chunk.lines().take(10) {
-        if line.starts_with("new file mode") {
-            return "added";
-        }
-        if line.starts_with("deleted file mode") {
-            return "deleted";
+    let Ok(manifest) = std::fs::read_to_string(path.join("context.json")) else {
+        return false;
+    };
+    let Ok(actual) = serde_json::from_str::<Value>(&manifest) else {
+        return false;
+    };
+    if actual != identity.manifest() || !path.join("worktree/.git").exists() {
+        return false;
+    }
+    let worktree = path.join("worktree");
+    let Ok(head) = git_output(&worktree, &["rev-parse", "HEAD"]).await else {
+        return false;
+    };
+    if String::from_utf8_lossy(&head.stdout).trim() != identity.head_sha {
+        return false;
+    }
+    for (reference, expected) in [
+        ("refs/heads/base", &identity.base_sha),
+        ("refs/heads/head", &identity.head_sha),
+    ] {
+        let Ok(output) = git_output(&worktree, &["rev-parse", reference]).await else {
+            return false;
+        };
+        if String::from_utf8_lossy(&output.stdout).trim() != expected {
+            return false;
         }
     }
-    "modified"
+    if git_output(&worktree, &["diff", "--quiet"]).await.is_err() {
+        return false;
+    }
+    git_output(&worktree, &["merge-base", "base", "head"])
+        .await
+        .is_ok_and(|output| !output.stdout.is_empty())
 }
 
 /// 在临时仓库里跑 git（失败带 stderr 尾部报错）。
@@ -136,7 +203,14 @@ async fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output> 
         .context("启动 git 失败")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let tail: String = stderr.chars().rev().take(300).collect::<String>().chars().rev().collect();
+        let tail: String = stderr
+            .chars()
+            .rev()
+            .take(300)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         anyhow::bail!("git {:?} 失败：{}", args, tail.trim());
     }
     Ok(out)
@@ -144,31 +218,6 @@ async fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output> 
 
 async fn git(repo: &Path, args: &[&str]) -> Result<()> {
     git_output(repo, args).await.map(|_| ())
-}
-
-async fn git_head_sha(repo: &Path) -> Result<String> {
-    let out = git_output(repo, &["rev-parse", "HEAD"]).await?;
-    let sha = String::from_utf8(out.stdout).context("git rev-parse HEAD 输出不是 UTF-8")?;
-    let sha = sha.trim();
-    anyhow::ensure!(!sha.is_empty(), "git rev-parse HEAD 返回空 SHA");
-    Ok(sha.to_string())
-}
-
-async fn git_commit_all(repo: &Path, message: &str) -> Result<()> {
-    git(
-        repo,
-        &["-c", "user.email=prdesk@local", "-c", "user.name=prdesk", "add", "-A"],
-    )
-    .await?;
-    // --allow-empty：base 侧可能全是新增文件（无任何 base 内容可写）
-    git(
-        repo,
-        &[
-            "-c", "user.email=prdesk@local", "-c", "user.name=prdesk", "commit", "--quiet",
-            "--allow-empty", "-m", message,
-        ],
-    )
-    .await
 }
 
 /// 解析 ocr 的 result.json：status=failed 报错；comments 原样收集；
@@ -181,7 +230,10 @@ pub fn parse_ocr_result(text: &str, lang: &str) -> Result<OcrRunOutcome> {
     let status = data["status"].as_str().unwrap_or("").to_string();
     if status == "failed" {
         let msg = data["error"].as_str().unwrap_or("");
-        anyhow::bail!("{}", crate::i18n::trf(lang, "err_ocr_failed_status", &[msg]));
+        anyhow::bail!(
+            "{}",
+            crate::i18n::trf(lang, "err_ocr_failed_status", &[msg])
+        );
     }
     // complete / partial / success（及未知非 failed 状态）都算可用
     let comments = data["comments"].as_array().cloned().unwrap_or_default();
@@ -228,28 +280,6 @@ pub fn resolve_ocr_path(cfg: &Config) -> PathBuf {
     resolve_ocr_path_in(&cfg.ocr_path, exe_dir.as_deref(), &cwd)
 }
 
-/// 并发拉取一批文件内容（调用方按 FETCH_CONCURRENCY 分批；任一任务出错整体报错）。
-async fn fetch_files_chunk(
-    gh: &GitHub,
-    repo: &str,
-    git_ref: &str,
-    paths: &[String],
-) -> Result<Vec<(String, Option<Vec<u8>>)>> {
-    let mut set = tokio::task::JoinSet::new();
-    for path in paths {
-        let gh = gh.clone();
-        let repo = repo.to_string();
-        let path = path.clone();
-        let git_ref = git_ref.to_string();
-        set.spawn(async move { gh.fetch_file_content(&repo, &path, &git_ref).await.map(|b| (path, b)) });
-    }
-    let mut out = Vec::with_capacity(paths.len());
-    while let Some(res) = set.join_next().await {
-        out.push(res.context("抓取文件任务 panic")??);
-    }
-    Ok(out)
-}
-
 fn check_cancel(cancel: Option<&Arc<AtomicBool>>, lang: &str) -> Result<()> {
     if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
         anyhow::bail!("{}", crate::i18n::tr(lang, "err_ocr_cancelled"));
@@ -277,16 +307,16 @@ async fn run_streaming_process(
     let mut child = cmd
         .spawn()
         .context(trf(lang, "err_ocr_spawn", &[&program]))?;
-    let stderr = child
-        .stderr
-        .take()
-        .context(tr(lang, "err_ocr_no_stderr"))?;
+    let stderr = child.stderr.take().context(tr(lang, "err_ocr_no_stderr"))?;
     let mut lines = BufReader::new(stderr).lines();
     let mut tail = VecDeque::<String>::new();
     let deadline = tokio::time::Instant::now() + OCR_TIMEOUT;
+    let mut exit_status = None;
     let status = loop {
         tokio::select! {
-            status = child.wait() => break status.context(tr(lang, "err_ocr_wait"))?,
+            status = child.wait(), if exit_status.is_none() => {
+                exit_status = Some(status.context(tr(lang, "err_ocr_wait"))?);
+            }
             line = lines.next_line() => {
                 match line {
                     Ok(Some(line)) => {
@@ -298,7 +328,12 @@ async fn run_streaming_process(
                             progress(format!("OCR · {text}"));
                         }
                     }
-                    Ok(None) => break child.wait().await.context(tr(lang, "err_ocr_wait"))?,
+                    Ok(None) => {
+                        break match exit_status {
+                            Some(status) => status,
+                            None => child.wait().await.context(tr(lang, "err_ocr_wait"))?,
+                        };
+                    }
                     Err(e) => {
                         let _ = child.kill().await;
                         let _ = child.wait().await;
@@ -322,9 +357,19 @@ async fn run_streaming_process(
     };
     if !status.success() {
         let detail = tail.into_iter().collect::<Vec<_>>().join("\n");
-        let detail = detail.chars().rev().take(500).collect::<String>().chars().rev().collect::<String>();
+        let detail = detail
+            .chars()
+            .rev()
+            .take(500)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
         match status.code() {
-            Some(code) => anyhow::bail!("{}", trf(lang, "err_ocr_exit", &[&code.to_string(), detail.trim()])),
+            Some(code) => anyhow::bail!(
+                "{}",
+                trf(lang, "err_ocr_exit", &[&code.to_string(), detail.trim()])
+            ),
             None => anyhow::bail!("{}", trf(lang, "err_ocr_terminated", &[detail.trim()])),
         }
     }
@@ -348,79 +393,140 @@ pub async fn run_ocr_review(
     run_ocr_review_with_diff(cfg, gh, repo, meta, &diff, progress, lang, None, None).await
 }
 
-/// 按固定 diff 重建 base/head 两个 commit，供普通 OCR 与 delegate 共用。
+fn git_repository_url(repository: &str) -> String {
+    if repository.starts_with("file://") {
+        repository.to_string()
+    } else {
+        format!("https://github.com/{repository}.git")
+    }
+}
+
 pub async fn build_ocr_git_snapshot(
-    gh: &GitHub,
+    _gh: &GitHub,
     repo: &str,
     meta: &Value,
     diff: &str,
+    root: &Path,
     progress: &mut (dyn FnMut(String) + Send),
     lang: &str,
     cancel: Option<Arc<AtomicBool>>,
 ) -> Result<OcrGitSnapshot> {
-    use crate::i18n::{tr, trf};
+    use crate::i18n::tr;
     let base_sha = meta["base"]["sha"].as_str().unwrap_or("").to_string();
     let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
     if base_sha.is_empty() || head_sha.is_empty() {
         anyhow::bail!("{}", tr(lang, "err_missing_sha"));
     }
-
-    check_cancel(cancel.as_ref(), lang)?;
-    progress(tr(lang, "prog_create_repo").into());
-    let tmp = TempDir::new()?;
-    git(&tmp.0, &["init", "--quiet"]).await?;
-
-    let files = reviewer::split_diff_files(diff);
-    if files.is_empty() {
+    if reviewer::split_diff_files(diff).is_empty() {
         anyhow::bail!("{}", tr(lang, "err_empty_diff"));
     }
-    let total = files.len();
+    let base_repo = meta["base"]["repo"]["full_name"]
+        .as_str()
+        .unwrap_or(repo)
+        .to_string();
+    let head_repo = meta["head"]["repo"]["full_name"]
+        .as_str()
+        .unwrap_or(&base_repo)
+        .to_string();
+    let identity = ContextIdentity {
+        repo: repo.to_string(),
+        number: meta["number"].as_i64().unwrap_or(0),
+        base_sha: base_sha.clone(),
+        head_sha: head_sha.clone(),
+        base_repo,
+        head_repo,
+    };
+    let final_path = context_dir_for(repo, identity.number, &base_sha, &head_sha, root);
+    let snapshot = |path: PathBuf| OcrGitSnapshot {
+        path: path.join("worktree"),
+        base_sha: base_sha.clone(),
+        head_sha: head_sha.clone(),
+    };
+    if valid_context(&final_path, &identity).await {
+        return Ok(snapshot(final_path));
+    }
+    if std::fs::symlink_metadata(&final_path).is_ok() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let backup =
+            final_path.with_extension(format!("incomplete-{}-{nanos}", std::process::id()));
+        std::fs::rename(&final_path, &backup).context("备份未完成的评审工作区失败")?;
+    }
 
-    // 第一个 commit：base 版本（新增文件在 base 侧 404 → None → 跳过；
-    // 二进制/超大文件两边都跳过，ocr 反正会排除）。分批并发拉取（批内 8 并发）。
-    let mut done = 0usize;
-    for chunk in files.chunks(FETCH_CONCURRENCY) {
-        check_cancel(cancel.as_ref(), lang)?;
-        let paths: Vec<String> = chunk.iter().map(|(p, _)| p.clone()).collect();
-        for (path, bytes) in fetch_files_chunk(gh, repo, &base_sha, &paths).await? {
-            done += 1;
-            progress(trf(lang, "prog_rebuild_base", &[&done.to_string(), &total.to_string()]));
-            if let Some(bytes) = bytes {
-                write_file(&tmp.0, &path, &bytes)?;
-            }
-        }
-    }
-    git_commit_all(&tmp.0, "base").await?;
+    check_cancel(cancel.as_ref(), lang)?;
+    std::fs::create_dir_all(root)?;
+    progress(if lang == "en" {
+        "Preparing the full Git worktree…".into()
+    } else {
+        "正在准备完整 Git 工作区…".into()
+    });
+    let mut staging = StagingDir::new(root)?;
+    let worktree = staging.path.join("worktree");
+    std::fs::create_dir_all(&worktree)?;
+    git(&worktree, &["init", "--quiet"]).await?;
+    git(&worktree, &["config", "core.longpaths", "true"]).await?;
 
-    // 第二个 commit：head 版本（新增/修改写 head 内容；被删文件从磁盘移除，不占并发额度）。
-    let mut to_fetch: Vec<String> = Vec::new();
-    for (path, chunk) in &files {
-        if file_status(chunk) == "deleted" {
-            if let Some(p) = safe_join(&tmp.0, path) {
-                let _ = std::fs::remove_file(p);
-            }
-            done += 1;
-            progress(trf(lang, "prog_rebuild_head", &[&done.to_string(), &total.to_string()]));
-        } else {
-            to_fetch.push(path.clone());
-        }
-    }
-    for batch in to_fetch.chunks(FETCH_CONCURRENCY) {
+    for (reference, sha, repository) in [
+        ("base", &identity.base_sha, &identity.base_repo),
+        ("head", &identity.head_sha, &identity.head_repo),
+    ] {
         check_cancel(cancel.as_ref(), lang)?;
-        for (path, bytes) in fetch_files_chunk(gh, repo, &head_sha, batch).await? {
-            done += 1;
-            progress(trf(lang, "prog_rebuild_head", &[&done.to_string(), &total.to_string()]));
-            if let Some(bytes) = bytes {
-                write_file(&tmp.0, &path, &bytes)?;
-            }
+        let url = git_repository_url(repository);
+        let refspec = format!("{sha}:refs/heads/{reference}");
+        git(&worktree, &["fetch", "--depth=64", &url, &refspec]).await?;
+    }
+    if git_output(&worktree, &["merge-base", "base", "head"])
+        .await
+        .is_err()
+    {
+        for (sha, repository) in [
+            (&identity.base_sha, &identity.base_repo),
+            (&identity.head_sha, &identity.head_repo),
+        ] {
+            let url = git_repository_url(repository);
+            git(&worktree, &["fetch", "--deepen=256", &url, sha]).await?;
         }
     }
-    git_commit_all(&tmp.0, "head").await?;
-    let head_sha = git_head_sha(&tmp.0).await?;
-    Ok(OcrGitSnapshot { _temp_dir: tmp, head_sha })
+    if git_output(&worktree, &["merge-base", "base", "head"])
+        .await
+        .is_err()
+    {
+        for (sha, repository) in [
+            (&identity.base_sha, &identity.base_repo),
+            (&identity.head_sha, &identity.head_repo),
+        ] {
+            let url = git_repository_url(repository);
+            git(&worktree, &["fetch", &url, sha]).await?;
+        }
+    }
+    git_output(&worktree, &["merge-base", "base", "head"]).await?;
+    git(
+        &worktree,
+        &["checkout", "--quiet", "--detach", &identity.head_sha],
+    )
+    .await?;
+    std::fs::write(
+        staging.path.join("context.json"),
+        serde_json::to_vec_pretty(&identity.manifest())?,
+    )?;
+    anyhow::ensure!(
+        valid_context(&staging.path, &identity).await,
+        "完整 Git 工作区校验失败"
+    );
+
+    if let Err(error) = std::fs::rename(&staging.path, &final_path) {
+        if valid_context(&final_path, &identity).await {
+            return Ok(snapshot(final_path));
+        }
+        return Err(error).context("发布完整 Git 工作区失败");
+    }
+    staging.publish = true;
+    Ok(snapshot(final_path))
 }
 
-/// Deep Review 入口：OCR 与 Finding 证据共用调用方固定的同一份 Diff 快照。
+/// 使用调用方固定的同一份 Diff 快照运行 OCR。
 pub async fn run_ocr_review_with_diff(
     cfg: &Config,
     gh: &GitHub,
@@ -450,6 +556,7 @@ pub async fn run_ocr_review_with_diff(
         repo,
         meta,
         diff,
+        &cfg.kimi_workspace_root_path(),
         progress,
         lang,
         cancel.clone(),
@@ -464,14 +571,16 @@ pub async fn run_ocr_review_with_diff(
     cmd.arg("review")
         .arg("--repo")
         .arg(snapshot.path())
-        .arg("--commit")
-        .arg("HEAD")
+        .arg("--from")
+        .arg(snapshot.base_sha())
+        .arg("--to")
+        .arg(snapshot.head_sha())
         .arg("--format")
         .arg("json")
         .arg("--audience")
         .arg("human")
         .arg("--output")
-        .arg(snapshot.path().join("result.json"))
+        .arg(snapshot.context_root().join("result.json"))
         .arg("--background")
         .arg(&background)
         .current_dir(snapshot.path())
@@ -489,13 +598,16 @@ pub async fn run_ocr_review_with_diff(
     run_streaming_process(&mut cmd, lang, progress, cancel).await?;
 
     progress(tr(lang, "prog_parse_ocr").into());
-    let text = std::fs::read_to_string(snapshot.path().join("result.json"))
+    let text = std::fs::read_to_string(snapshot.context_root().join("result.json"))
         .context(tr(lang, "err_ocr_no_result"))?;
     let outcome = parse_ocr_result(&text, lang)?;
     progress(trf(
         lang,
         "ocr_done",
-        &[&outcome.comments.len().to_string(), &outcome.files_reviewed.to_string()],
+        &[
+            &outcome.comments.len().to_string(),
+            &outcome.files_reviewed.to_string(),
+        ],
     ));
     Ok(outcome)
 }
@@ -524,13 +636,20 @@ mod tests {
         // 原样保留 schema
         assert_eq!(out.comments[0]["path"].as_str(), Some("src/a.rs"));
         assert_eq!(out.comments[0]["start_line"].as_i64(), Some(10));
-        assert_eq!(out.comments[0]["suggestion_code"].as_str(), Some("x.checked_add(1)"));
+        assert_eq!(
+            out.comments[0]["suggestion_code"].as_str(),
+            Some("x.checked_add(1)")
+        );
         assert_eq!(out.comments[1]["severity"].as_str(), Some("low"));
     }
 
     #[test]
     fn parse_result_partial_and_success_ok() {
-        let out = parse_ocr_result(r#"{"status":"partial","comments":[],"summary":{"files_reviewed":2}}"#, "zh").unwrap();
+        let out = parse_ocr_result(
+            r#"{"status":"partial","comments":[],"summary":{"files_reviewed":2}}"#,
+            "zh",
+        )
+        .unwrap();
         assert_eq!(out.status, "partial");
         assert_eq!(out.files_reviewed, 2);
         assert!(out.comments.is_empty());
@@ -542,8 +661,11 @@ mod tests {
 
     #[test]
     fn parse_result_failed_errors() {
-        let e = parse_ocr_result(r#"{"status":"failed","error":"LLM 连接失败","comments":[]}"#, "zh")
-            .unwrap_err();
+        let e = parse_ocr_result(
+            r#"{"status":"failed","error":"LLM 连接失败","comments":[]}"#,
+            "zh",
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("failed"));
         assert!(e.to_string().contains("LLM 连接失败"));
     }
@@ -555,25 +677,6 @@ mod tests {
         assert!(parse_ocr_result("[1,2]", "zh").is_err()); // 非对象
     }
 
-    #[test]
-    fn file_status_detection() {
-        assert_eq!(file_status("diff --git a/x b/x\nnew file mode 100644\nindex 000..111\n"), "added");
-        assert_eq!(file_status("diff --git a/x b/x\ndeleted file mode 100644\nindex 111..000\n"), "deleted");
-        assert_eq!(file_status("diff --git a/x b/x\nindex 111..222 100644\n"), "modified");
-    }
-
-    #[test]
-    fn safe_join_rejects_escapes() {
-        let root = Path::new("/tmp/x");
-        assert!(safe_join(root, "src/a.rs").is_some());
-        assert!(safe_join(root, "../etc/passwd").is_none());
-        assert!(safe_join(root, "a/../../b").is_none());
-        assert!(safe_join(root, "C:/win").is_none());
-        assert!(safe_join(root, "a\\b").is_none());
-        assert!(safe_join(root, "/abs").is_none());
-        assert!(safe_join(root, "").is_none());
-    }
-
     /// 造一组临时目录：exe_dir、cwd、以及可选的 bin/ocr 候选文件。
     struct ResolveFixture {
         root: PathBuf,
@@ -583,10 +686,8 @@ mod tests {
 
     impl ResolveFixture {
         fn new(tag: &str) -> Self {
-            let root = std::env::temp_dir().join(format!(
-                "prdesk-ocr-resolve-{tag}-{}",
-                std::process::id()
-            ));
+            let root = std::env::temp_dir()
+                .join(format!("prdesk-ocr-resolve-{tag}-{}", std::process::id()));
             let exe_dir = root.join("exe");
             let cwd = root.join("cwd");
             std::fs::create_dir_all(&exe_dir).unwrap();
@@ -646,10 +747,7 @@ mod tests {
         // 裸名 ocr（非 Windows）也能命中
         std::fs::remove_file(fx.cwd.join("bin").join("ocr.exe")).unwrap();
         let bare = fx.touch(&fx.cwd, "ocr");
-        assert_eq!(
-            resolve_ocr_path_in("ocr", Some(&fx.exe_dir), &fx.cwd),
-            bare
-        );
+        assert_eq!(resolve_ocr_path_in("ocr", Some(&fx.exe_dir), &fx.cwd), bare);
     }
 
     #[test]
@@ -668,9 +766,15 @@ mod tests {
 
     #[test]
     fn progress_text_trims_and_bounds_lines() {
-        assert_eq!(ocr_progress_text("  file-a.rs  \r"), Some("file-a.rs".into()));
+        assert_eq!(
+            ocr_progress_text("  file-a.rs  \r"),
+            Some("file-a.rs".into())
+        );
         assert_eq!(ocr_progress_text(" \r\n"), None);
-        assert_eq!(ocr_progress_text(&"x".repeat(300)).unwrap().chars().count(), 240);
+        assert_eq!(
+            ocr_progress_text(&"x".repeat(300)).unwrap().chars().count(),
+            240
+        );
     }
 
     #[cfg(windows)]
@@ -709,5 +813,164 @@ mod tests {
             .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(err.to_string().contains("取消"));
+    }
+
+    fn test_git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn test_file_url(path: &Path) -> String {
+        let raw = path.canonicalize().unwrap();
+        let raw = raw.to_string_lossy();
+        let raw = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
+        let path = raw.replace('\\', "/");
+        if cfg!(windows) {
+            format!("file:///{path}")
+        } else {
+            format!("file://{path}")
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_a_complete_persistent_range_worktree() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("pr-desk-git-test-{}-{unique}", std::process::id()));
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        test_git(&seed, &["init", "--quiet"]);
+        std::fs::create_dir_all(seed.join("src")).unwrap();
+        std::fs::write(seed.join("src/lib.rs"), "fn changed() { 1 }\n").unwrap();
+        std::fs::write(seed.join("src/unchanged.rs"), "fn untouched() { 42 }\n").unwrap();
+        test_git(&seed, &["add", "."]);
+        test_git(
+            &seed,
+            &[
+                "-c",
+                "user.email=test@local",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--quiet",
+                "-m",
+                "base",
+            ],
+        );
+        let base_sha = test_git(&seed, &["rev-parse", "HEAD"]);
+        std::fs::write(seed.join("src/lib.rs"), "fn changed() { 2 }\n").unwrap();
+        test_git(&seed, &["add", "."]);
+        test_git(
+            &seed,
+            &[
+                "-c",
+                "user.email=test@local",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--quiet",
+                "-m",
+                "head",
+            ],
+        );
+        let head_sha = test_git(&seed, &["rev-parse", "HEAD"]);
+
+        test_git(&root, &["init", "--quiet", "--bare", "base.git"]);
+        test_git(&root, &["init", "--quiet", "--bare", "fork.git"]);
+        let base_url = test_file_url(&root.join("base.git"));
+        let head_url = test_file_url(&root.join("fork.git"));
+        test_git(&seed, &["remote", "add", "base", &base_url]);
+        test_git(&seed, &["remote", "add", "head", &head_url]);
+        test_git(&seed, &["push", "--quiet", "base", "main:main"]);
+        test_git(&seed, &["push", "--quiet", "head", "main:main"]);
+
+        let meta = serde_json::json!({
+            "number": 7,
+            "title": "test",
+            "body": "body",
+            "base": {"sha": base_sha, "repo": {"full_name": base_url}},
+            "head": {"sha": head_sha, "repo": {"full_name": head_url}},
+        });
+        let workspace_root = root.join("workspaces");
+        let gh = GitHub::new(None, "").unwrap();
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new";
+        let snapshot = build_ocr_git_snapshot(
+            &gh,
+            "owner/repo",
+            &meta,
+            diff,
+            &workspace_root,
+            &mut |_| {},
+            "zh",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(snapshot.path().join("src/unchanged.rs").is_file());
+        assert!(snapshot.path().join("src/lib.rs").is_file());
+        assert_eq!(test_git(snapshot.path(), &["rev-parse", "HEAD"]), head_sha);
+        assert_eq!(
+            test_git(snapshot.path(), &["diff", "--name-only", "base", "head"]),
+            "src/lib.rs"
+        );
+        drop(snapshot);
+
+        std::fs::remove_dir_all(root.join("base.git")).unwrap();
+        std::fs::remove_dir_all(root.join("fork.git")).unwrap();
+        build_ocr_git_snapshot(
+            &gh,
+            "owner/repo",
+            &meta,
+            diff,
+            &workspace_root,
+            &mut |_| {},
+            "zh",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let invalid_root = root.join("invalid");
+        let invalid_path = context_dir_for("owner/repo", 7, &base_sha, &head_sha, &invalid_root);
+        std::fs::create_dir_all(&invalid_root).unwrap();
+        std::fs::write(&invalid_path, b"not a directory").unwrap();
+        let error = build_ocr_git_snapshot(
+            &gh,
+            "owner/repo",
+            &meta,
+            diff,
+            &invalid_root,
+            &mut |_| {},
+            "zh",
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.to_string().is_empty());
+        let backups = std::fs::read_dir(&invalid_root)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().contains("incomplete-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0].is_file());
+        assert!(!invalid_path.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -1,13 +1,13 @@
 #!/bin/bash
 # 验证 2：真实键盘路径（PostMessage WM_KEYDOWN）+ 详情面板 tab 惰性加载
-source /d/Code/pr-desk-rs-egui/scripts/verify.sh "键盘+详情面板"
+source /d/Code/pr-desk-rs/scripts/verify.sh "键盘+详情面板"
 # 前置：确保窗口可见（桌面其它活动可能把窗口最小化/盖住——隐藏窗口不绘制、键鼠语义不同）
 : > "$CMD"
 echo "trayshow" > "$CMD"
 sleep 1
 
 # 真键盘：J/K 移动（PostMessage WM_KEYDOWN → winit → egui → hotkeys）
-pmkey() { powershell -ExecutionPolicy Bypass -File /d/Code/pr-desk-rs-egui/scripts/pmclick.ps1 -key "$1" >/dev/null; sleep 1.2; }
+pmkey() { powershell -ExecutionPolicy Bypass -File /d/Code/pr-desk-rs/scripts/pmclick.ps1 -key "$1" >/dev/null; sleep 1.2; }
 # 轮询等待状态条件（powershell 启动 ~2s + 处理延迟，固定 sleep 不可靠）
 wait_state() {  # wait_state <python-expr>
   for i in $(seq 1 25); do
@@ -52,10 +52,11 @@ assert "Files tab 打开" "d['panel_tab']==3"
 assert "Files tab：已解析文件数 >0" "d['diff_files']>0"
 shot "detail-files-tab"
 
-# Deep Review（独立工作区，不影响原 Files/Diff）
-cmd "tab 4"; sleep 1
-assert "Deep Review tab 打开" "d['panel_tab']==4 and 'deep_status' in d"
-shot "detail-deep-review-tab"
+# Kimi CLI（无需预先创建任何评审工作区）
+cmd "tab 4"
+wait_state "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False" || true
+assert "Kimi 会话 tab 打开并启动真实 CLI" "d['panel_tab']==4 and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_error')==''"
+shot "detail-kimi-terminal-tab"
 
 # 复制评审（无评审记录 → 不应崩；剪贴板不变即正确跳过）
 cmd "copyreview"

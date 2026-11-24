@@ -74,8 +74,7 @@ PR：#{{number}} {{title}}
 ";
 
 /// JSON 解析失败后的重试纠正消息（plugin_metadata.py RETRY_SUFFIX 文案移植）
-pub const RETRY_SUFFIX: &str =
-    "\n\n你上一次的回复无法被解析为 JSON。请严格只输出一个 JSON 对象，不要包含任何解释文字或 markdown 代码块标记。";
+pub const RETRY_SUFFIX: &str = "\n\n你上一次的回复无法被解析为 JSON。请严格只输出一个 JSON 对象，不要包含任何解释文字或 markdown 代码块标记。";
 
 /// LLM 评审使用的系统提示词（plugin_metadata.py DEFAULT_REVIEWER_PERSONA 原样移植）
 pub const DEFAULT_REVIEWER_PERSONA: &str = "\
@@ -243,7 +242,11 @@ pub fn filter_diff(
     }
     let diff_text: String = included.iter().map(|(_, c)| c.as_str()).collect();
     omitted.extend(skipped);
-    (diff_text, included.into_iter().map(|(p, _)| p).collect(), omitted)
+    (
+        diff_text,
+        included.into_iter().map(|(p, _)| p).collect(),
+        omitted,
+    )
 }
 
 /// 输出格式约定（自定义 prompt 模板时自动附加，保证 JSON 输出契约不被破坏）。
@@ -273,7 +276,12 @@ pub fn build_prompt(
 ) -> String {
     let mut notes: Vec<String> = Vec::new();
     if !omitted.is_empty() {
-        let mut shown = omitted.iter().take(20).cloned().collect::<Vec<_>>().join("、");
+        let mut shown = omitted
+            .iter()
+            .take(20)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("、");
         if omitted.len() > 20 {
             shown.push_str(" 等");
         }
@@ -425,22 +433,16 @@ async fn chat_completion_messages(llm: &LlmSettings, messages: Value) -> Result<
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("LLM API {status}: {}", text.chars().take(500).collect::<String>());
+        anyhow::bail!(
+            "LLM API {status}: {}",
+            text.chars().take(500).collect::<String>()
+        );
     }
     let data: Value = resp.json().await.context("LLM 响应不是 JSON")?;
     data["choices"][0]["message"]["content"]
         .as_str()
         .map(|s| s.to_string())
         .context("LLM 响应缺少 choices[0].message.content")
-}
-
-/// Deep Review 改写与 Finding 问答共用的单发文本补全。
-pub async fn complete_text(llm: &LlmSettings, system: &str, user: &str) -> Result<String> {
-    let messages = json!([
-        {"role": "system", "content": system},
-        {"role": "user", "content": user},
-    ]);
-    chat_completion_messages(llm, messages).await
 }
 
 /// 调用 OpenAI 兼容 chat/completions，返回 assistant 文本；重试时带上上一轮回复。
@@ -510,7 +512,11 @@ pub async fn run_review(
         "size_label": size_label,
     });
     let finish = |score: Value, dimensions: Value, summary: String, flagged_files: Value| {
-        let high_value = if score.as_f64().unwrap_or(0.0) >= 8.0 { 1 } else { 0 };
+        let high_value = if score.as_f64().unwrap_or(0.0) >= 8.0 {
+            1
+        } else {
+            0
+        };
         let mut out = base.clone();
         out["score"] = score;
         out["high_value"] = json!(high_value);
@@ -624,12 +630,20 @@ index 555..666 100644
     #[test]
     fn size_info_rendering() {
         assert_eq!(build_size_info(None), "");
-        let s = SizeStats { files_changed: 3, additions: 90, deletions: 10 };
+        let s = SizeStats {
+            files_changed: 3,
+            additions: 90,
+            deletions: 10,
+        };
         assert_eq!(
             build_size_info(Some(&s)),
             "变更规模：+90/-10，共 3 个文件，体量 M（平均约 33.3 行/文件）。"
         );
-        let zero = SizeStats { files_changed: 0, additions: 0, deletions: 0 };
+        let zero = SizeStats {
+            files_changed: 0,
+            additions: 0,
+            deletions: 0,
+        };
         assert_eq!(
             build_size_info(Some(&zero)),
             "变更规模：+0/-0，共 0 个文件，体量 XS（平均约 0.0 行/文件）。"
@@ -673,20 +687,33 @@ index 555..666 100644
         assert!(text.contains("fn b()"));
         assert!(!text.contains("yarn.lock"));
         // omitted = 截断省略 + 跳过（lock/生成文件排在后面）
-        assert_eq!(omitted, vec!["yarn.lock".to_string(), "dist/bundle.js".to_string()]);
+        assert_eq!(
+            omitted,
+            vec!["yarn.lock".to_string(), "dist/bundle.js".to_string()]
+        );
     }
 
     #[test]
     fn filter_diff_max_files_and_chars() {
         let (_t, included, omitted) = filter_diff(SAMPLE_DIFF, 0, 60000);
         assert!(included.is_empty());
-        assert_eq!(omitted, vec!["src/a.rs".to_string(), "yarn.lock".to_string(), "dist/bundle.js".to_string()]);
+        assert_eq!(
+            omitted,
+            vec![
+                "src/a.rs".to_string(),
+                "yarn.lock".to_string(),
+                "dist/bundle.js".to_string()
+            ]
+        );
 
         // 字符上限：第一个文件纳入后 total 超限，后续省略；但首文件即使超限也纳入（total==0 不截断）
         let (text, included, omitted) = filter_diff(SAMPLE_DIFF, 30, 10);
         assert_eq!(included, vec!["src/a.rs".to_string()]);
         assert_eq!(text.len(), chunks_len(SAMPLE_DIFF, "src/a.rs"));
-        assert_eq!(omitted, vec!["yarn.lock".to_string(), "dist/bundle.js".to_string()]);
+        assert_eq!(
+            omitted,
+            vec!["yarn.lock".to_string(), "dist/bundle.js".to_string()]
+        );
     }
 
     fn chunks_len(patch: &str, path: &str) -> usize {
@@ -706,7 +733,11 @@ index 555..666 100644
             author: "alice".into(),
             url: "https://github.com/o/r/pull/42".into(),
         };
-        let stats = SizeStats { files_changed: 1, additions: 1, deletions: 0 };
+        let stats = SizeStats {
+            files_changed: 1,
+            additions: 1,
+            deletions: 0,
+        };
         let p = build_prompt(&meta, "DIFF_BODY", &[], "", Some(&stats), None);
         assert!(p.contains("仓库：o/r"));
         assert!(p.contains("PR：#42 标题"));
@@ -731,7 +762,14 @@ index 555..666 100644
             author: "alice".into(),
             url: "u".into(),
         };
-        let p = build_prompt(&meta, "DIFF", &[], "", None, Some("自定义视角评审 {{repo}}#{{number}}\n{{diff}}"));
+        let p = build_prompt(
+            &meta,
+            "DIFF",
+            &[],
+            "",
+            None,
+            Some("自定义视角评审 {{repo}}#{{number}}\n{{diff}}"),
+        );
         assert!(p.contains("自定义视角评审 o/r#42"));
         assert!(p.contains("DIFF"));
         // 输出契约自动附加：dimensions 四维硬性要求必须在
@@ -791,7 +829,10 @@ index 555..666 100644
 
     #[test]
     fn parse_review_json_fenced_and_noisy() {
-        let v = parse_review_json("前言\n```json\n{\"overall_score\": 7, \"summary\": \"s\"}\n```\n后语").unwrap();
+        let v = parse_review_json(
+            "前言\n```json\n{\"overall_score\": 7, \"summary\": \"s\"}\n```\n后语",
+        )
+        .unwrap();
         assert_eq!(v["score"].as_f64(), Some(7.0));
         assert_eq!(v["dimensions"], json!({}));
         assert_eq!(v["flagged_files"], json!([]));

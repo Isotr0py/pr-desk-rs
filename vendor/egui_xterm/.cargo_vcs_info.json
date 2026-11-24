@@ -1,0 +1,6 @@
+{
+  "git": {
+    "sha1": "ce8f66d279a8f3000fb81257e3bad72dec21e2e6"
+  },
+  "path_in_vcs": "crates/egui_xterm"
+}

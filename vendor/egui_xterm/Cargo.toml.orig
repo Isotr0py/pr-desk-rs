@@ -1,0 +1,54 @@
+[package]
+name = "egui_xterm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/egui_xterm"
+description = "High-performance, auto-layout terminal widget and runtime for egui"
+keywords = ["egui", "terminal", "xterm", "ansi", "widget"]
+categories = ["gui", "emulators"]
+
+[lints]
+workspace = true
+
+[features]
+default = [
+    "search",
+    "hyperlinks",
+    "shell-integration",
+    "kitty-keyboard",
+    "kitty-graphics",
+    "sixel",
+    "vector-glyphs",
+]
+search = ["egui_xterm_core/search"]
+hyperlinks = ["egui_xterm_core/hyperlinks"]
+shell-integration = ["egui_xterm_core/shell-integration"]
+kitty-keyboard = ["egui_xterm_core/kitty-keyboard"]
+kitty-graphics = ["egui_xterm_core/kitty-graphics"]
+sixel = ["egui_xterm_core/sixel"]
+vector-glyphs = []
+pty = ["dep:egui_xterm_pty"]
+native-clipboard = ["dep:arboard"]
+serde = ["egui_xterm_core/serde", "egui/serde", "dep:serde"]
+metrics = ["egui_xterm_core/metrics"]
+
+[dependencies]
+egui_xterm_core = { workspace = true, default-features = false }
+egui = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+egui_xterm_pty = { workspace = true, optional = true }
+arboard = { workspace = true, optional = true }
+
+[dev-dependencies]
+egui = { workspace = true, features = ["default_fonts"] }
+criterion = { workspace = true }
+
+[[bench]]
+name = "frame_render"
+harness = false

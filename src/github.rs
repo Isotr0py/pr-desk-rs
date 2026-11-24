@@ -1,12 +1,48 @@
 //! GitHub API 客户端（只读）：open PR 列表 + PR diff（带 Accept: diff header）。
 //! 每次响应解析 X-RateLimit-Remaining 写入共享状态（rate_limit_handle），供 UI 状态栏展示。
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const API: &str = "https://api.github.com";
+
+fn immutable_file_cache_path(
+    root: &Path,
+    repo: &str,
+    path: &str,
+    git_ref: &str,
+) -> Option<PathBuf> {
+    if git_ref.len() != 40 || !git_ref.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let key = format!("{repo}\0{git_ref}\0{path}");
+    Some(root.join(format!("{:x}.bin", Sha256::digest(key.as_bytes()))))
+}
+
+fn write_immutable_file_cache(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("系统时钟不可用")?
+        .as_nanos();
+    let part = path.with_extension(format!("part-{}-{nanos}", std::process::id()));
+    std::fs::write(&part, bytes)?;
+    if path.exists() {
+        let _ = std::fs::remove_file(&part);
+        return Ok(());
+    }
+    if let Err(error) = std::fs::rename(&part, path) {
+        let _ = std::fs::remove_file(&part);
+        return Err(error.into());
+    }
+    Ok(())
+}
 
 /// URL 路径段转义（percent-encode，保留 RFC 3986 unreserved 字符）。
 /// GitHub login 名义上只含 [A-Za-z0-9-]，但 bot 账号（如 claude[bot]）带方括号，
@@ -15,7 +51,9 @@ fn encode_path_segment(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -90,7 +128,10 @@ impl GitHub {
         let client = crate::http_client_builder(proxy, std::time::Duration::from_secs(30))?
             .default_headers(headers)
             .build()?;
-        Ok(Self { client, rate_limit: Arc::new(Mutex::new(None)) })
+        Ok(Self {
+            client,
+            rate_limit: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// 配额共享句柄：最近一次响应的 X-RateLimit-Remaining。
@@ -139,6 +180,14 @@ impl GitHub {
         path: &str,
         git_ref: &str,
     ) -> Result<Option<Vec<u8>>> {
+        let cache_path =
+            immutable_file_cache_path(&crate::data_dir().join("ocr-files"), repo, path, git_ref);
+        if let Some(bytes) = cache_path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+        {
+            return Ok(Some(bytes));
+        }
         let mut url = reqwest::Url::parse(&format!("{API}/repos/{repo}/contents/"))?;
         for seg in path.split('/') {
             url.path_segments_mut()
@@ -157,7 +206,13 @@ impl GitHub {
             return Ok(None);
         }
         if !resp.status().is_success() {
-            anyhow::bail!("GitHub contents {}:{} @{}: {}", repo, path, git_ref, resp.status());
+            anyhow::bail!(
+                "GitHub contents {}:{} @{}: {}",
+                repo,
+                path,
+                git_ref,
+                resp.status()
+            );
         }
         // 超过 1MB 直接跳过（content-length 先知，兜底再按实际体判断）
         if resp.content_length().is_some_and(|n| n > 1024 * 1024) {
@@ -170,6 +225,9 @@ impl GitHub {
         let head = &bytes[..bytes.len().min(8000)];
         if head.contains(&0) {
             return Ok(None);
+        }
+        if let Some(path) = cache_path {
+            let _ = write_immutable_file_cache(&path, &bytes);
         }
         Ok(Some(bytes.to_vec()))
     }
@@ -192,7 +250,11 @@ impl GitHub {
 
     /// 分页拉取通知：page 从 1 开始；返回 (本页通知, 是否还有下一页)。
     /// has_more 优先看 Link 头的 rel="next"，缺头时退化为「本页满 50 条」。
-    pub async fn fetch_notifications_page(&self, all: bool, page: u32) -> Result<(Vec<Notification>, bool)> {
+    pub async fn fetch_notifications_page(
+        &self,
+        all: bool,
+        page: u32,
+    ) -> Result<(Vec<Notification>, bool)> {
         let url = if all {
             format!("{API}/notifications?per_page=50&all=true&page={page}")
         } else {
@@ -215,7 +277,10 @@ impl GitHub {
             .into_iter()
             .map(|it| Notification {
                 id: it["id"].as_str().unwrap_or("").to_string(),
-                repo: it["repository"]["full_name"].as_str().unwrap_or("").to_string(),
+                repo: it["repository"]["full_name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
                 title: it["subject"]["title"].as_str().unwrap_or("").to_string(),
                 kind: it["subject"]["type"].as_str().unwrap_or("").to_string(),
                 reason: it["reason"].as_str().unwrap_or("").to_string(),
@@ -428,7 +493,9 @@ fn valid_repo_part(s: &str) -> bool {
 /// 解析 GitHub PR 页面地址，返回 owner/repo 与正整数编号。
 pub fn parse_pr_url(input: &str) -> Option<(String, i64)> {
     let url = reqwest::Url::parse(input.trim()).ok()?;
-    if url.scheme() != "https" || !matches!(url.host_str(), Some("github.com") | Some("www.github.com")) {
+    if url.scheme() != "https"
+        || !matches!(url.host_str(), Some("github.com") | Some("www.github.com"))
+    {
         return None;
     }
     let mut parts = url.path_segments()?;
@@ -442,7 +509,10 @@ pub fn parse_pr_url(input: &str) -> Option<(String, i64)> {
         return None;
     }
     let number = number.parse::<i64>().ok().filter(|n| *n > 0)?;
-    if parts.next().is_some_and(|s| !matches!(s, "" | "files" | "commits" | "checks" | "changes")) {
+    if parts
+        .next()
+        .is_some_and(|s| !matches!(s, "" | "files" | "commits" | "checks" | "changes"))
+    {
         return None;
     }
     Some((format!("{owner}/{repo}"), number))
@@ -504,13 +574,32 @@ mod tests {
     #[test]
     fn parse_pr_url_accepts_github_pr_pages() {
         for (url, expected) in [
-            ("https://github.com/octocat/Hello-World/pull/42", ("octocat/Hello-World", 42)),
-            ("  https://www.github.com/A.b/C-d_e.f/pull/7/?tab=diff#discussion  ", ("A.b/C-d_e.f", 7)),
-            ("https://github.com/octocat/Hello-World/pull/123/files", ("octocat/Hello-World", 123)),
-            ("https://github.com/octocat/Hello-World/pull/123/commits/deadbeef", ("octocat/Hello-World", 123)),
-            ("https://github.com/octocat/Hello-World/pull/123/checks", ("octocat/Hello-World", 123)),
+            (
+                "https://github.com/octocat/Hello-World/pull/42",
+                ("octocat/Hello-World", 42),
+            ),
+            (
+                "  https://www.github.com/A.b/C-d_e.f/pull/7/?tab=diff#discussion  ",
+                ("A.b/C-d_e.f", 7),
+            ),
+            (
+                "https://github.com/octocat/Hello-World/pull/123/files",
+                ("octocat/Hello-World", 123),
+            ),
+            (
+                "https://github.com/octocat/Hello-World/pull/123/commits/deadbeef",
+                ("octocat/Hello-World", 123),
+            ),
+            (
+                "https://github.com/octocat/Hello-World/pull/123/checks",
+                ("octocat/Hello-World", 123),
+            ),
         ] {
-            assert_eq!(parse_pr_url(url), Some((expected.0.to_string(), expected.1)), "应接受 {url}");
+            assert_eq!(
+                parse_pr_url(url),
+                Some((expected.0.to_string(), expected.1)),
+                "应接受 {url}"
+            );
         }
     }
 
@@ -549,7 +638,10 @@ mod tests {
 
     #[test]
     fn aggregate_ci_success() {
-        let runs = vec![run("completed", Some("success")), run("completed", Some("skipped"))];
+        let runs = vec![
+            run("completed", Some("success")),
+            run("completed", Some("skipped")),
+        ];
         assert_eq!(aggregate_ci(&runs), "success");
     }
 
@@ -624,5 +716,32 @@ mod tests {
         assert_eq!(out.get("o/r#1").map(String::as_str), Some("merged"));
         assert_eq!(out.get("o/r#3").map(String::as_str), Some("closed"));
         assert!(!out.contains_key("o/r#2"));
+    }
+
+    #[test]
+    fn immutable_file_cache_is_sha_scoped_and_atomic() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pr-desk-cache-test-{}-{unique}",
+            std::process::id()
+        ));
+        let sha = "a".repeat(40);
+        let path = immutable_file_cache_path(&root, "o/r", "src/lib.rs", &sha).unwrap();
+        let other = immutable_file_cache_path(&root, "o/r", "src/other.rs", &sha).unwrap();
+        assert_ne!(path, other);
+        assert!(immutable_file_cache_path(&root, "o/r", "src/lib.rs", "main").is_none());
+        assert!(immutable_file_cache_path(&root, "o/r", "src/lib.rs", "abc123").is_none());
+
+        write_immutable_file_cache(&path, b"fn answer() -> u32 { 42 }\n").unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"fn answer() -> u32 { 42 }\n"
+        );
+        write_immutable_file_cache(&path, b"fn answer() -> u32 { 42 }\n").unwrap();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

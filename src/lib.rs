@@ -4,7 +4,6 @@
 pub mod circle_crop;
 pub mod config;
 pub mod db;
-pub mod deep_review;
 pub mod diffview;
 pub mod github;
 pub mod i18n;
@@ -103,29 +102,36 @@ pub fn build_sections(
     sort_asc: bool,
 ) -> Vec<GroupSection> {
     let mut out: Vec<GroupSection> = Vec::new();
-    let mut emit = |key: &'static str, title_key: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
-        let mut idx: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter(|(_, r)| pred(r))
-            .map(|(i, _)| i)
-            .collect();
-        if sort_col != "upd" {
-            // 默认列之外才重排（upd 降序 = SQL 输入序，省一次排序且零风险）
-            idx.sort_by(|&a, &b| {
-                let o = col_cmp(&rows[a], &rows[b], sort_col);
-                if sort_asc { o } else { o.reverse() }
-            });
-        } else if sort_asc {
-            // upd 升序（最旧在前）：输入序反转
-            idx.reverse();
-        }
-        if !idx.is_empty() {
-            out.push(GroupSection { key, title: i18n::tr(lang, title_key).to_string(), idxs: idx });
-        }
-    };
+    let mut emit =
+        |key: &'static str, title_key: &str, pred: &dyn Fn(&serde_json::Value) -> bool| {
+            let mut idx: Vec<usize> = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| pred(r))
+                .map(|(i, _)| i)
+                .collect();
+            if sort_col != "upd" {
+                // 默认列之外才重排（upd 降序 = SQL 输入序，省一次排序且零风险）
+                idx.sort_by(|&a, &b| {
+                    let o = col_cmp(&rows[a], &rows[b], sort_col);
+                    if sort_asc { o } else { o.reverse() }
+                });
+            } else if sort_asc {
+                // upd 升序（最旧在前）：输入序反转
+                idx.reverse();
+            }
+            if !idx.is_empty() {
+                out.push(GroupSection {
+                    key,
+                    title: i18n::tr(lang, title_key).to_string(),
+                    idxs: idx,
+                });
+            }
+        };
     // 组标题纯文本（图标由 UI 层按 PrGroup.key 画 SVG；📌 等字形在部分字体下会豆腐块）
-    emit("pinned", "section_pinned", &|r| r["pinned"].as_i64() == Some(1));
+    emit("pinned", "section_pinned", &|r| {
+        r["pinned"].as_i64() == Some(1)
+    });
     emit("board", "section_board", &|r| {
         r["pinned"].as_i64() != Some(1) && r["on_board"].as_i64() == Some(1)
     });

@@ -1,12 +1,10 @@
 //! 本地 SQLite 层：schema 对齐插件（prs/reviews/todos）+ sync_state 游标 + outbox 改动队列
-//! + diff_cache + 仅本地的 Deep Review 工作区。迁移用 PRAGMA user_version。
+//! + diff_cache。迁移用 PRAGMA user_version。
 
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-use crate::deep_review::{DeepFindingData, DeepQaMessage, DeepWorkspaceData};
-
-pub const SCHEMA_VERSION: i32 = 6;
+pub const SCHEMA_VERSION: i32 = 7;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS prs (
@@ -59,41 +57,6 @@ CREATE TABLE IF NOT EXISTS deleted_prs (
 );
 "#;
 
-// v4：Deep Review 是本地工作区，不进入 reviews/outbox，也不随 AstrBot 同步。
-const MIGRATE_V4: &str = r#"
-CREATE TABLE IF NOT EXISTS deep_reviews (
-    repo TEXT NOT NULL,
-    number INTEGER NOT NULL,
-    head_sha TEXT NOT NULL,
-    base_sha TEXT NOT NULL,
-    title TEXT NOT NULL,
-    created_at TEXT NOT NULL,
-    PRIMARY KEY (repo, number, head_sha)
-);
-CREATE TABLE IF NOT EXISTS deep_findings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    repo TEXT NOT NULL,
-    number INTEGER NOT NULL,
-    head_sha TEXT NOT NULL,
-    fingerprint TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    finding_json TEXT NOT NULL,
-    suggested_text TEXT NOT NULL,
-    draft_text TEXT NOT NULL,
-    discarded INTEGER NOT NULL DEFAULT 0,
-    qa_json TEXT NOT NULL DEFAULT '[]',
-    revision INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL,
-    UNIQUE (repo, number, head_sha, fingerprint)
-);
-"#;
-
-#[derive(Debug)]
-pub struct DeepMutation {
-    pub finding: Option<DeepFindingData>,
-    pub conflict: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InsertPrOutcome {
     Inserted,
@@ -115,7 +78,10 @@ pub fn validate_database(path: &std::path::Path) -> Result<()> {
     anyhow::ensure!(path.is_file(), "数据库文件不存在：{}", path.display());
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    anyhow::ensure!(integrity.eq_ignore_ascii_case("ok"), "SQLite 完整性检查失败：{integrity}");
+    anyhow::ensure!(
+        integrity.eq_ignore_ascii_case("ok"),
+        "SQLite 完整性检查失败：{integrity}"
+    );
     let version: i32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     anyhow::ensure!(
         version <= SCHEMA_VERSION,
@@ -133,7 +99,11 @@ pub fn validate_database(path: &std::path::Path) -> Result<()> {
 /// 用 SQLite 在线备份生成包含 WAL 内容的单文件快照，目标已存在时绝不覆盖。
 pub fn backup_database(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
     anyhow::ensure!(source.is_file(), "数据库文件不存在：{}", source.display());
-    anyhow::ensure!(!destination.exists(), "目标文件已存在：{}", destination.display());
+    anyhow::ensure!(
+        !destination.exists(),
+        "目标文件已存在：{}",
+        destination.display()
+    );
     if let Some(parent) = destination.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
@@ -195,7 +165,9 @@ impl Db {
         // prs 增加 author_orgs 列（作者公开组织成员关系 JSON 数组；org 徽章数据源。
         // 本地模式由 refresh 从 /users/{author}/orgs 补齐；sync 行以服务端为准不覆盖）
         if !prs_cols.is_empty() && !prs_cols.iter().any(|c| c == "author_orgs") {
-            conn.execute_batch("ALTER TABLE prs ADD COLUMN author_orgs TEXT NOT NULL DEFAULT '[]'")?;
+            conn.execute_batch(
+                "ALTER TABLE prs ADD COLUMN author_orgs TEXT NOT NULL DEFAULT '[]'",
+            )?;
         }
         // prs 增加 additions/deletions 列：Files 标签页拉到文件清单时把增删行数落库，
         // 列表 +/- 列用它兜底（评审记录的 r.additions 优先，见 list_prs 的 COALESCE）
@@ -216,26 +188,8 @@ impl Db {
                 conn.execute_batch(MIGRATE_V2)?;
             }
         }
-        // v2 → v3 / v3 → v4：IF NOT EXISTS 天然幂等
+        // v2 → v3：IF NOT EXISTS 天然幂等
         conn.execute_batch(MIGRATE_V3)?;
-        conn.execute_batch(MIGRATE_V4)?;
-        // v4 → v5：PR 级问答上下文和历史；逐列检查保证重复打开幂等。
-        let deep_cols: Vec<String> = {
-            let mut stmt = conn.prepare("PRAGMA table_info(deep_reviews)")?;
-            stmt.query_map([], |r| r.get::<_, String>(1))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        for (column, ddl) in [
-            ("body", "ALTER TABLE deep_reviews ADD COLUMN body TEXT NOT NULL DEFAULT ''"),
-            ("diff", "ALTER TABLE deep_reviews ADD COLUMN diff TEXT NOT NULL DEFAULT ''"),
-            ("qa_json", "ALTER TABLE deep_reviews ADD COLUMN qa_json TEXT NOT NULL DEFAULT '[]'"),
-            // v5 → v6：Kimi ACP 会话 ID，旧工作区为空表示尚未接入 ACP。
-            ("agent_session_id", "ALTER TABLE deep_reviews ADD COLUMN agent_session_id TEXT"),
-        ] {
-            if !deep_cols.iter().any(|c| c == column) {
-                conn.execute_batch(ddl)?;
-            }
-        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Db { conn })
     }
@@ -372,12 +326,15 @@ impl Db {
         )?;
         let rows = stmt
             .query_map([], |r| {
-                let dims: Option<serde_json::Value> =
-                    r.get::<_, Option<String>>(4)?.and_then(|s| serde_json::from_str(&s).ok());
-                let flagged: Option<serde_json::Value> =
-                    r.get::<_, Option<String>>(6)?.and_then(|s| serde_json::from_str(&s).ok());
-                let comments: Option<serde_json::Value> =
-                    r.get::<_, Option<String>>(14)?.and_then(|s| serde_json::from_str(&s).ok());
+                let dims: Option<serde_json::Value> = r
+                    .get::<_, Option<String>>(4)?
+                    .and_then(|s| serde_json::from_str(&s).ok());
+                let flagged: Option<serde_json::Value> = r
+                    .get::<_, Option<String>>(6)?
+                    .and_then(|s| serde_json::from_str(&s).ok());
+                let comments: Option<serde_json::Value> = r
+                    .get::<_, Option<String>>(14)?
+                    .and_then(|s| serde_json::from_str(&s).ok());
                 Ok(serde_json::json!({
                     "repo": r.get::<_, String>(0)?,
                     "number": r.get::<_, i64>(1)?,
@@ -526,28 +483,6 @@ impl Db {
         Ok(None)
     }
 
-    // ── Deep Review：仅本地、按 head SHA 隔离的工作区 ──
-
-    fn deep_finding_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DeepFindingData> {
-        let finding_json = row.get::<_, String>(0)?;
-        let qa_json = row.get::<_, String>(7)?;
-        let json_err = |index, e: serde_json::Error| {
-            rusqlite::Error::FromSqlConversionFailure(index, rusqlite::types::Type::Text, Box::new(e))
-        };
-        let mut finding: DeepFindingData =
-            serde_json::from_str(&finding_json).map_err(|e| json_err(0, e))?;
-        finding.id = row.get(1)?;
-        finding.fingerprint = row.get(2)?;
-        finding.ordinal = row.get(3)?;
-        finding.suggested_text = row.get(4)?;
-        finding.draft_text = row.get(5)?;
-        finding.discarded = row.get::<_, i64>(6)? != 0;
-        finding.qa = serde_json::from_str(&qa_json).map_err(|e| json_err(7, e))?;
-        finding.revision = row.get(8)?;
-        finding.updated_at = row.get(9)?;
-        Ok(finding)
-    }
-
     pub fn pr_head_sha(&self, repo: &str, number: i64) -> Result<Option<String>> {
         Ok(self
             .conn
@@ -558,374 +493,6 @@ impl Db {
             )
             .optional()?
             .flatten())
-    }
-
-    pub fn get_deep_finding(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        finding_id: i64,
-    ) -> Result<Option<DeepFindingData>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT finding_json, id, fingerprint, ordinal, suggested_text, draft_text,
-                        discarded, qa_json, revision, updated_at
-                 FROM deep_findings
-                 WHERE repo=?1 AND number=?2 AND head_sha=?3 AND id=?4",
-                params![repo, number, head_sha, finding_id],
-                Self::deep_finding_from_row,
-            )
-            .optional()?)
-    }
-
-    pub fn get_deep_workspace(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-    ) -> Result<Option<DeepWorkspaceData>> {
-        let run = self
-            .conn
-            .query_row(
-                "SELECT base_sha, title, created_at, body, diff, qa_json, agent_session_id
-                 FROM deep_reviews
-                 WHERE repo=?1 AND number=?2 AND head_sha=?3",
-                params![repo, number, head_sha],
-                |r| {
-                    let qa_json = r.get::<_, String>(5)?;
-                    let qa = serde_json::from_str(&qa_json).map_err(|e| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            5,
-                            rusqlite::types::Type::Text,
-                            Box::new(e),
-                        )
-                    })?;
-                    Ok((
-                        r.get::<_, String>(0)?,
-                        r.get::<_, String>(1)?,
-                        r.get::<_, String>(2)?,
-                        r.get::<_, String>(3)?,
-                        r.get::<_, String>(4)?,
-                        qa,
-                        r.get::<_, Option<String>>(6)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((base_sha, title, created_at, body, diff, qa, agent_session_id)) = run else {
-            return Ok(None);
-        };
-        let mut stmt = self.conn.prepare(
-            "SELECT finding_json, id, fingerprint, ordinal, suggested_text, draft_text,
-                    discarded, qa_json, revision, updated_at
-             FROM deep_findings
-             WHERE repo=?1 AND number=?2 AND head_sha=?3
-             ORDER BY ordinal, id",
-        )?;
-        let findings = stmt
-            .query_map(params![repo, number, head_sha], Self::deep_finding_from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(Some(DeepWorkspaceData {
-            repo: repo.to_string(),
-            number,
-            base_sha,
-            head_sha: head_sha.to_string(),
-            title,
-            created_at,
-            body,
-            diff,
-            qa,
-            agent_session_id,
-            findings,
-        }))
-    }
-
-    pub fn get_latest_deep_workspace(
-        &self,
-        repo: &str,
-        number: i64,
-    ) -> Result<Option<DeepWorkspaceData>> {
-        let head_sha = self
-            .conn
-            .query_row(
-                "SELECT head_sha FROM deep_reviews
-                 WHERE repo=?1 AND number=?2
-                 ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                params![repo, number],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()?;
-        match head_sha {
-            Some(head_sha) => self.get_deep_workspace(repo, number, &head_sha),
-            None => Ok(None),
-        }
-    }
-
-    /// 创建完整快照；同 SHA 重入只读取已有数据，绝不覆盖用户草稿。
-    pub fn create_deep_workspace(
-        &self,
-        workspace: &DeepWorkspaceData,
-    ) -> Result<DeepWorkspaceData> {
-        let tx = self.conn.unchecked_transaction()?;
-        self.conn.execute(
-            "INSERT OR IGNORE INTO deep_reviews(
-                repo, number, head_sha, base_sha, title, created_at, body, diff, qa_json, agent_session_id)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-            params![
-                workspace.repo,
-                workspace.number,
-                workspace.head_sha,
-                workspace.base_sha,
-                workspace.title,
-                workspace.created_at,
-                workspace.body,
-                workspace.diff,
-                serde_json::to_string(&workspace.qa)?,
-                workspace.agent_session_id,
-            ],
-        )?;
-        for finding in &workspace.findings {
-            self.conn.execute(
-                "INSERT OR IGNORE INTO deep_findings(
-                    repo, number, head_sha, fingerprint, ordinal, finding_json,
-                    suggested_text, draft_text, discarded, qa_json, revision, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'[]',0,?10)",
-                params![
-                    workspace.repo,
-                    workspace.number,
-                    workspace.head_sha,
-                    finding.fingerprint,
-                    finding.ordinal,
-                    serde_json::to_string(finding)?,
-                    finding.suggested_text,
-                    finding.draft_text,
-                    finding.discarded as i64,
-                    finding.updated_at,
-                ],
-            )?;
-        }
-        tx.commit()?;
-        self.get_deep_workspace(&workspace.repo, workspace.number, &workspace.head_sha)?
-            .ok_or_else(|| anyhow::anyhow!("Deep Review 工作区创建后读取失败"))
-    }
-
-    pub fn set_deep_agent_session(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        session_id: &str,
-    ) -> Result<DeepWorkspaceData> {
-        self.conn.execute(
-            "UPDATE deep_reviews SET agent_session_id=?4 WHERE repo=?1 AND number=?2 AND head_sha=?3",
-            params![repo, number, head_sha, session_id],
-        )?;
-        self.get_deep_workspace(repo, number, head_sha)?
-            .ok_or_else(|| anyhow::anyhow!("Deep Review 工作区不存在，无法保存 ACP 会话"))
-    }
-
-    /// 用刷新合并后的集合替换 Findings；匹配项 ID 保持不变，PR 上下文不动。
-    pub fn replace_deep_findings(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        findings: &[DeepFindingData],
-    ) -> Result<DeepWorkspaceData> {
-        let tx = self.conn.unchecked_transaction()?;
-        self.conn.execute(
-            "DELETE FROM deep_findings WHERE repo=?1 AND number=?2 AND head_sha=?3",
-            params![repo, number, head_sha],
-        )?;
-        for finding in findings {
-            let id = (finding.id > 0).then_some(finding.id);
-            self.conn.execute(
-                "INSERT INTO deep_findings(
-                    id, repo, number, head_sha, fingerprint, ordinal, finding_json,
-                    suggested_text, draft_text, discarded, qa_json, revision, updated_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                params![
-                    id,
-                    repo,
-                    number,
-                    head_sha,
-                    finding.fingerprint,
-                    finding.ordinal,
-                    serde_json::to_string(finding)?,
-                    finding.suggested_text,
-                    finding.draft_text,
-                    finding.discarded as i64,
-                    serde_json::to_string(&finding.qa)?,
-                    finding.revision,
-                    finding.updated_at,
-                ],
-            )?;
-        }
-        tx.commit()?;
-        self.get_deep_workspace(repo, number, head_sha)?
-            .ok_or_else(|| anyhow::anyhow!("Deep Review 刷新后读取工作区失败"))
-    }
-
-    /// 旧工作区只补齐缺失的 PR 上下文，不覆盖已有内容或 Finding 草稿。
-    pub fn fill_deep_context_if_empty(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        body: &str,
-        diff: &str,
-    ) -> Result<Option<DeepWorkspaceData>> {
-        self.conn.execute(
-            "UPDATE deep_reviews
-             SET body=CASE WHEN body='' THEN ?4 ELSE body END,
-                 diff=CASE WHEN diff='' THEN ?5 ELSE diff END
-             WHERE repo=?1 AND number=?2 AND head_sha=?3 AND diff=''",
-            params![repo, number, head_sha, body, diff],
-        )?;
-        self.get_deep_workspace(repo, number, head_sha)
-    }
-
-    /// PR 级问答与 Finding QA 分离，保留最近三轮往返。
-    pub fn append_deep_pr_qa(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        messages: &[DeepQaMessage],
-    ) -> Result<Option<Vec<DeepQaMessage>>> {
-        let Some(mut workspace) = self.get_deep_workspace(repo, number, head_sha)? else {
-            return Ok(None);
-        };
-        workspace.qa.extend_from_slice(messages);
-        if workspace.qa.len() > 6 {
-            let drop = workspace.qa.len() - 6;
-            workspace.qa.drain(..drop);
-        }
-        self.conn.execute(
-            "UPDATE deep_reviews SET qa_json=?4 WHERE repo=?1 AND number=?2 AND head_sha=?3",
-            params![repo, number, head_sha, serde_json::to_string(&workspace.qa)?],
-        )?;
-        Ok(Some(workspace.qa))
-    }
-
-    fn mutate_deep_finding(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        finding_id: i64,
-        expected_revision: i64,
-        draft_text: Option<&str>,
-        discarded: Option<bool>,
-    ) -> Result<DeepMutation> {
-        let Some(current) = self.get_deep_finding(repo, number, head_sha, finding_id)? else {
-            return Ok(DeepMutation { finding: None, conflict: false });
-        };
-        let mut updated = current.clone();
-        if let Some(text) = draft_text {
-            updated.draft_text = text.to_string();
-        }
-        if let Some(value) = discarded {
-            updated.discarded = value;
-            updated.resolution = if value { "manual".into() } else { String::new() };
-        }
-        updated.updated_at = now();
-        let changed = self.conn.execute(
-            "UPDATE deep_findings
-             SET finding_json=?5, draft_text=?6, discarded=?7,
-                 revision=revision+1, updated_at=?8
-             WHERE id=?1 AND repo=?2 AND number=?3 AND head_sha=?4 AND revision=?9",
-            params![
-                finding_id,
-                repo,
-                number,
-                head_sha,
-                serde_json::to_string(&updated)?,
-                updated.draft_text,
-                updated.discarded as i64,
-                updated.updated_at,
-                expected_revision,
-            ],
-        )?;
-        let finding = self.get_deep_finding(repo, number, head_sha, finding_id)?;
-        Ok(DeepMutation {
-            finding,
-            conflict: changed == 0,
-        })
-    }
-
-    pub fn update_deep_draft(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        finding_id: i64,
-        expected_revision: i64,
-        draft_text: &str,
-    ) -> Result<DeepMutation> {
-        self.mutate_deep_finding(
-            repo,
-            number,
-            head_sha,
-            finding_id,
-            expected_revision,
-            Some(draft_text),
-            None,
-        )
-    }
-
-    pub fn set_deep_finding_discarded(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        finding_id: i64,
-        expected_revision: i64,
-        discarded: bool,
-    ) -> Result<DeepMutation> {
-        self.mutate_deep_finding(
-            repo,
-            number,
-            head_sha,
-            finding_id,
-            expected_revision,
-            None,
-            Some(discarded),
-        )
-    }
-
-    /// 问答独立追加，不改变草稿 revision；仅保留最近三条问答往返。
-    pub fn append_deep_qa(
-        &self,
-        repo: &str,
-        number: i64,
-        head_sha: &str,
-        finding_id: i64,
-        messages: &[DeepQaMessage],
-    ) -> Result<Option<DeepFindingData>> {
-        let Some(mut finding) = self.get_deep_finding(repo, number, head_sha, finding_id)? else {
-            return Ok(None);
-        };
-        finding.qa.extend_from_slice(messages);
-        if finding.qa.len() > 6 {
-            let drop = finding.qa.len() - 6;
-            finding.qa.drain(..drop);
-        }
-        self.conn.execute(
-            "UPDATE deep_findings SET qa_json=?5, updated_at=?6
-             WHERE id=?1 AND repo=?2 AND number=?3 AND head_sha=?4",
-            params![
-                finding_id,
-                repo,
-                number,
-                head_sha,
-                serde_json::to_string(&finding.qa)?,
-                now(),
-            ],
-        )?;
-        self.get_deep_finding(repo, number, head_sha, finding_id)
     }
 
     /// PR 是否已在本地库（Inbox「+ 预评审」的去重判断：避免 upsert 把已有行字段覆盖成空）。
@@ -956,12 +523,7 @@ impl Db {
             let mut stmt = self.conn.prepare(&sql)?;
             let flat: Vec<&dyn rusqlite::ToSql> = chunk
                 .iter()
-                .flat_map(|(r, n)| {
-                    [
-                        r as &dyn rusqlite::ToSql,
-                        n as &dyn rusqlite::ToSql,
-                    ]
-                })
+                .flat_map(|(r, n)| [r as &dyn rusqlite::ToSql, n as &dyn rusqlite::ToSql])
                 .collect();
             let rows = stmt
                 .query_map(&*flat, |r| {
@@ -984,7 +546,9 @@ impl Db {
 
     /// 全部 diff 缓存（repo, number, diff 文本）：回填 prs.additions/deletions 用。
     pub fn list_diff_cache(&self) -> Result<Vec<(String, i64, String)>> {
-        let mut stmt = self.conn.prepare("SELECT repo, number, diff FROM diff_cache")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT repo, number, diff FROM diff_cache")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
@@ -998,7 +562,13 @@ impl Db {
     }
 
     /// 回填 PR 的增删行数（只填空值，已有值不动——GitHub files API 的真值优先）。
-    pub fn fill_diff_sums_if_empty(&self, repo: &str, number: i64, adds: i64, dels: i64) -> Result<()> {
+    pub fn fill_diff_sums_if_empty(
+        &self,
+        repo: &str,
+        number: i64,
+        adds: i64,
+        dels: i64,
+    ) -> Result<()> {
         self.conn.execute(
             "UPDATE prs SET additions=?1, deletions=?2
              WHERE repo=?3 AND number=?4 AND additions IS NULL",
@@ -1051,9 +621,18 @@ impl Db {
     }
 
     // ── 本地改动（立即生效 + 入队 outbox 待推送） ──
-    pub fn local_pr_update(&self, repo: &str, number: i64, field: &str, value: &serde_json::Value) -> Result<()> {
+    pub fn local_pr_update(
+        &self,
+        repo: &str,
+        number: i64,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Result<()> {
         // 未知字段在动库之前拒绝（不参与事务）
-        if !matches!(field, "status" | "tags" | "priority" | "on_board" | "pinned") {
+        if !matches!(
+            field,
+            "status" | "tags" | "priority" | "on_board" | "pinned"
+        ) {
             anyhow::bail!("unknown field {field}");
         }
         // UPDATE prs + INSERT outbox 必须同生共死（unchecked_transaction：
@@ -1075,7 +654,9 @@ impl Db {
             _ => {
                 // priority | on_board | pinned（上面已校验白名单，format! 无注入面）
                 tx.execute(
-                    &format!("UPDATE prs SET {field}=?1, updated_at=?2 WHERE repo=?3 AND number=?4"),
+                    &format!(
+                        "UPDATE prs SET {field}=?1, updated_at=?2 WHERE repo=?3 AND number=?4"
+                    ),
                     params![value.as_i64().unwrap_or(0), now(), repo, number],
                 )?;
             }
@@ -1102,9 +683,7 @@ impl Db {
             .conn
             .prepare("SELECT id, payload FROM outbox ORDER BY id")?;
         let rows = stmt
-            .query_map([], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
+            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows
             .into_iter()
@@ -1119,7 +698,8 @@ impl Db {
     }
 
     pub fn outbox_remove(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM outbox WHERE id=?1", params![id])?;
+        self.conn
+            .execute("DELETE FROM outbox WHERE id=?1", params![id])?;
         Ok(())
     }
 
@@ -1136,7 +716,9 @@ impl Db {
              FROM prs WHERE repo=?1 AND number=?2",
         )?;
         let mut rows = stmt.query(params![repo, number])?;
-        let Some(r) = rows.next()? else { return Ok(None) };
+        let Some(r) = rows.next()? else {
+            return Ok(None);
+        };
         Ok(Some(serde_json::json!({
             "repo": r.get::<_, String>(0)?,
             "number": r.get::<_, i64>(1)?,
@@ -1242,7 +824,11 @@ impl Db {
     /// 源库只读；目标库写入包在一个事务里（unchecked_transaction 是连接级事务，
     /// 后续经 self.conn 的写入都在事务内——与 local_pr_update 同款）。
     /// 返回 (新插入 PR 数, 已存在跳过数, 复制评审数)。
-    pub fn copy_prs_to(src: &Db, dst: &Db, keys: &[(String, i64)]) -> Result<(usize, usize, usize)> {
+    pub fn copy_prs_to(
+        src: &Db,
+        dst: &Db,
+        keys: &[(String, i64)],
+    ) -> Result<(usize, usize, usize)> {
         // 先全部从源库读出（纯读，无需事务；复制中途源库变化最多拿到稍旧的行，可接受）
         let mut prs = Vec::new();
         let mut reviews = Vec::new();
@@ -1268,7 +854,7 @@ impl Db {
 
     // ── 删除 / 墓碑（local 模式） ──
 
-    /// 批量删除 PR：墓碑 + prs + reviews + diff_cache + Deep Review 本地工作区一个事务。
+    /// 批量删除 PR：墓碑 + prs + reviews + diff_cache 一个事务。
     /// 返回实际删除的 PR 行数（墓碑对全部 keys 记账——已不存在的键删了也安全）。
     pub fn delete_prs(&self, keys: &[(String, i64)]) -> Result<usize> {
         let tx = self.conn.unchecked_transaction()?;
@@ -1290,14 +876,6 @@ impl Db {
                 "DELETE FROM diff_cache WHERE repo=?1 AND number=?2",
                 params![repo, number],
             )?;
-            self.conn.execute(
-                "DELETE FROM deep_findings WHERE repo=?1 AND number=?2",
-                params![repo, number],
-            )?;
-            self.conn.execute(
-                "DELETE FROM deep_reviews WHERE repo=?1 AND number=?2",
-                params![repo, number],
-            )?;
         }
         tx.commit()?;
         Ok(deleted)
@@ -1317,7 +895,10 @@ impl Db {
     /// 带墓碑守卫的 upsert：已删除的 PR 返回 Ok(false) 不插入（显式复制 copy_prs_to
     /// 不走这里——跨档案复制是明确的用户意图，允许复活）。
     pub fn upsert_pr_unless_tombstoned(&self, p: &serde_json::Value) -> Result<bool> {
-        if self.is_tombstoned(p["repo"].as_str().unwrap_or(""), p["number"].as_i64().unwrap_or(0))? {
+        if self.is_tombstoned(
+            p["repo"].as_str().unwrap_or(""),
+            p["number"].as_i64().unwrap_or(0),
+        )? {
             return Ok(false);
         }
         self.upsert_pr(p)?;
@@ -1408,9 +989,7 @@ mod tests {
 
     fn source_of(db: &Db, n: i64) -> String {
         let rows = db.list_prs(&[]).unwrap();
-        rows.iter()
-            .find(|r| r["number"] == n)
-            .unwrap()["source"]
+        rows.iter().find(|r| r["number"] == n).unwrap()["source"]
             .as_str()
             .unwrap()
             .to_string()
@@ -1445,9 +1024,12 @@ mod tests {
     #[test]
     fn list_prs_filter_by_source() {
         let db = Db::open_memory().unwrap();
-        db.upsert_pr(&pr_json_src("o/r", 1, "srv", "server")).unwrap();
-        db.upsert_pr(&pr_json_src("o/r", 2, "inbox", "inbox")).unwrap();
-        db.upsert_pr(&pr_json_src("o/r", 3, "gh", "github")).unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 1, "srv", "server"))
+            .unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 2, "inbox", "inbox"))
+            .unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 3, "gh", "github"))
+            .unwrap();
         // 空过滤 = 全部（本地模式）
         assert_eq!(db.list_prs(&[]).unwrap().len(), 3);
         // sync 模式：server + inbox
@@ -1471,19 +1053,27 @@ mod tests {
         let backup_path = dir.join("nested").join("backup.db");
         let source = Db::open(&source_path).unwrap();
         source.upsert_pr(&pr_json("o/r", 1, "wal row")).unwrap();
-        source.upsert_review(&review_json("o/r", 1, "h1", 8.0)).unwrap();
-        source.create_deep_workspace(&deep_workspace("h1")).unwrap();
+        source
+            .upsert_review(&review_json("o/r", 1, "h1", 8.0))
+            .unwrap();
 
         backup_database(&source_path, &backup_path).unwrap();
         validate_database(&backup_path).unwrap();
         let backup = Db::open(&backup_path).unwrap();
         assert!(backup.pr_exists("o/r", 1).unwrap());
-        assert_eq!(backup.list_reviews_of("o/r", 1).unwrap()[0]["head_sha"], "h1");
-        assert!(backup.get_deep_workspace("o/r", 7, "h1").unwrap().is_some());
-        let integrity: String = backup.conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(
+            backup.list_reviews_of("o/r", 1).unwrap()[0]["head_sha"],
+            "h1"
+        );
+        let integrity: String = backup
+            .conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(integrity, "ok");
 
-        source.upsert_pr(&pr_json("o/r", 2, "after backup")).unwrap();
+        source
+            .upsert_pr(&pr_json("o/r", 2, "after backup"))
+            .unwrap();
         assert!(!backup.pr_exists("o/r", 2).unwrap());
         assert!(backup_database(&source_path, &backup_path).is_err());
         assert!(backup.pr_exists("o/r", 1).unwrap());
@@ -1502,7 +1092,10 @@ mod tests {
         assert!(validate_database(&text_path).is_err());
 
         let future_path = dir.join("future.db");
-        Connection::open(&future_path).unwrap().execute_batch("PRAGMA user_version=999").unwrap();
+        Connection::open(&future_path)
+            .unwrap()
+            .execute_batch("PRAGMA user_version=999")
+            .unwrap();
         assert!(validate_database(&future_path).is_err());
 
         let empty_path = dir.join("empty.db");
@@ -1553,7 +1146,8 @@ mod tests {
         assert_eq!(rows[0]["source"], "github");
         // sync 过滤下不可见；可被 server upsert 升级
         assert_eq!(db.list_prs(&["server", "inbox"]).unwrap().len(), 0);
-        db.upsert_pr(&pr_json_src("o/r", 1, "srv", "server")).unwrap();
+        db.upsert_pr(&pr_json_src("o/r", 1, "srv", "server"))
+            .unwrap();
         assert_eq!(db.list_prs(&["server", "inbox"]).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1563,16 +1157,24 @@ mod tests {
         let db = Db::open_memory().unwrap();
         assert!(db.get_cursor().unwrap().is_none());
         db.set_cursor("2026-01-01T00:00:00").unwrap();
-        assert_eq!(db.get_cursor().unwrap().as_deref(), Some("2026-01-01T00:00:00"));
+        assert_eq!(
+            db.get_cursor().unwrap().as_deref(),
+            Some("2026-01-01T00:00:00")
+        );
         db.set_cursor("2026-01-02T00:00:00").unwrap();
-        assert_eq!(db.get_cursor().unwrap().as_deref(), Some("2026-01-02T00:00:00"));
+        assert_eq!(
+            db.get_cursor().unwrap().as_deref(),
+            Some("2026-01-02T00:00:00")
+        );
     }
 
     #[test]
     fn outbox_enqueue_drain_remove() {
         let db = Db::open_memory().unwrap();
-        db.local_pr_update("o/r", 1, "pinned", &serde_json::json!(1)).unwrap();
-        db.local_pr_update("o/r", 2, "priority", &serde_json::json!(2)).unwrap();
+        db.local_pr_update("o/r", 1, "pinned", &serde_json::json!(1))
+            .unwrap();
+        db.local_pr_update("o/r", 2, "priority", &serde_json::json!(2))
+            .unwrap();
         let items = db.outbox_drain().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].1["pinned"], 1);
@@ -1589,11 +1191,13 @@ mod tests {
         // 且每行进一条 outbox（同事务）；白名单外字段整批拒绝。
         let db = Db::open_memory().unwrap();
         for n in [1, 2, 3] {
-            db.upsert_pr(&pr_json_src("o/r", n, &format!("t{n}"), "github")).unwrap();
+            db.upsert_pr(&pr_json_src("o/r", n, &format!("t{n}"), "github"))
+                .unwrap();
         }
         let keys: Vec<(String, i64)> = (1..=3).map(|n| ("o/r".to_string(), n)).collect();
         for (repo, number) in &keys {
-            db.local_pr_update(repo, *number, "priority", &serde_json::json!(2)).unwrap();
+            db.local_pr_update(repo, *number, "priority", &serde_json::json!(2))
+                .unwrap();
         }
         let rows = db.list_prs(&[]).unwrap();
         assert_eq!(rows.len(), 3);
@@ -1602,7 +1206,10 @@ mod tests {
         assert_eq!(items.len(), 3, "每行一条 outbox，待推送数 = 批量大小");
         assert!(items.iter().all(|(_, p)| p["priority"] == 2));
         // 白名单：未知字段拒绝且不进 outbox
-        assert!(db.local_pr_update("o/r", 1, "evil_field", &serde_json::json!(1)).is_err());
+        assert!(
+            db.local_pr_update("o/r", 1, "evil_field", &serde_json::json!(1))
+                .is_err()
+        );
         assert_eq!(db.outbox_drain().unwrap().len(), 3);
     }
 
@@ -1612,15 +1219,23 @@ mod tests {
         // 目标已有行整行跳过（本地策展状态不动）；重复复制幂等。
         let src = Db::open_memory().unwrap();
         let dst = Db::open_memory().unwrap();
-        src.upsert_pr(&pr_json_src("o/r", 1, "src pr1", "server")).unwrap();
-        src.upsert_pr(&pr_json_src("o/r", 2, "src pr2", "server")).unwrap();
-        src.upsert_review(&review_json("o/r", 1, "sha-a", 8.0)).unwrap();
-        src.upsert_review(&review_json("o/r", 1, "sha-b", 6.5)).unwrap();
+        src.upsert_pr(&pr_json_src("o/r", 1, "src pr1", "server"))
+            .unwrap();
+        src.upsert_pr(&pr_json_src("o/r", 2, "src pr2", "server"))
+            .unwrap();
+        src.upsert_review(&review_json("o/r", 1, "sha-a", 8.0))
+            .unwrap();
+        src.upsert_review(&review_json("o/r", 1, "sha-b", 6.5))
+            .unwrap();
         // 目标档案已有 o/r#2，且带本地策展状态（pinned/priority/status 是本地改的）
-        dst.upsert_pr(&pr_json_src("o/r", 2, "dst pr2", "github")).unwrap();
-        dst.local_pr_update("o/r", 2, "pinned", &serde_json::json!(1)).unwrap();
-        dst.local_pr_update("o/r", 2, "priority", &serde_json::json!(3)).unwrap();
-        dst.local_pr_update("o/r", 2, "status", &serde_json::json!("reviewed")).unwrap();
+        dst.upsert_pr(&pr_json_src("o/r", 2, "dst pr2", "github"))
+            .unwrap();
+        dst.local_pr_update("o/r", 2, "pinned", &serde_json::json!(1))
+            .unwrap();
+        dst.local_pr_update("o/r", 2, "priority", &serde_json::json!(3))
+            .unwrap();
+        dst.local_pr_update("o/r", 2, "status", &serde_json::json!("reviewed"))
+            .unwrap();
 
         let keys = vec![("o/r".to_string(), 1), ("o/r".to_string(), 2)];
         let (inserted, skipped, n_reviews) = Db::copy_prs_to(&src, &dst, &keys).unwrap();
@@ -1640,8 +1255,14 @@ mod tests {
         // 评审带全：同一 PR 两条不同 head_sha
         let rvs = dst.list_reviews_of("o/r", 1).unwrap();
         assert_eq!(rvs.len(), 2);
-        assert!(rvs.iter().any(|r| r["head_sha"] == "sha-a" && r["score"] == 8.0));
-        assert!(rvs.iter().any(|r| r["head_sha"] == "sha-b" && r["score"] == 6.5));
+        assert!(
+            rvs.iter()
+                .any(|r| r["head_sha"] == "sha-a" && r["score"] == 8.0)
+        );
+        assert!(
+            rvs.iter()
+                .any(|r| r["head_sha"] == "sha-b" && r["score"] == 6.5)
+        );
 
         // 重复复制幂等：PR 全部跳过，评审 upsert 同内容不翻倍
         let (inserted2, skipped2, n_reviews2) = Db::copy_prs_to(&src, &dst, &keys).unwrap();
@@ -1653,17 +1274,20 @@ mod tests {
     fn inbox_insert_reports_inserted_existing_and_tombstoned() {
         let db = Db::open_memory().unwrap();
         assert_eq!(
-            db.insert_pr_from_inbox(&pr_json("o/r", 1, "first")).unwrap(),
+            db.insert_pr_from_inbox(&pr_json("o/r", 1, "first"))
+                .unwrap(),
             InsertPrOutcome::Inserted
         );
         assert_eq!(
-            db.insert_pr_from_inbox(&pr_json("o/r", 1, "overwrite")).unwrap(),
+            db.insert_pr_from_inbox(&pr_json("o/r", 1, "overwrite"))
+                .unwrap(),
             InsertPrOutcome::AlreadyExists
         );
         assert_eq!(db.get_pr_full("o/r", 1).unwrap().unwrap()["title"], "first");
         db.delete_prs(&[("o/r".to_string(), 1)]).unwrap();
         assert_eq!(
-            db.insert_pr_from_inbox(&pr_json("o/r", 1, "blocked")).unwrap(),
+            db.insert_pr_from_inbox(&pr_json("o/r", 1, "blocked"))
+                .unwrap(),
             InsertPrOutcome::Tombstoned
         );
     }
@@ -1676,7 +1300,8 @@ mod tests {
         let db = Db::open_memory().unwrap();
         db.upsert_pr(&pr_json("o/r", 1, "t1")).unwrap();
         db.upsert_pr(&pr_json("o/r", 2, "t2")).unwrap();
-        db.upsert_review(&review_json("o/r", 1, "sha-a", 8.0)).unwrap();
+        db.upsert_review(&review_json("o/r", 1, "sha-a", 8.0))
+            .unwrap();
         db.put_diff("o/r", 1, "diff text").unwrap();
 
         let keys = vec![("o/r".to_string(), 1)];
@@ -1691,7 +1316,10 @@ mod tests {
         assert_eq!(db.tombstone_count().unwrap(), 1);
 
         // 模拟刷新/误加回插：守卫路径拒绝复活，普通 upsert 也先查墓碑（worker 侧模式）
-        assert!(!db.upsert_pr_unless_tombstoned(&pr_json("o/r", 1, "resurrected")).unwrap());
+        assert!(
+            !db.upsert_pr_unless_tombstoned(&pr_json("o/r", 1, "resurrected"))
+                .unwrap()
+        );
         assert!(!db.pr_exists("o/r", 1).unwrap(), "墓碑行不得复活");
         // 幂等：重复删除不炸，墓碑不翻倍
         assert_eq!(db.delete_prs(&keys).unwrap(), 0);
@@ -1700,7 +1328,10 @@ mod tests {
         // 清空删除记录后可恢复
         assert_eq!(db.clear_tombstones().unwrap(), 1);
         assert_eq!(db.tombstone_count().unwrap(), 0);
-        assert!(db.upsert_pr_unless_tombstoned(&pr_json("o/r", 1, "back")).unwrap());
+        assert!(
+            db.upsert_pr_unless_tombstoned(&pr_json("o/r", 1, "back"))
+                .unwrap()
+        );
         assert!(db.pr_exists("o/r", 1).unwrap());
     }
 
@@ -1743,7 +1374,9 @@ mod tests {
         // 断言字符串里是序列化后的对象内容而非 NULL
         let dims = r["dimensions"].as_str().expect("dimensions 不应为 NULL");
         assert!(dims.contains("\"readability\":8"), "dims={dims}");
-        let flagged = r["flagged_files"].as_str().expect("flagged_files 不应为 NULL");
+        let flagged = r["flagged_files"]
+            .as_str()
+            .expect("flagged_files 不应为 NULL");
         assert!(flagged.contains("a.rs"), "flagged={flagged}");
     }
 
@@ -1855,33 +1488,53 @@ mod tests {
     }
 
     #[test]
-    fn fill_pr_meta_only_fills_empty_fields() {        let db = Db::open_memory().unwrap();
+    fn fill_pr_meta_only_fills_empty_fields() {
+        let db = Db::open_memory().unwrap();
         // Inbox 入库的残缺行：author/head_sha 为空
         db.upsert_pr(&serde_json::json!({
             "repo": "o/r", "number": 1, "title": "t", "author": "", "url": "u1",
             "head_sha": "", "status": "pending", "updated_at": "t", "source": "inbox",
         }))
         .unwrap();
-        assert!(db.fill_pr_meta_if_empty("o/r", 1, "alice", "u2", "sha1", "t2").unwrap());
+        assert!(
+            db.fill_pr_meta_if_empty("o/r", 1, "alice", "u2", "sha1", "t2")
+                .unwrap()
+        );
         let row = &db.list_prs(&[]).unwrap()[0];
-        assert_eq!(row["author"], "alice");       // 空字段被补齐
-        assert_eq!(row["url"], "u1");             // 已有值不动
+        assert_eq!(row["author"], "alice"); // 空字段被补齐
+        assert_eq!(row["url"], "u1"); // 已有值不动
         assert_eq!(row["title"], "t");
         // head_sha 不在 list_prs 的选择列里，直接查表验证
-        let sha: String = db.conn.query_row(
-            "SELECT head_sha FROM prs WHERE repo='o/r' AND number=1", [], |r| r.get(0),
-        ).unwrap();
+        let sha: String = db
+            .conn
+            .query_row(
+                "SELECT head_sha FROM prs WHERE repo='o/r' AND number=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sha, "sha1");
         // 再补一次：全部已有值 → 什么都不变
-        assert!(db.fill_pr_meta_if_empty("o/r", 1, "bob", "u3", "sha2", "t3").unwrap());
+        assert!(
+            db.fill_pr_meta_if_empty("o/r", 1, "bob", "u3", "sha2", "t3")
+                .unwrap()
+        );
         let row = &db.list_prs(&[]).unwrap()[0];
         assert_eq!(row["author"], "alice");
-        let sha: String = db.conn.query_row(
-            "SELECT head_sha FROM prs WHERE repo='o/r' AND number=1", [], |r| r.get(0),
-        ).unwrap();
+        let sha: String = db
+            .conn
+            .query_row(
+                "SELECT head_sha FROM prs WHERE repo='o/r' AND number=1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(sha, "sha1");
         // 不存在的行：false
-        assert!(!db.fill_pr_meta_if_empty("o/r", 99, "x", "u", "s", "t").unwrap());
+        assert!(
+            !db.fill_pr_meta_if_empty("o/r", 99, "x", "u", "s", "t")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -1901,7 +1554,9 @@ mod tests {
         bare.as_object_mut().unwrap().remove("comments");
         db.upsert_review(&bare).unwrap();
         let r = db.get_review("o/r", 1).unwrap().unwrap();
-        let comments = r["comments"].as_array().expect("旧 comments 不应被 NULL 覆盖");
+        let comments = r["comments"]
+            .as_array()
+            .expect("旧 comments 不应被 NULL 覆盖");
         assert_eq!(comments[0]["path"], "src/a.rs");
         assert_eq!(r["score"], 9.0); // 其余字段正常被新评审覆盖
     }
@@ -1912,22 +1567,33 @@ mod tests {
         db.upsert_pr(&pr_json("o/r", 1, "t")).unwrap();
         // 拆掉 outbox 表让 INSERT 失败 → 事务整体回滚，prs.status 不变
         db.conn.execute_batch("DROP TABLE outbox").unwrap();
-        assert!(db.local_pr_update("o/r", 1, "status", &serde_json::json!("reviewed")).is_err());
+        assert!(
+            db.local_pr_update("o/r", 1, "status", &serde_json::json!("reviewed"))
+                .is_err()
+        );
         let rows = db.list_prs(&[]).unwrap();
         assert_eq!(rows[0]["status"], "pending");
         // 未知字段：动库前拒绝
-        assert!(db.local_pr_update("o/r", 1, "bogus", &serde_json::json!(1)).is_err());
+        assert!(
+            db.local_pr_update("o/r", 1, "bogus", &serde_json::json!(1))
+                .is_err()
+        );
         assert_eq!(db.list_prs(&[]).unwrap()[0]["status"], "pending");
     }
 
     #[test]
     fn outbox_drain_skips_corrupt_payload() {
         let db = Db::open_memory().unwrap();
-        db.local_pr_update("o/r", 1, "pinned", &serde_json::json!(1)).unwrap();
-        db.conn
-            .execute("INSERT INTO outbox(kind, payload, created_at) VALUES ('pr', '{bad', 't')", [])
+        db.local_pr_update("o/r", 1, "pinned", &serde_json::json!(1))
             .unwrap();
-        db.local_pr_update("o/r", 2, "priority", &serde_json::json!(2)).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO outbox(kind, payload, created_at) VALUES ('pr', '{bad', 't')",
+                [],
+            )
+            .unwrap();
+        db.local_pr_update("o/r", 2, "priority", &serde_json::json!(2))
+            .unwrap();
         let items = db.outbox_drain().unwrap();
         // 损坏条目跳过，好条目保留（含顺序）
         assert_eq!(items.len(), 2);
@@ -1957,247 +1623,91 @@ mod tests {
         assert_eq!(got.len(), 2);
     }
 
-    fn deep_workspace(head_sha: &str) -> DeepWorkspaceData {
-        DeepWorkspaceData {
-            repo: "o/r".into(),
-            number: 7,
-            base_sha: "base".into(),
-            head_sha: head_sha.into(),
-            title: "Deep test".into(),
-            created_at: format!("2026-01-01T00:00:0{}Z", if head_sha == "h1" { 1 } else { 2 }),
-            body: "whole PR body".into(),
-            diff: "diff --git a/src/a.rs b/src/a.rs".into(),
-            qa: Vec::new(),
-            agent_session_id: None,
-            findings: vec![DeepFindingData {
-                fingerprint: format!("fp-{head_sha}"),
-                ordinal: 1,
-                path: "src/a.rs".into(),
-                start_line: 10,
-                end_line: 10,
-                severity: "high".into(),
-                category: "bug".into(),
-                content: "problem".into(),
-                suggested_text: "initial".into(),
-                draft_text: "initial".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-                ..Default::default()
-            }],
-        }
-    }
-
     #[test]
-    fn deep_workspace_roundtrip_preserves_drafts_and_rejects_stale_writes() {
-        let db = Db::open_memory().unwrap();
-        let created = db.create_deep_workspace(&deep_workspace("h1")).unwrap();
-        assert!(created.agent_session_id.is_none());
-        let created = db.set_deep_agent_session("o/r", 7, "h1", "acp-session-1").unwrap();
-        assert_eq!(created.agent_session_id.as_deref(), Some("acp-session-1"));
-        let id = created.findings[0].id;
-        assert!(id > 0);
-
-        let saved = db.update_deep_draft("o/r", 7, "h1", id, 0, "edited").unwrap();
-        assert!(!saved.conflict);
-        assert_eq!(saved.finding.unwrap().revision, 1);
-        let stale = db.update_deep_draft("o/r", 7, "h1", id, 0, "overwrite").unwrap();
-        assert!(stale.conflict);
-        assert_eq!(stale.finding.unwrap().draft_text, "edited");
-
-        let discarded = db.set_deep_finding_discarded("o/r", 7, "h1", id, 1, true).unwrap();
-        assert!(!discarded.conflict);
-        let current = discarded.finding.unwrap();
-        assert!(current.discarded);
-        assert_eq!(current.revision, 2);
-        let restored = db.set_deep_finding_discarded("o/r", 7, "h1", id, 2, false).unwrap();
-        assert!(!restored.finding.unwrap().discarded);
-
-        let messages = (0..8)
-            .map(|i| DeepQaMessage {
-                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
-                content: format!("m{i}"),
-                created_at: now(),
-            })
-            .collect::<Vec<_>>();
-        let asked = db.append_deep_qa("o/r", 7, "h1", id, &messages).unwrap().unwrap();
-        assert_eq!(asked.qa.len(), 6);
-        assert_eq!(asked.qa[0].content, "m2");
-        assert_eq!(asked.revision, 3);
-        assert_eq!(asked.draft_text, "edited");
-
-        let reopened = db.create_deep_workspace(&deep_workspace("h1")).unwrap();
-        assert_eq!(reopened.findings[0].draft_text, "edited");
-        assert_eq!(reopened.findings[0].revision, 3);
-        assert_eq!(reopened.findings[0].qa.len(), 6);
-        assert!(db.unpushed_reviews().unwrap().is_empty());
-    }
-
-    #[test]
-    fn deep_pr_context_backfill_and_qa_do_not_touch_finding_drafts() {
-        let db = Db::open_memory().unwrap();
-        let created = db.create_deep_workspace(&deep_workspace("h1")).unwrap();
-        let id = created.findings[0].id;
-        db.update_deep_draft("o/r", 7, "h1", id, 0, "edited draft").unwrap();
-        db.conn.execute(
-            "UPDATE deep_reviews SET body='', diff='' WHERE repo='o/r' AND number=7 AND head_sha='h1'",
-            [],
-        ).unwrap();
-
-        let filled = db
-            .fill_deep_context_if_empty("o/r", 7, "h1", "backfilled body", "backfilled diff")
-            .unwrap()
-            .unwrap();
-        assert_eq!(filled.body, "backfilled body");
-        assert_eq!(filled.diff, "backfilled diff");
-        assert_eq!(filled.findings[0].draft_text, "edited draft");
-        assert_eq!(filled.findings[0].revision, 1);
-        let refilled = db
-            .fill_deep_context_if_empty("o/r", 7, "h1", "replacement", "replacement")
-            .unwrap()
-            .unwrap();
-        assert_eq!(refilled.body, "backfilled body");
-        assert_eq!(refilled.diff, "backfilled diff");
-
-        let finding_qa = [DeepQaMessage {
-            role: "user".into(),
-            content: "finding question".into(),
-            created_at: now(),
-        }];
-        db.append_deep_qa("o/r", 7, "h1", id, &finding_qa).unwrap();
-        let pr_qa = [
-            DeepQaMessage {
-                role: "user".into(),
-                content: "PR question".into(),
-                created_at: now(),
-            },
-            DeepQaMessage {
-                role: "assistant".into(),
-                content: "PR answer".into(),
-                created_at: now(),
-            },
-        ];
-        let qa = db.append_deep_pr_qa("o/r", 7, "h1", &pr_qa).unwrap().unwrap();
-        assert_eq!(qa.len(), 2);
-        let reopened = db.get_deep_workspace("o/r", 7, "h1").unwrap().unwrap();
-        assert_eq!(reopened.qa.len(), 2);
-        assert_eq!(reopened.findings[0].qa.len(), 1);
-        assert_eq!(reopened.findings[0].draft_text, "edited draft");
-        assert_eq!(reopened.findings[0].revision, 1);
-        assert_eq!(reopened.diff, "backfilled diff");
-    }
-
-    #[test]
-    fn replace_deep_findings_preserves_identity_history_and_pr_context() {
-        let db = Db::open_memory().unwrap();
-        let created = db.create_deep_workspace(&deep_workspace("h1")).unwrap();
-        let old_id = created.findings[0].id;
-        db.update_deep_draft("o/r", 7, "h1", old_id, 0, "keep this draft").unwrap();
-        db.append_deep_qa("o/r", 7, "h1", old_id, &[DeepQaMessage {
-            role: "user".into(),
-            content: "keep this question".into(),
-            created_at: now(),
-        }]).unwrap();
-        db.append_deep_pr_qa("o/r", 7, "h1", &[DeepQaMessage {
-            role: "user".into(),
-            content: "keep PR context".into(),
-            created_at: now(),
-        }]).unwrap();
-        let current = db.get_deep_workspace("o/r", 7, "h1").unwrap().unwrap();
-        let new_finding = DeepFindingData {
-            fingerprint: "new-finding".into(),
-            ordinal: 1,
-            path: "src/new.rs".into(),
-            start_line: 4,
-            end_line: 4,
-            severity: "medium".into(),
-            category: "test".into(),
-            content: "new issue".into(),
-            suggested_text: "new suggestion".into(),
-            draft_text: "new suggestion".into(),
-            updated_at: now(),
-            ..Default::default()
-        };
-        let merged = crate::deep_review::merge_refreshed_findings(
-            &current.findings,
-            std::slice::from_ref(&new_finding),
-        );
-        let refreshed = db.replace_deep_findings("o/r", 7, "h1", &merged).unwrap();
-        assert_eq!(refreshed.findings.len(), 2);
-        assert_eq!(refreshed.body, current.body);
-        assert_eq!(refreshed.diff, current.diff);
-        assert_eq!(refreshed.qa.len(), 1);
-        let old = refreshed
-            .findings
-            .iter()
-            .find(|finding| finding.id == old_id)
-            .unwrap();
-        assert_eq!(old.draft_text, "keep this draft");
-        assert_eq!(old.qa[0].content, "keep this question");
-        assert_eq!(old.resolution, "not_found");
-        assert!(old.discarded);
-        let new = refreshed
-            .findings
-            .iter()
-            .find(|finding| finding.fingerprint == "new-finding")
-            .unwrap();
-        assert!(new.id > 0);
-        assert!(!new.discarded);
-    }
-
-    #[test]
-    fn deep_workspace_separates_heads_and_delete_cleans_local_only_data() {
-        let source = Db::open_memory().unwrap();
-        source.create_deep_workspace(&deep_workspace("h1")).unwrap();
-        source.create_deep_workspace(&deep_workspace("h2")).unwrap();
-        assert_eq!(
-            source.get_latest_deep_workspace("o/r", 7).unwrap().unwrap().head_sha,
-            "h2"
-        );
-        assert_eq!(source.get_deep_workspace("o/r", 7, "h1").unwrap().unwrap().findings.len(), 1);
-
-        let target = Db::open_memory().unwrap();
-        Db::copy_prs_to(&source, &target, &[("o/r".into(), 7)]).unwrap();
-        assert!(target.get_latest_deep_workspace("o/r", 7).unwrap().is_none());
-
-        source.delete_prs(&[("o/r".into(), 7)]).unwrap();
-        assert!(source.get_latest_deep_workspace("o/r", 7).unwrap().is_none());
-        assert!(source.get_deep_workspace("o/r", 7, "h1").unwrap().is_none());
-    }
-
-    #[test]
-    fn migrate_v3_adds_deep_workspace_tables() {
-        let dir = std::env::temp_dir().join(format!("prdesk-db-mig-deep-{}", std::process::id()));
+    fn legacy_deep_tables_are_preserved_but_not_created_for_new_databases() {
+        let dir =
+            std::env::temp_dir().join(format!("prdesk-db-legacy-deep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.db");
         {
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(SCHEMA_V1).unwrap();
-            conn.pragma_update(None, "user_version", 3).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE deep_reviews (
+                    repo TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    base_sha TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    body TEXT NOT NULL DEFAULT '',
+                    diff TEXT NOT NULL DEFAULT '',
+                    qa_json TEXT NOT NULL DEFAULT '[]',
+                    agent_session_id TEXT,
+                    agent_session_cwd TEXT,
+                    PRIMARY KEY (repo, number, head_sha)
+                );
+                CREATE TABLE deep_findings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo TEXT NOT NULL,
+                    number INTEGER NOT NULL,
+                    head_sha TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    finding_json TEXT NOT NULL,
+                    suggested_text TEXT NOT NULL,
+                    draft_text TEXT NOT NULL,
+                    discarded INTEGER NOT NULL DEFAULT 0,
+                    qa_json TEXT NOT NULL DEFAULT '[]',
+                    revision INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE (repo, number, head_sha, fingerprint)
+                );
+                INSERT INTO deep_reviews(repo, number, head_sha, base_sha, title, created_at)
+                VALUES ('o/r', 7, 'h1', 'base', 'legacy workspace', '2026-01-01T00:00:00Z');
+                PRAGMA user_version = 7;
+                "#,
+            )
+            .unwrap();
         }
+
+        validate_database(&path).unwrap();
         let db = Db::open(&path).unwrap();
-        let version: i32 = db.conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
-        for table in ["deep_reviews", "deep_findings"] {
-            let count: i64 = db
-                .conn
-                .query_row(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
-                    params![table],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(count, 1);
-        }
-        let columns = {
-            let mut stmt = db.conn.prepare("PRAGMA table_info(deep_reviews)").unwrap();
-            stmt.query_map([], |r| r.get::<_, String>(1))
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        };
-        for column in ["body", "diff", "qa_json"] {
-            assert!(columns.iter().any(|c| c == column));
-        }
+        let title: String = db
+            .conn
+            .query_row("SELECT title FROM deep_reviews", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(title, "legacy workspace");
+        let legacy_tables: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name IN ('deep_reviews', 'deep_findings')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_tables, 2);
+        drop(db);
+
+        let memory = Db::open_memory().unwrap();
+        let new_tables: i64 = memory
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name IN ('deep_reviews', 'deep_findings')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_tables, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

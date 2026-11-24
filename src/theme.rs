@@ -1,6 +1,4 @@
-use egui::{
-    Color32, Context, CornerRadius, Frame, Mesh, Shadow, Shape, Stroke, Theme, Ui, Visuals,
-};
+use egui::{Color32, Context, CornerRadius, Mesh, Shadow, Shape, Stroke, Theme, Visuals};
 
 pub const THEMES: [&str; 4] = ["light", "dark", "glass-light", "glass-dark"];
 
@@ -225,30 +223,37 @@ fn glass_visuals(dark: bool) -> Visuals {
     visuals
 }
 
-pub fn card_frame(ui: &Ui, name: &str) -> Frame {
-    let frame = Frame::group(ui.style());
-    if !is_glass(name) {
-        return frame;
+pub fn terminal_theme(name: &str) -> egui_xterm::Theme {
+    let dark = matches!(name, "dark" | "glass-dark");
+    let glass = is_glass(name);
+    let mut theme = if dark {
+        egui_xterm::Theme::dark()
+    } else {
+        egui_xterm::Theme::light()
+    };
+    theme.scheme.background = if dark {
+        if glass { [20, 27, 44] } else { [15, 23, 42] }
+    } else {
+        [250, 252, 255]
+    };
+    theme.scheme.foreground = if dark { [230, 230, 230] } else { [32, 32, 32] };
+    theme.scheme.cursor = if dark { [157, 178, 255] } else { [66, 94, 190] };
+    theme.scheme.cursor_text = if dark { [8, 14, 26] } else { [255, 255, 255] };
+    theme.scheme.selection_bg = if dark {
+        [111, 143, 250]
+    } else {
+        [91, 124, 250]
+    };
+    theme.scheme.selection_fg = Some(if dark { [8, 14, 26] } else { [255, 255, 255] });
+    theme
+}
+
+pub fn terminal_background_opacity(name: &str) -> f32 {
+    match name {
+        "glass-dark" => 0.72,
+        "glass-light" => 0.65,
+        _ => 1.0,
     }
-    let dark = name == "glass-dark";
-    frame
-        .fill(if dark {
-            Color32::from_rgba_unmultiplied(34, 44, 67, 145)
-        } else {
-            Color32::from_rgba_unmultiplied(255, 255, 255, 105)
-        })
-        .stroke(Stroke::new(1.0, ui.visuals().window_stroke.color))
-        .corner_radius(CornerRadius::same(10))
-        .shadow(Shadow {
-            offset: [0, 3],
-            blur: 12,
-            spread: 0,
-            color: if dark {
-                Color32::from_black_alpha(35)
-            } else {
-                Color32::from_rgba_unmultiplied(45, 60, 95, 18)
-            },
-        })
 }
 
 #[cfg(test)]
@@ -278,6 +283,30 @@ mod tests {
                 let actual = ctx.global_style().visuals.clone();
                 let expected = regular_visuals(regular == "dark");
                 assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_themes_cover_regular_and_glass_palettes() {
+        assert_eq!(terminal_background_opacity("dark"), 1.0);
+        assert_eq!(terminal_background_opacity("light"), 1.0);
+        assert!(terminal_background_opacity("glass-dark") < 1.0);
+        assert!(terminal_background_opacity("glass-light") < 1.0);
+        for (name, dark) in [
+            ("dark", true),
+            ("glass-dark", true),
+            ("light", false),
+            ("glass-light", false),
+        ] {
+            let theme = terminal_theme(name);
+            assert_eq!(
+                theme.scheme.foreground,
+                if dark { [230, 230, 230] } else { [32, 32, 32] }
+            );
+            assert!(theme.scheme.selection_fg.is_some());
+            if name == "glass-dark" {
+                assert_eq!(theme.scheme.background, [20, 27, 44]);
             }
         }
     }

@@ -2,9 +2,8 @@
 //! 注释里标明的竞态守卫（档案切换串库防护、节流标记乐观记账、在飞去重、
 //! 身份守卫）都是踩坑换来的，不得简化。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -13,8 +12,6 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::{self, Db};
-#[cfg(test)]
-use pr_desk_rs::deep_review::DeepWorkspaceData;
 use pr_desk_rs::diffview;
 use pr_desk_rs::i18n::{tr, trf};
 use pr_desk_rs::reviewer::LlmSettings;
@@ -88,9 +85,18 @@ pub fn toggle_field(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str)
 
 /// 本地字段更新（pinned/on_board/priority/status）：按身份直改 DB，
 /// 不依赖行是否还在当前列表里（面板开着但行被刷新滤掉时操作仍生效）。
-pub fn local_update<V: Into<Value>>(app: &Arc<Mutex<App>>, repo: &str, number: i64, field: &str, value: V) {
+pub fn local_update<V: Into<Value>>(
+    app: &Arc<Mutex<App>>,
+    repo: &str,
+    number: i64,
+    field: &str,
+    value: V,
+) {
     let a = app.lock_recover();
-    if a.db.local_pr_update(repo, number, field, &value.into()).is_ok() {
+    if a.db
+        .local_pr_update(repo, number, field, &value.into())
+        .is_ok()
+    {
         let lang = a.cfg.language.clone();
         drop(a);
         reload_rows_global(app);
@@ -121,7 +127,10 @@ pub fn batch_local_update<V: Into<Value> + Clone>(
         let a = app.lock_recover();
         let mut n = 0usize;
         for (repo, number) in keys {
-            if a.db.local_pr_update(repo, *number, field, &value.clone().into()).is_ok() {
+            if a.db
+                .local_pr_update(repo, *number, field, &value.clone().into())
+                .is_ok()
+            {
                 n += 1;
             }
         }
@@ -168,7 +177,11 @@ pub fn open_pr_url(app: &Arc<Mutex<App>>, repo: &str, number: &i64) {
     };
     if let Err(e) = open::that(&url) {
         let lang = lang_of(app);
-        send_msg(Msg::Status(trf(&lang, "open_browser_failed", &[&e.to_string()])));
+        send_msg(Msg::Status(trf(
+            &lang,
+            "open_browser_failed",
+            &[&e.to_string()],
+        )));
     }
 }
 
@@ -223,7 +236,11 @@ pub fn reload_rows_global(app: &Arc<Mutex<App>>) {
                 tracing::warn!("列表加载失败: {e}");
                 let lang = a.cfg.language.clone();
                 drop(a);
-                send_msg(Msg::Status(trf(&lang, "list_load_failed", &[&e.to_string()])));
+                send_msg(Msg::Status(trf(
+                    &lang,
+                    "list_load_failed",
+                    &[&e.to_string()],
+                )));
                 return;
             }
         }
@@ -248,7 +265,10 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
                 tracing::warn!("列表加载失败: {e}");
                 let lang = a.cfg.language.clone();
                 drop(a);
-                send(msg_tx, Msg::Status(trf(&lang, "list_load_failed", &[&e.to_string()])));
+                send(
+                    msg_tx,
+                    Msg::Status(trf(&lang, "list_load_failed", &[&e.to_string()])),
+                );
                 return;
             }
         }
@@ -281,8 +301,11 @@ fn reload_rows(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>) {
             let c = app2.lock_recover().cfg.clone();
             (c.token(), c.proxy)
         };
-        let Ok(gh) = github::GitHub::new(token, &proxy) else { return };
-        let fetched = avatars::prefetch(&gh, logins).await + avatars::prefetch_orgs(&gh, orgs).await;
+        let Ok(gh) = github::GitHub::new(token, &proxy) else {
+            return;
+        };
+        let fetched =
+            avatars::prefetch(&gh, logins).await + avatars::prefetch_orgs(&gh, orgs).await;
         if fetched > 0 {
             // 新头像落盘：重建一次让 UI 拿到图（缓存已新鲜，不会递归预取）。
             // egui 侧纹理按 mtime 失效，这里仅需触发一次重绘
@@ -329,7 +352,10 @@ async fn fetch_notif_states(
 }
 
 /// 通知 → 行 JSON（state 取自批量查询结果，查不到为空串）。
-fn notif_row_json(n: &github::Notification, states: &std::collections::HashMap<String, String>) -> Value {
+fn notif_row_json(
+    n: &github::Notification,
+    states: &std::collections::HashMap<String, String>,
+) -> Value {
     let url = notif_html_url(&n.url);
     let state = notif_url_number(&url)
         .and_then(|num| states.get(&format!("{}#{num}", n.repo)).cloned())
@@ -374,7 +400,12 @@ async fn fetch_inbox_once(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &m
         let a = app.lock_recover();
         (a.cfg.token().is_some(), a.inbox_all, a.inbox_page.max(1))
     };
-    tracing::info!("fetch_inbox: has_token={} all={} pages={}", has_token, all, pages);
+    tracing::info!(
+        "fetch_inbox: has_token={} all={} pages={}",
+        has_token,
+        all,
+        pages
+    );
     if !has_token {
         // 无 token：关掉可能存在的 UI 加载态（首次进 Inbox 时置过 true）
         send(msg_tx, Msg::InboxLoading(false));
@@ -399,14 +430,21 @@ async fn fetch_inbox_once(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &m
             }
             Err(e) => {
                 let lang = lang_of(app);
-                send(msg_tx, Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])));
+                send(
+                    msg_tx,
+                    Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])),
+                );
                 // 失败也要关首次加载态（否则 Inbox 永远停在「加载中」）
                 send(msg_tx, Msg::InboxLoading(false));
                 return;
             }
         }
     }
-    tracing::info!("fetch_inbox: got {} notifications ({} pages)", all_ns.len(), pages);
+    tracing::info!(
+        "fetch_inbox: got {} notifications ({} pages)",
+        all_ns.len(),
+        pages
+    );
     let states = fetch_notif_states(gh, &all_ns).await;
     {
         let mut a = app.lock_recover();
@@ -459,12 +497,19 @@ async fn fetch_inbox_more(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &m
             Err(e) => {
                 let lang = a.cfg.language.clone();
                 drop(a);
-                send(msg_tx, Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])));
+                send(
+                    msg_tx,
+                    Msg::Status(trf(&lang, "inbox_fetch_failed", &[&e.to_string()])),
+                );
                 return;
             }
         }
     }
-    tracing::info!("fetch_inbox_more: page {} loaded, total {} rows", next_page, merged.len());
+    tracing::info!(
+        "fetch_inbox_more: page {} loaded, total {} rows",
+        next_page,
+        merged.len()
+    );
     send(msg_tx, Msg::InboxRows(merged));
 }
 
@@ -483,191 +528,119 @@ async fn run_review_task(
     number: i64,
 ) -> bool {
     let lang = cfg.language.as_str();
-    send(msg_tx, Msg::ReviewProgress {
-        repo: repo.to_string(),
-        number,
-        text: trf(lang, "review_start", &[repo, &number.to_string()]),
-    });
+    send(
+        msg_tx,
+        Msg::ReviewProgress {
+            repo: repo.to_string(),
+            number,
+            text: trf(lang, "review_start", &[repo, &number.to_string()]),
+        },
+    );
     // 进度回调 → channel（状态栏 + 面板进度，见 Msg::ReviewProgress）
     let tx = msg_tx.clone();
     let (r2, n2) = (repo.to_string(), number);
     let mut progress = move |text: String| {
-        send(&tx, Msg::ReviewProgress { repo: r2.clone(), number: n2, text });
+        send(
+            &tx,
+            Msg::ReviewProgress {
+                repo: r2.clone(),
+                number: n2,
+                text,
+            },
+        );
     };
     // 设置页的自定义评审模板（exe 旁 review_prompt.md；空/缺失 = 默认模板）
     let custom_prompt = std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
         .ok()
         .filter(|s| !s.trim().is_empty());
-    match reviewer::run_review(llm, g, repo, number, &mut progress, lang, custom_prompt.as_deref()).await {
+    match reviewer::run_review(
+        llm,
+        g,
+        repo,
+        number,
+        &mut progress,
+        lang,
+        custom_prompt.as_deref(),
+    )
+    .await
+    {
         Ok(mut v) => {
             // 第二段：OCR 行级评论（评分已拿到，OCR 失败不拖垮整单）
             match g.fetch_pr_meta(repo, number).await {
                 Ok(meta) => {
-                    match ocr::run_ocr_review(cfg, g, repo, number, &meta, &mut progress, lang).await {
+                    match ocr::run_ocr_review(cfg, g, repo, number, &meta, &mut progress, lang)
+                        .await
+                    {
                         Ok(outcome) => {
-                            send(msg_tx, Msg::ReviewProgress {
-                                repo: repo.to_string(),
-                                number,
-                                text: trf(
-                                    lang,
-                                    "ocr_done_status",
-                                    &[
-                                        &outcome.comments.len().to_string(),
-                                        &outcome.files_reviewed.to_string(),
-                                    ],
-                                ),
-                            });
+                            send(
+                                msg_tx,
+                                Msg::ReviewProgress {
+                                    repo: repo.to_string(),
+                                    number,
+                                    text: trf(
+                                        lang,
+                                        "ocr_done_status",
+                                        &[
+                                            &outcome.comments.len().to_string(),
+                                            &outcome.files_reviewed.to_string(),
+                                        ],
+                                    ),
+                                },
+                            );
                             v["comments"] = Value::Array(outcome.comments);
                         }
                         Err(e) => {
                             // 状态栏一闪而过很难捉到，同步写日志
                             tracing::warn!("OCR 明细获取失败 {repo} #{number}: {e}");
-                            send(msg_tx, Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])));
+                            send(
+                                msg_tx,
+                                Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])),
+                            );
                         }
                     }
                 }
                 Err(e) => {
                     tracing::warn!("OCR 前置 meta 拉取失败 {repo} #{number}: {e}");
-                    send(msg_tx, Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])));
+                    send(
+                        msg_tx,
+                        Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])),
+                    );
                 }
             }
-            let ok = lock_for_profile(app, profile)
-                .is_some_and(|a| a.db.upsert_review(&v).is_ok());
+            let ok = lock_for_profile(app, profile).is_some_and(|a| a.db.upsert_review(&v).is_ok());
             if ok {
-                send(msg_tx, Msg::ReviewDone { repo: repo.to_string(), number });
+                send(
+                    msg_tx,
+                    Msg::ReviewDone {
+                        repo: repo.to_string(),
+                        number,
+                    },
+                );
                 true
             } else {
-                send(msg_tx, Msg::ReviewFailed {
-                    repo: repo.to_string(),
-                    number,
-                    err: tr(lang, "review_save_failed").into(),
-                });
+                send(
+                    msg_tx,
+                    Msg::ReviewFailed {
+                        repo: repo.to_string(),
+                        number,
+                        err: tr(lang, "review_save_failed").into(),
+                    },
+                );
                 false
             }
         }
         Err(e) => {
-            send(msg_tx, Msg::ReviewFailed {
-                repo: repo.to_string(),
-                number,
-                err: format!("{e}"),
-            });
+            send(
+                msg_tx,
+                Msg::ReviewFailed {
+                    repo: repo.to_string(),
+                    number,
+                    err: format!("{e}"),
+                },
+            );
             false
         }
     }
-}
-
-// ── Deep Review：OCR 快照 + 本地草稿 + Finding 级文本助手 ──
-
-fn deep_fail(
-    tx: &mpsc::Sender<Msg>,
-    key: &DeepKey,
-    finding_id: Option<i64>,
-    request_id: u64,
-    action: DeepAction,
-    err: impl Into<String>,
-) {
-    send(tx, Msg::DeepFailed {
-        key: key.clone(),
-        finding_id,
-        request_id,
-        action,
-        err: err.into(),
-    });
-}
-
-type DeepCancelFlags = Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>;
-
-struct DeepCancelGuard {
-    flags: DeepCancelFlags,
-    request_id: u64,
-    cancel: Arc<AtomicBool>,
-}
-
-impl Drop for DeepCancelGuard {
-    fn drop(&mut self) {
-        let mut flags = self.flags.lock_recover();
-        if flags
-            .get(&self.request_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &self.cancel))
-        {
-            flags.remove(&self.request_id);
-        }
-    }
-}
-
-fn register_deep_cancel(flags: &DeepCancelFlags, request_id: u64) -> Arc<AtomicBool> {
-    debug_assert_ne!(request_id, 0);
-    let cancel = Arc::new(AtomicBool::new(false));
-    flags.lock_recover().insert(request_id, cancel.clone());
-    cancel
-}
-
-async fn wait_deep_cancel(cancel: Arc<AtomicBool>) {
-    while !cancel.load(Ordering::Relaxed) {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-}
-
-async fn run_deep_cancellable<T>(
-    msg_tx: &mpsc::Sender<Msg>,
-    key: &DeepKey,
-    finding_id: Option<i64>,
-    request_id: u64,
-    action: DeepAction,
-    lang: &str,
-    cancel: Arc<AtomicBool>,
-    task: impl std::future::Future<Output = T>,
-) -> Option<T> {
-    tokio::select! {
-        _ = wait_deep_cancel(cancel) => {
-            deep_fail(
-                msg_tx,
-                key,
-                finding_id,
-                request_id,
-                action,
-                tr(lang, "err_ocr_cancelled"),
-            );
-            None
-        }
-        output = task => Some(output),
-    }
-}
-
-fn deep_assist_running_for_pr(
-    inflight: &Mutex<HashSet<(DeepKey, i64)>>,
-    key: &DeepKey,
-) -> bool {
-    inflight.lock_recover().iter().any(|(running_key, _)| {
-        running_key.profile == key.profile
-            && running_key.repo == key.repo
-            && running_key.number == key.number
-    })
-}
-
-async fn run_deep_review_task(
-    cfg: &Config,
-    g: &github::GitHub,
-    app: &Arc<Mutex<App>>,
-    msg_tx: &mpsc::Sender<Msg>,
-    profile: &str,
-    repo: &str,
-    number: i64,
-    request_id: u64,
-    cancel: Arc<AtomicBool>,
-) -> bool {
-    crate::deep_acp::run_deep_review_task(
-        cfg,
-        g,
-        app,
-        msg_tx,
-        profile,
-        repo,
-        number,
-        request_id,
-        cancel,
-    )
-    .await
 }
 
 type AutoReviewKey = (String, String, i64);
@@ -690,7 +663,6 @@ impl AutoReviewQueue {
                 profile: profile.clone(),
                 repo,
                 number,
-                stage: AutoReviewStage::Standard,
             };
             if self.enrolled.insert(Self::key(&job)) {
                 self.pending.push_back(job);
@@ -698,16 +670,9 @@ impl AutoReviewQueue {
         }
     }
 
-    fn settle(&mut self, job: AutoReviewJob, continue_deep: bool) {
+    fn settle(&mut self, job: AutoReviewJob) {
         self.running.remove(&Self::key(&job));
-        if job.stage == AutoReviewStage::Standard && continue_deep {
-            self.pending.push_back(AutoReviewJob {
-                stage: AutoReviewStage::Deep,
-                ..job
-            });
-        } else {
-            self.enrolled.remove(&Self::key(&job));
-        }
+        self.enrolled.remove(&Self::key(&job));
     }
 
     fn clear(&mut self) {
@@ -729,81 +694,42 @@ fn spawn_auto_review(
     let tx = msg_tx.clone();
     let cmd2 = cmd_tx.clone();
     tokio::spawn(async move {
-        let deep = job.stage == AutoReviewStage::Deep;
         let guard = SlotGuard {
             slots,
             repo: job.repo.clone(),
             number: job.number,
-            deep,
         };
         let success = match github::GitHub::new(cfg.token(), &cfg.proxy) {
             Ok(g) => {
                 let rate = g.rate_limit_handle();
-                let success = if deep {
-                    run_deep_review_task(
-                        &cfg,
-                        &g,
-                        &app2,
-                        &tx,
-                        &job.profile,
-                        &job.repo,
-                        job.number,
-                        0,
-                        Arc::new(AtomicBool::new(false)),
-                    )
-                    .await
-                } else {
-                    run_review_task(
-                        &cfg,
-                        &llm,
-                        &g,
-                        &app2,
-                        &tx,
-                        &job.profile,
-                        &job.repo,
-                        job.number,
-                    )
-                    .await
-                };
+                let success = run_review_task(
+                    &cfg,
+                    &llm,
+                    &g,
+                    &app2,
+                    &tx,
+                    &job.profile,
+                    &job.repo,
+                    job.number,
+                )
+                .await;
                 if let Some(n) = *rate.lock_recover() {
                     *app2.lock_recover().rate_limit.lock_recover() = Some(n);
                 }
                 success
             }
             Err(e) => {
-                if deep {
-                    let key = DeepKey {
-                        profile: job.profile.clone(),
-                        repo: job.repo.clone(),
-                        number: job.number,
-                        head_sha: String::new(),
-                    };
-                    deep_fail(
-                        &tx,
-                        &key,
-                        None,
-                        0,
-                        DeepAction::Run,
-                        trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
-                    );
-                } else {
-                    send(&tx, Msg::ReviewFailed {
+                send(
+                    &tx,
+                    Msg::ReviewFailed {
                         repo: job.repo.clone(),
                         number: job.number,
                         err: trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
-                    });
-                }
+                    },
+                );
                 false
             }
         };
-        if deep {
-            let text_key = if success { "auto_deep_done" } else { "auto_deep_failed" };
-            send(&tx, Msg::Status(trf(
-                &cfg.language,
-                text_key,
-                &[&job.repo, &job.number.to_string()],
-            )));
-        }
         drop(guard);
         let _ = cmd2.send(Cmd::AutoReviewSettled { job, success });
     });
@@ -827,25 +753,25 @@ fn pump_auto_reviews(
     let mut warned_llm = false;
     while index < queue.pending.len() {
         let job = queue.pending[index].clone();
-        if job.profile != cfg.active_profile || queue.running.contains(&AutoReviewQueue::key(&job)) {
+        if job.profile != cfg.active_profile || queue.running.contains(&AutoReviewQueue::key(&job))
+        {
             index += 1;
             continue;
         }
         let Some(llm) = LlmSettings::from_config(&cfg) else {
             if !warned_llm {
-                send(msg_tx, Msg::Status(tr(&cfg.language, "llm_not_configured").into()));
+                send(
+                    msg_tx,
+                    Msg::Status(tr(&cfg.language, "llm_not_configured").into()),
+                );
                 warned_llm = true;
             }
             let job = queue.pending.remove(index).expect("queue index checked");
             queue.running.insert(AutoReviewQueue::key(&job));
-            queue.settle(job, true);
+            queue.settle(job);
             continue;
         };
-        let acquired = match job.stage {
-            AutoReviewStage::Standard => slots.lock_recover().try_acquire(&job.repo, job.number),
-            AutoReviewStage::Deep => slots.lock_recover().try_acquire_deep(&job.repo, job.number),
-        };
-        match acquired {
+        match slots.lock_recover().try_acquire(&job.repo, job.number) {
             Ok(()) => {
                 let job = queue.pending.remove(index).expect("queue index checked");
                 queue.running.insert(AutoReviewQueue::key(&job));
@@ -857,196 +783,17 @@ fn pump_auto_reviews(
     }
 }
 
-async fn run_deep_refresh_task(
-    cfg: &Config,
-    g: &github::GitHub,
-    app: &Arc<Mutex<App>>,
-    msg_tx: &mpsc::Sender<Msg>,
-    key: &DeepKey,
-    request_id: u64,
-    cancel: Arc<AtomicBool>,
-) {
-    let _ = crate::deep_acp::run_deep_refresh_task(
-        cfg,
-        g,
-        app,
-        msg_tx,
-        key,
-        request_id,
-        cancel,
-    )
-    .await;
-}
-
-async fn run_deep_rewrite_task(
-    cfg: &Config,
-    llm: &LlmSettings,
-    app: &Arc<Mutex<App>>,
-    msg_tx: &mpsc::Sender<Msg>,
-    key: &DeepKey,
-    finding_id: i64,
-    request_id: u64,
-    expected_revision: i64,
-    base_text: &str,
-    style: &str,
-    cancel: Arc<AtomicBool>,
-) {
-    crate::deep_acp::run_deep_rewrite_task(
-        cfg,
-        llm,
-        app,
-        msg_tx,
-        key,
-        finding_id,
-        request_id,
-        expected_revision,
-        base_text,
-        style,
-        cancel,
-    )
-    .await
-}
-
-async fn run_deep_ask_task(
-    cfg: &Config,
-    llm: &LlmSettings,
-    app: &Arc<Mutex<App>>,
-    msg_tx: &mpsc::Sender<Msg>,
-    key: &DeepKey,
-    finding_id: i64,
-    request_id: u64,
-    question: &str,
-    current_draft: &str,
-    cancel: Arc<AtomicBool>,
-) {
-    crate::deep_acp::run_deep_ask_task(
-        cfg,
-        llm,
-        app,
-        msg_tx,
-        key,
-        finding_id,
-        request_id,
-        question,
-        current_draft,
-        cancel,
-    )
-    .await
-}
-
-async fn run_deep_ask_pr_task(
-    cfg: &Config,
-    llm: &LlmSettings,
-    g: &github::GitHub,
-    app: &Arc<Mutex<App>>,
-    msg_tx: &mpsc::Sender<Msg>,
-    key: &DeepKey,
-    request_id: u64,
-    question: &str,
-    cancel: Arc<AtomicBool>,
-) {
-    crate::deep_acp::run_deep_ask_pr_task(
-        cfg,
-        llm,
-        g,
-        app,
-        msg_tx,
-        key,
-        request_id,
-        question,
-        cancel,
-    )
-    .await
-}
-
-fn mutate_deep_command(
-    app: &Arc<Mutex<App>>,
-    msg_tx: &mpsc::Sender<Msg>,
-    key: &DeepKey,
-    finding_id: i64,
-    request_id: u64,
-    expected_revision: i64,
-    action: DeepAction,
-    draft_text: Option<&str>,
-    discarded: Option<bool>,
-) {
-    let result = {
-        let Some(a) = lock_for_profile(app, &key.profile) else {
-            return;
-        };
-        match action {
-            DeepAction::Save => a.db.update_deep_draft(
-                &key.repo,
-                key.number,
-                &key.head_sha,
-                finding_id,
-                expected_revision,
-                draft_text.unwrap_or_default(),
-            ),
-            _ => a.db.set_deep_finding_discarded(
-                &key.repo,
-                key.number,
-                &key.head_sha,
-                finding_id,
-                expected_revision,
-                discarded.unwrap_or(false),
-            ),
-        }
-    };
-    match result {
-        Ok(mutation) => {
-            if let Some(finding) = mutation.finding {
-                send(msg_tx, Msg::DeepFindingUpdated {
-                    key: key.clone(),
-                    finding_id,
-                    request_id,
-                    action,
-                    finding: Box::new(finding),
-                    conflict: mutation.conflict,
-                });
-            } else {
-                let lang = lang_of(app);
-                deep_fail(
-                    msg_tx,
-                    key,
-                    Some(finding_id),
-                    request_id,
-                    action,
-                    tr(&lang, "deep_finding_missing"),
-                );
-            }
-        }
-        Err(e) => deep_fail(
-            msg_tx,
-            key,
-            Some(finding_id),
-            request_id,
-            action,
-            e.to_string(),
-        ),
-    }
-}
-
-struct DeepAssistGuard {
-    inflight: Arc<Mutex<HashSet<(DeepKey, i64)>>>,
-    key: DeepKey,
-    finding_id: i64,
-}
-
-impl Drop for DeepAssistGuard {
-    fn drop(&mut self) {
-        self.inflight
-            .lock_recover()
-            .remove(&(self.key.clone(), self.finding_id));
-    }
-}
-
 // ── 刷新 / 同步 ──
 
 /// 本地模式刷新：本地库是手动策展的（只有 Inbox「+ 预评审」加入的 PR），
 /// 不从 GitHub 自动拉任何 PR 列表——这里只刷新在库行的 GitHub 状态 + 通知收件箱。
 /// sync 启用时不走这条路——列表以服务器插件数据库为准。
-async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, for_profile: &str) {
+async fn refresh_from_github(
+    gh: &github::GitHub,
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    for_profile: &str,
+) {
     fetch_inbox(gh, app, msg_tx).await;
     // 本地模式（手动策展）：顺带刷新每个在库 PR 的 GitHub 状态——merged/closed 写入
     // status 列后分组会把已完结 PR 移出待评审区；否则合入了列表还显示 Open。
@@ -1071,14 +818,15 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
             let sums: Vec<(String, i64, i64, i64)> = cached
                 .iter()
                 .map(|(repo, number, diff)| {
-                    let (adds, dels) = diffview::split_files(diff)
-                        .iter()
-                        .fold((0i64, 0i64), |(a, d), (_p, text)| {
+                    let (adds, dels) = diffview::split_files(diff).iter().fold(
+                        (0i64, 0i64),
+                        |(a, d), (_p, text)| {
                             (
                                 a + text.lines().filter(|l| l.starts_with('+')).count() as i64,
                                 d + text.lines().filter(|l| l.starts_with('-')).count() as i64,
                             )
-                        });
+                        },
+                    );
                     (repo.clone(), *number, adds, dels)
                 })
                 .collect();
@@ -1181,7 +929,10 @@ async fn refresh_from_github(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx:
 /// 后台任务（sync 拉取 / GitHub 状态刷新）的网络请求要几秒，其间用户可能已切走档案；
 /// 在途结果若写回「当前」库就会把 A 档案的数据灌进 B 档案（曾致服务器列表串进本地库）。
 /// 检查与写入在同一把锁内完成：SwitchProfile 换库也要这把锁，无法插进来。
-fn lock_for_profile<'a>(app: &'a Mutex<App>, for_profile: &str) -> Option<std::sync::MutexGuard<'a, App>> {
+fn lock_for_profile<'a>(
+    app: &'a Mutex<App>,
+    for_profile: &str,
+) -> Option<std::sync::MutexGuard<'a, App>> {
     let a = app.lock_recover();
     if a.cfg.active_profile == for_profile {
         Some(a)
@@ -1210,12 +961,16 @@ pub async fn do_sync(
     // 被丢弃的拉取不丢数据：该档案的游标未前进，下次同步会重新拉。
     let result: anyhow::Result<Option<(sync::PullSummary, sync::PushSummary)>> = async {
         let since = {
-            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
+            let Some(a) = lock_for_profile(app, for_profile) else {
+                return Ok(None);
+            };
             a.db.get_cursor()?
         };
         let body = sync_client.pull_body(since).await?;
         let pulled = {
-            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
+            let Some(a) = lock_for_profile(app, for_profile) else {
+                return Ok(None);
+            };
             sync::apply_pull(&a.db, &body)?
         };
         if !pulled.new_pr_keys.is_empty() {
@@ -1225,12 +980,16 @@ pub async fn do_sync(
             });
         }
         let outbox = {
-            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
+            let Some(a) = lock_for_profile(app, for_profile) else {
+                return Ok(None);
+            };
             a.db.outbox_drain()?
         };
         let (updates, ids) = sync::merge_outbox(&outbox);
         let reviews_new = {
-            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
+            let Some(a) = lock_for_profile(app, for_profile) else {
+                return Ok(None);
+            };
             a.db.unpushed_reviews()?
         };
         let mut pushed = sync::PushSummary::default();
@@ -1247,7 +1006,9 @@ pub async fn do_sync(
                 })
                 .collect();
             let resp = sync_client.push_body(updates, reviews_new).await?;
-            let Some(a) = lock_for_profile(app, for_profile) else { return Ok(None) };
+            let Some(a) = lock_for_profile(app, for_profile) else {
+                return Ok(None);
+            };
             pushed = sync::apply_push_result(&a.db, &resp)?;
             for id in ids {
                 a.db.outbox_remove(id)?;
@@ -1265,17 +1026,20 @@ pub async fn do_sync(
                 (a.last_sync.clone(), a.cfg.language.clone())
             };
             sync::mark_synced(&last_sync);
-            send(msg_tx, Msg::Status(trf(
-                &lang,
-                "sync_done",
-                &[
-                    &pulled.pr_count.to_string(),
-                    &pulled.review_count.to_string(),
-                    &pulled.todo_count.to_string(),
-                    &push.applied.to_string(),
-                    &push.conflicts.to_string(),
-                ],
-            )));
+            send(
+                msg_tx,
+                Msg::Status(trf(
+                    &lang,
+                    "sync_done",
+                    &[
+                        &pulled.pr_count.to_string(),
+                        &pulled.review_count.to_string(),
+                        &pulled.todo_count.to_string(),
+                        &push.applied.to_string(),
+                        &push.conflicts.to_string(),
+                    ],
+                )),
+            );
             reload_rows(app, msg_tx);
         }
         Ok(None) => {
@@ -1284,7 +1048,10 @@ pub async fn do_sync(
         }
         Err(e) => {
             let lang = lang_of(app);
-            send(msg_tx, Msg::Status(trf(&lang, "sync_failed", &[&e.to_string()])));
+            send(
+                msg_tx,
+                Msg::Status(trf(&lang, "sync_failed", &[&e.to_string()])),
+            );
         }
     }
 }
@@ -1295,7 +1062,14 @@ pub async fn do_sync(
 /// 全部 DB 读写 + diff 解析在这里完成，UI 线程只负责把回送的 Msg 落地。
 /// 选中态（a.selected）由调用方先行设置（UI 点行时立即落地，
 /// 后续 Panel/DiffParsed 的身份守卫以此为准）。
-fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &UnboundedSender<Cmd>, repo: String, number: i64, refetch: bool) {
+fn open_drawer_work(
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    cmd_tx: &UnboundedSender<Cmd>,
+    repo: String,
+    number: i64,
+    refetch: bool,
+) {
     let lang = lang_of(app);
     // 行数据是快照（row 允许为 None：行被刷新滤掉时面板也保持打开，数据来自 DB）
     let (priority, row) = {
@@ -1307,7 +1081,7 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
         (priority, idx.and_then(|i| a.rows.get(i).cloned()))
     };
 
-    let (review, diff_cached, head_sha, deep) = {
+    let (review, diff_cached, head_sha) = {
         let a = app.lock_recover();
         let review = match a.db.get_review(&repo, number) {
             Ok(r) => r,
@@ -1323,15 +1097,12 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
                 None
             }
         };
-        let head_sha = a.db.pr_head_sha(&repo, number).ok().flatten().unwrap_or_default();
-        let deep = match a.db.get_latest_deep_workspace(&repo, number) {
-            Ok(w) => w,
-            Err(e) => {
-                tracing::warn!("读取 Deep Review 失败 {repo} #{number}: {e}");
-                None
-            }
-        };
-        (review, diff, head_sha, deep)
+        let head_sha =
+            a.db.pr_head_sha(&repo, number)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+        (review, diff, head_sha)
     };
 
     // 会话条目在 worker 装配（纯数据过界）；Checks/Files 保持 JSON，UI 线程解析
@@ -1339,9 +1110,8 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
         .as_ref()
         .map(|r| drawer_extras_json(r))
         .unwrap_or_default();
-    let convo = plain_convo_entries(
-        &serde_json::from_str::<Vec<Value>>(&convo_json).unwrap_or_default(),
-    );
+    let convo =
+        plain_convo_entries(&serde_json::from_str::<Vec<Value>>(&convo_json).unwrap_or_default());
     // 会话作者头像预取：UI 装盒时读的是磁盘缓存（miss → 字母降级），这里后台补齐；
     // 有实际新拉取才发 ConvoAvatars 让 UI 原地回填（模式照抄 reload_rows 尾部的头像预取：
     // 必须 GitHub::new 标准客户端——自建裸 reqwest 在 worker 会挂死）。spawn 而非 inline
@@ -1365,9 +1135,17 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
                 let c = app2.lock_recover().cfg.clone();
                 (c.token(), c.proxy)
             };
-            let Ok(gh) = github::GitHub::new(token, &proxy) else { return };
+            let Ok(gh) = github::GitHub::new(token, &proxy) else {
+                return;
+            };
             if avatars::prefetch(&gh, convo_authors).await > 0 {
-                send(&msg_tx2, Msg::ConvoAvatars { repo: repo2, number: number2 });
+                send(
+                    &msg_tx2,
+                    Msg::ConvoAvatars {
+                        repo: repo2,
+                        number: number2,
+                    },
+                );
             }
         });
     }
@@ -1398,7 +1176,13 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
     let state = row
         .as_ref()
         .and_then(|r| r["status"].as_str().map(|s| s.to_string()))
-        .map(|s| if s == "merged" || s == "closed" { s } else { "open".into() })
+        .map(|s| {
+            if s == "merged" || s == "closed" {
+                s
+            } else {
+                "open".into()
+            }
+        })
         .unwrap_or_else(|| "open".into());
     let ci = row
         .as_ref()
@@ -1408,48 +1192,60 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
         .as_ref()
         .map(|r| rel_time(r["updated_at"].as_str().unwrap_or("")))
         .unwrap_or_default();
-    let pinned = row.as_ref().map(|r| r["pinned"].as_i64() == Some(1)).unwrap_or(false);
-    let on_board = row.as_ref().map(|r| r["on_board"].as_i64() == Some(1)).unwrap_or(false);
+    let pinned = row
+        .as_ref()
+        .map(|r| r["pinned"].as_i64() == Some(1))
+        .unwrap_or(false);
+    let on_board = row
+        .as_ref()
+        .map(|r| r["on_board"].as_i64() == Some(1))
+        .unwrap_or(false);
 
-    send(msg_tx, Msg::Panel(Box::new(PanelData {
-        repo: repo.clone(),
-        number,
-        title: row
-            .as_ref()
-            .and_then(|r| r["title"].as_str().map(|s| s.to_string()))
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| format!("{repo} #{number}")),
-        author: row
-            .as_ref()
-            .and_then(|r| r["author"].as_str().map(|s| s.to_string()))
-            .unwrap_or_default(),
-        state,
-        ci,
-        updated: age,
-        priority,
-        pinned,
-        on_board,
-        convo,
-        checks_json,
-        files_json,
-        review: review_props(review.as_ref(), &lang),
-        review_status: String::new(),
-        review_progress: String::new(),
-        head_sha,
-        deep,
-        deep_status: String::new(),
-        deep_progress: String::new(),
-        deep_error: String::new(),
-    })));
+    send(
+        msg_tx,
+        Msg::Panel(Box::new(PanelData {
+            repo: repo.clone(),
+            number,
+            title: row
+                .as_ref()
+                .and_then(|r| r["title"].as_str().map(|s| s.to_string()))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{repo} #{number}")),
+            author: row
+                .as_ref()
+                .and_then(|r| r["author"].as_str().map(|s| s.to_string()))
+                .unwrap_or_default(),
+            state,
+            ci,
+            updated: age,
+            priority,
+            pinned,
+            on_board,
+            convo,
+            checks_json,
+            files_json,
+            review: review_props(review.as_ref(), &lang),
+            review_status: String::new(),
+            review_progress: String::new(),
+            head_sha,
+        })),
+    );
 
-    // 普通预审阅进行中才更新原评审按钮；Deep Review 有自己的进度状态。
+    // 普通预审阅进行中才更新原评审按钮。
     let running = app
         .lock_recover()
         .review_slots
         .lock_recover()
         .is_standard_review_running(&repo, number);
     if running {
-        send(msg_tx, Msg::ReviewProgress { repo: repo.clone(), number, text: tr(&lang, "review_running").into() });
+        send(
+            msg_tx,
+            Msg::ReviewProgress {
+                repo: repo.clone(),
+                number,
+                text: tr(&lang, "review_running").into(),
+            },
+        );
     }
 
     // diff 解析在 worker 完成（大 PR 几万行逐行解析不占 UI 线程），
@@ -1457,10 +1253,20 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
     match diff_cached {
         Some(d) => {
             let files = parse_diff(&d);
-            send(msg_tx, Msg::DiffParsed { repo: repo.clone(), number, files });
+            send(
+                msg_tx,
+                Msg::DiffParsed {
+                    repo: repo.clone(),
+                    number,
+                    files,
+                },
+            );
         }
         None => {
-            let _ = cmd_tx.send(Cmd::FetchDiff { repo: repo.clone(), number });
+            let _ = cmd_tx.send(Cmd::FetchDiff {
+                repo: repo.clone(),
+                number,
+            });
         }
     }
 
@@ -1473,19 +1279,32 @@ fn open_drawer_work(app: &Arc<Mutex<App>>, msg_tx: &mpsc::Sender<Msg>, cmd_tx: &
         None => false,
     };
     if refetch && damaged {
-        let _ = cmd_tx.send(Cmd::FetchPrMeta { repo: repo.clone(), number });
+        let _ = cmd_tx.send(Cmd::FetchPrMeta {
+            repo: repo.clone(),
+            number,
+        });
     }
 
     // 面板先显示缓存（可能陈旧）；后台实时拉取最新状态，回来后覆盖面板与列表行。
     // ReopenPanel 重开时 refetch=false，不再重复派发。
     if refetch {
-        let _ = cmd_tx.send(Cmd::FetchPrLive { repo, number, parts: PART_CHECKS });
+        let _ = cmd_tx.send(Cmd::FetchPrLive {
+            repo,
+            number,
+            parts: PART_CHECKS,
+        });
     }
 }
 
 // ── worker 命令循环 ──
 
-async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mpsc::Sender<Msg>, cmd_tx: UnboundedSender<Cmd>, cfg_path: PathBuf) {
+async fn worker(
+    app: Arc<Mutex<App>>,
+    mut rx: UnboundedReceiver<Cmd>,
+    msg_tx: mpsc::Sender<Msg>,
+    cmd_tx: UnboundedSender<Cmd>,
+    cfg_path: PathBuf,
+) {
     let _ = MSG_TX.set(msg_tx.clone());
 
     let (token, proxy) = {
@@ -1496,7 +1315,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
         Ok(g) => Some(g),
         Err(e) => {
             let lang = lang_of(&app);
-            send(&msg_tx, Msg::Status(trf(&lang, "gh_client_init_failed", &[&e.to_string()])));
+            send(
+                &msg_tx,
+                Msg::Status(trf(&lang, "gh_client_init_failed", &[&e.to_string()])),
+            );
             None
         }
     };
@@ -1516,8 +1338,6 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
     // 元数据补齐节流：同一行 300s 内最多补一次（兜底防 open_drawer↔ReopenPanel 循环）
     let meta_healed: Arc<Mutex<std::collections::HashMap<(String, i64), std::time::Instant>>> =
         Default::default();
-    let deep_assist_inflight: Arc<Mutex<HashSet<(DeepKey, i64)>>> = Default::default();
-    let deep_cancel_flags: DeepCancelFlags = Default::default();
     let mut auto_reviews = AutoReviewQueue::default();
 
     // unbounded channel + recv().await：不在 tokio 工作线程上做 std 阻塞 recv；
@@ -1542,7 +1362,9 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         a.gh_refreshing = false;
                         a.rows
                             .iter()
-                            .filter(|r| !matches!(r["status"].as_str(), Some("merged") | Some("closed")))
+                            .filter(|r| {
+                                !matches!(r["status"].as_str(), Some("merged") | Some("closed"))
+                            })
                             .count()
                     };
                     send(tx, Msg::RefreshDone(open_count));
@@ -1607,13 +1429,23 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                                 }
                                 // 解析在 task 内完成；消息带身份，面板已切走时 apply 丢弃上屏
                                 let files = parse_diff(&diff);
-                                send(&tx, Msg::DiffParsed { repo, number, files });
+                                send(
+                                    &tx,
+                                    Msg::DiffParsed {
+                                        repo,
+                                        number,
+                                        files,
+                                    },
+                                );
                                 // diff 响应也带配额头，状态栏重组刷新配额
                                 send(&tx, Msg::StatusBarRefresh);
                             }
                             Err(e) => {
                                 let lang = lang_of(&app2);
-                                send(&tx, Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
+                                send(
+                                    &tx,
+                                    Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])),
+                                );
                             }
                         }
                     });
@@ -1652,7 +1484,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             Ok(()) => fetch_inbox(&g, &app2, &tx).await,
                             Err(e) => {
                                 let lang = lang_of(&app2);
-                                send(&tx, Msg::Status(trf(&lang, "mark_read_failed", &[&e.to_string()])));
+                                send(
+                                    &tx,
+                                    Msg::Status(trf(&lang, "mark_read_failed", &[&e.to_string()])),
+                                );
                             }
                         }
                         send(&tx, Msg::StatusBarRefresh);
@@ -1670,11 +1505,14 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     // 否则面板永远停在「加载中」。
                     let Some(g) = &g else {
                         let lang = lang_of(&app2);
-                        send(&tx, Msg::NotifDetailFailed {
-                            repo,
-                            number,
-                            err: tr(&lang, "cfg_unconfigured").into(),
-                        });
+                        send(
+                            &tx,
+                            Msg::NotifDetailFailed {
+                                repo,
+                                number,
+                                err: tr(&lang, "cfg_unconfigured").into(),
+                            },
+                        );
                         return;
                     };
                     // 会话对 PR/Issue 都有；Files/Diff 仅 PullRequest
@@ -1682,7 +1520,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         Ok(c) => c,
                         Err(e) => {
                             let lang = lang_of(&app2);
-                            send(&tx, Msg::Status(trf(&lang, "convo_fetch_failed", &[&e.to_string()])));
+                            send(
+                                &tx,
+                                Msg::Status(trf(&lang, "convo_fetch_failed", &[&e.to_string()])),
+                            );
                             Vec::new()
                         }
                     };
@@ -1691,7 +1532,14 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             Ok(f) => f,
                             Err(e) => {
                                 let lang = lang_of(&app2);
-                                send(&tx, Msg::Status(trf(&lang, "files_fetch_failed", &[&e.to_string()])));
+                                send(
+                                    &tx,
+                                    Msg::Status(trf(
+                                        &lang,
+                                        "files_fetch_failed",
+                                        &[&e.to_string()],
+                                    )),
+                                );
                                 Vec::new()
                             }
                         };
@@ -1699,7 +1547,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             Ok(d) => d,
                             Err(e) => {
                                 let lang = lang_of(&app2);
-                                send(&tx, Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])));
+                                send(
+                                    &tx,
+                                    Msg::Status(trf(&lang, "diff_fetch_failed", &[&e.to_string()])),
+                                );
                                 String::new()
                             }
                         };
@@ -1717,20 +1568,28 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         .collect();
                     authors.sort();
                     authors.dedup();
-                    send(&tx, Msg::NotifDetail {
-                        repo: repo.clone(),
-                        number,
-                        convo: convo_entries,
-                        files_json: serde_json::to_string(&files).unwrap_or_else(|_| "[]".into()),
-                        diff_files: parse_diff(&diff),
-                    });
+                    send(
+                        &tx,
+                        Msg::NotifDetail {
+                            repo: repo.clone(),
+                            number,
+                            convo: convo_entries,
+                            files_json: serde_json::to_string(&files)
+                                .unwrap_or_else(|_| "[]".into()),
+                            diff_files: parse_diff(&diff),
+                        },
+                    );
                     send(&tx, Msg::StatusBarRefresh);
                     if !authors.is_empty() && avatars::prefetch(g, authors).await > 0 {
                         send(&tx, Msg::ConvoAvatars { repo, number });
                     }
                 });
             }
-            Cmd::OpenDrawer { repo, number, refetch } => {
+            Cmd::OpenDrawer {
+                repo,
+                number,
+                refetch,
+            } => {
                 open_drawer_work(&app, &msg_tx, &cmd_tx, repo, number, refetch);
             }
             Cmd::CopyReview => {
@@ -1757,7 +1616,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             send(&msg_tx, Msg::Status(tr(&lang, "review_copied").into()));
                         }
                         Err(e) => {
-                            send(&msg_tx, Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()])));
+                            send(
+                                &msg_tx,
+                                Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()])),
+                            );
                         }
                     }
                 }
@@ -1775,26 +1637,39 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         if let Some(parent) = dst_path.parent() {
                             let _ = std::fs::create_dir_all(parent);
                         }
-                        Some(Db::open(&dst_path).and_then(|dst| Db::copy_prs_to(&a.db, &dst, &keys)))
+                        Some(
+                            Db::open(&dst_path).and_then(|dst| Db::copy_prs_to(&a.db, &dst, &keys)),
+                        )
                     }
                 };
                 if let Some(r) = result {
                     match r {
                         Ok((inserted, skipped, n_reviews)) => {
                             let msg = if skipped > 0 {
-                                trf(&lang, "copy_done_skipped", &[
-                                    &inserted.to_string(),
-                                    &target,
-                                    &n_reviews.to_string(),
-                                    &skipped.to_string(),
-                                ])
+                                trf(
+                                    &lang,
+                                    "copy_done_skipped",
+                                    &[
+                                        &inserted.to_string(),
+                                        &target,
+                                        &n_reviews.to_string(),
+                                        &skipped.to_string(),
+                                    ],
+                                )
                             } else {
-                                trf(&lang, "copy_done", &[&inserted.to_string(), &target, &n_reviews.to_string()])
+                                trf(
+                                    &lang,
+                                    "copy_done",
+                                    &[&inserted.to_string(), &target, &n_reviews.to_string()],
+                                )
                             };
                             send(&msg_tx, Msg::Status(msg));
                         }
                         Err(e) => {
-                            send(&msg_tx, Msg::Status(trf(&lang, "copy_failed", &[&e.to_string()])));
+                            send(
+                                &msg_tx,
+                                Msg::Status(trf(&lang, "copy_failed", &[&e.to_string()])),
+                            );
                         }
                     }
                 }
@@ -1805,10 +1680,16 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 let n = text.lines().count();
                 match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
                     Ok(()) => {
-                        send(&msg_tx, Msg::Status(trf(&lang, "links_copied", &[&n.to_string()])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(&lang, "links_copied", &[&n.to_string()])),
+                        );
                     }
                     Err(e) => {
-                        send(&msg_tx, Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()])),
+                        );
                     }
                 }
             }
@@ -1831,14 +1712,26 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                             }
                             Err(e) => {
                                 let lang = lang_of(&app2);
-                                send(&tx, Msg::Status(trf(&lang, "mark_all_read_failed", &[&e.to_string()])));
+                                send(
+                                    &tx,
+                                    Msg::Status(trf(
+                                        &lang,
+                                        "mark_all_read_failed",
+                                        &[&e.to_string()],
+                                    )),
+                                );
                             }
                         }
                         send(&tx, Msg::StatusBarRefresh);
                     });
                 }
             }
-            Cmd::AddNotifReview { repo, number, title, url } => {
+            Cmd::AddNotifReview {
+                repo,
+                number,
+                title,
+                url,
+            } => {
                 let (outcome, profile) = {
                     let a = app.lock_recover();
                     let outcome = a.db.insert_pr_from_inbox(&serde_json::json!({
@@ -1851,24 +1744,51 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 };
                 match outcome {
                     Ok(db::InsertPrOutcome::Inserted) => {
-                        send(&msg_tx, Msg::Status(trf(&lang, "added_review", &[&repo, &number.to_string()])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(&lang, "added_review", &[&repo, &number.to_string()])),
+                        );
                         reload_rows(&app, &msg_tx);
                         // 通知只带 title/url：补拉 author/head_sha 等元数据（入库即补齐，不留残缺行）
-                        let _ = cmd_tx.send(Cmd::FetchPrMeta { repo: repo.clone(), number });
+                        let _ = cmd_tx.send(Cmd::FetchPrMeta {
+                            repo: repo.clone(),
+                            number,
+                        });
                         let _ = cmd_tx.send(Cmd::QueueAutoReviews {
                             profile,
                             keys: vec![(repo.clone(), number)],
                         });
                     }
                     Ok(db::InsertPrOutcome::AlreadyExists) => {
-                        send(&msg_tx, Msg::Status(trf(&lang, "already_in_list", &[&repo, &number.to_string()])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(
+                                &lang,
+                                "already_in_list",
+                                &[&repo, &number.to_string()],
+                            )),
+                        );
                     }
                     Ok(db::InsertPrOutcome::Tombstoned) => {
-                        send(&msg_tx, Msg::Status(trf(&lang, "add_blocked_tombstone", &[&repo, &number.to_string()])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(
+                                &lang,
+                                "add_blocked_tombstone",
+                                &[&repo, &number.to_string()],
+                            )),
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("Inbox PR 入库失败 {repo} #{number}: {e}");
-                        send(&msg_tx, Msg::Status(trf(&lang, "add_review_failed", &[&repo, &number.to_string()])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(
+                                &lang,
+                                "add_review_failed",
+                                &[&repo, &number.to_string()],
+                            )),
+                        );
                     }
                 }
                 // 重发当前通知行：apply 重新计算「已加入」标记
@@ -1882,21 +1802,19 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
             }
             Cmd::AutoReviewSettled { job, success } => {
                 if !success {
-                    tracing::warn!(
-                        "自动评审阶段失败 {} #{} {:?}",
-                        job.repo,
-                        job.number,
-                        job.stage
-                    );
+                    tracing::warn!("自动预评审失败 {} #{}", job.repo, job.number);
                 }
-                let enabled = app.lock_recover().cfg.auto_review_on_insert;
-                auto_reviews.settle(job, enabled);
+                auto_reviews.settle(job);
             }
             Cmd::ReviewSlotReleased => {}
             Cmd::RunReview { repo, number } => {
                 let (cfg, slots, profile) = {
                     let a = app.lock_recover();
-                    (a.cfg.clone(), a.review_slots.clone(), a.cfg.active_profile.clone())
+                    (
+                        a.cfg.clone(),
+                        a.review_slots.clone(),
+                        a.cfg.active_profile.clone(),
+                    )
                 };
                 // LLM 配置缺失：立即提示，不占并发槽
                 let Some(llm) = LlmSettings::from_config(&cfg) else {
@@ -1909,12 +1827,18 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 match acquired {
                     Ok(()) => {}
                     Err(SlotError::AlreadyRunning) => {
-                        send(&msg_tx, Msg::Status(tr(&lang, "review_already_running").into()));
+                        send(
+                            &msg_tx,
+                            Msg::Status(tr(&lang, "review_already_running").into()),
+                        );
                         continue;
                     }
                     Err(SlotError::AtCapacity) => {
                         let cap = slots.lock_recover().capacity.to_string();
-                        send(&msg_tx, Msg::Status(trf(&lang, "review_slots_full", &[&cap])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(&lang, "review_slots_full", &[&cap])),
+                        );
                         continue;
                     }
                 }
@@ -1924,19 +1848,31 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 let tx = msg_tx.clone();
                 let cmd2 = cmd_tx.clone();
                 tokio::spawn(async move {
-                    let guard = SlotGuard { slots, repo: repo.clone(), number, deep: false };
+                    let guard = SlotGuard {
+                        slots,
+                        repo: repo.clone(),
+                        number,
+                    };
                     let rl = match github::GitHub::new(cfg.token(), &cfg.proxy) {
                         Ok(g) => {
                             let h = g.rate_limit_handle();
-                            run_review_task(&cfg, &llm, &g, &app2, &tx, &profile, &repo, number).await;
+                            run_review_task(&cfg, &llm, &g, &app2, &tx, &profile, &repo, number)
+                                .await;
                             Some(h)
                         }
                         Err(e) => {
-                            send(&tx, Msg::ReviewFailed {
-                                repo: repo.clone(),
-                                number,
-                                err: trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
-                            });
+                            send(
+                                &tx,
+                                Msg::ReviewFailed {
+                                    repo: repo.clone(),
+                                    number,
+                                    err: trf(
+                                        &cfg.language,
+                                        "gh_client_init_failed",
+                                        &[&e.to_string()],
+                                    ),
+                                },
+                            );
                             None
                         }
                     };
@@ -1949,532 +1885,75 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     let _ = cmd2.send(Cmd::ReviewSlotReleased);
                 });
             }
-            Cmd::RunDeepReview { profile, repo, number, request_id } => {
-                let key = DeepKey {
-                    profile: profile.clone(),
-                    repo: repo.clone(),
-                    number,
-                    head_sha: String::new(),
-                };
-                let (cfg, slots) = {
-                    let a = app.lock_recover();
-                    (a.cfg.clone(), a.review_slots.clone())
-                };
-                let Some(_llm) = LlmSettings::from_config(&cfg) else {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        None,
-                        request_id,
-                        DeepAction::Run,
-                        tr(&lang, "llm_not_configured"),
-                    );
-                    continue;
-                };
-                if deep_assist_running_for_pr(&deep_assist_inflight, &key) {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        None,
-                        request_id,
-                        DeepAction::Run,
-                        tr(&lang, "deep_assist_busy"),
-                    );
-                    continue;
-                }
-                match slots.lock_recover().try_acquire_deep(&repo, number) {
-                    Ok(()) => {}
-                    Err(SlotError::AlreadyRunning) => {
-                        deep_fail(
+            Cmd::PrepareKimiContext { key } => {
+                let cfg = app.lock_recover().cfg.clone();
+                let g = match github::GitHub::new(cfg.token(), &cfg.proxy) {
+                    Ok(g) => g,
+                    Err(error) => {
+                        send(
                             &msg_tx,
-                            &key,
-                            None,
-                            request_id,
-                            DeepAction::Run,
-                            tr(&lang, "review_already_running"),
+                            Msg::KimiContextFailed {
+                                key,
+                                error: error.to_string(),
+                            },
                         );
                         continue;
                     }
-                    Err(SlotError::AtCapacity) => {
-                        let cap = slots.lock_recover().capacity.to_string();
-                        deep_fail(
-                            &msg_tx,
-                            &key,
-                            None,
-                            request_id,
-                            DeepAction::Run,
-                            trf(&lang, "review_slots_full", &[&cap]),
-                        );
-                        continue;
-                    }
-                }
-                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
-                let app2 = app.clone();
+                };
                 let tx = msg_tx.clone();
-                let cmd2 = cmd_tx.clone();
-                let flags = deep_cancel_flags.clone();
                 tokio::spawn(async move {
-                    let _cancel_guard = DeepCancelGuard {
-                        flags,
-                        request_id,
-                        cancel: cancel.clone(),
-                    };
-                    let guard = SlotGuard { slots, repo: repo.clone(), number, deep: true };
-                    match github::GitHub::new(cfg.token(), &cfg.proxy) {
-                        Ok(g) => {
-                            let rate = g.rate_limit_handle();
-                            let task_cancel = cancel.clone();
-                            run_deep_cancellable(
-                                &tx,
-                                &key,
-                                None,
-                                request_id,
-                                DeepAction::Run,
-                                &cfg.language,
-                                cancel,
-                                run_deep_review_task(
-                                    &cfg,
-                                    &g,
-                                    &app2,
-                                    &tx,
-                                    &profile,
-                                    &repo,
-                                    number,
-                                    request_id,
-                                    task_cancel,
-                                ),
-                            )
-                            .await;
-                            if let Some(n) = *rate.lock_recover() {
-                                *app2.lock_recover().rate_limit.lock_recover() = Some(n);
-                            }
+                    let result = async {
+                        let meta = g.fetch_pr_meta(&key.repo, key.number).await?;
+                        if !key.head_sha.is_empty()
+                            && meta["head"]["sha"].as_str().unwrap_or("") != key.head_sha
+                        {
+                            anyhow::bail!("{}", tr(&cfg.language, "kimi_context_stale"));
                         }
-                        Err(e) => {
-                            deep_fail(
-                                &tx,
-                                &key,
-                                None,
-                                request_id,
-                                DeepAction::Run,
-                                trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
-                            );
-                        }
-                    }
-                    drop(guard);
-                    let _ = cmd2.send(Cmd::ReviewSlotReleased);
-                });
-            }
-            Cmd::RefreshDeepFindings { key, request_id } => {
-                let (cfg, slots) = {
-                    let a = app.lock_recover();
-                    (a.cfg.clone(), a.review_slots.clone())
-                };
-                if LlmSettings::from_config(&cfg).is_none() {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        None,
-                        request_id,
-                        DeepAction::Run,
-                        tr(&lang, "llm_not_configured"),
-                    );
-                    continue;
-                }
-                if deep_assist_running_for_pr(&deep_assist_inflight, &key) {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        None,
-                        request_id,
-                        DeepAction::Run,
-                        tr(&lang, "deep_assist_busy"),
-                    );
-                    continue;
-                }
-                match slots.lock_recover().try_acquire_deep(&key.repo, key.number) {
-                    Ok(()) => {}
-                    Err(SlotError::AlreadyRunning) => {
-                        deep_fail(
-                            &msg_tx,
-                            &key,
+                        let diff = g.fetch_diff(&key.repo, key.number).await?;
+                        let context = crate::kimi_terminal::PrContext {
+                            repo: key.repo.clone(),
+                            number: key.number,
+                            base_sha: meta["base"]["sha"].as_str().unwrap_or("").to_string(),
+                            head_sha: meta["head"]["sha"].as_str().unwrap_or("").to_string(),
+                            title: meta["title"].as_str().unwrap_or("").to_string(),
+                            body: meta["body"].as_str().unwrap_or("").to_string(),
+                            diff,
+                        };
+                        ocr::build_ocr_git_snapshot(
+                            &g,
+                            &key.repo,
+                            &meta,
+                            &context.diff,
+                            &cfg.kimi_workspace_root_path(),
+                            &mut |_| {},
+                            &cfg.language,
                             None,
-                            request_id,
-                            DeepAction::Run,
-                            tr(&lang, "review_already_running"),
-                        );
-                        continue;
+                        )
+                        .await?;
+                        crate::kimi_terminal::prepare_context_dir(
+                            &context,
+                            &cfg.kimi_workspace_root_path(),
+                        )?;
+                        Ok(context)
                     }
-                    Err(SlotError::AtCapacity) => {
-                        let cap = slots.lock_recover().capacity.to_string();
-                        deep_fail(
-                            &msg_tx,
-                            &key,
-                            None,
-                            request_id,
-                            DeepAction::Run,
-                            trf(&lang, "review_slots_full", &[&cap]),
-                        );
-                        continue;
-                    }
-                }
-                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
-                let app2 = app.clone();
-                let tx = msg_tx.clone();
-                let cmd2 = cmd_tx.clone();
-                let flags = deep_cancel_flags.clone();
-                tokio::spawn(async move {
-                    let _cancel_guard = DeepCancelGuard {
-                        flags,
-                        request_id,
-                        cancel: cancel.clone(),
-                    };
-                    let guard = SlotGuard {
-                        slots,
-                        repo: key.repo.clone(),
-                        number: key.number,
-                        deep: true,
-                    };
-                    match github::GitHub::new(cfg.token(), &cfg.proxy) {
-                        Ok(g) => {
-                            let rate = g.rate_limit_handle();
-                            let task_cancel = cancel.clone();
-                            run_deep_cancellable(
-                                &tx,
-                                &key,
-                                None,
-                                request_id,
-                                DeepAction::Run,
-                                &cfg.language,
-                                cancel,
-                                run_deep_refresh_task(
-                                    &cfg,
-                                    &g,
-                                    &app2,
-                                    &tx,
-                                    &key,
-                                    request_id,
-                                    task_cancel,
-                                ),
-                            )
-                            .await;
-                            if let Some(n) = *rate.lock_recover() {
-                                *app2.lock_recover().rate_limit.lock_recover() = Some(n);
-                            }
-                        }
-                        Err(e) => deep_fail(
-                            &tx,
-                            &key,
-                            None,
-                            request_id,
-                            DeepAction::Run,
-                            trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
-                        ),
-                    }
-                    drop(guard);
-                    let _ = cmd2.send(Cmd::ReviewSlotReleased);
-                });
-            }
-            Cmd::CancelDeepReview { request_id } => {
-                if let Some(flag) = deep_cancel_flags.lock_recover().get(&request_id) {
-                    flag.store(true, Ordering::Relaxed);
-                }
-            }
-            Cmd::SaveDeepDraft { key, finding_id, request_id, expected_revision, text } => {
-                mutate_deep_command(
-                    &app,
-                    &msg_tx,
-                    &key,
-                    finding_id,
-                    request_id,
-                    expected_revision,
-                    DeepAction::Save,
-                    Some(&text),
-                    None,
-                );
-            }
-            Cmd::SetDeepFindingDiscarded {
-                key,
-                finding_id,
-                request_id,
-                expected_revision,
-                discarded,
-            } => {
-                mutate_deep_command(
-                    &app,
-                    &msg_tx,
-                    &key,
-                    finding_id,
-                    request_id,
-                    expected_revision,
-                    DeepAction::Discard,
-                    None,
-                    Some(discarded),
-                );
-            }
-            Cmd::RewriteDeepFinding {
-                key,
-                finding_id,
-                request_id,
-                expected_revision,
-                base_text,
-                style,
-            } => {
-                let (cfg, slots) = {
-                    let a = app.lock_recover();
-                    (a.cfg.clone(), a.review_slots.clone())
-                };
-                let Some(llm) = LlmSettings::from_config(&cfg) else {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(finding_id),
-                        request_id,
-                        DeepAction::Rewrite,
-                        tr(&lang, "llm_not_configured"),
-                    );
-                    continue;
-                };
-                if slots.lock_recover().is_deep_review_running(&key.repo, key.number) {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(finding_id),
-                        request_id,
-                        DeepAction::Rewrite,
-                        tr(&lang, "deep_review_busy"),
-                    );
-                    continue;
-                }
-                if !deep_assist_inflight.lock_recover().insert((key.clone(), finding_id)) {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(finding_id),
-                        request_id,
-                        DeepAction::Rewrite,
-                        tr(&lang, "deep_assist_busy"),
-                    );
-                    continue;
-                }
-                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
-                let app2 = app.clone();
-                let tx = msg_tx.clone();
-                let inflight = deep_assist_inflight.clone();
-                let flags = deep_cancel_flags.clone();
-                tokio::spawn(async move {
-                    let _cancel_guard = DeepCancelGuard {
-                        flags,
-                        request_id,
-                        cancel: cancel.clone(),
-                    };
-                    let _guard = DeepAssistGuard {
-                        inflight,
-                        key: key.clone(),
-                        finding_id,
-                    };
-                    let task_cancel = cancel.clone();
-                    run_deep_cancellable(
-                        &tx,
-                        &key,
-                        Some(finding_id),
-                        request_id,
-                        DeepAction::Rewrite,
-                        &cfg.language,
-                        cancel,
-                        run_deep_rewrite_task(
-                            &cfg,
-                            &llm,
-                            &app2,
-                            &tx,
-                            &key,
-                            finding_id,
-                            request_id,
-                            expected_revision,
-                            &base_text,
-                            &style,
-                            task_cancel,
-                        ),
-                    )
                     .await;
-                });
-            }
-            Cmd::AskDeepFinding { key, finding_id, request_id, question, current_draft } => {
-                let (cfg, slots) = {
-                    let a = app.lock_recover();
-                    (a.cfg.clone(), a.review_slots.clone())
-                };
-                let Some(llm) = LlmSettings::from_config(&cfg) else {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(finding_id),
-                        request_id,
-                        DeepAction::Ask,
-                        tr(&lang, "llm_not_configured"),
-                    );
-                    continue;
-                };
-                if slots.lock_recover().is_deep_review_running(&key.repo, key.number) {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(finding_id),
-                        request_id,
-                        DeepAction::Ask,
-                        tr(&lang, "deep_review_busy"),
-                    );
-                    continue;
-                }
-                if !deep_assist_inflight.lock_recover().insert((key.clone(), finding_id)) {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(finding_id),
-                        request_id,
-                        DeepAction::Ask,
-                        tr(&lang, "deep_assist_busy"),
-                    );
-                    continue;
-                }
-                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
-                let app2 = app.clone();
-                let tx = msg_tx.clone();
-                let inflight = deep_assist_inflight.clone();
-                let flags = deep_cancel_flags.clone();
-                tokio::spawn(async move {
-                    let _cancel_guard = DeepCancelGuard {
-                        flags,
-                        request_id,
-                        cancel: cancel.clone(),
-                    };
-                    let _guard = DeepAssistGuard {
-                        inflight,
-                        key: key.clone(),
-                        finding_id,
-                    };
-                    let task_cancel = cancel.clone();
-                    run_deep_cancellable(
-                        &tx,
-                        &key,
-                        Some(finding_id),
-                        request_id,
-                        DeepAction::Ask,
-                        &cfg.language,
-                        cancel,
-                        run_deep_ask_task(
-                            &cfg,
-                            &llm,
-                            &app2,
+                    match result {
+                        Ok(context) => send(
                             &tx,
-                            &key,
-                            finding_id,
-                            request_id,
-                            &question,
-                            &current_draft,
-                            task_cancel,
+                            Msg::KimiContextReady {
+                                key,
+                                context: Box::new(context),
+                            },
                         ),
-                    )
-                    .await;
-                });
-            }
-            Cmd::AskDeepPr { key, request_id, question } => {
-                let (cfg, slots) = {
-                    let a = app.lock_recover();
-                    (a.cfg.clone(), a.review_slots.clone())
-                };
-                let Some(llm) = LlmSettings::from_config(&cfg) else {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(0),
-                        request_id,
-                        DeepAction::Ask,
-                        tr(&lang, "llm_not_configured"),
-                    );
-                    continue;
-                };
-                if slots.lock_recover().is_deep_review_running(&key.repo, key.number) {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(0),
-                        request_id,
-                        DeepAction::Ask,
-                        tr(&lang, "deep_review_busy"),
-                    );
-                    continue;
-                }
-                if !deep_assist_inflight.lock_recover().insert((key.clone(), 0)) {
-                    deep_fail(
-                        &msg_tx,
-                        &key,
-                        Some(0),
-                        request_id,
-                        DeepAction::Ask,
-                        tr(&lang, "deep_assist_busy"),
-                    );
-                    continue;
-                }
-                let cancel = register_deep_cancel(&deep_cancel_flags, request_id);
-                let app2 = app.clone();
-                let tx = msg_tx.clone();
-                let inflight = deep_assist_inflight.clone();
-                let flags = deep_cancel_flags.clone();
-                tokio::spawn(async move {
-                    let _cancel_guard = DeepCancelGuard {
-                        flags,
-                        request_id,
-                        cancel: cancel.clone(),
-                    };
-                    let _guard = DeepAssistGuard {
-                        inflight,
-                        key: key.clone(),
-                        finding_id: 0,
-                    };
-                    match github::GitHub::new(cfg.token(), &cfg.proxy) {
-                        Ok(g) => {
-                            let task_cancel = cancel.clone();
-                            run_deep_cancellable(
-                                &tx,
-                                &key,
-                                Some(0),
-                                request_id,
-                                DeepAction::Ask,
-                                &cfg.language,
-                                cancel,
-                                run_deep_ask_pr_task(
-                                    &cfg,
-                                    &llm,
-                                    &g,
-                                    &app2,
-                                    &tx,
-                                    &key,
-                                    request_id,
-                                    &question,
-                                    task_cancel,
-                                ),
-                            )
-                            .await;
-                        }
-                        Err(e) => deep_fail(
+                        Err(error) => send(
                             &tx,
-                            &key,
-                            Some(0),
-                            request_id,
-                            DeepAction::Ask,
-                            trf(&cfg.language, "gh_client_init_failed", &[&e.to_string()]),
+                            Msg::KimiContextFailed {
+                                key,
+                                error: error.to_string(),
+                            },
                         ),
                     }
                 });
-            }
-            Cmd::CopyDeepText(text) => {
-                match arboard::Clipboard::new().and_then(|mut c| c.set_text(text)) {
-                    Ok(()) => send(&msg_tx, Msg::Status(tr(&lang, "deep_comment_copied").into())),
-                    Err(e) => send(
-                        &msg_tx,
-                        Msg::Status(trf(&lang, "review_copy_failed", &[&e.to_string()])),
-                    ),
-                }
             }
             Cmd::FetchModels { base, key } => {
                 // 设置页「获取」：拉 OpenAI 兼容端点的模型列表（base/key 是弹窗里正在编辑的值）
@@ -2498,11 +1977,12 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     send(&tx, Msg::DialogMsg(tr(&lang2, "models_fetching").into()));
                     let url = format!("{base}/models");
                     let result = async {
-                        let resp = pr_desk_rs::http_client(&proxy, std::time::Duration::from_secs(15))?
-                            .get(&url)
-                            .header("Authorization", format!("Bearer {key}"))
-                            .send()
-                            .await?;
+                        let resp =
+                            pr_desk_rs::http_client(&proxy, std::time::Duration::from_secs(15))?
+                                .get(&url)
+                                .header("Authorization", format!("Bearer {key}"))
+                                .send()
+                                .await?;
                         if !resp.status().is_success() {
                             anyhow::bail!("HTTP {}", resp.status());
                         }
@@ -2524,7 +2004,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         Ok(ids) => {
                             let n = ids.len();
                             send(&tx, Msg::ModelsLoaded(ids));
-                            send(&tx, Msg::Status(trf(&lang2, "models_fetched", &[&n.to_string()])));
+                            send(
+                                &tx,
+                                Msg::Status(trf(&lang2, "models_fetched", &[&n.to_string()])),
+                            );
                         }
                         Err(e) => {
                             let msg = trf(&lang2, "models_fetch_failed", &[&e.to_string()]);
@@ -2558,16 +2041,22 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     tokio::spawn(async move {
                         match g.fetch_pr_meta(&repo, number).await {
                             Ok(meta) => {
-                                let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
+                                let author =
+                                    meta["user"]["login"].as_str().unwrap_or("").to_string();
                                 let url = meta["html_url"].as_str().unwrap_or("").to_string();
-                                let head_sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
+                                let head_sha =
+                                    meta["head"]["sha"].as_str().unwrap_or("").to_string();
                                 let title = meta["title"].as_str().unwrap_or("").to_string();
                                 let filled = {
                                     let a = app2.lock_recover();
-                                    match a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &head_sha, &title) {
+                                    match a.db.fill_pr_meta_if_empty(
+                                        &repo, number, &author, &url, &head_sha, &title,
+                                    ) {
                                         Ok(f) => f,
                                         Err(e) => {
-                                            tracing::warn!("补齐 PR 元数据落库失败 {repo} #{number}: {e}");
+                                            tracing::warn!(
+                                                "补齐 PR 元数据落库失败 {repo} #{number}: {e}"
+                                            );
                                             false
                                         }
                                     }
@@ -2583,11 +2072,14 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                                 // 失败：移除节流标记（下次可立即重试）+ 状态栏报错
                                 healed.lock_recover().remove(&(repo.clone(), number));
                                 let lang = lang_of(&app2);
-                                send(&tx, Msg::Status(trf(
-                                    &lang,
-                                    "meta_fill_failed",
-                                    &[&repo, &number.to_string(), &e.to_string()],
-                                )));
+                                send(
+                                    &tx,
+                                    Msg::Status(trf(
+                                        &lang,
+                                        "meta_fill_failed",
+                                        &[&repo, &number.to_string(), &e.to_string()],
+                                    )),
+                                );
                             }
                         }
                     });
@@ -2596,7 +2088,11 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     meta_healed.lock_recover().remove(&(repo, number));
                 }
             }
-            Cmd::FetchPrLive { repo, number, parts } => {
+            Cmd::FetchPrLive {
+                repo,
+                number,
+                parts,
+            } => {
                 // 面板实时刷新：按位标志惰性拉取——打开面板只带 Checks（2 个请求），
                 // 会话/Files 切到对应 tab 才拉。每部分独立 120s 节流；配额 <50 跳过。
                 // spawn 化：节流检查 + 乐观记账在循环内做（防在飞重入），网络主体进 task
@@ -2646,239 +2142,266 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     let msg_tx = msg_tx.clone();
                     let live_fetched = live_fetched.clone();
                     tokio::spawn(async move {
-                    // meta 只在 checks 部分需要（head.sha → check runs；state/updated → 面板头部）
-                    let meta = if want_checks {
-                        match g.fetch_pr_meta(&repo, number).await {
-                            Ok(m) => Some(m),
-                            Err(e) => {
-                                send(&msg_tx, Msg::Status(trf(
-                                    &lang,
-                                    "live_refresh_failed",
-                                    &[&repo, &number.to_string(), &e.to_string()],
-                                )));
-                                // meta 失败整轮放弃（原语义）：撤掉本次记的所有节流标记，
-                                // 下次操作可立即重试（失败不吃满 120s 惩罚窗口）
-                                let mut f = live_fetched.lock_recover();
-                                f.remove(&(repo.clone(), number, PART_CONVO));
-                                f.remove(&(repo.clone(), number, PART_FILES));
-                                f.remove(&(repo.clone(), number, PART_CHECKS));
-                                return;
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    let (convo_pair, files, checks) = tokio::join!(
-                        async {
-                            if want_convo {
-                                // 评论失败 → None（整块不碰面板缓存）；评审失败只少评审条目
-                                match g.fetch_pr_convo(&repo, number).await {
-                                    Ok(c) => {
-                                        let r = g.fetch_pr_reviews(&repo, number).await
-                                            .map_err(|e| tracing::debug!("实时评审拉取失败 {repo} #{number}: {e}"))
-                                            .unwrap_or_default();
-                                        Some((c, r))
-                                    }
-                                    Err(e) => {
-                                        tracing::debug!("实时会话拉取失败 {repo} #{number}: {e}");
-                                        None
-                                    }
+                        // meta 只在 checks 部分需要（head.sha → check runs；state/updated → 面板头部）
+                        let meta = if want_checks {
+                            match g.fetch_pr_meta(&repo, number).await {
+                                Ok(m) => Some(m),
+                                Err(e) => {
+                                    send(
+                                        &msg_tx,
+                                        Msg::Status(trf(
+                                            &lang,
+                                            "live_refresh_failed",
+                                            &[&repo, &number.to_string(), &e.to_string()],
+                                        )),
+                                    );
+                                    // meta 失败整轮放弃（原语义）：撤掉本次记的所有节流标记，
+                                    // 下次操作可立即重试（失败不吃满 120s 惩罚窗口）
+                                    let mut f = live_fetched.lock_recover();
+                                    f.remove(&(repo.clone(), number, PART_CONVO));
+                                    f.remove(&(repo.clone(), number, PART_FILES));
+                                    f.remove(&(repo.clone(), number, PART_CHECKS));
+                                    return;
                                 }
-                            } else {
-                                None
                             }
-                        },
-                        async {
-                            if want_files {
-                                match g.fetch_pr_files(&repo, number).await {
-                                    Ok(f) => Some(f),
-                                    Err(e) => {
-                                        tracing::debug!("实时文件列表拉取失败 {repo} #{number}: {e}");
-                                        None
-                                    }
-                                }
-                            } else {
-                                None
-                            }
-                        },
-                        async {
-                            let sha = meta
-                                .as_ref()
-                                .map(|m| m["head"]["sha"].as_str().unwrap_or("").to_string())
-                                .unwrap_or_default();
-                            if !want_checks || sha.is_empty() {
-                                None
-                            } else {
-                                g.fetch_pr_checks(&repo, &sha).await
-                                    .map_err(|e| tracing::debug!("实时 Checks 拉取失败 {repo} #{number}: {e}"))
-                                    .ok()
-                            }
-                        },
-                    );
-
-                    // 撤掉失败部分的乐观节流标记（下次可立即重试）；
-                    // checks 部分的代价在 meta 请求上，meta 成功即算 checks 已拉
-                    {
-                        let mut f = live_fetched.lock_recover();
-                        if convo_pair.is_none() {
-                            f.remove(&(repo.clone(), number, PART_CONVO));
-                        }
-                        if files.is_none() {
-                            f.remove(&(repo.clone(), number, PART_FILES));
-                        }
-                        if meta.is_none() {
-                            f.remove(&(repo.clone(), number, PART_CHECKS));
-                        }
-                    }
-
-                    let mut ci_out: Option<String> = None;
-                    let mut state_out: Option<String> = None;
-                    let mut updated_out: Option<String> = None;
-                    let mut head_sha_out: Option<String> = None;
-                    let mut checks_json_out: Option<String> = None;
-                    let mut convo_out: Option<Vec<PlainConvoEntry>> = None;
-                    let mut convo_authors: Vec<String> = Vec::new();
-                    let mut files_json_out: Option<String> = None;
-                    let mut dirty = false;
-
-                    // 落库（直改 DB，不进 outbox：非用户改动，不该推送）
-                    if let Some(meta) = &meta {
-                        let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
-                        let url = meta["html_url"].as_str().unwrap_or("").to_string();
-                        let title = meta["title"].as_str().unwrap_or("").to_string();
-                        let sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
-                        let meta_updated = meta["updated_at"].as_str().unwrap_or("").to_string();
-                        // GitHub 终态（merged/closed）覆盖 status：分组靠它把已完结 PR 移出
-                        // 待评审区；open 不回写（避免冲掉 reviewed/failed 等工作流状态）
-                        let gh_state = if meta["merged_at"].is_null() {
-                            meta["state"].as_str().unwrap_or("open").to_string()
                         } else {
-                            "merged".to_string()
+                            None
                         };
+                        let (convo_pair, files, checks) = tokio::join!(
+                            async {
+                                if want_convo {
+                                    // 评论失败 → None（整块不碰面板缓存）；评审失败只少评审条目
+                                    match g.fetch_pr_convo(&repo, number).await {
+                                        Ok(c) => {
+                                            let r = g
+                                                .fetch_pr_reviews(&repo, number)
+                                                .await
+                                                .map_err(|e| {
+                                                    tracing::debug!(
+                                                        "实时评审拉取失败 {repo} #{number}: {e}"
+                                                    )
+                                                })
+                                                .unwrap_or_default();
+                                            Some((c, r))
+                                        }
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                "实时会话拉取失败 {repo} #{number}: {e}"
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                }
+                            },
+                            async {
+                                if want_files {
+                                    match g.fetch_pr_files(&repo, number).await {
+                                        Ok(f) => Some(f),
+                                        Err(e) => {
+                                            tracing::debug!(
+                                                "实时文件列表拉取失败 {repo} #{number}: {e}"
+                                            );
+                                            None
+                                        }
+                                    }
+                                } else {
+                                    None
+                                }
+                            },
+                            async {
+                                let sha = meta
+                                    .as_ref()
+                                    .map(|m| m["head"]["sha"].as_str().unwrap_or("").to_string())
+                                    .unwrap_or_default();
+                                if !want_checks || sha.is_empty() {
+                                    None
+                                } else {
+                                    g.fetch_pr_checks(&repo, &sha)
+                                        .await
+                                        .map_err(|e| {
+                                            tracing::debug!(
+                                                "实时 Checks 拉取失败 {repo} #{number}: {e}"
+                                            )
+                                        })
+                                        .ok()
+                                }
+                            },
+                        );
+
+                        // 撤掉失败部分的乐观节流标记（下次可立即重试）；
+                        // checks 部分的代价在 meta 请求上，meta 成功即算 checks 已拉
                         {
-                            let a = app.lock_recover();
-                            let _ = a.db.fill_pr_meta_if_empty(&repo, number, &author, &url, &sha, &title);
-                            if !sha.is_empty() {
-                                let _ = a.db.conn.execute(
-                                    "UPDATE prs SET head_sha=?1 WHERE repo=?2 AND number=?3",
-                                    rusqlite::params![sha, repo, number],
-                                );
-                                head_sha_out = Some(sha.clone());
+                            let mut f = live_fetched.lock_recover();
+                            if convo_pair.is_none() {
+                                f.remove(&(repo.clone(), number, PART_CONVO));
                             }
-                            if gh_state == "merged" || gh_state == "closed" {
-                                let _ = a.db.conn.execute(
+                            if files.is_none() {
+                                f.remove(&(repo.clone(), number, PART_FILES));
+                            }
+                            if meta.is_none() {
+                                f.remove(&(repo.clone(), number, PART_CHECKS));
+                            }
+                        }
+
+                        let mut ci_out: Option<String> = None;
+                        let mut state_out: Option<String> = None;
+                        let mut updated_out: Option<String> = None;
+                        let mut head_sha_out: Option<String> = None;
+                        let mut checks_json_out: Option<String> = None;
+                        let mut convo_out: Option<Vec<PlainConvoEntry>> = None;
+                        let mut convo_authors: Vec<String> = Vec::new();
+                        let mut files_json_out: Option<String> = None;
+                        let mut dirty = false;
+
+                        // 落库（直改 DB，不进 outbox：非用户改动，不该推送）
+                        if let Some(meta) = &meta {
+                            let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
+                            let url = meta["html_url"].as_str().unwrap_or("").to_string();
+                            let title = meta["title"].as_str().unwrap_or("").to_string();
+                            let sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
+                            let meta_updated =
+                                meta["updated_at"].as_str().unwrap_or("").to_string();
+                            // GitHub 终态（merged/closed）覆盖 status：分组靠它把已完结 PR 移出
+                            // 待评审区；open 不回写（避免冲掉 reviewed/failed 等工作流状态）
+                            let gh_state = if meta["merged_at"].is_null() {
+                                meta["state"].as_str().unwrap_or("open").to_string()
+                            } else {
+                                "merged".to_string()
+                            };
+                            {
+                                let a = app.lock_recover();
+                                let _ = a.db.fill_pr_meta_if_empty(
+                                    &repo, number, &author, &url, &sha, &title,
+                                );
+                                if !sha.is_empty() {
+                                    let _ = a.db.conn.execute(
+                                        "UPDATE prs SET head_sha=?1 WHERE repo=?2 AND number=?3",
+                                        rusqlite::params![sha, repo, number],
+                                    );
+                                    head_sha_out = Some(sha.clone());
+                                }
+                                if gh_state == "merged" || gh_state == "closed" {
+                                    let _ = a.db.conn.execute(
                                     "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
                                     rusqlite::params![gh_state, repo, number],
                                 );
-                            }
-                            match &checks {
-                                Some((ci, _)) => {
-                                    let _ = a.db.conn.execute(
+                                }
+                                match &checks {
+                                    Some((ci, _)) => {
+                                        let _ = a.db.conn.execute(
                                         "UPDATE prs SET ci_status=?1, updated_at=?2 WHERE repo=?3 AND number=?4",
                                         rusqlite::params![ci, meta_updated, repo, number],
                                     );
-                                    ci_out = Some(ci.clone());
-                                }
-                                None => {
-                                    // Checks 拉取失败：不覆盖 ci_status，面板回退库内现值（不清空指示）
-                                    if !meta_updated.is_empty() {
-                                        let _ = a.db.conn.execute(
+                                        ci_out = Some(ci.clone());
+                                    }
+                                    None => {
+                                        // Checks 拉取失败：不覆盖 ci_status，面板回退库内现值（不清空指示）
+                                        if !meta_updated.is_empty() {
+                                            let _ = a.db.conn.execute(
                                             "UPDATE prs SET updated_at=?1 WHERE repo=?2 AND number=?3",
                                             rusqlite::params![meta_updated, repo, number],
                                         );
-                                    }
-                                    ci_out = a.db.conn.query_row(
+                                        }
+                                        ci_out = a.db.conn.query_row(
                                         "SELECT ci_status FROM prs WHERE repo=?1 AND number=?2",
                                         rusqlite::params![repo, number],
                                         |r| r.get::<_, Option<String>>(0),
                                     ).ok().flatten();
+                                    }
                                 }
                             }
+                            state_out = Some(gh_state.clone());
+                            updated_out = Some(crate::state::rel_time(&meta_updated));
+                            checks_json_out = checks.map(|(_, items)| {
+                                serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
+                            });
+                            dirty = true;
                         }
-                        state_out = Some(gh_state.clone());
-                        updated_out = Some(crate::state::rel_time(&meta_updated));
-                        checks_json_out = checks.map(|(_, items)| {
-                            serde_json::to_string(&items).unwrap_or_else(|_| "[]".into())
-                        });
-                        dirty = true;
-                    }
-                    if let Some((convo, reviews)) = convo_pair {
-                        if let Some(rd) = derive_review_decision(&reviews) {
-                            let a = app.lock_recover();
-                            let _ = a.db.conn.execute(
-                                "UPDATE prs SET review_decision=?1 WHERE repo=?2 AND number=?3",
-                                rusqlite::params![rd, repo, number],
-                            );
+                        if let Some((convo, reviews)) = convo_pair {
+                            if let Some(rd) = derive_review_decision(&reviews) {
+                                let a = app.lock_recover();
+                                let _ = a.db.conn.execute(
+                                    "UPDATE prs SET review_decision=?1 WHERE repo=?2 AND number=?3",
+                                    rusqlite::params![rd, repo, number],
+                                );
+                            }
+                            // 会话 = 评论 + 评审（按时间升序）
+                            let mut convo_items: Vec<Value> = convo
+                                .into_iter()
+                                .map(|mut c| {
+                                    c["kind"] = serde_json::json!("comment");
+                                    c
+                                })
+                                .collect();
+                            convo_items.extend(reviews.into_iter().map(|mut r| {
+                                r["kind"] = serde_json::json!("review");
+                                r
+                            }));
+                            convo_items.sort_by(|x, y| {
+                                x["time"]
+                                    .as_str()
+                                    .unwrap_or("~")
+                                    .cmp(y["time"].as_str().unwrap_or("~"))
+                            });
+                            convo_out = Some(plain_convo_entries(&convo_items));
+                            // 会话作者收集（含评论与评审）：头像预取在 PanelLive 回送后做，
+                            // 装盒时缓存 miss 的字母降级由随后的 ConvoAvatars 原地回填
+                            convo_authors = convo_out
+                                .as_ref()
+                                .map(|es| es.iter().map(|e| e.author.clone()).collect())
+                                .unwrap_or_default();
+                            dirty = true;
                         }
-                        // 会话 = 评论 + 评审（按时间升序）
-                        let mut convo_items: Vec<Value> = convo
-                            .into_iter()
-                            .map(|mut c| {
-                                c["kind"] = serde_json::json!("comment");
-                                c
-                            })
-                            .collect();
-                        convo_items.extend(reviews.into_iter().map(|mut r| {
-                            r["kind"] = serde_json::json!("review");
-                            r
-                        }));
-                        convo_items.sort_by(|x, y| {
-                            x["time"].as_str().unwrap_or("~").cmp(y["time"].as_str().unwrap_or("~"))
-                        });
-                        convo_out = Some(plain_convo_entries(&convo_items));
-                        // 会话作者收集（含评论与评审）：头像预取在 PanelLive 回送后做，
-                        // 装盒时缓存 miss 的字母降级由随后的 ConvoAvatars 原地回填
-                        convo_authors = convo_out
-                            .as_ref()
-                            .map(|es| es.iter().map(|e| e.author.clone()).collect())
-                            .unwrap_or_default();
-                        dirty = true;
-                    }
-                    if let Some(files) = &files {
-                        // 增删行数落库：列表 +/- 列之前只来自评审记录，没评审过的 PR 永远 +0/-0
-                        let (adds, dels) = files.iter().fold((0i64, 0i64), |(a, d), f| {
-                            (
-                                a + f["adds"].as_i64().unwrap_or(0),
-                                d + f["dels"].as_i64().unwrap_or(0),
-                            )
-                        });
-                        {
-                            let a = app.lock_recover();
-                            let _ = a.db.conn.execute(
+                        if let Some(files) = &files {
+                            // 增删行数落库：列表 +/- 列之前只来自评审记录，没评审过的 PR 永远 +0/-0
+                            let (adds, dels) = files.iter().fold((0i64, 0i64), |(a, d), f| {
+                                (
+                                    a + f["adds"].as_i64().unwrap_or(0),
+                                    d + f["dels"].as_i64().unwrap_or(0),
+                                )
+                            });
+                            {
+                                let a = app.lock_recover();
+                                let _ = a.db.conn.execute(
                                 "UPDATE prs SET additions=?1, deletions=?2 WHERE repo=?3 AND number=?4",
                                 rusqlite::params![adds, dels, repo, number],
                             );
+                            }
+                            files_json_out =
+                                Some(serde_json::to_string(files).unwrap_or_else(|_| "[]".into()));
+                            dirty = true;
                         }
-                        files_json_out =
-                            Some(serde_json::to_string(files).unwrap_or_else(|_| "[]".into()));
-                        dirty = true;
-                    }
-                    if dirty {
-                        reload_rows(&app, &msg_tx);
-                        send(&msg_tx, Msg::PanelLive {
-                            repo: repo.clone(),
-                            number,
-                            ci: ci_out,
-                            state: state_out,
-                            updated: updated_out,
-                            head_sha: head_sha_out,
-                            convo: convo_out,
-                            checks_json: checks_json_out,
-                            files_json: files_json_out,
-                        });
-                        send(&msg_tx, Msg::StatusBarRefresh);
-                    }
-                    // 会话作者头像预取回填（与 open_drawer / NotifDetail 同款）：
-                    // 首屏会话可能来自面板缓存（extras_detail 滞后），新条目由本路径带进来——
-                    // 不在这里预取的话这些作者永远停在字母降级。跟 FetchPrLive 的 120s
-                    // 节流同频，且 prefetch 内部按 TTL 过滤新鲜缓存，不放大请求量。
-                    if !convo_authors.is_empty() {
-                        convo_authors.sort();
-                        convo_authors.dedup();
-                        if avatars::prefetch(&g, convo_authors).await > 0 {
-                            send(&msg_tx, Msg::ConvoAvatars { repo, number });
+                        if dirty {
+                            reload_rows(&app, &msg_tx);
+                            send(
+                                &msg_tx,
+                                Msg::PanelLive {
+                                    repo: repo.clone(),
+                                    number,
+                                    ci: ci_out,
+                                    state: state_out,
+                                    updated: updated_out,
+                                    head_sha: head_sha_out,
+                                    convo: convo_out,
+                                    checks_json: checks_json_out,
+                                    files_json: files_json_out,
+                                },
+                            );
+                            send(&msg_tx, Msg::StatusBarRefresh);
                         }
-                    }
+                        // 会话作者头像预取回填（与 open_drawer / NotifDetail 同款）：
+                        // 首屏会话可能来自面板缓存（extras_detail 滞后），新条目由本路径带进来——
+                        // 不在这里预取的话这些作者永远停在字母降级。跟 FetchPrLive 的 120s
+                        // 节流同频，且 prefetch 内部按 TTL 过滤新鲜缓存，不放大请求量。
+                        if !convo_authors.is_empty() {
+                            convo_authors.sort();
+                            convo_authors.dedup();
+                            if avatars::prefetch(&g, convo_authors).await > 0 {
+                                send(&msg_tx, Msg::ConvoAvatars { repo, number });
+                            }
+                        }
                     });
                 }
             }
@@ -2905,7 +2428,11 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     } else if a.cfg.has_profile(&name) {
                         Some(trf(&lang, "profile_exists", &[&name]))
                     } else if destination.exists() {
-                        Some(trf(&lang, "db_import_target_exists", &[&destination.to_string_lossy()]))
+                        Some(trf(
+                            &lang,
+                            "db_import_target_exists",
+                            &[&destination.to_string_lossy()],
+                        ))
                     } else {
                         None
                     }
@@ -2963,7 +2490,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         && (name == "local" || pr_desk_rs::config::valid_profile_name(&name))
                 };
                 if !valid {
-                    send(&msg_tx, Msg::Status(trf(&lang, "profile_unknown", &[&name])));
+                    send(
+                        &msg_tx,
+                        Msg::Status(trf(&lang, "profile_unknown", &[&name])),
+                    );
                     let (names, active) = {
                         let a = app.lock_recover();
                         (a.cfg.profile_names(), a.cfg.active_profile.clone())
@@ -2983,11 +2513,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                 let new_db = match Db::open(&db_path) {
                     Ok(d) => d,
                     Err(e) => {
-                        send(&msg_tx, Msg::Status(trf(
-                            &lang,
-                            "profile_db_failed",
-                            &[&name, &e.to_string()],
-                        )));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(&lang, "profile_db_failed", &[&name, &e.to_string()])),
+                        );
                         // 换库失败：回填纠正 UI 选中（顶栏是乐观切换）
                         let (names, active) = {
                             let a = app.lock_recover();
@@ -3002,7 +2531,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     a.cfg.active_profile = name.clone();
                     if let Err(e) = a.cfg.save(&cfg_path) {
                         // 落盘失败不阻断切换（内存态已切），仅提示
-                        send(&msg_tx, Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(&lang, "cfg_save_failed", &[&e.to_string()])),
+                        );
                     }
                     a.db = new_db; // 旧 Db 随 drop 关闭连接
                     a.selected = None;
@@ -3021,9 +2553,18 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                     sync::SyncClient::new(&a.cfg)
                 };
                 let names = app.lock_recover().cfg.profile_names();
-                send(&msg_tx, Msg::Profiles { names, active: name.clone() });
+                send(
+                    &msg_tx,
+                    Msg::Profiles {
+                        names,
+                        active: name.clone(),
+                    },
+                );
                 send(&msg_tx, Msg::ClosePanel);
-                send(&msg_tx, Msg::Status(trf(&lang, "profile_switched", &[&name])));
+                send(
+                    &msg_tx,
+                    Msg::Status(trf(&lang, "profile_switched", &[&name])),
+                );
                 // 走现有刷新路径：远程档 do_sync 全量拉；本地档 GitHub 状态刷新。
                 // 但先让 UI 立即落地：换库后马上重载行 + 回放上一条通知列表，
                 // 网络刷新 spawn 到后台，切换档案不再卡 worker 队列
@@ -3063,7 +2604,10 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
                         gh = Some(g);
                     }
                     Err(e) => {
-                        send(&msg_tx, Msg::Status(trf(&lang, "gh_client_rebuild_failed", &[&e.to_string()])));
+                        send(
+                            &msg_tx,
+                            Msg::Status(trf(&lang, "gh_client_rebuild_failed", &[&e.to_string()])),
+                        );
                     }
                 }
                 sync_client = sync::SyncClient::new(&cfg);
@@ -3098,25 +2642,31 @@ async fn worker(app: Arc<Mutex<App>>, mut rx: UnboundedReceiver<Cmd>, msg_tx: mp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pr_desk_rs::deep_review::DeepFindingData;
 
     #[test]
-    fn auto_review_queue_deduplicates_and_runs_standard_before_deep() {
+    fn auto_review_queue_deduplicates_and_settles_standard() {
         let mut queue = AutoReviewQueue::default();
-        queue.enqueue("local".into(), vec![("o/r".into(), 1), ("o/r".into(), 1), ("o/r".into(), 2)]);
+        queue.enqueue(
+            "local".into(),
+            vec![("o/r".into(), 1), ("o/r".into(), 1), ("o/r".into(), 2)],
+        );
         assert_eq!(queue.pending.len(), 2);
 
         let first = queue.pending.pop_front().unwrap();
         queue.running.insert(AutoReviewQueue::key(&first));
-        queue.settle(first, true);
-        assert_eq!(queue.pending.back().unwrap().stage, AutoReviewStage::Deep);
-        assert_eq!(queue.pending.back().unwrap().number, 1);
-
-        let deep = queue.pending.pop_back().unwrap();
-        queue.running.insert(AutoReviewQueue::key(&deep));
-        queue.settle(deep, true);
-        assert!(!queue.enrolled.contains(&("local".to_string(), "o/r".to_string(), 1)));
-        assert!(queue.enrolled.contains(&("local".to_string(), "o/r".to_string(), 2)));
+        queue.settle(first);
+        assert_eq!(queue.pending.len(), 1);
+        assert_eq!(queue.pending.back().unwrap().number, 2);
+        assert!(
+            !queue
+                .enrolled
+                .contains(&("local".to_string(), "o/r".to_string(), 1))
+        );
+        assert!(
+            queue
+                .enrolled
+                .contains(&("local".to_string(), "o/r".to_string(), 2))
+        );
     }
 
     #[test]
@@ -3128,14 +2678,17 @@ mod tests {
         queue.clear();
         assert!(queue.pending.is_empty());
         assert_eq!(queue.enrolled.len(), 1);
-        queue.settle(running, false);
+        queue.settle(running);
         assert!(queue.enrolled.is_empty());
         assert!(queue.running.is_empty());
     }
 
     #[test]
     fn auto_review_pump_waits_for_manual_slot() {
-        let app = Arc::new(Mutex::new(App::new(Config::default(), Db::open_memory().unwrap())));
+        let app = Arc::new(Mutex::new(App::new(
+            Config::default(),
+            Db::open_memory().unwrap(),
+        )));
         {
             let mut a = app.lock_recover();
             a.cfg.auto_review_on_insert = true;
@@ -3151,729 +2704,6 @@ mod tests {
         pump_auto_reviews(&app, &msg_tx, &cmd_tx, &mut queue);
         assert_eq!(queue.pending.len(), 1);
         assert!(queue.running.is_empty());
-    }
-
-    struct FakeOpenAi {
-        base_url: String,
-        request: mpsc::Receiver<Value>,
-        release: Option<mpsc::Sender<()>>,
-    }
-
-    fn fake_openai_server(answer: &str, wait_for_release: bool) -> FakeOpenAi {
-        use std::io::{Read, Write};
-
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let (request_tx, request) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let response_body = serde_json::json!({
-            "choices": [{"message": {"role": "assistant", "content": answer}}]
-        })
-        .to_string();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                .unwrap();
-            let mut bytes = Vec::new();
-            let header_end = loop {
-                if let Some(pos) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    break pos + 4;
-                }
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap();
-                assert!(n > 0, "请求头未完整到达");
-                bytes.extend_from_slice(&buf[..n]);
-            };
-            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
-            let content_length = headers
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then(|| value.trim().parse::<usize>().unwrap())
-                })
-                .expect("LLM 请求缺少 Content-Length");
-            while bytes.len() < header_end + content_length {
-                let mut buf = [0u8; 4096];
-                let n = stream.read(&mut buf).unwrap();
-                assert!(n > 0, "请求体未按 Content-Length 完整到达");
-                bytes.extend_from_slice(&buf[..n]);
-            }
-            let body: Value = serde_json::from_slice(
-                &bytes[header_end..header_end + content_length],
-            )
-            .unwrap();
-            request_tx.send(body).unwrap();
-            if wait_for_release {
-                release_rx
-                    .recv_timeout(std::time::Duration::from_secs(10))
-                    .unwrap();
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                response_body.len(),
-                response_body
-            );
-            let _ = stream.write_all(response.as_bytes());
-        });
-        FakeOpenAi {
-            base_url: format!("http://{addr}/v1"),
-            request,
-            release: wait_for_release.then_some(release_tx),
-        }
-    }
-
-    fn deep_workspace() -> DeepWorkspaceData {
-        DeepWorkspaceData {
-            repo: "o/r".into(),
-            number: 7,
-            base_sha: "base-1".into(),
-            head_sha: "head-1".into(),
-            title: "Deep worker test".into(),
-            created_at: "2026-01-01T00:00:00Z".into(),
-            body: "whole PR body".into(),
-            diff: "diff --git a/src/a.rs b/src/a.rs".into(),
-            qa: Vec::new(),
-            agent_session_id: None,
-            findings: vec![DeepFindingData {
-                fingerprint: "fp-1".into(),
-                ordinal: 1,
-                path: "src/a.rs".into(),
-                start_line: 10,
-                end_line: 10,
-                severity: "high".into(),
-                category: "bug".into(),
-                content: "problem".into(),
-                suggested_text: "initial draft".into(),
-                draft_text: "initial draft".into(),
-                updated_at: "2026-01-01T00:00:00Z".into(),
-                ..Default::default()
-            }],
-        }
-    }
-
-    fn deep_test_app(base_url: &str) -> (Arc<Mutex<App>>, DeepKey, i64) {
-        let db = Db::open_memory().unwrap();
-        let workspace = db.create_deep_workspace(&deep_workspace()).unwrap();
-        let finding_id = workspace.findings[0].id;
-        let mut cfg = Config::default();
-        cfg.kimi_cli_path = crate::kimi_acp::test_support::fake_acp_path()
-            .to_string_lossy()
-            .into_owned();
-        cfg.llm_base_url = base_url.into();
-        cfg.llm_api_key = Some("sk-test".into());
-        cfg.llm_model = "test-model".into();
-        let key = DeepKey {
-            profile: cfg.active_profile.clone(),
-            repo: workspace.repo,
-            number: workspace.number,
-            head_sha: workspace.head_sha,
-        };
-        (Arc::new(Mutex::new(App::new(cfg, db))), key, finding_id)
-    }
-
-    #[test]
-    fn deep_rewrite_updates_draft_and_emits_update() {
-        let server = fake_openai_server("  rewritten by fake LLM\n", false);
-        let (app, key, finding_id) = deep_test_app(&server.base_url);
-        let cfg = app.lock_recover().cfg.clone();
-        let llm = LlmSettings::from_config(&cfg).unwrap();
-        let (msg_tx, msg_rx) = mpsc::channel();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_rewrite_task(
-            &cfg,
-            &llm,
-            &app,
-            &msg_tx,
-            &key,
-            finding_id,
-            41,
-            0,
-            "draft before rewrite",
-            "direct",
-            Arc::new(AtomicBool::new(false)),
-        ));
-
-        let request = server
-            .request
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        assert_eq!(request["model"], "test-model");
-        assert!(request["messages"][1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("draft before rewrite"));
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        let finding = &workspace.findings[0];
-        assert_eq!(finding.draft_text, "rewritten by fake LLM");
-        assert_eq!(finding.revision, 1);
-        assert!(finding.qa.is_empty());
-
-        match msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
-            Msg::DeepFindingUpdated {
-                key: updated_key,
-                finding_id: updated_id,
-                request_id,
-                action,
-                finding,
-                conflict,
-            } => {
-                assert_eq!(updated_key, key);
-                assert_eq!(updated_id, finding_id);
-                assert_eq!(request_id, 41);
-                assert_eq!(action, DeepAction::Rewrite);
-                assert!(!conflict);
-                assert_eq!(finding.draft_text, "rewritten by fake LLM");
-                assert_eq!(finding.revision, 1);
-            }
-            _ => panic!("Deep Rewrite 未回送 DeepFindingUpdated"),
-        }
-        assert!(msg_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn deep_ask_persists_qa_without_changing_draft() {
-        let server = fake_openai_server("  answer from fake LLM\n", false);
-        let (app, key, finding_id) = deep_test_app(&server.base_url);
-        let cfg = app.lock_recover().cfg.clone();
-        let llm = LlmSettings::from_config(&cfg).unwrap();
-        let (msg_tx, msg_rx) = mpsc::channel();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_ask_task(
-            &cfg,
-            &llm,
-            &app,
-            &msg_tx,
-            &key,
-            finding_id,
-            42,
-            "  Why is this risky?  ",
-            "initial draft",
-            Arc::new(AtomicBool::new(false)),
-        ));
-
-        let request = server
-            .request
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        assert!(request["messages"][1]["content"]
-            .as_str()
-            .unwrap()
-            .contains("Why is this risky?"));
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        let finding = &workspace.findings[0];
-        assert_eq!(finding.draft_text, "initial draft");
-        assert_eq!(finding.revision, 0);
-        assert_eq!(finding.qa.len(), 2);
-        assert_eq!(finding.qa[0].role, "user");
-        assert_eq!(finding.qa[0].content, "Why is this risky?");
-        assert_eq!(finding.qa[1].role, "assistant");
-        assert_eq!(finding.qa[1].content, "answer from fake LLM");
-
-        match msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
-            Msg::DeepFindingUpdated {
-                key: updated_key,
-                finding_id: updated_id,
-                request_id,
-                action,
-                finding,
-                conflict,
-            } => {
-                assert_eq!(updated_key, key);
-                assert_eq!(updated_id, finding_id);
-                assert_eq!(request_id, 42);
-                assert_eq!(action, DeepAction::Ask);
-                assert!(!conflict);
-                assert_eq!(finding.draft_text, "initial draft");
-                assert_eq!(finding.revision, 0);
-                assert_eq!(finding.qa.len(), 2);
-            }
-            _ => panic!("Deep Ask 未回送 DeepFindingUpdated"),
-        }
-        assert!(msg_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn deep_ask_pr_uses_whole_context_and_separate_history() {
-        let server = fake_openai_server("  whole PR answer\n", false);
-        let (app, key, _) = deep_test_app(&server.base_url);
-        let cfg = app.lock_recover().cfg.clone();
-        let llm = LlmSettings::from_config(&cfg).unwrap();
-        let gh = github::GitHub::new(None, "").unwrap();
-        let (msg_tx, msg_rx) = mpsc::channel();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_ask_pr_task(
-            &cfg,
-            &llm,
-            &gh,
-            &app,
-            &msg_tx,
-            &key,
-            44,
-            "  What does this PR change?  ",
-            Arc::new(AtomicBool::new(false)),
-        ));
-
-        let request = server
-            .request
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        let prompt = request["messages"][1]["content"].as_str().unwrap();
-        assert!(prompt.contains("whole PR body"));
-        assert!(prompt.contains("diff --git a/src/a.rs"));
-        assert!(prompt.contains("What does this PR change?"));
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(workspace.qa.len(), 2);
-        assert_eq!(workspace.qa[0].content, "What does this PR change?");
-        assert_eq!(workspace.qa[1].content, "whole PR answer");
-        assert!(workspace.findings[0].qa.is_empty());
-        assert_eq!(workspace.findings[0].revision, 0);
-        assert_eq!(workspace.findings[0].draft_text, "initial draft");
-
-        match msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
-            Msg::DeepPrUpdated {
-                key: updated_key,
-                request_id,
-                qa,
-            } => {
-                assert_eq!(updated_key, key);
-                assert_eq!(request_id, 44);
-                assert_eq!(qa.len(), 2);
-            }
-            _ => panic!("PR 问答未回送 DeepPrUpdated"),
-        }
-        assert!(msg_rx.try_recv().is_err());
-    }
-
-    fn assert_deep_cancelled(
-        msg_rx: &mpsc::Receiver<Msg>,
-        request_id: u64,
-        finding_id: Option<i64>,
-        action: DeepAction,
-    ) {
-        match msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap() {
-            Msg::DeepFailed {
-                request_id: failed_request,
-                finding_id: failed_finding,
-                action: failed_action,
-                ..
-            } => {
-                assert_eq!(failed_request, request_id);
-                assert_eq!(failed_finding, finding_id);
-                assert_eq!(failed_action, action);
-            }
-            _ => panic!("取消任务未回送匹配的 DeepFailed"),
-        }
-        assert!(msg_rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn delayed_deep_rewrite_can_cancel_without_db_write_and_retry() {
-        let server = fake_openai_server("cancelled rewrite", true);
-        let (app, key, finding_id) = deep_test_app(&server.base_url);
-        let cfg = app.lock_recover().cfg.clone();
-        let llm = LlmSettings::from_config(&cfg).unwrap();
-        let flags = DeepCancelFlags::default();
-        let cancel = register_deep_cancel(&flags, 51);
-        let (msg_tx, msg_rx) = mpsc::channel();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let app2 = app.clone();
-            let key2 = key.clone();
-            let flags2 = flags.clone();
-            let msg_tx = msg_tx.clone();
-            let task = tokio::spawn(async move {
-                let _guard = DeepCancelGuard {
-                    flags: flags2,
-                    request_id: 51,
-                    cancel: cancel.clone(),
-                };
-                let task_cancel = cancel.clone();
-                run_deep_cancellable(
-                    &msg_tx,
-                    &key2,
-                    Some(finding_id),
-                    51,
-                    DeepAction::Rewrite,
-                    &cfg.language,
-                    cancel,
-                    run_deep_rewrite_task(
-                        &cfg,
-                        &llm,
-                        &app2,
-                        &msg_tx,
-                        &key2,
-                        finding_id,
-                        51,
-                        0,
-                        "initial draft",
-                        "direct",
-                        task_cancel,
-                    ),
-                )
-                .await;
-            });
-            server.request.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            flags.lock_recover().get(&51).unwrap().store(true, Ordering::Relaxed);
-            task.await.unwrap();
-            assert!(flags.lock_recover().is_empty());
-        });
-        server.release.as_ref().unwrap().send(()).unwrap();
-        assert_deep_cancelled(&msg_rx, 51, Some(finding_id), DeepAction::Rewrite);
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(workspace.findings[0].draft_text, "initial draft");
-        assert_eq!(workspace.findings[0].revision, 0);
-        assert!(workspace.findings[0].qa.is_empty());
-
-        let retry_server = fake_openai_server("rewrite after retry", false);
-        let retry_cfg = {
-            let mut a = app.lock_recover();
-            a.cfg.llm_base_url = retry_server.base_url.clone();
-            a.cfg.clone()
-        };
-        let retry_llm = LlmSettings::from_config(&retry_cfg).unwrap();
-        let retry_cancel = register_deep_cancel(&flags, 52);
-        let retry_guard = DeepCancelGuard {
-            flags: flags.clone(),
-            request_id: 52,
-            cancel: retry_cancel.clone(),
-        };
-        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_cancellable(
-            &msg_tx,
-            &key,
-            Some(finding_id),
-            52,
-            DeepAction::Rewrite,
-            &retry_cfg.language,
-            retry_cancel.clone(),
-            run_deep_rewrite_task(
-                &retry_cfg,
-                &retry_llm,
-                &app,
-                &msg_tx,
-                &key,
-                finding_id,
-                52,
-                0,
-                "initial draft",
-                "direct",
-                retry_cancel,
-            ),
-        ));
-        drop(retry_guard);
-        assert!(flags.lock_recover().is_empty());
-        assert!(matches!(
-            msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
-            Msg::DeepFindingUpdated { request_id: 52, action: DeepAction::Rewrite, .. }
-        ));
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(workspace.findings[0].draft_text, "rewrite after retry");
-        assert_eq!(workspace.findings[0].revision, 1);
-    }
-
-    #[test]
-    fn delayed_deep_finding_ask_can_cancel_without_db_write_and_retry() {
-        let server = fake_openai_server("cancelled finding answer", true);
-        let (app, key, finding_id) = deep_test_app(&server.base_url);
-        let cfg = app.lock_recover().cfg.clone();
-        let llm = LlmSettings::from_config(&cfg).unwrap();
-        let flags = DeepCancelFlags::default();
-        let cancel = register_deep_cancel(&flags, 53);
-        let (msg_tx, msg_rx) = mpsc::channel();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let app2 = app.clone();
-            let key2 = key.clone();
-            let flags2 = flags.clone();
-            let msg_tx = msg_tx.clone();
-            let task = tokio::spawn(async move {
-                let _guard = DeepCancelGuard {
-                    flags: flags2,
-                    request_id: 53,
-                    cancel: cancel.clone(),
-                };
-                let task_cancel = cancel.clone();
-                run_deep_cancellable(
-                    &msg_tx,
-                    &key2,
-                    Some(finding_id),
-                    53,
-                    DeepAction::Ask,
-                    &cfg.language,
-                    cancel,
-                    run_deep_ask_task(
-                        &cfg,
-                        &llm,
-                        &app2,
-                        &msg_tx,
-                        &key2,
-                        finding_id,
-                        53,
-                        "cancel this question",
-                        "initial draft",
-                        task_cancel,
-                    ),
-                )
-                .await;
-            });
-            server.request.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            flags.lock_recover().get(&53).unwrap().store(true, Ordering::Relaxed);
-            task.await.unwrap();
-            assert!(flags.lock_recover().is_empty());
-        });
-        server.release.as_ref().unwrap().send(()).unwrap();
-        assert_deep_cancelled(&msg_rx, 53, Some(finding_id), DeepAction::Ask);
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        assert!(workspace.findings[0].qa.is_empty());
-        assert_eq!(workspace.findings[0].draft_text, "initial draft");
-        assert_eq!(workspace.findings[0].revision, 0);
-
-        let retry_server = fake_openai_server("finding answer after retry", false);
-        let retry_cfg = {
-            let mut a = app.lock_recover();
-            a.cfg.llm_base_url = retry_server.base_url.clone();
-            a.cfg.clone()
-        };
-        let retry_llm = LlmSettings::from_config(&retry_cfg).unwrap();
-        let retry_cancel = register_deep_cancel(&flags, 54);
-        let retry_guard = DeepCancelGuard {
-            flags: flags.clone(),
-            request_id: 54,
-            cancel: retry_cancel.clone(),
-        };
-        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_cancellable(
-            &msg_tx,
-            &key,
-            Some(finding_id),
-            54,
-            DeepAction::Ask,
-            &retry_cfg.language,
-            retry_cancel.clone(),
-            run_deep_ask_task(
-                &retry_cfg,
-                &retry_llm,
-                &app,
-                &msg_tx,
-                &key,
-                finding_id,
-                54,
-                "retry this question",
-                "initial draft",
-                retry_cancel,
-            ),
-        ));
-        drop(retry_guard);
-        assert!(flags.lock_recover().is_empty());
-        assert!(matches!(
-            msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
-            Msg::DeepFindingUpdated { request_id: 54, action: DeepAction::Ask, .. }
-        ));
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(workspace.findings[0].qa.len(), 2);
-        assert_eq!(workspace.findings[0].qa[0].content, "retry this question");
-        assert_eq!(workspace.findings[0].qa[1].content, "finding answer after retry");
-    }
-
-    #[test]
-    fn delayed_deep_pr_ask_can_cancel_without_db_write_and_retry() {
-        let server = fake_openai_server("cancelled PR answer", true);
-        let (app, key, _) = deep_test_app(&server.base_url);
-        let cfg = app.lock_recover().cfg.clone();
-        let llm = LlmSettings::from_config(&cfg).unwrap();
-        let flags = DeepCancelFlags::default();
-        let cancel = register_deep_cancel(&flags, 55);
-        let (msg_tx, msg_rx) = mpsc::channel();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let app2 = app.clone();
-            let key2 = key.clone();
-            let flags2 = flags.clone();
-            let msg_tx = msg_tx.clone();
-            let task = tokio::spawn(async move {
-                let _guard = DeepCancelGuard {
-                    flags: flags2,
-                    request_id: 55,
-                    cancel: cancel.clone(),
-                };
-                let task_cancel = cancel.clone();
-                let gh = github::GitHub::new(None, "").unwrap();
-                run_deep_cancellable(
-                    &msg_tx,
-                    &key2,
-                    Some(0),
-                    55,
-                    DeepAction::Ask,
-                    &cfg.language,
-                    cancel,
-                    run_deep_ask_pr_task(
-                        &cfg,
-                        &llm,
-                        &gh,
-                        &app2,
-                        &msg_tx,
-                        &key2,
-                        55,
-                        "cancel this PR question",
-                        task_cancel,
-                    ),
-                )
-                .await;
-            });
-            server.request.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            flags.lock_recover().get(&55).unwrap().store(true, Ordering::Relaxed);
-            task.await.unwrap();
-            assert!(flags.lock_recover().is_empty());
-        });
-        server.release.as_ref().unwrap().send(()).unwrap();
-        assert_deep_cancelled(&msg_rx, 55, Some(0), DeepAction::Ask);
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        assert!(workspace.qa.is_empty());
-        assert!(workspace.findings[0].qa.is_empty());
-
-        let retry_server = fake_openai_server("PR answer after retry", false);
-        let retry_cfg = {
-            let mut a = app.lock_recover();
-            a.cfg.llm_base_url = retry_server.base_url.clone();
-            a.cfg.clone()
-        };
-        let retry_llm = LlmSettings::from_config(&retry_cfg).unwrap();
-        let retry_cancel = register_deep_cancel(&flags, 56);
-        let retry_guard = DeepCancelGuard {
-            flags: flags.clone(),
-            request_id: 56,
-            cancel: retry_cancel.clone(),
-        };
-        let gh = github::GitHub::new(None, "").unwrap();
-        tokio::runtime::Runtime::new().unwrap().block_on(run_deep_cancellable(
-            &msg_tx,
-            &key,
-            Some(0),
-            56,
-            DeepAction::Ask,
-            &retry_cfg.language,
-            retry_cancel.clone(),
-            run_deep_ask_pr_task(
-                &retry_cfg,
-                &retry_llm,
-                &gh,
-                &app,
-                &msg_tx,
-                &key,
-                56,
-                "retry this PR question",
-                retry_cancel,
-            ),
-        ));
-        drop(retry_guard);
-        assert!(flags.lock_recover().is_empty());
-        assert!(matches!(
-            msg_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap(),
-            Msg::DeepPrUpdated { request_id: 56, .. }
-        ));
-        let workspace = app
-            .lock_recover()
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(workspace.qa.len(), 2);
-        assert_eq!(workspace.qa[0].content, "retry this PR question");
-        assert_eq!(workspace.qa[1].content, "PR answer after retry");
-        assert!(workspace.findings[0].qa.is_empty());
-    }
-
-    #[test]
-    fn inflight_deep_rewrite_must_not_write_into_switched_profile_db() {
-        let server = fake_openai_server("must not cross profiles", true);
-        let (app, key, finding_id) = deep_test_app(&server.base_url);
-        let cfg = app.lock_recover().cfg.clone();
-        let llm = LlmSettings::from_config(&cfg).unwrap();
-        let (msg_tx, msg_rx) = mpsc::channel();
-
-        tokio::runtime::Runtime::new().unwrap().block_on(async {
-            let app2 = app.clone();
-            let key2 = key.clone();
-            let task = tokio::spawn(async move {
-                run_deep_rewrite_task(
-                    &cfg,
-                    &llm,
-                    &app2,
-                    &msg_tx,
-                    &key2,
-                    finding_id,
-                    43,
-                    0,
-                    "initial draft",
-                    "shorter",
-                    Arc::new(AtomicBool::new(false)),
-                )
-                .await;
-            });
-            server
-                .request
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
-            {
-                let mut a = app.lock_recover();
-                a.cfg.active_profile = "other".into();
-                let new_db = Db::open_memory().unwrap();
-                new_db.create_deep_workspace(&deep_workspace()).unwrap();
-                a.db = new_db;
-            }
-            server.release.as_ref().unwrap().send(()).unwrap();
-            task.await.unwrap();
-        });
-
-        let a = app.lock_recover();
-        let workspace = a
-            .db
-            .get_deep_workspace("o/r", 7, "head-1")
-            .unwrap()
-            .unwrap();
-        assert_eq!(workspace.findings[0].draft_text, "initial draft");
-        assert_eq!(workspace.findings[0].revision, 0);
-        assert!(msg_rx.try_recv().is_err());
     }
 
     /// 微型 sync 服务器：收到一次请求后延迟 delay 再返回 body（模拟网络在途）。
@@ -3922,7 +2752,10 @@ mod tests {
         .to_string();
         let url = fake_sync_server(std::time::Duration::from_millis(400), body);
 
-        let app = Arc::new(Mutex::new(App::new(Config::default(), Db::open_memory().unwrap())));
+        let app = Arc::new(Mutex::new(App::new(
+            Config::default(),
+            Db::open_memory().unwrap(),
+        )));
         {
             let mut a = app.lock_recover();
             a.cfg.server_url = url;
@@ -3937,7 +2770,8 @@ mod tests {
             let app2 = app.clone();
             let (msg_tx, _rx) = mpsc::channel::<Msg>();
             let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::unbounded_channel();
-            let h = tokio::spawn(async move { do_sync(&app2, &sc, &msg_tx, &cmd_tx, "default").await });
+            let h =
+                tokio::spawn(async move { do_sync(&app2, &sc, &msg_tx, &cmd_tx, "default").await });
             // 拉取在途：用户切回 local —— 换库
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             {
@@ -3952,6 +2786,9 @@ mod tests {
             a.db.list_pr_keys().unwrap().is_empty(),
             "在途 sync 把服务器数据写进了切换后的 local 库（串库）"
         );
-        assert!(a.db.get_cursor().unwrap().is_none(), "sync 游标泄漏进了 local 库");
+        assert!(
+            a.db.get_cursor().unwrap().is_none(),
+            "sync 游标泄漏进了 local 库"
+        );
     }
 }

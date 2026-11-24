@@ -10,7 +10,6 @@ use serde_json::Value;
 
 use pr_desk_rs::config::Config;
 use pr_desk_rs::db::Db;
-use pr_desk_rs::deep_review::{DeepFindingData, DeepQaMessage, DeepWorkspaceData};
 use pr_desk_rs::i18n::{tr, trf};
 use pr_desk_rs::{diffview, selection, sync};
 
@@ -30,81 +29,94 @@ impl<T> LockRecover<T> for Mutex<T> {
 // ── 后台命令 / 回送消息 ──
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct DeepKey {
-    pub profile: String,
-    pub repo: String,
-    pub number: i64,
-    pub head_sha: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeepAction {
-    Run,
-    Save,
-    Discard,
-    Rewrite,
-    Ask,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum AutoReviewStage {
-    Standard,
-    Deep,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AutoReviewJob {
     pub profile: String,
     pub repo: String,
     pub number: i64,
-    pub stage: AutoReviewStage,
 }
 
 pub enum Cmd {
     RefreshGithub,
     Sync,
-    FetchDiff { repo: String, number: i64 },
-    FetchInbox,                 // 拉取 GitHub 通知（RefreshGithub/Sync 也会顺带触发）
-    FetchInboxMore,             // Inbox「加载更多」：拉下一页追加
-    MarkNotifRead(String),      // 标记通知线程已读，完成后重新拉取
-    MarkAllNotifsRead,          // PUT /notifications 全部已读，完成后重新拉取
-    AddNotifReview { repo: String, number: i64, title: String, url: String },  // Inbox「+ 预评审」入库
-    FetchNotifDetail { repo: String, number: i64, kind: String },  // Inbox 预览面板：拉会话/Files/Diff
+    FetchDiff {
+        repo: String,
+        number: i64,
+    },
+    FetchInbox,            // 拉取 GitHub 通知（RefreshGithub/Sync 也会顺带触发）
+    FetchInboxMore,        // Inbox「加载更多」：拉下一页追加
+    MarkNotifRead(String), // 标记通知线程已读，完成后重新拉取
+    MarkAllNotifsRead,     // PUT /notifications 全部已读，完成后重新拉取
+    AddNotifReview {
+        repo: String,
+        number: i64,
+        title: String,
+        url: String,
+    }, // Inbox「+ 预评审」入库
+    FetchNotifDetail {
+        repo: String,
+        number: i64,
+        kind: String,
+    }, // Inbox 预览面板：拉会话/Files/Diff
     // 详情面板装配（原 UI 线程 open_drawer）：DB 读写 + diff 解析全在 worker，
     // UI 线程只把 Msg::Panel/DiffParsed 落地。refetch=false 用于 ReopenPanel（防 FetchPrMeta 死循环）
-    OpenDrawer { repo: String, number: i64, refetch: bool },
+    OpenDrawer {
+        repo: String,
+        number: i64,
+        refetch: bool,
+    },
     CopyReview,        // 详情面板「复制评审」：get_review SQL + 剪贴板写入都在 worker
     CopyLinks(String), // 多选「复制链接」：换行拼接的 URL 文本，剪贴板写入在 worker
     // 右键/操作条「复制到档案…」：当前选择集（多选优先，否则当前行）+ 全部评审复制到目标档案
-    CopyToProfile { target: String, keys: Vec<(String, i64)> },
-    ExportDatabase { destination: PathBuf },
-    ImportDatabase { source: PathBuf, name: String },
-    LoadReviewPrompt,  // 设置页打开时重读 exe 旁 review_prompt.md（可能被外部编辑过）
-    ReloadConfig,   // 设置保存后热生效：重建客户端并立即刷新+同步
-    SwitchProfile(String),  // 切换数据源档案（"local"/"default"/自定义名）：换库 + 重建同步客户端
-    RunReview { repo: String, number: i64 },  // 详情面板「AI 评审」：LLM 评审并入库
-    RunDeepReview { profile: String, repo: String, number: i64, request_id: u64 },
-    QueueAutoReviews { profile: String, keys: Vec<(String, i64)> },
-    AutoReviewSettled { job: AutoReviewJob, success: bool },
+    CopyToProfile {
+        target: String,
+        keys: Vec<(String, i64)>,
+    },
+    ExportDatabase {
+        destination: PathBuf,
+    },
+    ImportDatabase {
+        source: PathBuf,
+        name: String,
+    },
+    LoadReviewPrompt, // 设置页打开时重读 exe 旁 review_prompt.md（可能被外部编辑过）
+    ReloadConfig,     // 设置保存后热生效：重建客户端并立即刷新+同步
+    SwitchProfile(String), // 切换数据源档案（"local"/"default"/自定义名）：换库 + 重建同步客户端
+    RunReview {
+        repo: String,
+        number: i64,
+    }, // 详情面板「AI 评审」：LLM 评审并入库
+    QueueAutoReviews {
+        profile: String,
+        keys: Vec<(String, i64)>,
+    },
+    AutoReviewSettled {
+        job: AutoReviewJob,
+        success: bool,
+    },
     ReviewSlotReleased,
-    RefreshDeepFindings { key: DeepKey, request_id: u64 },
-    CancelDeepReview { request_id: u64 },
-    SaveDeepDraft { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, text: String },
-    SetDeepFindingDiscarded { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, discarded: bool },
-    RewriteDeepFinding { key: DeepKey, finding_id: i64, request_id: u64, expected_revision: i64, base_text: String, style: String },
-    AskDeepFinding { key: DeepKey, finding_id: i64, request_id: u64, question: String, current_draft: String },
-    AskDeepPr { key: DeepKey, request_id: u64, question: String },
-    CopyDeepText(String),
-    FetchModels { base: String, key: String },  // 设置页「获取」：拉 OpenAI 兼容端点的模型列表
-    FetchPrMeta { repo: String, number: i64 },  // 补齐残缺行的 author/url/head_sha（Inbox 入库的行缺这些）
-    FetchPrLive { repo: String, number: i64, parts: u8 },  // 面板实时拉取（parts 位标志：1=会话+评审 2=Files 4=Checks+meta；按 tab 惰性拉取）
-    Shutdown,  // 真正退出：worker 跳出命令循环（修「窗口关了进程不死」的僵尸问题）
+    PrepareKimiContext {
+        key: crate::kimi_terminal::KimiKey,
+    },
+    FetchModels {
+        base: String,
+        key: String,
+    }, // 设置页「获取」：拉 OpenAI 兼容端点的模型列表
+    FetchPrMeta {
+        repo: String,
+        number: i64,
+    }, // 补齐残缺行的 author/url/head_sha（Inbox 入库的行缺这些）
+    FetchPrLive {
+        repo: String,
+        number: i64,
+        parts: u8,
+    }, // 面板实时拉取（parts 位标志：1=会话+评审 2=Files 4=Checks+meta；按 tab 惰性拉取）
+    Shutdown, // 真正退出：worker 跳出命令循环（修「窗口关了进程不死」的僵尸问题）
 }
 
 /// FetchPrLive 的 parts 位标志：按 tab 惰性拉取（打开面板只带 CHECKS，会话/Files 切到才拉）。
-pub const PART_CONVO: u8 = 1;   // 会话 tab：评论 + 评审意见
-pub const PART_FILES: u8 = 2;   // Files tab
-pub const PART_CHECKS: u8 = 4;  // Checks tab / 打开面板（含 meta：状态徽章/更新时间）
+pub const PART_CONVO: u8 = 1; // 会话 tab：评论 + 评审意见
+pub const PART_FILES: u8 = 2; // Files tab
+pub const PART_CHECKS: u8 = 4; // Checks tab / 打开面板（含 meta：状态徽章/更新时间）
 
 /// 状态栏配置状态文本（语言取 cfg.language）。
 pub fn config_status(cfg: &Config) -> String {
@@ -130,39 +142,40 @@ pub enum Msg {
     Status(String),
     Rows(Vec<Value>),
     FilterChanged(String),
-    ViewPrefsChanged,  // 排序方式 / 高分快筛变化（重算过滤视图）
-    StatusBarRefresh,  // 只重组状态栏（配额 / 同步时间变化，不改临时消息）
+    ViewPrefsChanged, // 排序方式 / 高分快筛变化（重算过滤视图）
+    StatusBarRefresh, // 只重组状态栏（配额 / 同步时间变化，不改临时消息）
     Panel(Box<PanelData>),
     ClosePanel,
     // AI 评审进度：状态栏显示 text；若详情面板正打开该 PR，面板置 running 并显示进度
-    ReviewProgress { repo: String, number: i64, text: String },
-    ReviewDone { repo: String, number: i64 },
-    ReviewFailed { repo: String, number: i64, err: String },
-    DeepProgress { key: DeepKey, request_id: u64, text: String },
-    DeepLoaded { key: DeepKey, request_id: u64, workspace: Box<DeepWorkspaceData> },
-    DeepFindingUpdated {
-        key: DeepKey,
-        finding_id: i64,
-        request_id: u64,
-        action: DeepAction,
-        finding: Box<DeepFindingData>,
-        conflict: bool,
+    ReviewProgress {
+        repo: String,
+        number: i64,
+        text: String,
     },
-    DeepPrUpdated {
-        key: DeepKey,
-        request_id: u64,
-        qa: Vec<DeepQaMessage>,
+    ReviewDone {
+        repo: String,
+        number: i64,
     },
-    DeepFailed {
-        key: DeepKey,
-        finding_id: Option<i64>,
-        request_id: u64,
-        action: DeepAction,
+    ReviewFailed {
+        repo: String,
+        number: i64,
         err: String,
+    },
+    KimiContextReady {
+        key: crate::kimi_terminal::KimiKey,
+        context: Box<crate::kimi_terminal::PrContext>,
+    },
+    KimiContextFailed {
+        key: crate::kimi_terminal::KimiKey,
+        error: String,
     },
     // diff 的结构化解析结果（worker 解析完成，大 PR 几万行不占 UI 线程）。
     // 携带身份：面板已切走则不上屏（diff 缓存已在 worker 落库，下次打开能用）
-    DiffParsed { repo: String, number: i64, files: Vec<DiffFileData> },
+    DiffParsed {
+        repo: String,
+        number: i64,
+        files: Vec<DiffFileData>,
+    },
     InboxRows(Vec<Value>),
     // Inbox 预览面板：会话条目已在 worker 完成 markdown 解析。携带身份：
     // apply 前与 app.inbox_detail 比对，快速连点两条通知时旧结果丢弃
@@ -173,13 +186,20 @@ pub enum Msg {
         files_json: String,
         diff_files: Vec<DiffFileData>,
     },
-    NotifDetailFailed { repo: String, number: i64, err: String },
+    NotifDetailFailed {
+        repo: String,
+        number: i64,
+        err: String,
+    },
     RefreshDone(usize),
     SyncFinished,
-    DialogMsg(String),       // 设置弹窗内联错误行
-    InboxLoading(bool),      // Inbox 首次加载态
+    DialogMsg(String),  // 设置弹窗内联错误行
+    InboxLoading(bool), // Inbox 首次加载态
     ModelsLoaded(Vec<String>),
-    Profiles { names: Vec<String>, active: String },
+    Profiles {
+        names: Vec<String>,
+        active: String,
+    },
     DatabaseExportFinished(Result<PathBuf, String>),
     DatabaseImportFinished(Result<String, String>),
     // 设置页档案名校正：新增档案非法时把 settings_profile 写回之前的有效值
@@ -200,7 +220,10 @@ pub enum Msg {
         files_json: Option<String>,
     },
     // 会话头像预取落盘完成（有实际新拉取才发）：apply 侧按身份守卫后原地更新
-    ConvoAvatars { repo: String, number: i64 },
+    ConvoAvatars {
+        repo: String,
+        number: i64,
+    },
     // 托盘：左键还原窗口 / 右键菜单「退出」
     TrayShow,
     TrayQuit,
@@ -223,7 +246,7 @@ pub struct PlainConvoEntry {
 pub struct OcrCommentRow {
     pub severity: String,
     pub category: String,
-    pub location: String,   // 如 "src/foo.rs:42-58"
+    pub location: String, // 如 "src/foo.rs:42-58"
     pub content: String,
 }
 
@@ -272,10 +295,6 @@ pub struct PanelData {
     pub review_status: String,
     pub review_progress: String,
     pub head_sha: String,
-    pub deep: Option<DeepWorkspaceData>,
-    pub deep_status: String,
-    pub deep_progress: String,
-    pub deep_error: String,
 }
 
 /// 评审分项键名 → 界面语言名（未知键原样展示）。
@@ -319,9 +338,11 @@ pub fn build_review_markdown(repo: &str, number: i64, rv: &Value, lang: &str) ->
         s.push_str(&format!("**Score: {score:.1}/10**"));
         if let Some(sz) = rv["size_label"].as_str().filter(|x| !x.is_empty()) {
             s.push_str(&format!(" · {sz}"));
-            if let (Some(a), Some(d), Some(f)) =
-                (rv["additions"].as_i64(), rv["deletions"].as_i64(), rv["files_changed"].as_i64())
-            {
+            if let (Some(a), Some(d), Some(f)) = (
+                rv["additions"].as_i64(),
+                rv["deletions"].as_i64(),
+                rv["files_changed"].as_i64(),
+            ) {
                 s.push_str(&format!(" (+{a}/-{d}, {f} files)"));
             }
         }
@@ -394,8 +415,16 @@ pub fn ocr_comment_rows(rv: &Value) -> Vec<OcrCommentRow> {
         .unwrap_or_default()
         .iter()
         .map(|c| OcrCommentRow {
-            severity: c["severity"].as_str().filter(|s| !s.is_empty()).unwrap_or("other").to_string(),
-            category: c["category"].as_str().filter(|s| !s.is_empty()).unwrap_or("other").to_string(),
+            severity: c["severity"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("other")
+                .to_string(),
+            category: c["category"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("other")
+                .to_string(),
             location: ocr_comment_location(c),
             content: c["content"].as_str().unwrap_or("").to_string(),
         })
@@ -441,7 +470,12 @@ pub fn review_props(review: Option<&Value>, lang: &str) -> ReviewProps {
         .unwrap_or_default();
     let dimensions = dims
         .iter()
-        .map(|(k, v)| (dim_label(k, lang).to_string(), v.as_f64().unwrap_or(0.0) as f32))
+        .map(|(k, v)| {
+            (
+                dim_label(k, lang).to_string(),
+                v.as_f64().unwrap_or(0.0) as f32,
+            )
+        })
         .collect();
     let summary = rv["summary"].as_str().unwrap_or("").to_string();
     let flagged = json_field(rv, "flagged_files")
@@ -470,17 +504,16 @@ pub fn review_props(review: Option<&Value>, lang: &str) -> ReviewProps {
 
 // ── 预评审并发槽 ──
 
-/// 预评审并发槽位：普通与 Deep 各允许同 PR 一个任务，总并发仍受容量限制。
+/// 普通预评审并发槽位：同一 PR 禁止重入，总并发受容量限制。
 /// 容量来自配置 review_concurrency（设置页可改，保存即时生效）。
 pub struct ReviewSlots {
     pub capacity: usize,
     standard_inflight: HashSet<(String, i64)>,
-    deep_inflight: HashSet<(String, i64)>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SlotError {
-    AlreadyRunning, // 同一 PR 已有同类型评审在跑
+    AlreadyRunning, // 同一 PR 已有评审在跑
     AtCapacity,     // 槽位已满
 }
 
@@ -489,15 +522,13 @@ impl ReviewSlots {
         Self {
             capacity,
             standard_inflight: HashSet::new(),
-            deep_inflight: HashSet::new(),
         }
     }
 
     fn at_capacity(&self) -> bool {
-        self.standard_inflight.len() + self.deep_inflight.len() >= self.capacity
+        self.standard_inflight.len() >= self.capacity
     }
 
-    /// 普通预审阅：同 PR 允许与一个 Deep Review 并行，但禁止同类重入。
     pub fn try_acquire(&mut self, repo: &str, number: i64) -> Result<(), SlotError> {
         if self.standard_inflight.contains(&(repo.to_string(), number)) {
             return Err(SlotError::AlreadyRunning);
@@ -509,38 +540,17 @@ impl ReviewSlots {
         Ok(())
     }
 
-    /// Deep Review：与普通预审阅独立防重入，并共享全局容量。
-    pub fn try_acquire_deep(&mut self, repo: &str, number: i64) -> Result<(), SlotError> {
-        if self.deep_inflight.contains(&(repo.to_string(), number)) {
-            return Err(SlotError::AlreadyRunning);
-        }
-        if self.at_capacity() {
-            return Err(SlotError::AtCapacity);
-        }
-        self.deep_inflight.insert((repo.to_string(), number));
-        Ok(())
-    }
-
     pub fn release(&mut self, repo: &str, number: i64) {
         self.standard_inflight.remove(&(repo.to_string(), number));
     }
 
-    pub fn release_deep(&mut self, repo: &str, number: i64) {
-        self.deep_inflight.remove(&(repo.to_string(), number));
-    }
-
-    /// 面板打开时查询：该 PR 是否有任一评审任务。
+    /// 面板打开时查询：该 PR 是否有评审任务。
     pub fn is_running(&self, repo: &str, number: i64) -> bool {
         self.standard_inflight.contains(&(repo.to_string(), number))
-            || self.deep_inflight.contains(&(repo.to_string(), number))
     }
 
     pub fn is_standard_review_running(&self, repo: &str, number: i64) -> bool {
         self.standard_inflight.contains(&(repo.to_string(), number))
-    }
-
-    pub fn is_deep_review_running(&self, repo: &str, number: i64) -> bool {
-        self.deep_inflight.contains(&(repo.to_string(), number))
     }
 
     /// 设置页调整并发数（不影响已占用的槽位）。
@@ -549,22 +559,16 @@ impl ReviewSlots {
     }
 }
 
-/// 槽位 RAII 守卫：只释放本任务类型，不影响同 PR 的另一类型任务。
+/// 槽位 RAII 守卫：任务结束时释放普通预评审槽位。
 pub struct SlotGuard {
     pub slots: Arc<Mutex<ReviewSlots>>,
     pub repo: String,
     pub number: i64,
-    pub deep: bool,
 }
 
 impl Drop for SlotGuard {
     fn drop(&mut self) {
-        let mut slots = self.slots.lock_recover();
-        if self.deep {
-            slots.release_deep(&self.repo, self.number);
-        } else {
-            slots.release(&self.repo, self.number);
-        }
+        self.slots.lock_recover().release(&self.repo, self.number);
     }
 }
 
@@ -573,50 +577,58 @@ impl Drop for SlotGuard {
 /// 列表摊平后的展示项（组头与数据行混排；折叠组的行不进 flat）。
 #[derive(Clone)]
 pub enum FlatItem {
-    Header { key: String, title: String, count: usize },
-    Row { rows_idx: usize },
+    Header {
+        key: String,
+        title: String,
+        count: usize,
+    },
+    Row {
+        rows_idx: usize,
+    },
 }
 
 pub struct App {
     pub cfg: Config,
     pub db: Db,
-    pub rows: Vec<Value>,                 // 扁平数据行（按身份查找，见 find_row）
-    pub flat: Vec<FlatItem>,              // 展示序摊平（过滤+排序+分组+折叠后），渲染与点击映射以此为准
+    pub rows: Vec<Value>,    // 扁平数据行（按身份查找，见 find_row）
+    pub flat: Vec<FlatItem>, // 展示序摊平（过滤+排序+分组+折叠后），渲染与点击映射以此为准
     pub view_visible: Vec<(String, i64)>, // 可见行的展示序身份；键盘导航以此为准
-    pub collapsed: HashSet<String>,       // 折叠的组 key；跨刷新保留
-    pub filter: String,                   // 当前过滤词（空 = 全量）
-    pub sort_col: String,                 // 组内排序列（默认 "upd" = 更新时间降序，即 SQL 输入序）
-    pub sort_asc: bool,                   // 排序方向（false = 降序）
-    pub min_score: f32,                   // 高分快筛阈值（0 = 关；8 = 只看 ≥8.0）
-    pub selected: Option<(String, i64)>,  // 选中 PR 身份（repo, number）；刷新后行序变化也不漂移
-    pub selection: Vec<(String, i64)>,    // 多选集合（Ctrl 点选/Shift 范围选，保持点选顺序；纯左键点击清空）
-    pub anchor: Option<(String, i64)>,    // Shift 范围选锚点（存身份而非下标：刷新后下标漂移、身份不漂）
-    pub status_msg: String,               // 状态栏临时消息（最近一条 Status）
-    pub status_gen: u64,                  // 状态栏临时消息序号（自动清除定时器的竞态守卫）
+    pub collapsed: HashSet<String>, // 折叠的组 key；跨刷新保留
+    pub filter: String,      // 当前过滤词（空 = 全量）
+    pub sort_col: String,    // 组内排序列（默认 "upd" = 更新时间降序，即 SQL 输入序）
+    pub sort_asc: bool,      // 排序方向（false = 降序）
+    pub min_score: f32,      // 高分快筛阈值（0 = 关；8 = 只看 ≥8.0）
+    pub selected: Option<(String, i64)>, // 选中 PR 身份（repo, number）；刷新后行序变化也不漂移
+    pub selection: Vec<(String, i64)>, // 多选集合（Ctrl 点选/Shift 范围选，保持点选顺序；纯左键点击清空）
+    pub anchor: Option<(String, i64)>, // Shift 范围选锚点（存身份而非下标：刷新后下标漂移、身份不漂）
+    pub status_msg: String,            // 状态栏临时消息（最近一条 Status）
+    pub status_gen: u64,               // 状态栏临时消息序号（自动清除定时器的竞态守卫）
     pub status_msg_at: Option<std::time::Instant>, // 临时消息写入时刻（egui 侧按 6s 到期清除，替代 Slint Timer）
-    pub gh_refreshing: bool,              // GitHub 刷新在途（顶栏转圈 + 连点去重）
-    pub sync_inflight: bool,              // 同步在途（顶栏转圈 + 连点/定时去重）
-    pub inbox: Vec<Value>,                // 最近一批通知行（未过滤；repo 下拉由此去重）
-    pub inbox_view: Vec<Value>,           // 仓库过滤后的通知行（inbox_activated 按下标取 thread id）
-    pub inbox_filter: String,             // Inbox 仓库过滤（"" = 全部）
-    pub inbox_all: bool,                  // 通知拉取范围：true = 含已读（&all=true），false = 只看未读
-    pub inbox_page: u32,                  // 已加载到的页码（每页 50 条；「加载更多」追加下一页）
-    pub inbox_has_more: bool,             // 是否还有下一页可加载
-    pub inbox_loading_more: bool,         // 「加载更多」进行中（防重入）
-    pub inbox_fetching: bool,             // 通知拉取在飞（fetch_inbox 在飞去重：并发触发合并为一次+补跑）
-    pub inbox_fetch_again: bool,          // 在飞期间又来拉取需求：结束后补跑一次
-    pub inbox_detail: Option<(String, i64, String, String)>,  // 预览面板当前行（repo, number, kind, url）
-    pub inbox_added: bool,              // 预览面板当前行「已加入」标记（InboxRows 重发时重算）
-    pub total: usize,                   // 全部行数（状态栏「共 N 个 PR」）
-    pub rate_limit: Arc<Mutex<Option<u64>>>,    // GitHub X-RateLimit-Remaining 共享状态
-    pub last_sync: sync::SharedLastSync,        // 最近同步成功时间
-    pub review_slots: Arc<Mutex<ReviewSlots>>,  // 预评审并发槽（worker 与 UI 侧共享）
+    pub gh_refreshing: bool,                       // GitHub 刷新在途（顶栏转圈 + 连点去重）
+    pub sync_inflight: bool,                       // 同步在途（顶栏转圈 + 连点/定时去重）
+    pub inbox: Vec<Value>,                         // 最近一批通知行（未过滤；repo 下拉由此去重）
+    pub inbox_view: Vec<Value>, // 仓库过滤后的通知行（inbox_activated 按下标取 thread id）
+    pub inbox_filter: String,   // Inbox 仓库过滤（"" = 全部）
+    pub inbox_all: bool,        // 通知拉取范围：true = 含已读（&all=true），false = 只看未读
+    pub inbox_page: u32,        // 已加载到的页码（每页 50 条；「加载更多」追加下一页）
+    pub inbox_has_more: bool,   // 是否还有下一页可加载
+    pub inbox_loading_more: bool, // 「加载更多」进行中（防重入）
+    pub inbox_fetching: bool,   // 通知拉取在飞（fetch_inbox 在飞去重：并发触发合并为一次+补跑）
+    pub inbox_fetch_again: bool, // 在飞期间又来拉取需求：结束后补跑一次
+    pub inbox_detail: Option<(String, i64, String, String)>, // 预览面板当前行（repo, number, kind, url）
+    pub inbox_added: bool, // 预览面板当前行「已加入」标记（InboxRows 重发时重算）
+    pub total: usize,      // 全部行数（状态栏「共 N 个 PR」）
+    pub rate_limit: Arc<Mutex<Option<u64>>>, // GitHub X-RateLimit-Remaining 共享状态
+    pub last_sync: sync::SharedLastSync, // 最近同步成功时间
+    pub review_slots: Arc<Mutex<ReviewSlots>>, // 预评审并发槽（worker 与 UI 侧共享）
 }
 
 impl App {
     pub fn new(cfg: Config, db: Db) -> Self {
         Self {
-            review_slots: Arc::new(Mutex::new(ReviewSlots::new(cfg.review_concurrency as usize))),
+            review_slots: Arc::new(Mutex::new(ReviewSlots::new(
+                cfg.review_concurrency as usize,
+            ))),
             cfg,
             db,
             rows: Vec::new(),
@@ -697,7 +709,11 @@ pub fn recompute_flat(a: &mut App) {
     let mut visible = Vec::new();
     for sec in pr_desk_rs::build_sections(&sub, &a.cfg.language, &a.sort_col, a.sort_asc) {
         let is_collapsed = a.collapsed.contains(sec.key);
-        flat.push(FlatItem::Header { key: sec.key.into(), title: sec.title.clone(), count: sec.idxs.len() });
+        flat.push(FlatItem::Header {
+            key: sec.key.into(),
+            title: sec.title.clone(),
+            count: sec.idxs.len(),
+        });
         if is_collapsed {
             continue;
         }
@@ -708,7 +724,9 @@ pub fn recompute_flat(a: &mut App) {
                 r["number"].as_i64().unwrap_or(0),
             );
             visible.push(id);
-            flat.push(FlatItem::Row { rows_idx: view[*si] });
+            flat.push(FlatItem::Row {
+                rows_idx: view[*si],
+            });
         }
     }
     // 多选/锚点按身份修剪（fold 组的行不在 visible 里，但数据行修剪看全部 keys——
@@ -716,7 +734,12 @@ pub fn recompute_flat(a: &mut App) {
     let all_keys: Vec<(String, i64)> = a
         .rows
         .iter()
-        .map(|r| (r["repo"].as_str().unwrap_or("").to_string(), r["number"].as_i64().unwrap_or(0)))
+        .map(|r| {
+            (
+                r["repo"].as_str().unwrap_or("").to_string(),
+                r["number"].as_i64().unwrap_or(0),
+            )
+        })
         .collect();
     selection::retain_existing(&mut a.selection, &all_keys);
     if a.anchor.as_ref().is_some_and(|k| !all_keys.contains(k)) {
@@ -751,9 +774,7 @@ pub fn selection_summary(a: &App) -> (usize, bool, bool, bool) {
         })
     };
     let all_rejected = a.selection.iter().all(|(r, num)| {
-        find_row(a, r, *num)
-            .and_then(|i| a.rows[i]["status"].as_str())
-            == Some("rejected")
+        find_row(a, r, *num).and_then(|i| a.rows[i]["status"].as_str()) == Some("rejected")
     });
     (n, field_all("pinned"), field_all("on_board"), all_rejected)
 }
@@ -923,7 +944,9 @@ pub fn notif_reason_label(lang: &str, reason: &str) -> String {
 pub fn inbox_filtered(a: &App) -> Vec<Value> {
     a.inbox
         .iter()
-        .filter(|n| a.inbox_filter.is_empty() || n["repo"].as_str() == Some(a.inbox_filter.as_str()))
+        .filter(|n| {
+            a.inbox_filter.is_empty() || n["repo"].as_str() == Some(a.inbox_filter.as_str())
+        })
         .cloned()
         .collect()
 }
@@ -948,7 +971,10 @@ pub fn derive_review_decision(reviews: &[Value]) -> Option<&'static str> {
     if let Some((_, d)) = latest {
         return Some(d);
     }
-    if reviews.iter().any(|r| r["state"].as_str() == Some("commented")) {
+    if reviews
+        .iter()
+        .any(|r| r["state"].as_str() == Some("commented"))
+    {
         Some("commented")
     } else {
         None
@@ -1000,7 +1026,9 @@ pub fn drawer_extras_json(r: &Value) -> (String, String) {
         if let Some(rc) = r["recent_commits"].as_str() {
             if let Ok(cs) = serde_json::from_str::<Vec<String>>(rc) {
                 for c in cs {
-                    convo.push(serde_json::json!({"kind": "commit", "author": "", "time": "", "text": c}));
+                    convo.push(
+                        serde_json::json!({"kind": "commit", "author": "", "time": "", "text": c}),
+                    );
                 }
             }
         }
@@ -1094,7 +1122,13 @@ pub fn profile_fields(cfg: &Config, name: &str) -> (String, String, String) {
             .profiles
             .iter()
             .find(|p| p.name == n)
-            .map(|p| (p.server_url.clone(), p.sync_token.clone(), p.api_key.clone()))
+            .map(|p| {
+                (
+                    p.server_url.clone(),
+                    p.sync_token.clone(),
+                    p.api_key.clone(),
+                )
+            })
             .unwrap_or_default(),
     }
 }
@@ -1117,7 +1151,10 @@ mod tests {
 
     #[test]
     fn notif_url_number_parses_trailing_segment() {
-        assert_eq!(notif_url_number("https://github.com/o/r/pull/123"), Some(123));
+        assert_eq!(
+            notif_url_number("https://github.com/o/r/pull/123"),
+            Some(123)
+        );
         assert_eq!(notif_url_number("https://github.com/o/r/releases"), None);
         assert_eq!(notif_url_number(""), None);
     }
@@ -1133,30 +1170,19 @@ mod tests {
     }
 
     #[test]
-    fn review_slots_allow_standard_and_deep_for_same_pr_but_block_same_type() {
+    fn review_slots_track_standard_running_status() {
         let mut s = ReviewSlots::new(2);
-        s.try_acquire_deep("o/r", 1).unwrap();
-        assert!(s.is_running("o/r", 1));
-        assert!(s.is_deep_review_running("o/r", 1));
+        assert!(!s.is_running("o/r", 1));
         assert!(!s.is_standard_review_running("o/r", 1));
-        assert_eq!(s.try_acquire_deep("o/r", 1), Err(SlotError::AlreadyRunning));
 
         s.try_acquire("o/r", 1).unwrap();
         assert!(s.is_running("o/r", 1));
         assert!(s.is_standard_review_running("o/r", 1));
-        assert_eq!(s.try_acquire("o/r", 1), Err(SlotError::AlreadyRunning));
-        assert_eq!(s.try_acquire("o/r", 2), Err(SlotError::AtCapacity));
+        assert!(!s.is_running("o/r", 2));
 
         s.release("o/r", 1);
-        assert!(s.is_running("o/r", 1));
+        assert!(!s.is_running("o/r", 1));
         assert!(!s.is_standard_review_running("o/r", 1));
-        s.try_acquire("o/r", 1).unwrap();
-
-        s.release_deep("o/r", 1);
-        assert!(s.is_running("o/r", 1));
-        assert!(!s.is_deep_review_running("o/r", 1));
-        assert!(s.is_standard_review_running("o/r", 1));
-        assert!(s.try_acquire_deep("o/r", 1).is_ok());
     }
 
     #[test]
@@ -1199,15 +1225,22 @@ mod tests {
         let slots = Arc::new(Mutex::new(ReviewSlots::new(1)));
         slots.lock_recover().try_acquire("o/r", 1).unwrap();
         {
-            let _g = SlotGuard { slots: slots.clone(), repo: "o/r".into(), number: 1, deep: false };
+            let _g = SlotGuard {
+                slots: slots.clone(),
+                repo: "o/r".into(),
+                number: 1,
+            };
         }
         assert!(!slots.lock_recover().is_running("o/r", 1));
         assert!(slots.lock_recover().try_acquire("o/r", 1).is_ok());
     }
 
     fn test_app(rows: Vec<Value>) -> Arc<Mutex<App>> {
-        Arc::new(Mutex::new(App::new(Config::default(), Db::open_memory().unwrap())))
-            .tap_rows(rows)
+        Arc::new(Mutex::new(App::new(
+            Config::default(),
+            Db::open_memory().unwrap(),
+        )))
+        .tap_rows(rows)
     }
 
     // 小工具：替换 rows 并重建 flat
@@ -1305,9 +1338,15 @@ mod tests {
         assert_eq!(size_line(&rv, "zh"), "XL（+2122/-23，24 个文件）");
         assert_eq!(size_line(&rv, "en"), "XL (+2122/-23, 24 files)");
         assert_eq!(size_line(&serde_json::json!({}), "zh"), "");
-        assert_eq!(size_line(&serde_json::json!({"size_label": "S"}), "zh"), "S");
         assert_eq!(
-            size_line(&serde_json::json!({"additions": 10, "deletions": 2, "files_changed": 3}), "zh"),
+            size_line(&serde_json::json!({"size_label": "S"}), "zh"),
+            "S"
+        );
+        assert_eq!(
+            size_line(
+                &serde_json::json!({"additions": 10, "deletions": 2, "files_changed": 3}),
+                "zh"
+            ),
             "（+10/-2，3 个文件）"
         );
     }
@@ -1376,7 +1415,8 @@ mod tests {
     #[test]
     fn rel_time_formats() {
         use chrono::Duration;
-        let n = chrono::NaiveDateTime::parse_from_str("2026-02-01T12:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let n = chrono::NaiveDateTime::parse_from_str("2026-02-01T12:00:00", "%Y-%m-%dT%H:%M:%S")
+            .unwrap();
         let at = |d: Duration| rel_time_at(Some(n - d), n);
         assert_eq!(at(Duration::minutes(27)), "27m");
         assert_eq!(at(Duration::seconds(30)), "0m");
@@ -1391,7 +1431,8 @@ mod tests {
     #[test]
     fn parse_ts_formats() {
         use chrono::NaiveDateTime;
-        let expect = NaiveDateTime::parse_from_str("2026-01-02T03:04:05", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let expect =
+            NaiveDateTime::parse_from_str("2026-01-02T03:04:05", "%Y-%m-%dT%H:%M:%S").unwrap();
         assert_eq!(parse_ts("2026-01-02T03:04:05"), Some(expect));
         assert_eq!(parse_ts("2026-01-02 03:04:05"), Some(expect));
         assert!(parse_ts("2026-01-02T03:04:05Z").is_some());
@@ -1402,7 +1443,10 @@ mod tests {
     #[test]
     fn author_orgs_parses_both_shapes() {
         let arr = serde_json::json!({"author_orgs": ["acme", "oss "]});
-        assert_eq!(author_orgs(&arr), vec!["acme".to_string(), "oss".to_string()]);
+        assert_eq!(
+            author_orgs(&arr),
+            vec!["acme".to_string(), "oss".to_string()]
+        );
         let s = serde_json::json!({"author_orgs": "[\"acme\"]"});
         assert_eq!(author_orgs(&s), vec!["acme".to_string()]);
         assert!(author_orgs(&serde_json::json!({})).is_empty());
@@ -1424,7 +1468,10 @@ mod tests {
         assert_eq!(activity_text(&r, "en"), "3 reviews");
         let r2 = serde_json::json!({"updated_at": recent, "reviews": 2});
         assert_eq!(activity_text(&r2, "zh"), "2 条评审");
-        assert_eq!(activity_text(&serde_json::json!({"updated_at": recent}), "zh"), "");
+        assert_eq!(
+            activity_text(&serde_json::json!({"updated_at": recent}), "zh"),
+            ""
+        );
         assert_eq!(activity_text(&serde_json::json!({}), "zh"), "");
     }
 

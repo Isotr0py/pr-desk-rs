@@ -3,7 +3,7 @@
 //! GitHub token 优先级：环境变量 GITHUB_TOKEN > config.toml。
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
@@ -39,10 +39,12 @@ llm_model = ""
 ocr_path = "ocr"
 # 预评审并发数（1-16；每个 PR 评审 = 评分 + OCR 多次 LLM 调用，配额紧张时调低）
 review_concurrency = 16
-# PR 入库时自动评审：新入库 PR 自动执行预评审 + Deep Review，会消耗 LLM/OCR 配额
+# PR 入库时自动评审：新入库 PR 自动执行预评审，会消耗 LLM/OCR 配额
 auto_review_on_insert = false
-# Kimi CLI 路径（Deep Review 通过 ACP 使用；需要已安装并登录 Kimi CLI）
+# Kimi CLI 路径（内嵌会话使用；需要已安装并登录 Kimi CLI）
 kimi_cli_path = "kimi"
+# Kimi CLI 工作区根目录（空 = data/kimi-workspaces；相对路径也锚定 data 目录）
+kimi_workspace_root = ""
 # 多数据源：active_profile 选择当前数据源（"local" = 本地库 / "default" = 顶层键 / 自定义档案名）
 # 自定义远程档案三段式（name 仅允许 a-z0-9_-）：
 # profile.<name>.server_url / profile.<name>.sync_token / profile.<name>.api_key
@@ -105,10 +107,12 @@ pub struct Config {
     pub ocr_path: String,
     /// 预评审并发数（1-8）
     pub review_concurrency: u64,
-    /// 新入库 PR 自动执行预评审 + Deep Review（消耗 LLM/OCR 配额）
+    /// 新入库 PR 自动执行预评审（消耗 LLM/OCR 配额）
     pub auto_review_on_insert: bool,
-    /// Kimi CLI 路径（Deep Review 通过 ACP 使用）
+    /// Kimi CLI 路径（内嵌会话使用）
     pub kimi_cli_path: String,
+    /// Kimi CLI 工作区根目录（空/相对路径均锚定 data_dir）
+    pub kimi_workspace_root: String,
     /// 远程数据源档案列表（自定义档；"default" 档由顶层键合成，见 load 的兼容迁移）
     pub profiles: Vec<Profile>,
     /// 当前数据源："local" = 本地模式；"default" = 顶层 server_url/sync_token；其它 = profiles 里的档案名
@@ -140,6 +144,7 @@ impl Default for Config {
             review_concurrency: 16,
             auto_review_on_insert: false,
             kimi_cli_path: "kimi".into(),
+            kimi_workspace_root: String::new(),
             profiles: Vec::new(),
             active_profile: "local".into(),
             window_width: None,
@@ -209,8 +214,12 @@ fn quote(s: &str) -> String {
 /// 解析一行 `profile.<name>.<field> = value`（rest 已去掉 "profile." 前缀）。
 /// 非法名字/保留名/未知字段跳过并告警，不让手写的坏行炸掉整个配置加载。
 fn parse_profile_line(rest: &str, profiles: &mut Vec<Profile>) {
-    let Some((name, rest)) = rest.split_once('.') else { return };
-    let Some((field, value)) = rest.split_once('=') else { return };
+    let Some((name, rest)) = rest.split_once('.') else {
+        return;
+    };
+    let Some((field, value)) = rest.split_once('=') else {
+        return;
+    };
     if !valid_profile_name(name) || is_reserved_profile_name(name) {
         tracing::warn!("忽略非法/保留档案名的配置行: profile.{name}.*");
         return;
@@ -241,6 +250,19 @@ impl Config {
     /// 返回是否「未配置」（repos 为空或全是模板占位）。
     pub fn is_unconfigured(&self) -> bool {
         self.repos.is_empty() || self.repos.iter().all(|r| r == "owner/repo")
+    }
+
+    pub fn kimi_workspace_root_path(&self) -> PathBuf {
+        let configured = self.kimi_workspace_root.trim();
+        if configured.is_empty() {
+            return crate::data_dir().join("kimi-workspaces");
+        }
+        let root = PathBuf::from(configured);
+        if root.is_absolute() {
+            root
+        } else {
+            crate::data_dir().join(root)
+        }
     }
 
     /// 当前是否深色主题。
@@ -383,7 +405,9 @@ impl Config {
                 let v = unquote(v);
                 match v.as_str() {
                     "" | "software" | "femtovg" => cfg.renderer = v,
-                    _ => tracing::warn!("忽略非法 renderer 配置值 {v:?}（合法值：\"\" / \"software\" / \"femtovg\"）"),
+                    _ => tracing::warn!(
+                        "忽略非法 renderer 配置值 {v:?}（合法值：\"\" / \"software\" / \"femtovg\"）"
+                    ),
                 }
             } else if let Some(v) = parse_value(line, "llm_base_url") {
                 let v = unquote(v);
@@ -416,6 +440,8 @@ impl Config {
                 if !v.is_empty() {
                     cfg.kimi_cli_path = v;
                 }
+            } else if let Some(v) = parse_value(line, "kimi_workspace_root") {
+                cfg.kimi_workspace_root = unquote(v);
             } else if let Some(v) = parse_value(line, "active_profile") {
                 active = Some(unquote(v)).filter(|s| !s.is_empty());
             } else if let Some(v) = parse_value(line, "window_width") {
@@ -455,13 +481,20 @@ impl Config {
     pub fn save(&self, path: &Path) -> Result<()> {
         let repos_toml = format!(
             "[{}]",
-            self.repos.iter().map(|r| quote(r)).collect::<Vec<_>>().join(", ")
+            self.repos
+                .iter()
+                .map(|r| quote(r))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         let kv: Vec<(&str, String)> = vec![
             ("server_url", quote(&self.server_url)),
             ("sync_token", quote(&self.sync_token)),
             ("astrbot_api_key", quote(&self.astrbot_api_key)),
-            ("github_token", quote(self.github_token.as_deref().unwrap_or(""))),
+            (
+                "github_token",
+                quote(self.github_token.as_deref().unwrap_or("")),
+            ),
             ("proxy", quote(&self.proxy)),
             ("repos", repos_toml),
             ("poll_interval_min", self.poll_interval_min.to_string()),
@@ -469,12 +502,19 @@ impl Config {
             ("language", quote(&self.language)),
             ("font_scale", self.font_scale.to_string()),
             ("llm_base_url", quote(&self.llm_base_url)),
-            ("llm_api_key", quote(self.llm_api_key.as_deref().unwrap_or(""))),
+            (
+                "llm_api_key",
+                quote(self.llm_api_key.as_deref().unwrap_or("")),
+            ),
             ("llm_model", quote(&self.llm_model)),
             ("ocr_path", quote(&self.ocr_path)),
             ("review_concurrency", self.review_concurrency.to_string()),
-            ("auto_review_on_insert", self.auto_review_on_insert.to_string()),
+            (
+                "auto_review_on_insert",
+                self.auto_review_on_insert.to_string(),
+            ),
             ("kimi_cli_path", quote(&self.kimi_cli_path)),
+            ("kimi_workspace_root", quote(&self.kimi_workspace_root)),
             ("active_profile", quote(&self.active_profile)),
         ];
         // 几何记忆：仅在记录过时写（None 不往配置里添键）
@@ -505,7 +545,9 @@ impl Config {
                 continue;
             }
             for (k, (key, val)) in kv.iter().enumerate() {
-                if trimmed.starts_with(&format!("{key}")) && trimmed[key.len()..].trim_start().starts_with('=') {
+                if trimmed.starts_with(&format!("{key}"))
+                    && trimmed[key.len()..].trim_start().starts_with('=')
+                {
                     *line = format!("{key} = {val}");
                     seen[k] = true;
                     break;
@@ -523,9 +565,21 @@ impl Config {
             if is_reserved_profile_name(&p.name) || !valid_profile_name(&p.name) {
                 continue;
             }
-            lines.push(format!("profile.{}.server_url = {}", p.name, quote(&p.server_url)));
-            lines.push(format!("profile.{}.sync_token = {}", p.name, quote(&p.sync_token)));
-            lines.push(format!("profile.{}.api_key = {}", p.name, quote(&p.api_key)));
+            lines.push(format!(
+                "profile.{}.server_url = {}",
+                p.name,
+                quote(&p.server_url)
+            ));
+            lines.push(format!(
+                "profile.{}.sync_token = {}",
+                p.name,
+                quote(&p.sync_token)
+            ));
+            lines.push(format!(
+                "profile.{}.api_key = {}",
+                p.name,
+                quote(&p.api_key)
+            ));
         }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).ok();
@@ -569,7 +623,8 @@ mod tests {
 
     #[test]
     fn auto_review_on_insert_parses_strict_booleans() {
-        let dir = std::env::temp_dir().join(format!("prdesk-cfg-auto-review-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("prdesk-cfg-auto-review-{}", std::process::id()));
         let path = dir.join("config.toml");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "").unwrap();
@@ -594,9 +649,18 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(&path, "").unwrap();
-        assert_eq!(Config::load(&path).unwrap().kimi_cli_path, "kimi");
+        let default = Config::load(&path).unwrap();
+        assert_eq!(default.kimi_cli_path, "kimi");
+        assert!(
+            default
+                .kimi_workspace_root_path()
+                .ends_with("kimi-workspaces")
+        );
         std::fs::write(&path, "kimi_cli_path = \"/opt/kimi/bin/kimi\"\n").unwrap();
-        assert_eq!(Config::load(&path).unwrap().kimi_cli_path, "/opt/kimi/bin/kimi");
+        assert_eq!(
+            Config::load(&path).unwrap().kimi_cli_path,
+            "/opt/kimi/bin/kimi"
+        );
         std::fs::write(&path, "kimi_cli_path = \"\"\n").unwrap();
         assert_eq!(Config::load(&path).unwrap().kimi_cli_path, "kimi");
         let _ = std::fs::remove_dir_all(&dir);
@@ -633,7 +697,10 @@ mod tests {
         let path = dir.join("config.toml");
         std::fs::create_dir_all(&dir).unwrap();
         // 合法值
-        for (input, want) in [("renderer = \"software\"", "software"), ("renderer = \"femtovg\"", "femtovg")] {
+        for (input, want) in [
+            ("renderer = \"software\"", "software"),
+            ("renderer = \"femtovg\"", "femtovg"),
+        ] {
             std::fs::write(&path, input).unwrap();
             assert_eq!(Config::load(&path).unwrap().renderer, want);
         }
@@ -645,7 +712,10 @@ mod tests {
         let cfg = Config::load(&path).unwrap();
         cfg.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("renderer = \"software\""), "renderer 行应被保留");
+        assert!(
+            text.contains("renderer = \"software\""),
+            "renderer 行应被保留"
+        );
         assert_eq!(Config::load(&path).unwrap().renderer, "software");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -675,6 +745,7 @@ mod tests {
             review_concurrency: 5,
             auto_review_on_insert: true,
             kimi_cli_path: "/opt/kimi/bin/kimi".into(),
+            kimi_workspace_root: r#"D:\Kimi\工作 区"#.into(),
             profiles: Vec::new(),
             active_profile: "local".into(),
             window_width: Some(1440.0),
@@ -702,6 +773,7 @@ mod tests {
         assert_eq!(loaded.review_concurrency, 5);
         assert!(loaded.auto_review_on_insert);
         assert_eq!(loaded.kimi_cli_path, "/opt/kimi/bin/kimi");
+        assert_eq!(loaded.kimi_workspace_root, r#"D:\Kimi\工作 区"#);
         assert_eq!(loaded.window_width, Some(1440.0));
         assert_eq!(loaded.window_height, Some(810.0));
         assert_eq!(loaded.panel_width, Some(460.0));
@@ -784,7 +856,8 @@ mod tests {
     }
 
     #[test]
-    fn llm_key_fallback() {        // 环境变量 LLM_API_KEY 未设置时回退 config.toml；两者皆空则为 None
+    fn llm_key_fallback() {
+        // 环境变量 LLM_API_KEY 未设置时回退 config.toml；两者皆空则为 None
         let mut c = Config::default();
         if std::env::var("LLM_API_KEY").is_err() {
             assert_eq!(c.llm_key(), None);
@@ -841,10 +914,21 @@ mod tests {
             loaded.active_sync(),
             Some(profile("nas", "http://nas:6185", "tok-nas", "ak-nas"))
         );
-        assert_eq!(loaded.profile_names(), vec!["local".to_string(), "nas".to_string(), "home_srv".to_string()]);
+        assert_eq!(
+            loaded.profile_names(),
+            vec![
+                "local".to_string(),
+                "nas".to_string(),
+                "home_srv".to_string()
+            ]
+        );
 
         // 删掉一个档案后保存：旧的 profile.home_srv.* 行应被清除（先摘后重写）
-        loaded.profiles.iter().find(|p| p.name == "home_srv").unwrap();
+        loaded
+            .profiles
+            .iter()
+            .find(|p| p.name == "home_srv")
+            .unwrap();
         let mut cfg2 = loaded;
         cfg2.profiles.retain(|p| p.name != "home_srv");
         cfg2.save(&path).unwrap();
@@ -869,17 +953,26 @@ mod tests {
         .unwrap();
         let cfg = Config::load(&path).unwrap();
         // 迁移：合成 default 档；active_profile 缺省落 "default"
-        assert!(cfg.profiles.contains(&profile("default", "http://nas:6185", "tok-1", "ak-1")));
+        assert!(
+            cfg.profiles
+                .contains(&profile("default", "http://nas:6185", "tok-1", "ak-1"))
+        );
         assert_eq!(cfg.active_profile, "default");
         assert_eq!(
             cfg.active_sync(),
             Some(profile("default", "http://nas:6185", "tok-1", "ak-1"))
         );
-        assert_eq!(cfg.profile_names(), vec!["local".to_string(), "default".to_string()]);
+        assert_eq!(
+            cfg.profile_names(),
+            vec!["local".to_string(), "default".to_string()]
+        );
         // 保存：default 档不落 profile.* 新键；重载后迁移仍成立
         cfg.save(&path).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains("profile.default."), "default 档不应落 profile.* 行");
+        assert!(
+            !text.contains("profile.default."),
+            "default 档不应落 profile.* 行"
+        );
         assert!(text.contains("active_profile = \"default\""));
         let reloaded = Config::load(&path).unwrap();
         assert_eq!(reloaded.active_profile, "default");
@@ -936,7 +1029,10 @@ mod tests {
         c.sync_token = "tok".into();
         assert_eq!(c.active_sync().unwrap().sync_token, "tok");
         // 自定义：token 空 → None；非空 → Some；未知名 → None
-        c.profiles = vec![profile("nas", "http://nas:6185", "", ""), profile("home", "http://h:1", "t2", "")];
+        c.profiles = vec![
+            profile("nas", "http://nas:6185", "", ""),
+            profile("home", "http://h:1", "t2", ""),
+        ];
         c.active_profile = "nas".into();
         assert_eq!(c.active_sync(), None);
         c.active_profile = "home".into();

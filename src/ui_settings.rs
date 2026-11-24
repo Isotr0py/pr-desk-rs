@@ -9,8 +9,8 @@ use egui::RichText;
 use pr_desk_rs::config::Profile;
 use pr_desk_rs::i18n::{tr, trf};
 
-use crate::state::*;
 use crate::EguiApp;
+use crate::state::*;
 
 /// 打开设置：回填当前配置（LLM 字段可能在别处被改动）+ 重读自定义评审模板。
 pub fn open_settings(app: &mut EguiApp) {
@@ -36,6 +36,7 @@ pub fn open_settings(app: &mut EguiApp) {
     app.s_review_conc = cfg.review_concurrency as i64;
     app.s_auto_review_on_insert = cfg.auto_review_on_insert;
     app.s_kimi_cli_path = cfg.kimi_cli_path.clone();
+    app.s_kimi_workspace_root = cfg.kimi_workspace_root.clone();
     // 弹窗内联错误行清空（上一次失败的残留不带进本次会话）
     app.dialog_error.clear();
     // 自定义评审模板每次打开重读（可能被外部编辑过）：
@@ -75,8 +76,20 @@ fn save_settings(app: &mut EguiApp) -> bool {
     // 服务器三字段按「正在编辑的档案」写回（local 档字段锁定，不读表单值）
     let edit_profile = app.settings_profile.clone();
     #[allow(clippy::type_complexity)]
-    let (theme, language, mut profiles, active_profile, mut server_url, mut sync_token, mut ak_s,
-         font_scale, renderer, window_width, window_height, panel_width) = {
+    let (
+        theme,
+        language,
+        mut profiles,
+        active_profile,
+        mut server_url,
+        mut sync_token,
+        mut ak_s,
+        font_scale,
+        renderer,
+        window_width,
+        window_height,
+        panel_width,
+    ) = {
         let a = app.app.lock_recover();
         // 主题/语言/数据源档案/活跃档不在设置页表单里，保留当前值。
         // 字号与窗口/面板几何同样是保留项——必须在同一个锁块里一次取完：
@@ -141,13 +154,22 @@ fn save_settings(app: &mut EguiApp) -> bool {
         llm_base_url: app.s_llm_base.trim().to_string(),
         llm_api_key: Some(app.s_llm_key.trim().to_string()).filter(|t| !t.is_empty()),
         llm_model: app.s_llm_model.trim().to_string(),
-        ocr_path: if ocr_path.is_empty() { "ocr".into() } else { ocr_path.to_string() },
+        ocr_path: if ocr_path.is_empty() {
+            "ocr".into()
+        } else {
+            ocr_path.to_string()
+        },
         review_concurrency,
         auto_review_on_insert: app.s_auto_review_on_insert,
         kimi_cli_path: {
             let path = app.s_kimi_cli_path.trim();
-            if path.is_empty() { "kimi".into() } else { path.into() }
+            if path.is_empty() {
+                "kimi".into()
+            } else {
+                path.into()
+            }
         },
+        kimi_workspace_root: app.s_kimi_workspace_root.trim().to_string(),
         profiles,
         active_profile,
         window_width,
@@ -158,6 +180,13 @@ fn save_settings(app: &mut EguiApp) -> bool {
         dialog_err(app, trf(&lang, "cfg_save_failed", &[&e.to_string()]));
         return false;
     }
+    let workspace_changed = {
+        let a = app.app.lock_recover();
+        a.cfg.kimi_workspace_root != new_cfg.kimi_workspace_root
+    };
+    if workspace_changed {
+        app.kimi_terminal = None;
+    }
     {
         let mut a = app.app.lock_recover();
         a.cfg = new_cfg.clone();
@@ -166,7 +195,9 @@ fn save_settings(app: &mut EguiApp) -> bool {
         a.status_gen = a.status_gen.wrapping_add(1);
         a.status_msg_at = Some(Instant::now());
         // 并发上限即时生效（不影响已占用的槽位）
-        a.review_slots.lock_recover().set_capacity(review_concurrency as usize);
+        a.review_slots
+            .lock_recover()
+            .set_capacity(review_concurrency as usize);
     }
     // 自定义评审模板落盘（exe 旁 review_prompt.md；清空 = 删除文件回到默认模板）。
     // 回填竞态：异步回填未完成时跳过（此时表单里是空占位，写盘会覆盖磁盘新模板）
@@ -316,12 +347,10 @@ pub fn settings_window(app: &mut EguiApp, ctx: &egui::Context) {
             egui::ScrollArea::vertical()
                 .id_salt("settings-scroll")
                 .auto_shrink([false, true])
-                .show(ui, |ui| {
-                    match app.settings_tab {
-                        0 => tab_source(app, ui, &lang),
-                        1 => tab_general(app, ui, &lang),
-                        _ => tab_llm(app, ui, &lang),
-                    }
+                .show(ui, |ui| match app.settings_tab {
+                    0 => tab_source(app, ui, &lang),
+                    1 => tab_general(app, ui, &lang),
+                    _ => tab_llm(app, ui, &lang),
                 });
             // 弹窗内联错误行
             if !app.dialog_error.is_empty() {
@@ -347,7 +376,10 @@ pub fn settings_window(app: &mut EguiApp, ctx: &egui::Context) {
 }
 
 fn default_import_profile_name(source: &Path) -> String {
-    let stem = source.file_stem().map(|s| s.to_string_lossy()).unwrap_or_default();
+    let stem = source
+        .file_stem()
+        .map(|s| s.to_string_lossy())
+        .unwrap_or_default();
     let mut cleaned = String::new();
     let mut invalid = false;
     for ch in stem.chars().flat_map(char::to_lowercase) {
@@ -445,21 +477,27 @@ fn tab_source(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     let editing_local = app.settings_profile == "local";
     ui.add_enabled_ui(!editing_local, |ui| {
         field(ui, tr(lang, "settings_server_url"), |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.s_server)
-                .hint_text(tr(lang, "settings_server_placeholder"))
-                .desired_width(f32::INFINITY));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.s_server)
+                    .hint_text(tr(lang, "settings_server_placeholder"))
+                    .desired_width(f32::INFINITY),
+            );
         });
         field(ui, tr(lang, "settings_sync_token"), |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.s_sync_token)
-                .password(true)
-                .hint_text(tr(lang, "settings_sync_token_placeholder"))
-                .desired_width(f32::INFINITY));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.s_sync_token)
+                    .password(true)
+                    .hint_text(tr(lang, "settings_sync_token_placeholder"))
+                    .desired_width(f32::INFINITY),
+            );
         });
         field(ui, tr(lang, "settings_astrbot_key"), |ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.s_ak)
-                .password(true)
-                .hint_text(tr(lang, "settings_astrbot_key_placeholder"))
-                .desired_width(f32::INFINITY));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.s_ak)
+                    .password(true)
+                    .hint_text(tr(lang, "settings_astrbot_key_placeholder"))
+                    .desired_width(f32::INFINITY),
+            );
         });
     });
     if editing_local {
@@ -495,7 +533,10 @@ fn database_management(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     });
     ui.horizontal_wrapped(|ui| {
         if ui
-            .add_enabled(!app.database_busy, egui::Button::new(tr(lang, "db_import_pick")))
+            .add_enabled(
+                !app.database_busy,
+                egui::Button::new(tr(lang, "db_import_pick")),
+            )
             .clicked()
         {
             let source = rfd::FileDialog::new()
@@ -550,26 +591,32 @@ fn tab_general(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
         "GitHub token"
     };
     field(ui, gh_label, |ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.s_gh_token)
-            .password(true)
-            .hint_text(if app.gh_token_from_env {
-                tr(lang, "settings_gh_token_placeholder_env")
-            } else {
-                tr(lang, "settings_gh_token_placeholder")
-            })
-            .desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.s_gh_token)
+                .password(true)
+                .hint_text(if app.gh_token_from_env {
+                    tr(lang, "settings_gh_token_placeholder_env")
+                } else {
+                    tr(lang, "settings_gh_token_placeholder")
+                })
+                .desired_width(f32::INFINITY),
+        );
     });
     field(ui, tr(lang, "settings_proxy"), |ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.s_proxy)
-            .hint_text("http://127.0.0.1:7890")
-            .desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.s_proxy)
+                .hint_text("http://127.0.0.1:7890")
+                .desired_width(f32::INFINITY),
+        );
     });
     ui.weak(tr(lang, "settings_proxy_hint"));
     field(ui, tr(lang, "settings_repos"), |ui| {
-        ui.add(egui::TextEdit::multiline(&mut app.s_repos)
-            .hint_text("owner/repo")
-            .desired_rows(4)
-            .desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::multiline(&mut app.s_repos)
+                .hint_text("owner/repo")
+                .desired_rows(4)
+                .desired_width(f32::INFINITY),
+        );
     });
     field(ui, tr(lang, "settings_poll_interval"), |ui| {
         ui.add(egui::DragValue::new(&mut app.s_poll).range(1..=120));
@@ -579,7 +626,10 @@ fn tab_general(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
         ui.horizontal_wrapped(|ui| {
             let cur = app.app.lock_recover().cfg.theme.clone();
             for name in crate::theme::THEMES {
-                if ui.selectable_label(cur == name, tr(lang, crate::theme::label_key(name))).clicked() {
+                if ui
+                    .selectable_label(cur == name, tr(lang, crate::theme::label_key(name)))
+                    .clicked()
+                {
                     app.theme_changed(ui.ctx(), name);
                 }
             }
@@ -589,10 +639,16 @@ fn tab_general(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     field(ui, tr(lang, "settings_language"), |ui| {
         ui.horizontal(|ui| {
             let cur = app.lang();
-            if ui.selectable_label(cur != "en", tr(lang, "lang_name_zh")).clicked() {
+            if ui
+                .selectable_label(cur != "en", tr(lang, "lang_name_zh"))
+                .clicked()
+            {
                 app.language_changed("zh");
             }
-            if ui.selectable_label(cur == "en", tr(lang, "lang_name_en")).clicked() {
+            if ui
+                .selectable_label(cur == "en", tr(lang, "lang_name_en"))
+                .clicked()
+            {
                 app.language_changed("en");
             }
         });
@@ -616,21 +672,27 @@ fn tab_general(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
 
 fn tab_llm(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     field(ui, tr(lang, "settings_llm_base"), |ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.s_llm_base)
-            .hint_text("https://api.openai.com/v1")
-            .desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.s_llm_base)
+                .hint_text("https://api.openai.com/v1")
+                .desired_width(f32::INFINITY),
+        );
     });
     field(ui, tr(lang, "settings_llm_key"), |ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.s_llm_key)
-            .password(true)
-            .hint_text("sk-...")
-            .desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.s_llm_key)
+                .password(true)
+                .hint_text("sk-...")
+                .desired_width(f32::INFINITY),
+        );
     });
     field(ui, tr(lang, "settings_model_name"), |ui| {
         ui.horizontal(|ui| {
-            ui.add(egui::TextEdit::singleline(&mut app.s_llm_model)
-                .hint_text("gpt-4o-mini")
-                .desired_width(200.0));
+            ui.add(
+                egui::TextEdit::singleline(&mut app.s_llm_model)
+                    .hint_text("gpt-4o-mini")
+                    .desired_width(200.0),
+            );
             // 「获取」：用弹窗里正在编辑的 base/key 拉取（无需先保存）
             if ui.button(tr(lang, "settings_fetch_models")).clicked() {
                 let (base, key) = (app.s_llm_base.clone(), app.s_llm_key.clone());
@@ -652,19 +714,18 @@ fn tab_llm(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
             .show(ui, |ui| {
                 app.model_list_open = true;
                 for m in app.model_list.clone() {
-                    if ui
-                        .selectable_label(app.s_llm_model == m, &m)
-                        .clicked()
-                    {
+                    if ui.selectable_label(app.s_llm_model == m, &m).clicked() {
                         app.s_llm_model = m;
                     }
                 }
             });
     }
     field(ui, tr(lang, "settings_ocr_path"), |ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.s_ocr_path)
-            .hint_text("ocr")
-            .desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.s_ocr_path)
+                .hint_text("ocr")
+                .desired_width(f32::INFINITY),
+        );
     });
     field(ui, tr(lang, "settings_review_concurrency"), |ui| {
         ui.horizontal(|ui| {
@@ -678,11 +739,28 @@ fn tab_llm(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     );
     ui.weak(tr(lang, "settings_auto_review_on_insert_hint"));
     field(ui, tr(lang, "settings_kimi_cli_path"), |ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.s_kimi_cli_path)
-            .hint_text("kimi")
-            .desired_width(f32::INFINITY));
+        ui.add(
+            egui::TextEdit::singleline(&mut app.s_kimi_cli_path)
+                .hint_text("kimi")
+                .desired_width(f32::INFINITY),
+        );
     });
     ui.weak(tr(lang, "settings_kimi_cli_hint"));
+    field(ui, tr(lang, "settings_kimi_workspace_root"), |ui| {
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut app.s_kimi_workspace_root)
+                    .hint_text(tr(lang, "settings_kimi_workspace_default"))
+                    .desired_width(f32::INFINITY),
+            );
+            if ui.button(tr(lang, "settings_browse")).clicked()
+                && let Some(path) = rfd::FileDialog::new().pick_folder()
+            {
+                app.s_kimi_workspace_root = path.to_string_lossy().into_owned();
+            }
+        });
+    });
+    ui.weak(tr(lang, "settings_kimi_workspace_hint"));
     ui.add_space(6.0);
     field(ui, tr(lang, "settings_review_prompt"), |ui| {
         ui.add_enabled(
