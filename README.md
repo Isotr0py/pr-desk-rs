@@ -5,6 +5,7 @@ egui/eframe. It combines a conventional LLM/OCR pre-review pipeline with a real,
 embedded Kimi CLI for repository-aware reviews and follow-up work.
 
 ![PR list and review details](docs/screenshot-review.png)
+![Embedded Kimi CLI session](docs/screenshot-kimi.png)
 
 ## Features
 
