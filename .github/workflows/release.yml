@@ -1,8 +1,10 @@
-name: release
+name: Build and Release
 
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -45,6 +47,9 @@ jobs:
 
       - name: Fetch ocr sidecar (bin/)
         run: python scripts/fetch_ocr.py
+
+      - name: Test
+        run: cargo test --all-targets --locked --target ${{ matrix.target }}
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
