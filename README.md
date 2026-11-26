@@ -82,6 +82,19 @@ Runtime requirements:
   PATH. Without it only line-level comments are unavailable; scored reviews
   (pure LLM) still work.
 
+### Shared Git object cache
+
+PR worktrees share one bare Git mirror per remote repository under
+`<kimi_workspace_root>/.git-mirrors/`. Their `.git/objects/info/alternates`
+entries reference these mirrors, so base/head history is downloaded once rather
+than duplicated for every PR. Checked-out files, branches and local edits remain
+independent for each PR, and `git pull` still uses the real GitHub remote.
+
+Deleting a mirror does not delete checked-out files, but worktrees that reference
+it can lose access to their Git history. Keep mirrors together with the workspace
+when moving or backing it up; rebuild missing mirrors before relying on offline
+history.
+
 ### Renderer note
 
 The UI renders with eframe's **glow** backend. The wgpu stack is not

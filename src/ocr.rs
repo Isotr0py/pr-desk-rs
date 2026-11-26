@@ -6,11 +6,11 @@
 //! LLM 配置不落 ocr 全局配置：在临时目录写 config.json，子进程用
 //! 环境变量 OCR_CONFIG_PATH 指向它（未配置 LLM 时不设，ocr 用自家全局配置）。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -188,9 +188,12 @@ async fn valid_context(path: &Path, identity: &ContextIdentity) -> bool {
     if git_output(&worktree, &["diff", "--quiet"]).await.is_err() {
         return false;
     }
-    git_output(&worktree, &["merge-base", "base", "head"])
-        .await
-        .is_ok_and(|output| !output.stdout.is_empty())
+    git_output(
+        &worktree,
+        &["merge-base", "refs/heads/base", "refs/heads/head"],
+    )
+    .await
+    .is_ok_and(|output| !output.stdout.is_empty())
 }
 
 /// 在临时仓库里跑 git（失败带 stderr 尾部报错）。
@@ -401,6 +404,186 @@ fn git_repository_url(repository: &str) -> String {
     }
 }
 
+#[derive(Clone)]
+struct GitMirror {
+    path: PathBuf,
+    url: String,
+}
+
+fn git_mirror(root: &Path, url: &str) -> GitMirror {
+    use sha2::Digest as _;
+    let hash = format!("{:x}", sha2::Sha256::digest(url.as_bytes()));
+    GitMirror {
+        path: root
+            .join(".git-mirrors")
+            .join(format!("{}.git", &hash[..16])),
+        url: url.to_string(),
+    }
+}
+
+fn git_path(path: &Path) -> String {
+    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let text = absolute.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    text.replace('\\', "/")
+}
+
+fn git_mirror_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut locks = locks.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+async fn lock_git_mirror(
+    mirror: &GitMirror,
+    cancel: Option<&Arc<AtomicBool>>,
+    lang: &str,
+) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+    let lock = git_mirror_lock(&mirror.path);
+    check_cancel(cancel, lang)?;
+    let guard = lock.lock_owned().await;
+    check_cancel(cancel, lang)?;
+    Ok(guard)
+}
+
+async fn git_mirror_is_shallow(mirror: &GitMirror) -> Result<bool> {
+    git_output(
+        mirror.path.as_path(),
+        &["rev-parse", "--is-shallow-repository"],
+    )
+    .await
+    .map(|output| String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+async fn prepare_git_mirror(
+    mirror: &GitMirror,
+    shas: &[&str],
+    cancel: Option<&Arc<AtomicBool>>,
+    lang: &str,
+) -> Result<()> {
+    let _guard = lock_git_mirror(mirror, cancel, lang).await?;
+    let parent = mirror.path.parent().context("Git mirror 缺少父目录")?;
+    std::fs::create_dir_all(parent)?;
+    let is_new = !mirror.path.exists();
+    let mirror_path = git_path(&mirror.path);
+    git(parent, &["init", "--quiet", "--bare", &mirror_path]).await?;
+
+    let mut missing = Vec::new();
+    for sha in shas {
+        check_cancel(cancel, lang)?;
+        let object = format!("{sha}^{{commit}}");
+        if git_output(&mirror.path, &["cat-file", "-e", &object])
+            .await
+            .is_err()
+        {
+            missing.push(*sha);
+        }
+    }
+    if missing.is_empty() {
+        tracing::info!(mirror = %mirror.path.display(), "OCR Git mirror 复用已有对象");
+        return Ok(());
+    }
+
+    check_cancel(cancel, lang)?;
+    let shallow = is_new || git_mirror_is_shallow(mirror).await?;
+    let mut args = vec!["fetch".to_string(), "--no-tags".to_string()];
+    if shallow {
+        args.push("--depth=64".to_string());
+    }
+    args.push(mirror.url.clone());
+    for sha in &missing {
+        args.push(format!("{sha}:refs/pr-desk/{sha}"));
+    }
+    tracing::info!(
+        mirror = %mirror.path.display(),
+        commits = missing.len(),
+        mode = if shallow { "depth64" } else { "full" },
+        "OCR Git mirror 下载缺失对象"
+    );
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git(&mirror.path, &args).await
+}
+
+async fn deepen_git_mirror(
+    mirror: &GitMirror,
+    shas: &[&str],
+    cancel: Option<&Arc<AtomicBool>>,
+    lang: &str,
+) -> Result<()> {
+    let _guard = lock_git_mirror(mirror, cancel, lang).await?;
+    if !git_mirror_is_shallow(mirror).await? {
+        return Ok(());
+    }
+    check_cancel(cancel, lang)?;
+    let mut args = vec![
+        "fetch".to_string(),
+        "--no-tags".to_string(),
+        "--deepen=256".to_string(),
+        mirror.url.clone(),
+    ];
+    args.extend(shas.iter().map(|sha| (*sha).to_string()));
+    tracing::info!(mirror = %mirror.path.display(), "OCR Git mirror deepen256");
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git(&mirror.path, &args).await
+}
+
+async fn unshallow_git_mirror(
+    mirror: &GitMirror,
+    shas: &[&str],
+    cancel: Option<&Arc<AtomicBool>>,
+    lang: &str,
+) -> Result<()> {
+    let _guard = lock_git_mirror(mirror, cancel, lang).await?;
+    if !git_mirror_is_shallow(mirror).await? {
+        return Ok(());
+    }
+    check_cancel(cancel, lang)?;
+    let mut args = vec![
+        "fetch".to_string(),
+        "--no-tags".to_string(),
+        "--unshallow".to_string(),
+        mirror.url.clone(),
+    ];
+    args.extend(shas.iter().map(|sha| (*sha).to_string()));
+    tracing::info!(mirror = %mirror.path.display(), "OCR Git mirror unshallow");
+    let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+    git(&mirror.path, &args).await
+}
+
+async fn update_worktree_refs(
+    worktree: &Path,
+    mirror: &GitMirror,
+    refs: &[(&str, &str)],
+) -> Result<()> {
+    for (sha, reference) in refs {
+        let mirror_ref = format!("refs/pr-desk/{sha}");
+        let resolved = git_output(&mirror.path, &["rev-parse", &mirror_ref]).await?;
+        anyhow::ensure!(
+            String::from_utf8_lossy(&resolved.stdout).trim() == *sha,
+            "Git mirror 提交引用不一致"
+        );
+        let worktree_ref = format!("refs/heads/{reference}");
+        git(worktree, &["update-ref", &worktree_ref, sha]).await?;
+    }
+    Ok(())
+}
+
+async fn worktree_has_merge_base(worktree: &Path) -> bool {
+    git_output(
+        worktree,
+        &["merge-base", "refs/heads/base", "refs/heads/head"],
+    )
+    .await
+    .is_ok()
+}
+
 pub async fn build_ocr_git_snapshot(
     _gh: &GitHub,
     repo: &str,
@@ -462,46 +645,109 @@ pub async fn build_ocr_git_snapshot(
     } else {
         "正在准备完整 Git 工作区…".into()
     });
+    let base_url = git_repository_url(&identity.base_repo);
+    let head_url = git_repository_url(&identity.head_repo);
+    let base_mirror = git_mirror(root, &base_url);
+    let head_mirror = git_mirror(root, &head_url);
+    let same_mirror = base_mirror.path == head_mirror.path;
+    if same_mirror {
+        prepare_git_mirror(
+            &base_mirror,
+            &[&identity.base_sha, &identity.head_sha],
+            cancel.as_ref(),
+            lang,
+        )
+        .await?;
+    } else {
+        for (mirror, sha) in [
+            (&base_mirror, identity.base_sha.as_str()),
+            (&head_mirror, identity.head_sha.as_str()),
+        ] {
+            check_cancel(cancel.as_ref(), lang)?;
+            prepare_git_mirror(mirror, &[sha], cancel.as_ref(), lang).await?;
+        }
+    }
+
     let mut staging = StagingDir::new(root)?;
     let worktree = staging.path.join("worktree");
     std::fs::create_dir_all(&worktree)?;
     git(&worktree, &["init", "--quiet"]).await?;
     git(&worktree, &["config", "core.longpaths", "true"]).await?;
+    git(&worktree, &["remote", "add", "origin", &base_url]).await?;
+    let alternates_dir = worktree.join(".git/objects/info");
+    std::fs::create_dir_all(&alternates_dir)?;
+    let mirrors = if same_mirror {
+        vec![&base_mirror]
+    } else {
+        vec![&base_mirror, &head_mirror]
+    };
+    let mut alternates = mirrors
+        .iter()
+        .map(|mirror| git_path(&mirror.path.join("objects")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    alternates.push('\n');
+    std::fs::write(alternates_dir.join("alternates"), alternates)?;
+    if same_mirror {
+        update_worktree_refs(
+            &worktree,
+            &base_mirror,
+            &[(&identity.base_sha, "base"), (&identity.head_sha, "head")],
+        )
+        .await?;
+    } else {
+        for (mirror, sha, reference) in [
+            (&base_mirror, identity.base_sha.as_str(), "base"),
+            (&head_mirror, identity.head_sha.as_str(), "head"),
+        ] {
+            check_cancel(cancel.as_ref(), lang)?;
+            update_worktree_refs(&worktree, mirror, &[(sha, reference)]).await?;
+        }
+    }
 
-    for (reference, sha, repository) in [
-        ("base", &identity.base_sha, &identity.base_repo),
-        ("head", &identity.head_sha, &identity.head_repo),
-    ] {
-        check_cancel(cancel.as_ref(), lang)?;
-        let url = git_repository_url(repository);
-        let refspec = format!("{sha}:refs/heads/{reference}");
-        git(&worktree, &["fetch", "--depth=64", &url, &refspec]).await?;
-    }
-    if git_output(&worktree, &["merge-base", "base", "head"])
-        .await
-        .is_err()
-    {
-        for (sha, repository) in [
-            (&identity.base_sha, &identity.base_repo),
-            (&identity.head_sha, &identity.head_repo),
-        ] {
-            let url = git_repository_url(repository);
-            git(&worktree, &["fetch", "--deepen=256", &url, sha]).await?;
+    if !worktree_has_merge_base(&worktree).await {
+        if same_mirror {
+            deepen_git_mirror(
+                &base_mirror,
+                &[&identity.base_sha, &identity.head_sha],
+                cancel.as_ref(),
+                lang,
+            )
+            .await?;
+        } else {
+            for (mirror, sha) in [
+                (&base_mirror, identity.base_sha.as_str()),
+                (&head_mirror, identity.head_sha.as_str()),
+            ] {
+                check_cancel(cancel.as_ref(), lang)?;
+                deepen_git_mirror(mirror, &[sha], cancel.as_ref(), lang).await?;
+            }
         }
     }
-    if git_output(&worktree, &["merge-base", "base", "head"])
-        .await
-        .is_err()
-    {
-        for (sha, repository) in [
-            (&identity.base_sha, &identity.base_repo),
-            (&identity.head_sha, &identity.head_repo),
-        ] {
-            let url = git_repository_url(repository);
-            git(&worktree, &["fetch", &url, sha]).await?;
+    if !worktree_has_merge_base(&worktree).await {
+        if same_mirror {
+            unshallow_git_mirror(
+                &base_mirror,
+                &[&identity.base_sha, &identity.head_sha],
+                cancel.as_ref(),
+                lang,
+            )
+            .await?;
+        } else {
+            for (mirror, sha) in [
+                (&base_mirror, identity.base_sha.as_str()),
+                (&head_mirror, identity.head_sha.as_str()),
+            ] {
+                check_cancel(cancel.as_ref(), lang)?;
+                unshallow_git_mirror(mirror, &[sha], cancel.as_ref(), lang).await?;
+            }
         }
     }
-    git_output(&worktree, &["merge-base", "base", "head"]).await?;
+    git_output(
+        &worktree,
+        &["merge-base", "refs/heads/base", "refs/heads/head"],
+    )
+    .await?;
     git(
         &worktree,
         &["checkout", "--quiet", "--detach", &identity.head_sha],
@@ -842,6 +1088,30 @@ mod tests {
         }
     }
 
+    fn assert_shared_mirrors(snapshot: &OcrGitSnapshot, root: &Path, urls: &[&str]) {
+        let expected = urls
+            .iter()
+            .map(|url| git_path(&git_mirror(root, url).path.join("objects")))
+            .collect::<Vec<_>>();
+        let alternates =
+            std::fs::read_to_string(snapshot.path().join(".git/objects/info/alternates")).unwrap();
+        assert_eq!(
+            alternates.lines().collect::<Vec<_>>(),
+            expected.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            std::fs::read_dir(snapshot.path().join(".git/objects/pack"))
+                .unwrap()
+                .count(),
+            0,
+            "工作树不应复制 mirror 的 pack 对象"
+        );
+        assert_eq!(
+            test_git(snapshot.path(), &["rev-parse", "--is-shallow-repository"]),
+            "false"
+        );
+    }
+
     #[tokio::test]
     async fn snapshot_is_a_complete_persistent_range_worktree() {
         let unique = SystemTime::now()
@@ -871,6 +1141,22 @@ mod tests {
             ],
         );
         let base_sha = test_git(&seed, &["rev-parse", "HEAD"]);
+        for index in 0..321 {
+            test_git(
+                &seed,
+                &[
+                    "-c",
+                    "user.email=test@local",
+                    "-c",
+                    "user.name=test",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    &format!("history {index}"),
+                ],
+            );
+        }
         std::fs::write(seed.join("src/lib.rs"), "fn changed() { 2 }\n").unwrap();
         test_git(&seed, &["add", "."]);
         test_git(
@@ -923,14 +1209,30 @@ mod tests {
         assert!(snapshot.path().join("src/lib.rs").is_file());
         assert_eq!(test_git(snapshot.path(), &["rev-parse", "HEAD"]), head_sha);
         assert_eq!(
-            test_git(snapshot.path(), &["diff", "--name-only", "base", "head"]),
+            test_git(
+                snapshot.path(),
+                &["diff", "--name-only", "refs/heads/base", "refs/heads/head"]
+            ),
             "src/lib.rs"
         );
+        assert_shared_mirrors(&snapshot, &workspace_root, &[&base_url, &head_url]);
+        assert_eq!(
+            test_git(snapshot.path(), &["remote", "get-url", "origin"]),
+            base_url
+        );
+        for (url, sha) in [(&base_url, &base_sha), (&head_url, &head_sha)] {
+            let mirror = git_mirror(&workspace_root, url);
+            let reference = format!("refs/pr-desk/{sha}");
+            assert_eq!(test_git(&mirror.path, &["rev-parse", &reference]), *sha);
+        }
+        test_git(
+            snapshot.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/pr-desk"],
+        );
+        let snapshot_path = snapshot.path().to_path_buf();
         drop(snapshot);
 
-        std::fs::remove_dir_all(root.join("base.git")).unwrap();
-        std::fs::remove_dir_all(root.join("fork.git")).unwrap();
-        build_ocr_git_snapshot(
+        let persistent = build_ocr_git_snapshot(
             &gh,
             "owner/repo",
             &meta,
@@ -942,6 +1244,109 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(persistent.path(), snapshot_path);
+        drop(persistent);
+
+        let same_repo_root = root.join("same-repo-workspaces");
+        let mut same_repo_meta = meta.clone();
+        same_repo_meta["head"]["repo"]["full_name"] = serde_json::Value::String(base_url.clone());
+        let same_repo_snapshot = build_ocr_git_snapshot(
+            &gh,
+            "owner/repo",
+            &same_repo_meta,
+            diff,
+            &same_repo_root,
+            &mut |_| {},
+            "zh",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            test_git(same_repo_snapshot.path(), &["rev-parse", "HEAD"]),
+            head_sha
+        );
+        assert_shared_mirrors(&same_repo_snapshot, &same_repo_root, &[&base_url]);
+        assert_eq!(
+            test_git(same_repo_snapshot.path(), &["merge-base", "base", "head"]),
+            base_sha
+        );
+        drop(same_repo_snapshot);
+
+        let concurrent_root = root.join("concurrent-workspaces");
+        let mut first_meta = meta.clone();
+        first_meta["number"] = serde_json::json!(9);
+        let mut second_meta = meta.clone();
+        second_meta["number"] = serde_json::json!(10);
+        let mut first_progress = |_| {};
+        let mut second_progress = |_| {};
+        let (first, second) = tokio::join!(
+            build_ocr_git_snapshot(
+                &gh,
+                "owner/repo",
+                &first_meta,
+                diff,
+                &concurrent_root,
+                &mut first_progress,
+                "zh",
+                None,
+            ),
+            build_ocr_git_snapshot(
+                &gh,
+                "owner/repo",
+                &second_meta,
+                diff,
+                &concurrent_root,
+                &mut second_progress,
+                "zh",
+                None,
+            )
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_shared_mirrors(&first, &concurrent_root, &[&base_url, &head_url]);
+        assert_shared_mirrors(&second, &concurrent_root, &[&base_url, &head_url]);
+        drop(first);
+        drop(second);
+
+        std::fs::remove_dir_all(root.join("base.git")).unwrap();
+        std::fs::remove_dir_all(root.join("fork.git")).unwrap();
+        let mut offline_meta = meta.clone();
+        offline_meta["number"] = serde_json::json!(11);
+        let offline = build_ocr_git_snapshot(
+            &gh,
+            "owner/repo",
+            &offline_meta,
+            diff,
+            &workspace_root,
+            &mut |_| {},
+            "zh",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_ne!(offline.path(), snapshot_path);
+        assert_shared_mirrors(&offline, &workspace_root, &[&base_url, &head_url]);
+        assert_eq!(
+            test_git(offline.path(), &["merge-base", "base", "head"]),
+            base_sha
+        );
+        std::fs::write(snapshot_path.join("src/lib.rs"), "first worktree\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(offline.path().join("src/lib.rs"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "fn changed() { 2 }\n"
+        );
+        std::fs::write(offline.path().join("src/unchanged.rs"), "second worktree\n").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(snapshot_path.join("src/unchanged.rs"))
+                .unwrap()
+                .replace("\r\n", "\n"),
+            "fn untouched() { 42 }\n"
+        );
+        drop(offline);
 
         let invalid_root = root.join("invalid");
         let invalid_path = context_dir_for("owner/repo", 7, &base_sha, &head_sha, &invalid_root);

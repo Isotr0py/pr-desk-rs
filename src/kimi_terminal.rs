@@ -21,7 +21,6 @@ pub struct KimiKey {
     pub profile: String,
     pub repo: String,
     pub number: i64,
-    pub head_sha: String,
     pub request_id: u64,
 }
 
@@ -44,10 +43,50 @@ pub fn prepare_context_dir(context: &PrContext, root: &Path) -> Result<PathBuf> 
             "base_sha": context.base_sha,
             "head_sha": context.head_sha,
             "title": context.title,
+            "pull_ref": format!("refs/pull/{}/head", context.number),
         }))?,
     )?;
     let _ = std::fs::remove_file(path.join("findings.json"));
-    Ok(path.join("worktree"))
+    let worktree = path.join("worktree");
+    if worktree.join(".git").is_dir() {
+        let git = |args: &[&str]| -> Result<()> {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&worktree)
+                .args(args)
+                .status()
+                .context("配置 Kimi 工作区 Git 失败")?;
+            anyhow::ensure!(status.success(), "配置 Kimi 工作区 Git 失败: {args:?}");
+            Ok(())
+        };
+        let origin = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&worktree)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .context("检查 Kimi 工作区 Git 远端失败")?;
+        if !origin.status.success() {
+            let url = if context.repo.starts_with("file://") {
+                context.repo.clone()
+            } else {
+                format!("https://github.com/{}.git", context.repo)
+            };
+            git(&["remote", "add", "origin", &url])?;
+        }
+        let pull_ref = format!("refs/pull/{}/head", context.number);
+        let fetch_refspec = format!("+{pull_ref}:refs/remotes/origin/pr/{}", context.number);
+        git(&[
+            "config",
+            "--replace-all",
+            "remote.origin.fetch",
+            &fetch_refspec,
+        ])?;
+        git(&["config", "remote.origin.tagOpt", "--no-tags"])?;
+        git(&["symbolic-ref", "HEAD", "refs/heads/pr-desk"])?;
+        git(&["config", "branch.pr-desk.remote", "origin"])?;
+        git(&["config", "branch.pr-desk.merge", &pull_ref])?;
+    }
+    Ok(worktree)
 }
 
 pub struct KimiTerminal {
@@ -145,6 +184,16 @@ mod tests {
             ..Default::default()
         };
         let first = prepare_context_dir(&context, &root).unwrap();
+        std::fs::create_dir_all(&first).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&first)
+                .args(["init", "--quiet"])
+                .status()
+                .unwrap()
+                .success()
+        );
         std::fs::write(first.parent().unwrap().join("findings.json"), b"[]").unwrap();
         let second = prepare_context_dir(&context, &root).unwrap();
         assert_eq!(first, second);
@@ -157,6 +206,48 @@ mod tests {
         assert!(context_root.join("pr.diff").is_file());
         assert!(context_root.join("pr.json").is_file());
         assert!(!context_root.join("findings.json").exists());
+        let pr_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(context_root.join("pr.json")).unwrap())
+                .unwrap();
+        assert_eq!(pr_json["pull_ref"].as_str(), Some("refs/pull/42/head"));
+        let origin = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&first)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .unwrap();
+        assert!(origin.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&origin.stdout).trim(),
+            "https://github.com/owner/repo.git"
+        );
+        let upstream = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&first)
+            .args(["config", "--get-regexp", "^branch\\.pr-desk\\."])
+            .output()
+            .unwrap();
+        assert!(upstream.status.success());
+        let upstream = String::from_utf8_lossy(&upstream.stdout);
+        assert!(upstream.contains("branch.pr-desk.remote origin"));
+        assert!(upstream.contains("branch.pr-desk.merge refs/pull/42/head"));
+        let fetch = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&first)
+            .args(["config", "--get-all", "remote.origin.fetch"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&fetch.stdout).trim(),
+            "+refs/pull/42/head:refs/remotes/origin/pr/42"
+        );
+        let tag_opt = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&first)
+            .args(["config", "remote.origin.tagOpt"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&tag_opt.stdout).trim(), "--no-tags");
         context.head_sha = "head-2".into();
         assert_ne!(prepare_context_dir(&context, &root).unwrap(), first);
         let _ = std::fs::remove_dir_all(root);

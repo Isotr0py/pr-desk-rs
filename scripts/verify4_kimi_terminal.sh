@@ -34,6 +34,7 @@ WORKSPACE=$(state | python -c "import json,sys; print(json.load(sys.stdin).get('
 CONTEXT=$(dirname "$WORKSPACE")
 assert "工作区路径已持久化到可配置根目录" "bool(d.get('kimi_workspace'))"
 [ -n "$WORKSPACE" ] && [ -d "$WORKSPACE/.git" ] && { echo "  PASS: 完整 Git 工作树"; PASS=$((PASS+1)); } || { echo "  FAIL: 完整 Git 工作树: $WORKSPACE"; FAIL=$((FAIL+1)); }
+[ -f "$WORKSPACE/.git/objects/info/alternates" ] && grep -q '.git-mirrors' "$WORKSPACE/.git/objects/info/alternates" && { echo "  PASS: 工作树通过 alternates 共享 mirror 对象"; PASS=$((PASS+1)); } || { echo "  FAIL: 工作树未使用共享 mirror"; FAIL=$((FAIL+1)); }
 [ -f "$CONTEXT/pr.json" ] && [ -f "$CONTEXT/pr-body.md" ] && [ -f "$CONTEXT/pr.diff" ] && { echo "  PASS: PR 描述、元数据与完整 diff"; PASS=$((PASS+1)); } || { echo "  FAIL: PR 上下文文件"; FAIL=$((FAIL+1)); }
 [ ! -e "$CONTEXT/findings.json" ] && { echo "  PASS: 不再生成 findings.json"; PASS=$((PASS+1)); } || { echo "  FAIL: 仍有 findings.json"; FAIL=$((FAIL+1)); }
 BASE_SHA=$(python -c "import json; print(json.load(open('$CONTEXT/pr.json'))['base_sha'])" 2>/dev/null)
@@ -62,6 +63,24 @@ cmd "kimienter"
 wait_state "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False" || true
 assert "通过 CLI 原生命令新建会话" "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_error')==''"
 shot "kimi-cli-new-session"
+
+OTHER_REPO="${PD_REPO2:-octocat/Hello-World}"
+OTHER_NUMBER="${PD_NUMBER2:-2}"
+cmd "openpr $OTHER_REPO $OTHER_NUMBER"
+wait_state "d['panel_open']==True and d.get('panel_number')==$OTHER_NUMBER" || true
+assert "切到另一个 PR 后原 CLI 仍在后台" "d.get('kimi_cached_live')==1"
+cmd "tab 4"
+wait_state "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False" || true
+OTHER_REQUEST_ID=$(state | python -c "import json,sys; print(json.load(sys.stdin).get('kimi_request_id') or 0)")
+assert "第二个 PR 使用独立 CLI" "$OTHER_REQUEST_ID > 0 and $OTHER_REQUEST_ID != $REQUEST_ID and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_error')==''"
+
+cmd "openpr $REPO $NUMBER"
+wait_state "d['panel_open']==True and d.get('panel_number')==$NUMBER" || true
+assert "返回前两个 CLI 都保留在后台" "d.get('kimi_cached_live')==2"
+cmd "tab 4"
+wait_state "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False" || true
+assert "切回立即恢复原 CLI 进程" "d.get('kimi_request_id')==$REQUEST_ID and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_error')==''"
+assert "两个 PR 的 CLI 可同时存活" "d.get('kimi_cached_live')==1 and d.get('kimi_terminal_closed')==False"
 
 cmd "review"
 sleep 1

@@ -1903,13 +1903,10 @@ async fn worker(
                 let tx = msg_tx.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let meta = g.fetch_pr_meta(&key.repo, key.number).await?;
-                        if !key.head_sha.is_empty()
-                            && meta["head"]["sha"].as_str().unwrap_or("") != key.head_sha
-                        {
-                            anyhow::bail!("{}", tr(&cfg.language, "kimi_context_stale"));
-                        }
-                        let diff = g.fetch_diff(&key.repo, key.number).await?;
+                        let (meta, diff) = tokio::try_join!(
+                            g.fetch_pr_meta(&key.repo, key.number),
+                            g.fetch_diff(&key.repo, key.number),
+                        )?;
                         let context = crate::kimi_terminal::PrContext {
                             repo: key.repo.clone(),
                             number: key.number,
@@ -1930,11 +1927,7 @@ async fn worker(
                             None,
                         )
                         .await?;
-                        crate::kimi_terminal::prepare_context_dir(
-                            &context,
-                            &cfg.kimi_workspace_root_path(),
-                        )?;
-                        Ok(context)
+                        Ok::<_, anyhow::Error>(context)
                     }
                     .await;
                     match result {

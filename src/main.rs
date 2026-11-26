@@ -18,6 +18,7 @@ mod ui_list;
 mod ui_settings;
 mod worker;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,14 @@ use pr_desk_rs::db::Db;
 use pr_desk_rs::i18n::{tr, trf};
 
 use state::*;
+
+const MAX_PARKED_KIMI_TERMINALS: usize = 4;
+
+struct ParkedKimiTerminal {
+    terminal: kimi_terminal::KimiTerminal,
+    context: kimi_terminal::PrContext,
+    last_used: Instant,
+}
 
 /// UI 侧即时状态（App 是业务状态；这里是面板/弹窗/表单等展示态）。
 pub struct EguiApp {
@@ -69,6 +78,7 @@ pub struct EguiApp {
     pub kimi_terminal_fresh: bool,
     pub kimi_context: Option<kimi_terminal::PrContext>,
     pub kimi_key: Option<kimi_terminal::KimiKey>,
+    kimi_terminal_cache: HashMap<kimi_terminal::KimiKey, ParkedKimiTerminal>,
     // ── Inbox ──
     pub inbox_loading: bool,
     pub inbox_sel: Option<usize>, // 当前选中通知在 inbox_view 里的下标
@@ -86,6 +96,7 @@ pub struct EguiApp {
     pub mar_confirm: Option<Instant>, // 「全部已读」两步确认（3s 超时还原）
     // ── 设置 ──
     pub settings_open: bool,
+    pub settings_reset_geometry: bool,
     pub settings_tab: usize,
     pub settings_profile: String,
     pub s_server: String,
@@ -373,22 +384,57 @@ impl EguiApp {
         self.next_kimi_request_id
     }
 
+    fn park_kimi_terminal(&mut self) {
+        let Some(key) = self.kimi_key.clone() else {
+            return;
+        };
+        let Some(terminal) = self.kimi_terminal.take() else {
+            return;
+        };
+        let Some(context) = self.kimi_context.clone() else {
+            self.kimi_terminal = Some(terminal);
+            return;
+        };
+        self.kimi_terminal_cache.insert(
+            key,
+            ParkedKimiTerminal {
+                terminal,
+                context,
+                last_used: Instant::now(),
+            },
+        );
+        while self.kimi_terminal_cache.len() > MAX_PARKED_KIMI_TERMINALS {
+            let oldest = self
+                .kimi_terminal_cache
+                .iter()
+                .min_by_key(|(_, parked)| parked.last_used)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.kimi_terminal_cache.remove(&oldest);
+        }
+    }
+
     fn current_kimi_key(&mut self) -> Option<kimi_terminal::KimiKey> {
         let profile = self.app.lock_recover().cfg.active_profile.clone();
         let panel = self.panel.as_ref()?;
         if let Some(key) = self.kimi_key.as_ref().filter(|key| {
-            key.profile == profile
-                && key.repo == panel.repo
-                && key.number == panel.number
-                && key.head_sha == panel.head_sha
+            key.profile == profile && key.repo == panel.repo && key.number == panel.number
         }) {
             return Some(key.clone());
+        }
+        if let Some(key) = self.kimi_terminal_cache.keys().find(|key| {
+            key.profile == profile && key.repo == panel.repo && key.number == panel.number
+        }) {
+            let key = key.clone();
+            self.kimi_key = Some(key.clone());
+            return Some(key);
         }
         let key = kimi_terminal::KimiKey {
             profile,
             repo: panel.repo.clone(),
             number: panel.number,
-            head_sha: panel.head_sha.clone(),
             request_id: self.next_kimi_request(),
         };
         self.kimi_key = Some(key.clone());
@@ -409,12 +455,15 @@ impl EguiApp {
         {
             return;
         }
+        if let Some(parked) = self.kimi_terminal_cache.remove(&key) {
+            self.kimi_context = Some(parked.context);
+            if !parked.terminal.is_closed() {
+                self.kimi_terminal = Some(parked.terminal);
+                return;
+            }
+        }
         self.kimi_terminal = None;
-        if let Some(context) = self
-            .kimi_context
-            .clone()
-            .filter(|context| key.head_sha.is_empty() || context.head_sha == key.head_sha)
-        {
+        if let Some(context) = self.kimi_context.clone() {
             let cfg = self.app.lock_recover().cfg.clone();
             let fresh = std::mem::take(&mut self.kimi_terminal_fresh);
             match kimi_terminal::KimiTerminal::spawn(key, &cfg, &context, ctx, fresh) {
@@ -874,13 +923,14 @@ impl EguiApp {
             }
             Msg::Panel(pd) => {
                 self.diff_requested = None;
-                let reset = self.panel.as_ref().is_none_or(|old| {
-                    old.repo != pd.repo || old.number != pd.number || old.head_sha != pd.head_sha
-                });
+                let reset = self
+                    .panel
+                    .as_ref()
+                    .is_none_or(|old| old.repo != pd.repo || old.number != pd.number);
                 self.panel = Some(*pd);
                 if reset {
+                    self.park_kimi_terminal();
                     self.review_run_started = None;
-                    self.kimi_terminal = None;
                     self.kimi_terminal_error.clear();
                     self.kimi_terminal_preparing = false;
                     self.kimi_terminal_fresh = false;
@@ -1519,6 +1569,9 @@ impl EguiApp {
             "kimi_terminal_closed": self.kimi_terminal.as_ref().map(|terminal| terminal.is_closed()),
             "kimi_terminal_dimensions": self.kimi_terminal.as_ref().and_then(|terminal| terminal.dimensions()),
             "kimi_terminal_error": self.kimi_terminal_error,
+            "kimi_cached_sessions": self.kimi_terminal_cache.len(),
+            "kimi_cache_limit": MAX_PARKED_KIMI_TERMINALS,
+            "kimi_cached_live": self.kimi_terminal_cache.values().filter(|parked| !parked.terminal.is_closed()).count(),
             "kimi_request_id": self.kimi_key.as_ref().map(|key| key.request_id),
             "kimi_workspace": self.kimi_context.as_ref().map(|context| pr_desk_rs::ocr::context_dir_for(&context.repo, context.number, &context.base_sha, &context.head_sha, &a.cfg.kimi_workspace_root_path()).join("worktree").to_string_lossy().into_owned()),
             "panel_convo": self.panel.as_ref().map(|p| p.convo.len()),
@@ -2078,6 +2131,7 @@ fn main() -> anyhow::Result<()> {
                 kimi_terminal_fresh: false,
                 kimi_context: None,
                 kimi_key: None,
+                kimi_terminal_cache: HashMap::new(),
                 scroll_to: None,
                 inbox_loading: false,
                 inbox_sel: None,
@@ -2098,6 +2152,7 @@ fn main() -> anyhow::Result<()> {
                 delete_confirm: None,
                 geom_clamped: false,
                 settings_open: unconfigured, // 首启自动打开设置
+                settings_reset_geometry: true,
                 settings_tab: 0,
                 settings_profile: "local".into(),
                 s_server: String::new(),

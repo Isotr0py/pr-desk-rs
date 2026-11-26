@@ -47,6 +47,7 @@ pub fn open_settings(app: &mut EguiApp) {
     app.s_prompt_loading = true;
     let _ = app.cmd_tx.send(Cmd::LoadReviewPrompt);
     app.settings_open = true;
+    app.settings_reset_geometry = true;
 }
 
 /// 弹窗内发起的操作失败：除了状态栏还要写弹窗内联错误行（状态栏被遮罩盖住）。
@@ -319,57 +320,66 @@ pub fn settings_window(app: &mut EguiApp, ctx: &egui::Context) {
         return;
     }
     let lang = app.lang();
+    let available = ctx.content_rect();
+    let default_size = egui::vec2(available.width().min(520.0), available.height().min(560.0));
+    let reset_geometry = std::mem::take(&mut app.settings_reset_geometry);
     let mut open = true;
-    egui::Window::new(tr(&lang, "settings_title"))
+    let mut window = egui::Window::new(tr(&lang, "settings_title"))
         .id(egui::Id::unique("settings"))
         .collapsible(false)
         .resizable(true)
-        .default_size([520.0, 560.0])
+        .default_size(default_size)
+        .max_size(available.size())
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .open(&mut open)
-        .show(ctx, |ui| {
-            // 功能分 tab：数据源 / 通用 / LLM 预评审
-            ui.horizontal(|ui| {
-                for (i, t) in [
-                    tr(&lang, "settings_tab_source"),
-                    tr(&lang, "settings_tab_general"),
-                    tr(&lang, "settings_tab_llm"),
-                ]
-                .iter()
-                .enumerate()
-                {
-                    if ui.selectable_label(app.settings_tab == i, *t).clicked() {
-                        app.settings_tab = i;
-                    }
+        .open(&mut open);
+    if reset_geometry {
+        window = window
+            .current_pos(available.center() - default_size / 2.0)
+            .max_size(default_size);
+    }
+    window.show(ctx, |ui| {
+        // 功能分 tab：数据源 / 通用 / LLM 预评审
+        ui.horizontal(|ui| {
+            for (i, t) in [
+                tr(&lang, "settings_tab_source"),
+                tr(&lang, "settings_tab_general"),
+                tr(&lang, "settings_tab_llm"),
+            ]
+            .iter()
+            .enumerate()
+            {
+                if ui.selectable_label(app.settings_tab == i, *t).clicked() {
+                    app.settings_tab = i;
                 }
-            });
-            ui.separator();
-            egui::ScrollArea::vertical()
-                .id_salt("settings-scroll")
-                .auto_shrink([false, true])
-                .show(ui, |ui| match app.settings_tab {
-                    0 => tab_source(app, ui, &lang),
-                    1 => tab_general(app, ui, &lang),
-                    _ => tab_llm(app, ui, &lang),
-                });
-            // 弹窗内联错误行
-            if !app.dialog_error.is_empty() {
-                ui.colored_label(egui::Color32::from_rgb(209, 36, 47), &app.dialog_error);
             }
-            ui.horizontal(|ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button(tr(&lang, "save")).clicked() {
-                        app.dialog_error.clear();
-                        if save_settings(app) {
-                            app.settings_open = false;
-                        }
-                    }
-                    if ui.button(tr(&lang, "cancel")).clicked() {
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .id_salt("settings-scroll")
+            .auto_shrink([false, true])
+            .show(ui, |ui| match app.settings_tab {
+                0 => tab_source(app, ui, &lang),
+                1 => tab_general(app, ui, &lang),
+                _ => tab_llm(app, ui, &lang),
+            });
+        // 弹窗内联错误行
+        if !app.dialog_error.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(209, 36, 47), &app.dialog_error);
+        }
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button(tr(&lang, "save")).clicked() {
+                    app.dialog_error.clear();
+                    if save_settings(app) {
                         app.settings_open = false;
                     }
-                });
+                }
+                if ui.button(tr(&lang, "cancel")).clicked() {
+                    app.settings_open = false;
+                }
             });
         });
+    });
     if !open {
         app.settings_open = false;
     }

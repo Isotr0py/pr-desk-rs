@@ -245,7 +245,6 @@ const ZH: &[(&str, &str)] = &[
     ("tab_kimi_session", "Kimi 会话"),
     ("kimi_cli_starting", "正在启动 Kimi CLI…"),
     ("kimi_cli_exited", "CLI 已退出；重新打开 PR 详情可重新启动"),
-    ("kimi_context_stale", "PR 已有新提交，请重新打开 Kimi 会话"),
     ("err_ocr_cancelled", "OCR 已取消"),
     ("err_ocr_no_stderr", "无法读取 OCR 进度输出"),
     ("err_ocr_wait", "等待 OCR 子进程退出失败"),
@@ -756,10 +755,6 @@ const EN: &[(&str, &str)] = &[
     (
         "kimi_cli_exited",
         "CLI exited; reopen the PR details to restart",
-    ),
-    (
-        "kimi_context_stale",
-        "The PR has new commits; reopen the Kimi session",
     ),
     ("err_ocr_cancelled", "OCR cancelled"),
     ("err_ocr_no_stderr", "Unable to read OCR progress output"),
