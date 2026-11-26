@@ -484,6 +484,9 @@ async fn prepare_git_mirror(
             .is_err()
         {
             missing.push(*sha);
+        } else {
+            let mirror_ref = format!("refs/pr-desk/{sha}");
+            git(&mirror.path, &["update-ref", &mirror_ref, sha]).await?;
         }
     }
     if missing.is_empty() {
@@ -557,18 +560,10 @@ async fn unshallow_git_mirror(
     git(&mirror.path, &args).await
 }
 
-async fn update_worktree_refs(
-    worktree: &Path,
-    mirror: &GitMirror,
-    refs: &[(&str, &str)],
-) -> Result<()> {
+async fn update_worktree_refs(worktree: &Path, refs: &[(&str, &str)]) -> Result<()> {
     for (sha, reference) in refs {
-        let mirror_ref = format!("refs/pr-desk/{sha}");
-        let resolved = git_output(&mirror.path, &["rev-parse", &mirror_ref]).await?;
-        anyhow::ensure!(
-            String::from_utf8_lossy(&resolved.stdout).trim() == *sha,
-            "Git mirror 提交引用不一致"
-        );
+        let object = format!("{sha}^{{commit}}");
+        git_output(worktree, &["cat-file", "-e", &object]).await?;
         let worktree_ref = format!("refs/heads/{reference}");
         git(worktree, &["update-ref", &worktree_ref, sha]).await?;
     }
@@ -691,17 +686,16 @@ pub async fn build_ocr_git_snapshot(
     if same_mirror {
         update_worktree_refs(
             &worktree,
-            &base_mirror,
             &[(&identity.base_sha, "base"), (&identity.head_sha, "head")],
         )
         .await?;
     } else {
-        for (mirror, sha, reference) in [
+        for (_mirror, sha, reference) in [
             (&base_mirror, identity.base_sha.as_str(), "base"),
             (&head_mirror, identity.head_sha.as_str(), "head"),
         ] {
             check_cancel(cancel.as_ref(), lang)?;
-            update_worktree_refs(&worktree, mirror, &[(sha, reference)]).await?;
+            update_worktree_refs(&worktree, &[(sha, reference)]).await?;
         }
     }
 
@@ -890,6 +884,74 @@ mod tests {
         assert!(result.is_err());
         assert!(mirror.path.join("HEAD").is_file());
         assert!(!mirror.path.join("data").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn worktree_refs_do_not_require_mirror_cache_ref() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pr-desk-mirror-ref-test-{}-{unique}",
+            std::process::id()
+        ));
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        test_git(&seed, &["init", "--quiet"]);
+        std::fs::write(seed.join("file.txt"), "content\n").unwrap();
+        test_git(&seed, &["add", "."]);
+        test_git(
+            &seed,
+            &[
+                "-c",
+                "user.email=test@local",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--quiet",
+                "-m",
+                "head",
+            ],
+        );
+        let sha = test_git(&seed, &["rev-parse", "HEAD"]);
+        let mirror = git_mirror(&root, &test_file_url(&seed));
+        let mirror_parent = mirror.path.parent().unwrap();
+        std::fs::create_dir_all(mirror_parent).unwrap();
+        test_git(
+            mirror_parent,
+            &["init", "--quiet", "--bare", &git_path(&mirror.path)],
+        );
+        test_git(&mirror.path, &["fetch", "--quiet", &git_path(&seed), &sha]);
+        test_git(&mirror.path, &["update-ref", "refs/heads/seed", &sha]);
+
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        test_git(&worktree, &["init", "--quiet"]);
+        let info = worktree.join(".git/objects/info");
+        std::fs::create_dir_all(&info).unwrap();
+        std::fs::write(
+            info.join("alternates"),
+            format!("{}\n", git_path(&mirror.path.join("objects"))),
+        )
+        .unwrap();
+        update_worktree_refs(&worktree, &[(&sha, "head")])
+            .await
+            .unwrap();
+        assert_eq!(test_git(&worktree, &["rev-parse", "refs/heads/head"]), sha);
+        assert!(
+            git_output(&mirror.path, &["rev-parse", &format!("refs/pr-desk/{sha}")])
+                .await
+                .is_err()
+        );
+        prepare_git_mirror(&mirror, &[&sha], None, "zh")
+            .await
+            .unwrap();
+        assert_eq!(
+            test_git(&mirror.path, &["rev-parse", &format!("refs/pr-desk/{sha}")]),
+            sha
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
