@@ -1180,8 +1180,8 @@ mod tests {
         let head_url = test_file_url(&root.join("fork.git"));
         test_git(&seed, &["remote", "add", "base", &base_url]);
         test_git(&seed, &["remote", "add", "head", &head_url]);
-        test_git(&seed, &["push", "--quiet", "base", "main:main"]);
-        test_git(&seed, &["push", "--quiet", "head", "main:main"]);
+        test_git(&seed, &["push", "--quiet", "base", "HEAD:main"]);
+        test_git(&seed, &["push", "--quiet", "head", "HEAD:main"]);
 
         let meta = serde_json::json!({
             "number": 7,
