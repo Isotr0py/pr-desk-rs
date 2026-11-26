@@ -8,7 +8,7 @@ use egui::{Align2, Color32, FontId, RichText, Ui};
 use pr_desk_rs::i18n::{tr, trf};
 
 use crate::state::*;
-use crate::{ui_detail, worker, EguiApp};
+use crate::{EguiApp, ui_detail, worker};
 
 pub fn search_id() -> egui::Id {
     egui::Id::unique("search-box")
@@ -47,7 +47,11 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
                 ui.add(egui::Spinner::new());
             }
             // 同步：同刷新（连点去重）
-            if ui.button("⇅").on_hover_text(tr(&lang, "sync_tooltip")).clicked() {
+            if ui
+                .button("⇅")
+                .on_hover_text(tr(&lang, "sync_tooltip"))
+                .clicked()
+            {
                 let send = {
                     let mut a = app.app.lock_recover();
                     if a.sync_inflight {
@@ -86,19 +90,29 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
                 recompute_flat(&mut a);
             }
             ui.separator();
-            // 视图切换：列表 / Inbox
-            for (i, t) in [tr(&lang, "tab_list"), tr(&lang, "tab_inbox")].iter().enumerate() {
-                if ui
-                    .selectable_label(app.view_mode == i, *t)
-                    .on_hover_text(tr(&lang, if i == 0 { "tab_list" } else { "tab_inbox" }))
-                    .clicked()
-                    && app.view_mode != i
-                {
+            // 视图切换：列表 / Inbox / Needs-you
+            let needs_you_count = app.app.lock_recover().needs_you.len();
+            let needs_you_label = if needs_you_count == 0 {
+                tr(&lang, "tab_needs_you").to_string()
+            } else {
+                format!("{} ({needs_you_count})", tr(&lang, "tab_needs_you"))
+            };
+            for (i, t) in [
+                tr(&lang, "tab_list").to_string(),
+                tr(&lang, "tab_inbox").to_string(),
+                needs_you_label,
+            ]
+            .iter()
+            .enumerate()
+            {
+                if ui.selectable_label(app.view_mode == i, t).clicked() && app.view_mode != i {
                     app.view_mode = i;
                     if i == 1 {
-                        // 首次进 Inbox：拉取通知（加载态，不显示误导空态）
                         app.inbox_loading = true;
                         let _ = app.cmd_tx.send(Cmd::FetchInbox);
+                    } else if i == 2 {
+                        app.app.lock_recover().needs_you_loading = true;
+                        let _ = app.cmd_tx.send(Cmd::LoadNeedsYou);
                     }
                 }
             }
@@ -114,7 +128,11 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
                 .selected_text(active_label)
                 .show_ui(ui, |ui| {
                     for p in &app.profile_names {
-                        let text = if p == "local" { tr(&lang, "source_local").to_string() } else { p.clone() };
+                        let text = if p == "local" {
+                            tr(&lang, "source_local").to_string()
+                        } else {
+                            p.clone()
+                        };
                         if ui.selectable_label(active == *p, text).clicked() && active != *p {
                             let _ = app.cmd_tx.send(Cmd::SwitchProfile(p.clone()));
                         }
@@ -143,7 +161,13 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
                 .selected_text(tr(&lang, crate::theme::label_key(&current_theme)))
                 .show_ui(ui, |ui| {
                     for name in crate::theme::THEMES {
-                        if ui.selectable_label(current_theme == name, tr(&lang, crate::theme::label_key(name))).clicked() {
+                        if ui
+                            .selectable_label(
+                                current_theme == name,
+                                tr(&lang, crate::theme::label_key(name)),
+                            )
+                            .clicked()
+                        {
                             app.theme_changed(ui.ctx(), name);
                         }
                     }
@@ -169,7 +193,14 @@ pub fn status_bar(app: &EguiApp, ui: &mut Ui) {
         ui.horizontal(|ui| {
             let lang = app.lang();
             ui.label(app.status_bar_sync_text());
-            ui.weak(tr(&lang, if app.view_mode == 0 { "statusbar_hints" } else { "statusbar_hints_inbox" }));
+            ui.weak(tr(
+                &lang,
+                if app.view_mode == 0 {
+                    "statusbar_hints"
+                } else {
+                    "statusbar_hints_inbox"
+                },
+            ));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let a = app.app.lock_recover();
                 ui.weak(trf(&lang, "sb_pr_count", &[&a.total.to_string()]));
@@ -236,19 +267,31 @@ pub fn selection_bar(app: &mut EguiApp, ui: &mut Ui) {
                     }
                 });
             if ui
-                .button(if all_pinned { tr(&lang, "ctx_unpin") } else { tr(&lang, "tip_pin") })
+                .button(if all_pinned {
+                    tr(&lang, "ctx_unpin")
+                } else {
+                    tr(&lang, "tip_pin")
+                })
                 .clicked()
             {
                 worker::batch_toggle(&app.app, "pinned");
             }
             if ui
-                .button(if all_on_board { tr(&lang, "ctx_remove_board") } else { tr(&lang, "detail_add_board") })
+                .button(if all_on_board {
+                    tr(&lang, "ctx_remove_board")
+                } else {
+                    tr(&lang, "detail_add_board")
+                })
                 .clicked()
             {
                 worker::batch_toggle(&app.app, "on_board");
             }
             if ui
-                .button(if all_rejected { tr(&lang, "ctx_restore") } else { tr(&lang, "ctx_skip") })
+                .button(if all_rejected {
+                    tr(&lang, "ctx_restore")
+                } else {
+                    tr(&lang, "ctx_skip")
+                })
                 .clicked()
             {
                 batch_set_status(app, if all_rejected { "pending" } else { "rejected" });
@@ -329,7 +372,12 @@ fn batch_run_review(app: &EguiApp) {
 
 /// pr_list_view 的单锁快照项（见 pr_list_view 注释：flat/rows 一致性竞态修复）
 enum ViewItem {
-    Header { key: String, title: String, count: usize, collapsed: bool },
+    Header {
+        key: String,
+        title: String,
+        count: usize,
+        collapsed: bool,
+    },
     Row(RowData),
 }
 
@@ -398,22 +446,91 @@ fn icon_center_x(c: egui::Rect) -> f32 {
 }
 
 pub const COL_SPECS: &[ColSpec] = &[
-    ColSpec { id: "priority", label: "P", def_w: 26.0, min_w: 24.0, flex: false },
-    ColSpec { id: "num", label: "#", def_w: 60.0, min_w: 44.0, flex: false },
-    ColSpec { id: "title", label: "col_title", def_w: 0.0, min_w: 120.0, flex: true },
-    ColSpec { id: "author", label: "col_author", def_w: 110.0, min_w: 60.0, flex: false },
-    ColSpec { id: "turn", label: "col_turn", def_w: 38.0, min_w: 30.0, flex: false },
-    ColSpec { id: "review", label: "col_review", def_w: 84.0, min_w: 40.0, flex: false },
-    ColSpec { id: "ci", label: "CI", def_w: 40.0, min_w: 32.0, flex: false },
-    ColSpec { id: "size", label: "col_size", def_w: 40.0, min_w: 32.0, flex: false },
-    ColSpec { id: "changes", label: "+/-", def_w: 70.0, min_w: 52.0, flex: false },
-    ColSpec { id: "score", label: "★", def_w: 40.0, min_w: 32.0, flex: false },
-    ColSpec { id: "upd", label: "col_updated", def_w: 48.0, min_w: 40.0, flex: false },
+    ColSpec {
+        id: "priority",
+        label: "P",
+        def_w: 26.0,
+        min_w: 24.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "num",
+        label: "#",
+        def_w: 60.0,
+        min_w: 44.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "title",
+        label: "col_title",
+        def_w: 0.0,
+        min_w: 120.0,
+        flex: true,
+    },
+    ColSpec {
+        id: "author",
+        label: "col_author",
+        def_w: 110.0,
+        min_w: 60.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "turn",
+        label: "col_turn",
+        def_w: 38.0,
+        min_w: 30.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "review",
+        label: "col_review",
+        def_w: 84.0,
+        min_w: 40.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "ci",
+        label: "CI",
+        def_w: 40.0,
+        min_w: 32.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "size",
+        label: "col_size",
+        def_w: 40.0,
+        min_w: 32.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "changes",
+        label: "+/-",
+        def_w: 70.0,
+        min_w: 52.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "score",
+        label: "★",
+        def_w: 40.0,
+        min_w: 32.0,
+        flex: false,
+    },
+    ColSpec {
+        id: "upd",
+        label: "col_updated",
+        def_w: 48.0,
+        min_w: 40.0,
+        flex: false,
+    },
 ];
 
 /// 列宽初值（标题列占位的 0 会在布局时按剩余宽计算，不进 col_widths）。
 pub fn default_col_widths() -> Vec<f32> {
-    COL_SPECS.iter().map(|c| if c.flex { 0.0 } else { c.def_w }).collect()
+    COL_SPECS
+        .iter()
+        .map(|c| if c.flex { 0.0 } else { c.def_w })
+        .collect()
 }
 
 fn col_label<'a>(key: &'a str, lang: &str) -> &'a str {
@@ -459,9 +576,13 @@ pub(crate) fn paint_cell(ui: &Ui, cell: egui::Rect, text: &str, font: FontId, co
         return;
     }
     let text = ellipsize(ui, text, font.clone(), cell.width() - 4.0);
-    ui.painter()
-        .with_clip_rect(cell)
-        .text(egui::pos2(cell.left() + 2.0, cell.center().y), Align2::LEFT_CENTER, text, font, color);
+    ui.painter().with_clip_rect(cell).text(
+        egui::pos2(cell.left() + 2.0, cell.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        font,
+        color,
+    );
 }
 
 fn size_badge_colors(size: &str, dark: bool) -> Option<(Color32, Color32)> {
@@ -482,12 +603,23 @@ fn size_badge_colors(size: &str, dark: bool) -> Option<(Color32, Color32)> {
     Some((bg, fg))
 }
 
-fn paint_size_badge(ui: &Ui, cell: egui::Rect, size: &str, font: FontId, weak: Color32, dark: bool) {
+fn paint_size_badge(
+    ui: &Ui,
+    cell: egui::Rect,
+    size: &str,
+    font: FontId,
+    weak: Color32,
+    dark: bool,
+) {
     let Some((bg, fg)) = size_badge_colors(size, dark) else {
         paint_cell(ui, cell, size, font, weak);
         return;
     };
-    let text_w = ui.fonts_mut(|f| f.layout_no_wrap(size.to_string(), font.clone(), fg).rect.width());
+    let text_w = ui.fonts_mut(|f| {
+        f.layout_no_wrap(size.to_string(), font.clone(), fg)
+            .rect
+            .width()
+    });
     let rect = egui::Rect::from_center_size(
         egui::pos2(icon_center_x(cell), cell.center().y),
         egui::vec2((text_w + 12.0).max(26.0), 16.0),
@@ -499,20 +631,40 @@ fn paint_size_badge(ui: &Ui, cell: egui::Rect, size: &str, font: FontId, weak: C
 
 fn diff_count_colors(dark: bool) -> (Color32, Color32) {
     if dark {
-        (Color32::from_rgb(63, 185, 80), Color32::from_rgb(248, 81, 73))
+        (
+            Color32::from_rgb(63, 185, 80),
+            Color32::from_rgb(248, 81, 73),
+        )
     } else {
-        (Color32::from_rgb(26, 127, 55), Color32::from_rgb(207, 34, 46))
+        (
+            Color32::from_rgb(26, 127, 55),
+            Color32::from_rgb(207, 34, 46),
+        )
     }
 }
 
-fn paint_diff_count(ui: &Ui, cell: egui::Rect, adds: i64, dels: i64, font: FontId, weak: Color32, dark: bool) {
+fn paint_diff_count(
+    ui: &Ui,
+    cell: egui::Rect,
+    adds: i64,
+    dels: i64,
+    font: FontId,
+    weak: Color32,
+    dark: bool,
+) {
     let additions = format!("+{adds}");
     let deletions = format!("-{dels}");
     let (adds_w, separator_w, dels_w) = ui.fonts_mut(|f| {
         (
-            f.layout_no_wrap(additions.clone(), font.clone(), Color32::WHITE).rect.width(),
-            f.layout_no_wrap("/".into(), font.clone(), Color32::WHITE).rect.width(),
-            f.layout_no_wrap(deletions.clone(), font.clone(), Color32::WHITE).rect.width(),
+            f.layout_no_wrap(additions.clone(), font.clone(), Color32::WHITE)
+                .rect
+                .width(),
+            f.layout_no_wrap("/".into(), font.clone(), Color32::WHITE)
+                .rect
+                .width(),
+            f.layout_no_wrap(deletions.clone(), font.clone(), Color32::WHITE)
+                .rect
+                .width(),
         )
     });
     if adds_w + separator_w + dels_w > cell.width() - 4.0 {
@@ -524,17 +676,39 @@ fn paint_diff_count(ui: &Ui, cell: egui::Rect, adds: i64, dels: i64, font: FontI
     let painter = ui.painter().with_clip_rect(cell);
     let y = cell.center().y;
     let mut x = cell.left() + 2.0;
-    painter.text(egui::pos2(x, y), Align2::LEFT_CENTER, additions, font.clone(), adds_color);
+    painter.text(
+        egui::pos2(x, y),
+        Align2::LEFT_CENTER,
+        additions,
+        font.clone(),
+        adds_color,
+    );
     x += adds_w;
-    painter.text(egui::pos2(x, y), Align2::LEFT_CENTER, "/", font.clone(), weak);
+    painter.text(
+        egui::pos2(x, y),
+        Align2::LEFT_CENTER,
+        "/",
+        font.clone(),
+        weak,
+    );
     x += separator_w;
-    painter.text(egui::pos2(x, y), Align2::LEFT_CENTER, deletions, font, dels_color);
+    painter.text(
+        egui::pos2(x, y),
+        Align2::LEFT_CENTER,
+        deletions,
+        font,
+        dels_color,
+    );
 }
 
 /// 超出宽度时截断加「…」；按字符步进测量（行数少，成本可忽略）。
 pub(crate) fn ellipsize(ui: &Ui, text: &str, font: FontId, max_w: f32) -> String {
     let measure = |ui: &Ui, s: String| {
-        ui.fonts_mut(|f| f.layout_no_wrap(s, font.clone(), Color32::WHITE).rect.width())
+        ui.fonts_mut(|f| {
+            f.layout_no_wrap(s, font.clone(), Color32::WHITE)
+                .rect
+                .width()
+        })
     };
     if measure(ui, text.to_string()) <= max_w {
         return text.to_string();
@@ -575,24 +749,51 @@ fn paint_rev_icon(ui: &Ui, c: egui::Rect, review: &str, _dark: bool) {
     match review {
         "approved" => {
             let g = Color32::from_rgb(46, 160, 67);
-            stroke(&p, [ctr + egui::vec2(-4.0, 0.5), ctr + egui::vec2(-1.0, 3.5)], g);
-            stroke(&p, [ctr + egui::vec2(-1.0, 3.5), ctr + egui::vec2(4.5, -3.5)], g);
+            stroke(
+                &p,
+                [ctr + egui::vec2(-4.0, 0.5), ctr + egui::vec2(-1.0, 3.5)],
+                g,
+            );
+            stroke(
+                &p,
+                [ctr + egui::vec2(-1.0, 3.5), ctr + egui::vec2(4.5, -3.5)],
+                g,
+            );
         }
         "changes_requested" => {
             let r = Color32::from_rgb(209, 36, 47);
-            stroke(&p, [ctr + egui::vec2(0.0, -4.0), ctr + egui::vec2(0.0, 1.0)], r);
+            stroke(
+                &p,
+                [ctr + egui::vec2(0.0, -4.0), ctr + egui::vec2(0.0, 1.0)],
+                r,
+            );
             p.circle_filled(ctr + egui::vec2(0.0, 4.0), 1.2, r);
         }
         "commented" => {
             let g = Color32::from_rgb(150, 150, 150);
             let b = egui::Rect::from_center_size(ctr, egui::vec2(9.0, 7.0));
             p.rect_stroke(b, 2.0, egui::Stroke::new(1.2, g), egui::StrokeKind::Inside);
-            stroke(&p, [b.left_bottom() + egui::vec2(2.0, 0.0), b.left_bottom() + egui::vec2(0.5, 2.5)], g);
+            stroke(
+                &p,
+                [
+                    b.left_bottom() + egui::vec2(2.0, 0.0),
+                    b.left_bottom() + egui::vec2(0.5, 2.5),
+                ],
+                g,
+            );
         }
         "failed" => {
             let r = Color32::from_rgb(209, 36, 47);
-            stroke(&p, [ctr + egui::vec2(-3.5, -3.5), ctr + egui::vec2(3.5, 3.5)], r);
-            stroke(&p, [ctr + egui::vec2(3.5, -3.5), ctr + egui::vec2(-3.5, 3.5)], r);
+            stroke(
+                &p,
+                [ctr + egui::vec2(-3.5, -3.5), ctr + egui::vec2(3.5, 3.5)],
+                r,
+            );
+            stroke(
+                &p,
+                [ctr + egui::vec2(3.5, -3.5), ctr + egui::vec2(-3.5, 3.5)],
+                r,
+            );
         }
         _ => {}
     }
@@ -619,7 +820,9 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
                         count: *count,
                         collapsed: a.collapsed.contains(key),
                     }),
-                    FlatItem::Row { rows_idx } => items.push(ViewItem::Row(row_data(&a, *rows_idx))),
+                    FlatItem::Row { rows_idx } => {
+                        items.push(ViewItem::Row(row_data(&a, *rows_idx)))
+                    }
                 }
             }
             (items, a.selected.clone(), a.selection.clone())
@@ -637,7 +840,12 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
             .show(ui, |ui| {
                 for item in &items {
                     match item {
-                        ViewItem::Header { key, title, count, collapsed } => {
+                        ViewItem::Header {
+                            key,
+                            title,
+                            count,
+                            collapsed,
+                        } => {
                             let resp = ui_detail::disclosure_header(
                                 ui,
                                 RichText::new(format!("{title} ({count})")).strong(),
@@ -648,7 +856,14 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
                             }
                         }
                         ViewItem::Row(row) => {
-                            pr_row(app, ui, row, selected.as_ref() == Some(&row.key), selection.contains(&row.key), &lang);
+                            pr_row(
+                                app,
+                                ui,
+                                row,
+                                selected.as_ref() == Some(&row.key),
+                                selection.contains(&row.key),
+                                &lang,
+                            );
                         }
                     }
                 }
@@ -660,7 +875,11 @@ pub fn pr_list_view(app: &mut EguiApp, ui: &mut Ui) {
 /// 几何约定（测试钉住）：把手区以列边界为中心左右对称各 8px；排序文字区左侧
 /// 让出前一个把手、右侧让出本列把手的各 8px——排序区 ∩ 把手区 = ∅。
 /// 抽出纯函数供测试钉住「点击把手区不触发排序」的几何前提。
-pub fn header_text_zone(cell: egui::Rect, has_left_handle: bool, has_right_handle: bool) -> egui::Rect {
+pub fn header_text_zone(
+    cell: egui::Rect,
+    has_left_handle: bool,
+    has_right_handle: bool,
+) -> egui::Rect {
     let l = if has_left_handle { HANDLE_HALF } else { 0.0 };
     let r = if has_right_handle { HANDLE_HALF } else { 0.0 };
     egui::Rect::from_min_max(
@@ -690,7 +909,10 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     if app.show_col_grid {
         for (x, w) in &layout {
             ui.painter().line_segment(
-                [egui::pos2(rect.left() + x + w, rect.top()), egui::pos2(rect.left() + x + w, rect.bottom())],
+                [
+                    egui::pos2(rect.left() + x + w, rect.top()),
+                    egui::pos2(rect.left() + x + w, rect.bottom()),
+                ],
                 egui::Stroke::new(1.0, Color32::from_rgb(255, 0, 200)),
             );
         }
@@ -699,16 +921,24 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     let sep_hot = ui.visuals().hyperlink_color;
     for (i, c) in COL_SPECS.iter().enumerate() {
         let (x, w) = layout[i];
-        let cell = egui::Rect::from_min_size(egui::pos2(rect.left() + x, rect.top()), egui::vec2(w, rect.height()));
+        let cell = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + x, rect.top()),
+            egui::vec2(w, rect.height()),
+        );
         let is_last = i + 1 == COL_SPECS.len();
         // 文字区/把手区几何互斥（见 header_text_zone 注释）：排序区左让前把手右让本把手
         let has_left = i > 0;
         let has_right = !is_last;
         let text_cell = header_text_zone(cell, has_left, has_right);
         // 排序点击只认文字区（把手区点/拖都不触发排序）
-        let resp = ui.interact(text_cell, egui::Id::unique(("col-h", c.id)), egui::Sense::click());
+        let resp = ui.interact(
+            text_cell,
+            egui::Id::unique(("col-h", c.id)),
+            egui::Sense::click(),
+        );
         if resp.hovered() {
-            ui.painter().rect_filled(text_cell, 2.0, ui.visuals().widgets.hovered.bg_fill);
+            ui.painter()
+                .rect_filled(text_cell, 2.0, ui.visuals().widgets.hovered.bg_fill);
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
         resp.clone().on_hover_text(tr(lang, "tip_sort"));
@@ -719,14 +949,29 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         };
         // 表头文字水平居中：宽列在收窄后的文字区内居中；窄列（<64px，如 Turn/Size）
         // 在整列居中（否则只剩 ~20px 全是省略号——文字压到把手区上方可接受，交互区仍收窄）
-        let paint_cell_r = if text_cell.width() >= 64.0 { text_cell } else { cell };
+        let paint_cell_r = if text_cell.width() >= 64.0 {
+            text_cell
+        } else {
+            cell
+        };
         let text = format!("{}{arrow}", col_label(c.label, lang));
-        let text = ellipsize(ui, &text, FontId::proportional(12.0), paint_cell_r.width() - 4.0);
-        ui.painter()
-            .with_clip_rect(cell)
-            .text(paint_cell_r.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.0), ui.visuals().weak_text_color());
+        let text = ellipsize(
+            ui,
+            &text,
+            FontId::proportional(12.0),
+            paint_cell_r.width() - 4.0,
+        );
+        ui.painter().with_clip_rect(cell).text(
+            paint_cell_r.center(),
+            Align2::CENTER_CENTER,
+            text,
+            FontId::proportional(12.0),
+            ui.visuals().weak_text_color(),
+        );
         // 拖拽调宽后松开不得触发排序（双保险：文字区已收窄，这里是时间窗守卫）
-        let dragging = app.header_drag_at.is_some_and(|t| t.elapsed().as_millis() < 300);
+        let dragging = app
+            .header_drag_at
+            .is_some_and(|t| t.elapsed().as_millis() < 300);
         if resp.clicked() && !dragging {
             app.header_clicked(c.id);
         }
@@ -736,19 +981,25 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
             // 把手区以列边界为中心左右对称（±8px）：左半压本列右缘、右半压下一列左缘，
             // 但下一列的排序文字区左让了这 8px——几何互斥
             let handle = header_handle_zone(bx, cell);
-            let dresp = ui.interact(handle, egui::Id::unique(("col-drag", c.id)), egui::Sense::click_and_drag());
+            let dresp = ui.interact(
+                handle,
+                egui::Id::unique(("col-drag", c.id)),
+                egui::Sense::click_and_drag(),
+            );
             let hot = dresp.hovered() || dresp.dragged();
             // 把手区专属 hover 反馈：主题色 grip + 双向箭头光标；点击不排序（arm 内不写）
             if hot {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                ui.painter().rect_filled(handle, 2.0, sep_hot.gamma_multiply(0.15));
+                ui.painter()
+                    .rect_filled(handle, 2.0, sep_hot.gamma_multiply(0.15));
             }
             if dresp.dragged() {
                 let dx = dresp.drag_delta().x;
                 if c.flex {
                     // 弹性列宽度 = 剩余空间，自身不可调：本把手改的是右侧固定列的宽度
                     // （方向取反——拖右 = 右列变窄、边界跟随光标右移）
-                    app.col_widths[i + 1] = (app.col_widths[i + 1] - dx).max(COL_SPECS[i + 1].min_w);
+                    app.col_widths[i + 1] =
+                        (app.col_widths[i + 1] - dx).max(COL_SPECS[i + 1].min_w);
                 } else if COL_SPECS[i + 1].flex {
                     // 右邻是弹性 Title：它自动反向补偿，只调本列即可让边界跟随光标
                     app.col_widths[i] = (app.col_widths[i] + dx).max(c.min_w);
@@ -783,7 +1034,14 @@ fn header_row(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     }
 }
 
-fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_selected: bool, lang: &str) {
+fn pr_row(
+    app: &mut EguiApp,
+    ui: &mut Ui,
+    row: &RowData,
+    selected: bool,
+    multi_selected: bool,
+    lang: &str,
+) {
     let height = 24.0;
     let (rect, resp) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), height),
@@ -837,7 +1095,10 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     }
     let cell = |i: usize| -> egui::Rect {
         let (x, w) = layout[i];
-        egui::Rect::from_min_max(egui::pos2(rect.left() + x, rect.top()), egui::pos2(rect.left() + x + w, rect.bottom()))
+        egui::Rect::from_min_max(
+            egui::pos2(rect.left() + x, rect.top()),
+            egui::pos2(rect.left() + x + w, rect.bottom()),
+        )
     };
 
     // P（优先级徽章：1→P0 最紧急 / 2→P1 / 3→P2；0=未设不显示）
@@ -878,7 +1139,11 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
                 egui::pos2(tx + 5.0, cy - 4.0),
                 egui::pos2(tx + 10.0, cy + 4.0),
             ];
-            p.add(egui::Shape::convex_polygon(pts, Color32::from_rgb(191, 135, 0), egui::Stroke::NONE));
+            p.add(egui::Shape::convex_polygon(
+                pts,
+                Color32::from_rgb(191, 135, 0),
+                egui::Stroke::NONE,
+            ));
             tx += 14.0;
         }
         if row.on_board {
@@ -889,7 +1154,11 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
                 egui::pos2(tx + 4.0, cy + 5.0),
                 egui::pos2(tx - 1.0, cy),
             ];
-            p.add(egui::Shape::convex_polygon(pts, Color32::from_rgb(56, 139, 253), egui::Stroke::NONE));
+            p.add(egui::Shape::convex_polygon(
+                pts,
+                Color32::from_rgb(56, 139, 253),
+                egui::Stroke::NONE,
+            ));
             tx += 13.0;
         }
         let text_cell = egui::Rect::from_min_max(egui::pos2(tx, c.top()), c.max);
@@ -934,14 +1203,22 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
         let shown = total_orgs.min(3).min(max_icons);
         let overflow = total_orgs - shown;
         // 有溢出时给角标留 22px
-        let badge_w = if overflow > 0 && avail_for_icons >= shown as f32 * 14.0 + 22.0 { 22.0 } else { 0.0 };
+        let badge_w = if overflow > 0 && avail_for_icons >= shown as f32 * 14.0 + 22.0 {
+            22.0
+        } else {
+            0.0
+        };
         let show_badge = overflow > 0 && badge_w > 0.0;
         let strip_w = shown as f32 * 14.0 + badge_w;
         // 名字最多画到「给条带留位」为止；条带位置 = 名字实际渲染宽 + 4px（钳在列内）
         let strip_reserve = if strip_w > 0.0 { strip_w + 4.0 } else { 0.0 };
         let name_max_w = (c.right() - 2.0 - strip_reserve - name_x).max(0.0);
         let name = ellipsize(ui, &row.author, small.clone(), name_max_w);
-        let name_w = ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), small.clone(), weak).rect.width());
+        let name_w = ui.fonts_mut(|f| {
+            f.layout_no_wrap(name.clone(), small.clone(), weak)
+                .rect
+                .width()
+        });
         ui.painter().with_clip_rect(c).text(
             egui::pos2(name_x, c.center().y),
             Align2::LEFT_CENTER,
@@ -949,7 +1226,9 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             small.clone(),
             weak,
         );
-        let icons_left = (name_x + name_w + 4.0).min(c.right() - 2.0 - strip_w).max(name_x);
+        let icons_left = (name_x + name_w + 4.0)
+            .min(c.right() - 2.0 - strip_w)
+            .max(name_x);
         let cp = ui.painter().with_clip_rect(c);
         for (oi, org) in row.orgs.iter().take(shown).enumerate() {
             let ir = egui::Rect::from_min_size(
@@ -957,10 +1236,19 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
                 egui::vec2(12.0, 12.0),
             );
             if let Some(tex) = crate::avatars::get_org_icon(ui.ctx(), org) {
-                cp.image(tex.id(), ir, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                cp.image(
+                    tex.id(),
+                    ir,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
             }
             // hover 显示组织名（行数据 author_orgs 直接带名字）
-            let resp = ui.interact(ir, egui::Id::unique(("org", row.key.clone(), oi)), egui::Sense::hover());
+            let resp = ui.interact(
+                ir,
+                egui::Id::unique(("org", row.key.clone(), oi)),
+                egui::Sense::hover(),
+            );
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::Default);
             }
@@ -978,7 +1266,11 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
                 FontId::proportional(9.0),
                 weak,
             );
-            let resp = ui.interact(br, egui::Id::unique(("orgmore", row.key.clone())), egui::Sense::hover());
+            let resp = ui.interact(
+                br,
+                egui::Id::unique(("orgmore", row.key.clone())),
+                egui::Sense::hover(),
+            );
             resp.on_hover_text(row.orgs.join(", "));
         }
     }
@@ -986,15 +1278,30 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     {
         let c = cell(4);
         let (label, bg, fg) = match row.turn.as_str() {
-            "me" => (tr(lang, "turn_me"), Color32::from_rgb(0x1f, 0x6f, 0xeb).gamma_multiply(0.25), Color32::from_rgb(0x58, 0xa6, 0xff)),
-            "them" => (tr(lang, "turn_them"), Color32::from_rgb(0x8a, 0x8a, 0x8a).gamma_multiply(0.25), weak),
+            "me" => (
+                tr(lang, "turn_me"),
+                Color32::from_rgb(0x1f, 0x6f, 0xeb).gamma_multiply(0.25),
+                Color32::from_rgb(0x58, 0xa6, 0xff),
+            ),
+            "them" => (
+                tr(lang, "turn_them"),
+                Color32::from_rgb(0x8a, 0x8a, 0x8a).gamma_multiply(0.25),
+                weak,
+            ),
             _ => ("", Color32::TRANSPARENT, weak),
         };
         if !label.is_empty() {
             let p = ui.painter().with_clip_rect(c);
             // 与表头文字中心同一 x（收窄区中心）
-            let tw = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), small.clone(), fg).rect.width());
-            let pr = egui::Rect::from_center_size(egui::pos2(icon_center_x(c), c.center().y), egui::vec2(tw + 10.0, 16.0));
+            let tw = ui.fonts_mut(|f| {
+                f.layout_no_wrap(label.to_string(), small.clone(), fg)
+                    .rect
+                    .width()
+            });
+            let pr = egui::Rect::from_center_size(
+                egui::pos2(icon_center_x(c), c.center().y),
+                egui::vec2(tw + 10.0, 16.0),
+            );
             p.rect_filled(pr, 8.0, bg);
             p.text(pr.center(), Align2::CENTER_CENTER, label, small.clone(), fg);
         }
@@ -1010,14 +1317,23 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     // CI 圆点
     if !row.ci.is_empty() {
         let c = cell(6);
-        ui.painter().circle_filled(egui::pos2(icon_center_x(c), c.center().y), 3.5, ui_detail::ci_color(&row.ci));
+        ui.painter().circle_filled(
+            egui::pos2(icon_center_x(c), c.center().y),
+            3.5,
+            ui_detail::ci_color(&row.ci),
+        );
     }
     paint_size_badge(ui, cell(7), &row.size, small.clone(), weak, dark);
     paint_diff_count(ui, cell(8), row.adds, row.dels, small.clone(), weak, dark);
     // ★ 评分列：列内居中（图标列语义）
     if row.score > 0.0 {
         let c = cell(9);
-        let t = ellipsize(ui, &format!("{:.1}", row.score), small.clone(), c.width() - 4.0);
+        let t = ellipsize(
+            ui,
+            &format!("{:.1}", row.score),
+            small.clone(),
+            c.width() - 4.0,
+        );
         ui.painter().with_clip_rect(c).text(
             egui::pos2(icon_center_x(c), c.center().y),
             Align2::CENTER_CENTER,
@@ -1048,12 +1364,19 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             ("×", "tip_reject"),
         ];
         for (glyph, tip) in items {
-            let br = egui::Rect::from_center_size(egui::pos2(bx + btn / 2.0, y), egui::vec2(btn, btn));
-            let r = ui.interact(br, egui::Id::unique(("row-qa", row.key.clone(), tip)), egui::Sense::click());
+            let br =
+                egui::Rect::from_center_size(egui::pos2(bx + btn / 2.0, y), egui::vec2(btn, btn));
+            let r = ui.interact(
+                br,
+                egui::Id::unique(("row-qa", row.key.clone(), tip)),
+                egui::Sense::click(),
+            );
             if r.hovered() {
-                ui.painter().rect_filled(br, 4.0, ui.visuals().widgets.active.bg_fill);
+                ui.painter()
+                    .rect_filled(br, 4.0, ui.visuals().widgets.active.bg_fill);
             } else {
-                ui.painter().rect_filled(br, 4.0, ui.visuals().extreme_bg_color);
+                ui.painter()
+                    .rect_filled(br, 4.0, ui.visuals().extreme_bg_color);
             }
             ui.painter().text(
                 br.center(),
@@ -1074,10 +1397,16 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
                         let cur = {
                             let a = app.app.lock_recover();
                             find_row(&a, &key.0, key.1)
-                                .and_then(|idx| a.rows[idx]["status"].as_str().map(|s| s.to_string()))
+                                .and_then(|idx| {
+                                    a.rows[idx]["status"].as_str().map(|s| s.to_string())
+                                })
                                 .unwrap_or_else(|| "pending".into())
                         };
-                        let to = if cur == "rejected" { "pending" } else { "rejected" };
+                        let to = if cur == "rejected" {
+                            "pending"
+                        } else {
+                            "rejected"
+                        };
                         worker::local_update(&app.app, &key.0, key.1, "status", to);
                     }
                 }
@@ -1095,7 +1424,11 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         let a = app.app.lock_recover();
         selection_summary(&a)
     };
-    if n <= 1 && ui.button(format!("{} [o]", tr(lang, "inbox_open_browser"))).clicked() {
+    if n <= 1
+        && ui
+            .button(format!("{} [o]", tr(lang, "inbox_open_browser")))
+            .clicked()
+    {
         worker::batch_open_browser(&app.app);
         ui.close();
     }
@@ -1114,7 +1447,11 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     if ui
         .button(format!(
             "{} [p]",
-            if all_pinned { tr(lang, "ctx_unpin") } else { tr(lang, "tip_pin") }
+            if all_pinned {
+                tr(lang, "ctx_unpin")
+            } else {
+                tr(lang, "tip_pin")
+            }
         ))
         .clicked()
     {
@@ -1122,14 +1459,22 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
         ui.close();
     }
     if ui
-        .button(if all_on_board { tr(lang, "ctx_remove_board") } else { tr(lang, "detail_add_board") })
+        .button(if all_on_board {
+            tr(lang, "ctx_remove_board")
+        } else {
+            tr(lang, "detail_add_board")
+        })
         .clicked()
     {
         worker::batch_toggle(&app.app, "on_board");
         ui.close();
     }
     if ui
-        .button(if all_rejected { tr(lang, "ctx_restore") } else { tr(lang, "ctx_skip") })
+        .button(if all_rejected {
+            tr(lang, "ctx_restore")
+        } else {
+            tr(lang, "ctx_skip")
+        })
         .clicked()
     {
         batch_set_status(app, if all_rejected { "pending" } else { "rejected" });
@@ -1163,13 +1508,20 @@ fn context_menu(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     }
     if is_local {
         let n = app.app.lock_recover().db.tombstone_count().unwrap_or(0);
-        if n > 0 && ui.button(trf(lang, "ctx_clear_tombstones", &[&n.to_string()])).clicked() {
+        if n > 0
+            && ui
+                .button(trf(lang, "ctx_clear_tombstones", &[&n.to_string()]))
+                .clicked()
+        {
             app.clear_tombstones();
             ui.close();
         }
     }
     ui.separator();
-    if ui.button(format!("{} [Esc]", tr(lang, "ctx_clear_selection"))).clicked() {
+    if ui
+        .button(format!("{} [Esc]", tr(lang, "ctx_clear_selection")))
+        .clicked()
+    {
         app.clear_multi_selection();
         ui.close();
     }
@@ -1259,7 +1611,9 @@ pub fn copy_picker_window(app: &mut EguiApp, ctx: &egui::Context) {
 
 /// 「删除…」确认框：数量 + 前 5 个标题；删除是不可逆操作，必须显式确认。
 pub fn delete_confirm_window(app: &mut EguiApp, ctx: &egui::Context) {
-    let Some(items) = app.delete_confirm.clone() else { return };
+    let Some(items) = app.delete_confirm.clone() else {
+        return;
+    };
     let lang = app.lang();
     let mut open = true;
     let mut confirm = false;
@@ -1270,13 +1624,21 @@ pub fn delete_confirm_window(app: &mut EguiApp, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .open(&mut open)
         .show(ctx, |ui| {
-            ui.label(trf(&lang, "delete_confirm_body", &[&items.len().to_string()]));
+            ui.label(trf(
+                &lang,
+                "delete_confirm_body",
+                &[&items.len().to_string()],
+            ));
             ui.add_space(4.0);
             for (_, n, t) in items.iter().take(5) {
                 ui.monospace(format!("#{n}  {t}"));
             }
             if items.len() > 5 {
-                ui.weak(trf(&lang, "delete_confirm_more", &[&(items.len() - 5).to_string()]));
+                ui.weak(trf(
+                    &lang,
+                    "delete_confirm_more",
+                    &[&(items.len() - 5).to_string()],
+                ));
             }
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1307,17 +1669,33 @@ mod tests {
         let cell = egui::Rect::from_min_size(egui::pos2(100.0, 0.0), egui::vec2(110.0, 22.0));
         let text = header_text_zone(cell, true, true);
         let handle = header_handle_zone(cell.right(), cell);
-        assert!(text.intersect(handle).area() <= 0.0, "文字区与把手区不得有面积重叠");
-        assert!((handle.center().x - cell.right()).abs() < 0.01, "把手以列边界为中心");
+        assert!(
+            text.intersect(handle).area() <= 0.0,
+            "文字区与把手区不得有面积重叠"
+        );
+        assert!(
+            (handle.center().x - cell.right()).abs() < 0.01,
+            "把手以列边界为中心"
+        );
         assert!((handle.width() - HANDLE_W).abs() < 0.01);
         // 文字区中心 = 列中心（对称让位）
         assert!((text.center().x - cell.center().x).abs() < 0.01);
         // 本列文字区右缘 + 把手 + 下一列文字区左缘：链式不重叠
-        let next = egui::Rect::from_min_size(egui::pos2(cell.right(), 0.0), egui::vec2(110.0, 22.0));
+        let next =
+            egui::Rect::from_min_size(egui::pos2(cell.right(), 0.0), egui::vec2(110.0, 22.0));
         let next_text = header_text_zone(next, true, true);
-        assert!(handle.intersect(next_text).area() <= 0.0, "把手区与下一列文字区不得有面积重叠");
-        assert!((text.right() - (handle.left())).abs() < 0.01, "文字区右缘 = 把手左缘");
-        assert!((next_text.left() - handle.right()).abs() < 0.01, "下区左缘 = 把手右缘");
+        assert!(
+            handle.intersect(next_text).area() <= 0.0,
+            "把手区与下一列文字区不得有面积重叠"
+        );
+        assert!(
+            (text.right() - (handle.left())).abs() < 0.01,
+            "文字区右缘 = 把手左缘"
+        );
+        assert!(
+            (next_text.left() - handle.right()).abs() < 0.01,
+            "下区左缘 = 把手右缘"
+        );
     }
 
     #[test]
@@ -1351,7 +1729,8 @@ mod tests {
     #[test]
     fn semantic_colors_cover_all_size_levels_and_themes() {
         for dark in [false, true] {
-            let colors = ["XS", "S", "M", "L", "XL"].map(|size| size_badge_colors(size, dark).unwrap());
+            let colors =
+                ["XS", "S", "M", "L", "XL"].map(|size| size_badge_colors(size, dark).unwrap());
             for (i, (bg, fg)) in colors.iter().enumerate() {
                 assert_ne!(bg, fg, "标签底色与文字色必须区分");
                 for (_, other_fg) in colors.iter().skip(i + 1) {
@@ -1380,7 +1759,9 @@ mod tests {
                 assert!(
                     layout[i].1 >= c.min_w - 0.01,
                     "列 {} 宽度 {} 小于最小 {}（total={total}）",
-                    c.id, layout[i].1, c.min_w
+                    c.id,
+                    layout[i].1,
+                    c.min_w
                 );
             }
         }

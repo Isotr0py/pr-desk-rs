@@ -86,6 +86,10 @@ impl NativeBackdrop {
     pub fn clear_alpha(&self) -> u8 {
         clear_alpha_for(self.mode())
     }
+
+    pub fn restore(&self) {
+        self.platform.restore();
+    }
 }
 
 fn clear_alpha_for(mode: BackdropMode) -> u8 {

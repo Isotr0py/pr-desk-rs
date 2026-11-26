@@ -6,6 +6,7 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWM_SYSTEMBACKDROP_TYPE, DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE,
     DWMWA_USE_IMMERSIVE_DARK_MODE, DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_RESTORE, SetForegroundWindow, ShowWindow};
 
 use super::{BackdropMode, BackdropRequest};
 
@@ -36,6 +37,15 @@ impl Default for PlatformBackdrop {
 }
 
 impl PlatformBackdrop {
+    pub fn restore(&self) {
+        if let Some(hwnd) = self.hwnd {
+            unsafe {
+                ShowWindow(hwnd as HWND, SW_RESTORE);
+                SetForegroundWindow(hwnd as HWND);
+            }
+        }
+    }
+
     pub fn sync(
         &mut self,
         handle: Option<RawWindowHandle>,

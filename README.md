@@ -18,7 +18,10 @@ embedded Kimi CLI.
 - Provides conversation, checks and a compact Files/Diff view with real line
   numbers and per-file collapse.
 - Runs conventional LLM pre-reviews with summaries, dimensions and OCR
-  line-level comments, live progress, cancellation and optional auto-review.
+  line-level comments, live progress and optional auto-review.
+- Runs persistent Kimi deep reviews with structured findings, resumable sessions,
+  incremental re-reviews and a Needs-you inbox for reports, stale heads, CI and
+  agent decisions.
 - Embeds the full Kimi CLI, including plugins, MCP tools, slash commands and
   resumable sessions. Multiple PR sessions can stay open at once.
 - Gives each PR a persistent Git worktree with base/head history, the PR body
@@ -73,6 +76,34 @@ repository under `.git-mirrors/` through Git alternates, avoiding duplicate
 history and pack files. Keep mirrors with the workspace when moving or backing
 it up; deleting one can leave dependent worktrees without their Git history.
 
+## Agent deep reviews
+
+**Review with Kimi** creates a durable review session and run queue in the active
+profile's SQLite database. Each run captures a consistent base/head/diff snapshot.
+Only a complete, validated report can advance the reviewed head. Failures,
+cancellations, partial reports, CI-only checks and late superseded runs do not
+move that baseline.
+
+A new PR head marks the review stale. Re-review resumes the same Kimi session,
+checks the delta from the last successful head, and reconciles every previous
+finding as open, fixed or obsolete. Findings also have independent local
+accept/dismiss/reopen decisions. The Needs-you view collects unread reports,
+failures, stale reviews, CI failures and agent decision cards.
+
+`agent_review_concurrency` defaults to 2 and is independent of conventional
+pre-review concurrency. `auto_agent_rereview` defaults to `false`; enable it only
+when automatic Kimi quota usage is acceptable. Quiet watch polls never invoke a
+model.
+
+Reviews are read-only by default. GitHub comments, review submission, merge,
+push and code edits require an application-level confirmation separate from the
+agent's suggestion. Free text is only accepted for clarification. Every external
+action rechecks that its run head, reviewed head and remote head still match;
+stale decisions cannot write to a newer PR head. The application records the
+decision and result. Kimi plugins and MCP tools are not an OS-level sandbox, so
+the approval boundary does not replace isolating untrusted repositories or
+configuring CLI permissions.
+
 ## Testing
 
 ```sh
@@ -80,10 +111,11 @@ cargo test --all-targets
 cargo check --all-targets
 ```
 
-Tests cover review and sync logic, configuration, database migration and backup,
-deep Git history, shared mirror reuse, offline worktree rebuilding, concurrent
-context creation and real terminal I/O. Windows desktop verification scripts
-are in `scripts/`.
+Tests cover review and sync logic, agent report validation, review baselines,
+finding reconciliation, persistent queues, decisions, configuration, database
+migration and backup, deep Git history, shared mirror reuse, offline worktree
+rebuilding, concurrent context creation and real terminal I/O. Windows desktop
+verification scripts are in `scripts/`.
 
 ## Third-party
 

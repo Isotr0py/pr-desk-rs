@@ -41,6 +41,10 @@ ocr_path = "ocr"
 review_concurrency = 16
 # PR 入库时自动评审：新入库 PR 自动执行预评审，会消耗 LLM/OCR 配额
 auto_review_on_insert = false
+# 已建立 Kimi 深审的 PR 出现新 head / CI 变化时自动复审（会消耗 Kimi 额度）
+auto_agent_rereview = false
+# 后台 Kimi 深审并发数（1-4，独立于普通预评审）
+agent_review_concurrency = 2
 # Kimi CLI 路径（内嵌会话使用；需要已安装并登录 Kimi CLI）
 kimi_cli_path = "kimi"
 # Kimi CLI 工作区根目录（空 = data/kimi-workspaces；相对路径也锚定 data 目录）
@@ -105,10 +109,14 @@ pub struct Config {
     pub llm_model: String,
     /// ocr CLI 路径（"ocr" = 自动查找：优先随包 bin/ 目录，其次 PATH）
     pub ocr_path: String,
-    /// 预评审并发数（1-8）
+    /// 预评审并发数（1-16）
     pub review_concurrency: u64,
     /// 新入库 PR 自动执行预评审（消耗 LLM/OCR 配额）
     pub auto_review_on_insert: bool,
+    /// 已建立 Kimi 深审的 PR 出现新 head / CI 变化时自动复审
+    pub auto_agent_rereview: bool,
+    /// 后台 Kimi 深审并发数（1-4）
+    pub agent_review_concurrency: u64,
     /// Kimi CLI 路径（内嵌会话使用）
     pub kimi_cli_path: String,
     /// Kimi CLI 工作区根目录（空/相对路径均锚定 data_dir）
@@ -143,6 +151,8 @@ impl Default for Config {
             ocr_path: "ocr".into(),
             review_concurrency: 16,
             auto_review_on_insert: false,
+            auto_agent_rereview: false,
+            agent_review_concurrency: 2,
             kimi_cli_path: "kimi".into(),
             kimi_workspace_root: String::new(),
             profiles: Vec::new(),
@@ -435,6 +445,17 @@ impl Config {
                     "false" => false,
                     _ => false,
                 };
+            } else if let Some(v) = parse_value(line, "auto_agent_rereview") {
+                cfg.auto_agent_rereview = match v.trim() {
+                    "true" => true,
+                    "false" => false,
+                    _ => false,
+                };
+            } else if let Some(v) = parse_value(line, "agent_review_concurrency") {
+                cfg.agent_review_concurrency = match v.trim().parse::<u64>() {
+                    Ok(n) if (1..=4).contains(&n) => n,
+                    _ => 2,
+                };
             } else if let Some(v) = parse_value(line, "kimi_cli_path") {
                 let v = unquote(v);
                 if !v.is_empty() {
@@ -512,6 +533,11 @@ impl Config {
             (
                 "auto_review_on_insert",
                 self.auto_review_on_insert.to_string(),
+            ),
+            ("auto_agent_rereview", self.auto_agent_rereview.to_string()),
+            (
+                "agent_review_concurrency",
+                self.agent_review_concurrency.to_string(),
             ),
             ("kimi_cli_path", quote(&self.kimi_cli_path)),
             ("kimi_workspace_root", quote(&self.kimi_workspace_root)),
@@ -744,6 +770,8 @@ mod tests {
             ocr_path: "D:/tools/ocr.exe".into(),
             review_concurrency: 5,
             auto_review_on_insert: true,
+            auto_agent_rereview: true,
+            agent_review_concurrency: 3,
             kimi_cli_path: "/opt/kimi/bin/kimi".into(),
             kimi_workspace_root: r#"D:\Kimi\工作 区"#.into(),
             profiles: Vec::new(),
@@ -772,6 +800,8 @@ mod tests {
         assert_eq!(loaded.ocr_path, "D:/tools/ocr.exe");
         assert_eq!(loaded.review_concurrency, 5);
         assert!(loaded.auto_review_on_insert);
+        assert!(loaded.auto_agent_rereview);
+        assert_eq!(loaded.agent_review_concurrency, 3);
         assert_eq!(loaded.kimi_cli_path, "/opt/kimi/bin/kimi");
         assert_eq!(loaded.kimi_workspace_root, r#"D:\Kimi\工作 区"#);
         assert_eq!(loaded.window_width, Some(1440.0));

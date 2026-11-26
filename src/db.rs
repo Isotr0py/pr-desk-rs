@@ -4,7 +4,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 8;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS prs (
@@ -55,6 +55,53 @@ CREATE TABLE IF NOT EXISTS deleted_prs (
     repo TEXT NOT NULL, number INTEGER NOT NULL, deleted_at TEXT,
     PRIMARY KEY (repo, number)
 );
+"#;
+
+const MIGRATE_V8: &str = r#"
+DROP TABLE IF EXISTS diff_cache;
+CREATE TABLE diff_cache (
+    repo TEXT NOT NULL, number INTEGER NOT NULL, head_sha TEXT NOT NULL,
+    diff TEXT NOT NULL, fetched_at TEXT,
+    PRIMARY KEY (repo, number, head_sha)
+);
+CREATE TABLE agent_reviews (
+    repo TEXT NOT NULL, number INTEGER NOT NULL,
+    session_id TEXT, workspace TEXT,
+    requested_base_sha TEXT, requested_head_sha TEXT,
+    reviewed_base_sha TEXT, reviewed_head_sha TEXT,
+    active_run_id INTEGER, status TEXT, verdict TEXT, summary TEXT, validation TEXT,
+    last_ci_status TEXT, acknowledged_at TEXT, error TEXT,
+    created_at TEXT, updated_at TEXT,
+    PRIMARY KEY (repo, number)
+);
+CREATE TABLE agent_review_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL, number INTEGER NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,
+    base_sha TEXT, head_sha TEXT NOT NULL, parent_head_sha TEXT,
+    session_id TEXT, workspace TEXT, scope_complete INTEGER,
+    report_json TEXT, error TEXT, created_at TEXT, started_at TEXT, finished_at TEXT
+);
+CREATE TABLE agent_findings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL, number INTEGER NOT NULL, fingerprint TEXT NOT NULL,
+    severity TEXT, category TEXT, path TEXT, start_line INTEGER, end_line INTEGER,
+    title TEXT, evidence TEXT, suggestion TEXT, status TEXT, human_status TEXT,
+    first_head_sha TEXT, last_head_sha TEXT, resolution_note TEXT, updated_at TEXT,
+    UNIQUE (repo, number, fingerprint)
+);
+CREATE TABLE agent_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL, number INTEGER NOT NULL, run_id INTEGER,
+    kind TEXT, title TEXT, context TEXT, options_json TEXT,
+    review_event TEXT, merge_method TEXT, status TEXT, answer TEXT, result TEXT,
+    created_at TEXT, resolved_at TEXT
+);
+CREATE INDEX idx_agent_review_runs_queue ON agent_review_runs(status, created_at, id);
+CREATE INDEX idx_agent_review_runs_pr ON agent_review_runs(repo, number, id);
+CREATE UNIQUE INDEX idx_agent_review_runs_active ON agent_review_runs(repo, number)
+    WHERE status IN ('queued', 'running', 'preparing', 'validating', 'waiting_decision');
+CREATE INDEX idx_agent_findings_pr ON agent_findings(repo, number, status);
+CREATE INDEX idx_agent_decisions_pr ON agent_decisions(repo, number, status);
 "#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -190,6 +237,10 @@ impl Db {
         }
         // v2 → v3：IF NOT EXISTS 天然幂等
         conn.execute_batch(MIGRATE_V3)?;
+        if version < 8 {
+            // diff 是按 head 派生的缓存，旧键无法可靠补齐 head_sha，迁移时直接清空重建。
+            conn.execute_batch(MIGRATE_V8)?;
+        }
         conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         Ok(Db { conn })
     }
@@ -544,17 +595,18 @@ impl Db {
         Ok(rows)
     }
 
-    /// 全部 diff 缓存（repo, number, diff 文本）：回填 prs.additions/deletions 用。
-    pub fn list_diff_cache(&self) -> Result<Vec<(String, i64, String)>> {
+    /// 全部 diff 缓存（repo, number, head_sha, diff 文本）：回填 prs.additions/deletions 用。
+    pub fn list_diff_cache(&self) -> Result<Vec<(String, i64, String, String)>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT repo, number, diff FROM diff_cache")?;
+            .prepare("SELECT repo, number, head_sha, diff FROM diff_cache")?;
         let rows = stmt
             .query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
                     r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -818,25 +870,29 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// 跨档案复制：keys 指定的 PR 行 + 各自全部评审记录写入 dst。
-    /// prs 走 insert_pr_if_absent（目标已有行整行跳过，本地策展状态不动）；
-    /// 评审走 upsert_review（同 head_sha 幂等覆盖同内容，comments COALESCE 安全）。
-    /// 源库只读；目标库写入包在一个事务里（unchecked_transaction 是连接级事务，
-    /// 后续经 self.conn 的写入都在事务内——与 local_pr_update 同款）。
-    /// 返回 (新插入 PR 数, 已存在跳过数, 复制评审数)。
+    /// 跨档案复制：keys 指定的 PR 行 + 各自全部普通评审和 agent 当前快照写入 dst。
+    /// prs 走 insert_pr_if_absent（目标已有行整行跳过，本地策展状态不动）。
+    /// agent run 历史不跨档案复制；进行中的 review 仅复制当前报告状态并标为 stale，
+    /// 不携带 active_run_id。decision 的 run_id 同样置空，避免引用目标库不存在的 run。
+    /// 返回 (新插入 PR 数, 已存在跳过数, 复制普通评审数)。
     pub fn copy_prs_to(
         src: &Db,
         dst: &Db,
         keys: &[(String, i64)],
     ) -> Result<(usize, usize, usize)> {
-        // 先全部从源库读出（纯读，无需事务；复制中途源库变化最多拿到稍旧的行，可接受）
         let mut prs = Vec::new();
         let mut reviews = Vec::new();
+        let mut agent_snapshots = Vec::new();
         for (repo, number) in keys {
             if let Some(p) = src.get_pr_full(repo, *number)? {
                 prs.push(p);
             }
             reviews.extend(src.list_reviews_of(repo, *number)?);
+            if let Some(review) = src.load_agent_review(repo, *number)? {
+                let findings = src.list_agent_findings(repo, *number)?;
+                let decisions = src.list_agent_decisions(repo, *number)?;
+                agent_snapshots.push((review, findings, decisions));
+            }
         }
         let _tx = dst.conn.unchecked_transaction()?;
         let mut inserted = 0usize;
@@ -847,6 +903,119 @@ impl Db {
         }
         for r in &reviews {
             dst.upsert_review(r)?;
+        }
+        for (review, findings, decisions) in &agent_snapshots {
+            let repo = review["repo"].as_str().unwrap_or("");
+            let number = review["number"].as_i64().unwrap_or(0);
+            let was_active = matches!(
+                review["status"].as_str(),
+                Some("queued")
+                    | Some("running")
+                    | Some("preparing")
+                    | Some("validating")
+                    | Some("waiting_decision")
+            );
+            let status = if was_active {
+                Some("stale")
+            } else {
+                review["status"].as_str()
+            };
+            dst.conn.execute(
+                "INSERT INTO agent_reviews(
+                    repo, number, session_id, workspace, requested_base_sha, requested_head_sha,
+                    reviewed_base_sha, reviewed_head_sha, active_run_id, status, verdict, summary,
+                    validation, last_ci_status, acknowledged_at, error, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+                 ON CONFLICT(repo,number) DO UPDATE SET
+                    session_id=excluded.session_id, workspace=excluded.workspace,
+                    requested_base_sha=excluded.requested_base_sha,
+                    requested_head_sha=excluded.requested_head_sha,
+                    reviewed_base_sha=excluded.reviewed_base_sha,
+                    reviewed_head_sha=excluded.reviewed_head_sha,
+                    active_run_id=NULL, status=excluded.status, verdict=excluded.verdict,
+                    summary=excluded.summary, validation=excluded.validation,
+                    last_ci_status=excluded.last_ci_status,
+                    acknowledged_at=excluded.acknowledged_at, error=excluded.error,
+                    created_at=excluded.created_at, updated_at=excluded.updated_at",
+                params![
+                    repo,
+                    number,
+                    review["session_id"].as_str(),
+                    review["workspace"].as_str(),
+                    review["requested_base_sha"].as_str(),
+                    review["requested_head_sha"].as_str(),
+                    review["reviewed_base_sha"].as_str(),
+                    review["reviewed_head_sha"].as_str(),
+                    status,
+                    review["verdict"].as_str(),
+                    review["summary"].as_str(),
+                    review["validation"].as_str(),
+                    review["last_ci_status"].as_str(),
+                    review["acknowledged_at"].as_str(),
+                    review["error"].as_str(),
+                    review["created_at"].as_str(),
+                    review["updated_at"].as_str(),
+                ],
+            )?;
+            dst.conn.execute(
+                "DELETE FROM agent_findings WHERE repo=?1 AND number=?2",
+                params![repo, number],
+            )?;
+            for finding in findings {
+                dst.conn.execute(
+                    "INSERT INTO agent_findings(
+                        repo, number, fingerprint, severity, category, path, start_line, end_line,
+                        title, evidence, suggestion, status, human_status, first_head_sha,
+                        last_head_sha, resolution_note, updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                    params![
+                        repo,
+                        number,
+                        finding["fingerprint"].as_str().unwrap_or(""),
+                        finding["severity"].as_str(),
+                        finding["category"].as_str(),
+                        finding["path"].as_str(),
+                        finding["start_line"].as_i64(),
+                        finding["end_line"].as_i64(),
+                        finding["title"].as_str(),
+                        finding["evidence"].as_str(),
+                        finding["suggestion"].as_str(),
+                        finding["status"].as_str(),
+                        finding["human_status"].as_str(),
+                        finding["first_head_sha"].as_str(),
+                        finding["last_head_sha"].as_str(),
+                        finding["resolution_note"].as_str(),
+                        finding["updated_at"].as_str(),
+                    ],
+                )?;
+            }
+            dst.conn.execute(
+                "DELETE FROM agent_decisions WHERE repo=?1 AND number=?2",
+                params![repo, number],
+            )?;
+            for decision in decisions {
+                dst.conn.execute(
+                    "INSERT INTO agent_decisions(
+                        repo, number, run_id, kind, title, context, options_json,
+                        review_event, merge_method, status, answer, result, created_at, resolved_at)
+                     VALUES (?1,?2,NULL,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![
+                        repo,
+                        number,
+                        decision["kind"].as_str(),
+                        decision["title"].as_str(),
+                        decision["context"].as_str(),
+                        serde_json::to_string(&decision["options"])?,
+                        decision["review_event"].as_str(),
+                        decision["merge_method"].as_str(),
+                        decision["status"].as_str(),
+                        decision["answer"].as_str(),
+                        decision["result"].as_str(),
+                        decision["created_at"].as_str(),
+                        decision["resolved_at"].as_str(),
+                    ],
+                )?;
+            }
         }
         _tx.commit()?;
         Ok((inserted, prs.len() - inserted, reviews.len()))
@@ -876,6 +1045,17 @@ impl Db {
                 "DELETE FROM diff_cache WHERE repo=?1 AND number=?2",
                 params![repo, number],
             )?;
+            for table in [
+                "agent_decisions",
+                "agent_findings",
+                "agent_review_runs",
+                "agent_reviews",
+            ] {
+                self.conn.execute(
+                    &format!("DELETE FROM {table} WHERE repo=?1 AND number=?2"),
+                    params![repo, number],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(deleted)
@@ -935,20 +1115,1139 @@ impl Db {
         Ok(self.conn.execute("DELETE FROM deleted_prs", [])?)
     }
 
+    // ── 持久 agent review ──
+
+    fn agent_run_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "id": r.get::<_, i64>(0)?,
+            "repo": r.get::<_, String>(1)?,
+            "number": r.get::<_, i64>(2)?,
+            "kind": r.get::<_, String>(3)?,
+            "status": r.get::<_, String>(4)?,
+            "base_sha": r.get::<_, Option<String>>(5)?,
+            "head_sha": r.get::<_, String>(6)?,
+            "parent_head_sha": r.get::<_, Option<String>>(7)?,
+            "session_id": r.get::<_, Option<String>>(8)?,
+            "workspace": r.get::<_, Option<String>>(9)?,
+            "scope_complete": r.get::<_, Option<i64>>(10)?.map(|v| v != 0),
+            "report": r.get::<_, Option<String>>(11)?
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
+            "error": r.get::<_, Option<String>>(12)?,
+            "created_at": r.get::<_, Option<String>>(13)?,
+            "started_at": r.get::<_, Option<String>>(14)?,
+            "finished_at": r.get::<_, Option<String>>(15)?,
+        }))
+    }
+
+    const AGENT_RUN_COLUMNS: &'static str =
+        "id, repo, number, kind, status, base_sha, head_sha, parent_head_sha,
+         session_id, workspace, scope_complete, report_json, error,
+         created_at, started_at, finished_at";
+
+    fn agent_run_by_id(conn: &Connection, id: i64) -> Result<Option<serde_json::Value>> {
+        let sql = format!(
+            "SELECT {} FROM agent_review_runs WHERE id=?1",
+            Self::AGENT_RUN_COLUMNS
+        );
+        Ok(conn
+            .query_row(&sql, params![id], Self::agent_run_from_row)
+            .optional()?)
+    }
+
+    fn agent_review_from_row(
+        r: &rusqlite::Row<'_>,
+        offset: usize,
+    ) -> rusqlite::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "repo": r.get::<_, String>(offset)?,
+            "number": r.get::<_, i64>(offset + 1)?,
+            "session_id": r.get::<_, Option<String>>(offset + 2)?,
+            "workspace": r.get::<_, Option<String>>(offset + 3)?,
+            "requested_base_sha": r.get::<_, Option<String>>(offset + 4)?,
+            "requested_head_sha": r.get::<_, Option<String>>(offset + 5)?,
+            "reviewed_base_sha": r.get::<_, Option<String>>(offset + 6)?,
+            "reviewed_head_sha": r.get::<_, Option<String>>(offset + 7)?,
+            "active_run_id": r.get::<_, Option<i64>>(offset + 8)?,
+            "status": r.get::<_, Option<String>>(offset + 9)?,
+            "verdict": r.get::<_, Option<String>>(offset + 10)?,
+            "summary": r.get::<_, Option<String>>(offset + 11)?,
+            "validation": r.get::<_, Option<String>>(offset + 12)?,
+            "last_ci_status": r.get::<_, Option<String>>(offset + 13)?,
+            "acknowledged_at": r.get::<_, Option<String>>(offset + 14)?,
+            "error": r.get::<_, Option<String>>(offset + 15)?,
+            "created_at": r.get::<_, Option<String>>(offset + 16)?,
+            "updated_at": r.get::<_, Option<String>>(offset + 17)?,
+        }))
+    }
+
+    const AGENT_REVIEW_COLUMNS: &'static str =
+        "repo, number, session_id, workspace, requested_base_sha, requested_head_sha,
+         reviewed_base_sha, reviewed_head_sha, active_run_id, status, verdict, summary,
+         validation, last_ci_status, acknowledged_at, error, created_at, updated_at";
+
+    fn agent_review_on(
+        conn: &Connection,
+        repo: &str,
+        number: i64,
+    ) -> Result<Option<serde_json::Value>> {
+        let sql = format!(
+            "SELECT {} FROM agent_reviews WHERE repo=?1 AND number=?2",
+            Self::AGENT_REVIEW_COLUMNS
+        );
+        Ok(conn
+            .query_row(&sql, params![repo, number], |r| {
+                Self::agent_review_from_row(r, 0)
+            })
+            .optional()?)
+    }
+
+    fn enqueue_agent_review_inner(
+        &self,
+        repo: &str,
+        number: i64,
+        kind: &str,
+        base: &str,
+        head: &str,
+        parent: Option<&str>,
+        workspace: &str,
+    ) -> Result<i64> {
+        if let Some(id) = self
+            .conn
+            .query_row(
+                "SELECT id FROM agent_review_runs
+                 WHERE repo=?1 AND number=?2
+                   AND status IN ('queued','running','preparing','validating','waiting_decision')
+                 ORDER BY id DESC LIMIT 1",
+                params![repo, number],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+        {
+            self.conn.execute(
+                "UPDATE agent_reviews SET active_run_id=?1, updated_at=?2
+                 WHERE repo=?3 AND number=?4",
+                params![id, now(), repo, number],
+            )?;
+            return Ok(id);
+        }
+
+        let previous = Self::agent_review_on(&self.conn, repo, number)?;
+        let inherited_parent = if kind == "initial" && parent.is_none() {
+            previous
+                .as_ref()
+                .and_then(|r| r["reviewed_head_sha"].as_str())
+        } else {
+            None
+        };
+        let parent = parent.or(inherited_parent);
+        let session_id = previous.as_ref().and_then(|r| r["session_id"].as_str());
+        let ts = now();
+        self.conn.execute(
+            "INSERT INTO agent_review_runs(
+                repo, number, kind, status, base_sha, head_sha, parent_head_sha,
+                session_id, workspace, created_at)
+             VALUES (?1,?2,?3,'queued',?4,?5,?6,?7,?8,?9)",
+            params![
+                repo, number, kind, base, head, parent, session_id, workspace, ts
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        self.conn.execute(
+            "INSERT INTO agent_reviews(
+                repo, number, session_id, workspace, requested_base_sha, requested_head_sha,
+                active_run_id, status, error, acknowledged_at, created_at, updated_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,'queued',NULL,NULL,?8,?8)
+             ON CONFLICT(repo,number) DO UPDATE SET
+                session_id=agent_reviews.session_id,
+                workspace=excluded.workspace,
+                requested_base_sha=excluded.requested_base_sha,
+                requested_head_sha=excluded.requested_head_sha,
+                active_run_id=excluded.active_run_id,
+                status='queued', error=NULL, acknowledged_at=NULL, updated_at=excluded.updated_at",
+            params![repo, number, session_id, workspace, base, head, id, ts],
+        )?;
+        Ok(id)
+    }
+
+    pub fn enqueue_agent_review(
+        &self,
+        repo: &str,
+        number: i64,
+        kind: &str,
+        base: &str,
+        head: &str,
+        parent: Option<&str>,
+        workspace: &str,
+    ) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let id =
+            self.enqueue_agent_review_inner(repo, number, kind, base, head, parent, workspace)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn get_agent_run(&self, run_id: i64) -> Result<Option<serde_json::Value>> {
+        Self::agent_run_by_id(&self.conn, run_id)
+    }
+
+    pub fn next_agent_run(&self) -> Result<Option<serde_json::Value>> {
+        let sql = format!(
+            "SELECT {} FROM agent_review_runs WHERE status='queued'
+             ORDER BY created_at, id LIMIT 1",
+            Self::AGENT_RUN_COLUMNS
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, [], Self::agent_run_from_row)
+            .optional()?)
+    }
+
+    pub fn mark_agent_run_running(&self, run_id: i64) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ts = now();
+        let n = self.conn.execute(
+            "UPDATE agent_review_runs
+             SET status='running', started_at=?1, finished_at=NULL, error=NULL
+             WHERE id=?2 AND status='queued'",
+            params![ts, run_id],
+        )?;
+        if n > 0 {
+            if let Some(run) = Self::agent_run_by_id(&self.conn, run_id)? {
+                self.conn.execute(
+                    "UPDATE agent_reviews SET status='running', active_run_id=?1, updated_at=?2
+                     WHERE repo=?3 AND number=?4 AND active_run_id=?1",
+                    params![
+                        run_id,
+                        ts,
+                        run["repo"].as_str().unwrap_or(""),
+                        run["number"].as_i64().unwrap_or(0)
+                    ],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    pub fn apply_agent_report(
+        &self,
+        run_id: i64,
+        report: &crate::agent_review::AgentReport,
+    ) -> Result<bool> {
+        let report = serde_json::to_value(report)?;
+        let report_json = serde_json::to_string(&report)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(run) = Self::agent_run_by_id(&self.conn, run_id)? else {
+            return Ok(false);
+        };
+        if !matches!(
+            run["status"].as_str(),
+            Some("running") | Some("preparing") | Some("validating")
+        ) {
+            return Ok(false);
+        }
+        let repo = run["repo"].as_str().unwrap_or("");
+        let number = run["number"].as_i64().unwrap_or(0);
+        let review = Self::agent_review_on(&self.conn, repo, number)?;
+        let pr_head = self
+            .conn
+            .query_row(
+                "SELECT head_sha FROM prs WHERE repo=?1 AND number=?2",
+                params![repo, number],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+        let valid = review.as_ref().is_some_and(|review| {
+            let parent_matches = match run["parent_head_sha"].as_str() {
+                Some(parent) => review["reviewed_head_sha"].as_str() == Some(parent),
+                None => true,
+            };
+            review["active_run_id"].as_i64() == Some(run_id)
+                && review["requested_head_sha"].as_str() == run["head_sha"].as_str()
+                && review["requested_base_sha"].as_str() == run["base_sha"].as_str()
+                && parent_matches
+                && report["repo"].as_str() == Some(repo)
+                && report["number"].as_i64() == Some(number)
+                && report["base_sha"].as_str() == run["base_sha"].as_str()
+                && report["head_sha"].as_str() == run["head_sha"].as_str()
+                && report["parent_head_sha"].as_str() == run["parent_head_sha"].as_str()
+                && pr_head
+                    .as_deref()
+                    .is_none_or(|head| head.is_empty() || Some(head) == run["head_sha"].as_str())
+        });
+        if !valid {
+            let ts = now();
+            self.conn.execute(
+                "UPDATE agent_review_runs
+                 SET status='superseded', report_json=?1, finished_at=?2,
+                     error='superseded by a newer baseline'
+                 WHERE id=?3",
+                params![report_json, ts, run_id],
+            )?;
+            self.conn.execute(
+                "UPDATE agent_reviews
+                 SET active_run_id=NULL, status='failed', error='agent run superseded', updated_at=?1
+                 WHERE repo=?2 AND number=?3 AND active_run_id=?4",
+                params![ts, repo, number, run_id],
+            )?;
+            tx.commit()?;
+            return Ok(false);
+        }
+        let scope_complete = report["scope_complete"].as_bool().unwrap_or(false);
+        let text = |value: &serde_json::Value| -> Option<String> {
+            match value {
+                serde_json::Value::Null => None,
+                serde_json::Value::String(s) => Some(s.clone()),
+                other => serde_json::to_string(other).ok(),
+            }
+        };
+        let verdict = text(&report["verdict"]);
+        let summary = text(&report["summary"]);
+        let validation = text(&report["validation"]);
+        let ts = now();
+
+        let mut decisions = Vec::new();
+        if let Some(decision) = report.get("decision").filter(|d| !d.is_null()) {
+            decisions.push(decision.clone());
+        } else if let Some(decision) = report.get("decision_request").filter(|d| !d.is_null()) {
+            decisions.push(decision.clone());
+        }
+        if let Some(array) = report["decisions"].as_array() {
+            decisions.extend(array.iter().cloned());
+        }
+        let clarification = decisions.iter().any(|d| {
+            d["kind"]
+                .as_str()
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("clarification"))
+        });
+        for decision in &decisions {
+            let options = decision
+                .get("options")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
+            self.conn.execute(
+                "INSERT INTO agent_decisions(
+                    repo, number, run_id, kind, title, context, options_json,
+                    review_event, merge_method, status, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'open',?10)",
+                params![
+                    repo,
+                    number,
+                    run_id,
+                    text(&decision["kind"]),
+                    text(&decision["title"]),
+                    text(&decision["context"]),
+                    serde_json::to_string(&options)?,
+                    text(&decision["review_event"]),
+                    text(&decision["merge_method"]),
+                    ts,
+                ],
+            )?;
+        }
+
+        let incomplete_without_clarification = !scope_complete && !clarification;
+        let mut reconciliation_error = incomplete_without_clarification
+            .then(|| "scope incomplete without clarification; retry required".to_owned());
+        let reconcile_findings =
+            scope_complete && !matches!(run["kind"].as_str(), Some("ci_recheck") | Some("edit"));
+        if reconcile_findings {
+            let mut stmt = self.conn.prepare(
+                "SELECT fingerprint FROM agent_findings
+                 WHERE repo=?1 AND number=?2 AND status='open'",
+            )?;
+            let expected = stmt
+                .query_map(params![repo, number], |r| r.get::<_, String>(0))?
+                .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+            drop(stmt);
+            let mut seen = std::collections::HashSet::new();
+            let empty = Vec::new();
+            let findings = report["findings"].as_array().unwrap_or(&empty);
+            for finding in findings {
+                let candidate_fingerprint = finding["fingerprint"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "{}:{}:{}:{}",
+                            finding["category"].as_str().unwrap_or(""),
+                            finding["path"].as_str().unwrap_or(""),
+                            finding["start_line"].as_i64().unwrap_or(0),
+                            finding["title"].as_str().unwrap_or("")
+                        )
+                    });
+                let reported_id = finding["id"].as_str().filter(|id| !id.is_empty());
+                let existing = match reported_id {
+                    Some(id) => self
+                        .conn
+                        .query_row(
+                            "SELECT fingerprint FROM agent_findings
+                         WHERE repo=?1 AND number=?2 AND CAST(id AS TEXT)=?3",
+                            params![repo, number, id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?,
+                    None => None,
+                };
+                let existing = match existing {
+                    Some(fingerprint) => Some(fingerprint),
+                    None => self
+                        .conn
+                        .query_row(
+                            "SELECT fingerprint FROM agent_findings
+                         WHERE repo=?1 AND number=?2 AND fingerprint=?3",
+                            params![repo, number, candidate_fingerprint],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?,
+                };
+                let fingerprint = existing.unwrap_or(candidate_fingerprint);
+                seen.insert(fingerprint.clone());
+                let reported_status = finding["status"]
+                    .as_str()
+                    .unwrap_or("open")
+                    .to_ascii_lowercase();
+                let note =
+                    text(&finding["resolution_note"]).or_else(|| text(&finding["resolution"]));
+                let obsolete = reported_status == "obsolete"
+                    || note.as_deref().is_some_and(|note| {
+                        let note = note.to_ascii_lowercase();
+                        note.contains("obsolete") || note.contains("not an issue")
+                    });
+                let status = if obsolete {
+                    "obsolete"
+                } else if matches!(reported_status.as_str(), "resolved" | "fixed") {
+                    "fixed"
+                } else {
+                    "open"
+                };
+                self.conn.execute(
+                    "INSERT INTO agent_findings(
+                        repo, number, fingerprint, severity, category, path, start_line, end_line,
+                        title, evidence, suggestion, status, first_head_sha, last_head_sha,
+                        resolution_note, updated_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?13,?14,?15)
+                     ON CONFLICT(repo,number,fingerprint) DO UPDATE SET
+                        severity=excluded.severity, category=excluded.category, path=excluded.path,
+                        start_line=excluded.start_line, end_line=excluded.end_line,
+                        title=excluded.title, evidence=excluded.evidence,
+                        suggestion=excluded.suggestion, status=excluded.status,
+                        last_head_sha=excluded.last_head_sha,
+                        resolution_note=excluded.resolution_note, updated_at=excluded.updated_at",
+                    params![
+                        repo,
+                        number,
+                        fingerprint,
+                        text(&finding["severity"]),
+                        text(&finding["category"]),
+                        text(&finding["path"]),
+                        finding["start_line"].as_i64(),
+                        finding["end_line"].as_i64(),
+                        text(&finding["title"]),
+                        text(&finding["evidence"]),
+                        text(&finding["suggestion"]),
+                        status,
+                        run["head_sha"].as_str().unwrap_or(""),
+                        note,
+                        ts,
+                    ],
+                )?;
+            }
+            let resolved_findings = report["resolved_findings"].as_array().unwrap_or(&empty);
+            for finding in resolved_findings {
+                let identifier = finding["fingerprint"].as_str().unwrap_or("");
+                let existing = self
+                    .conn
+                    .query_row(
+                        "SELECT fingerprint FROM agent_findings
+                     WHERE repo=?1 AND number=?2 AND (fingerprint=?3 OR CAST(id AS TEXT)=?3)",
+                        params![repo, number, identifier],
+                        |r| r.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let fingerprint = existing.unwrap_or_else(|| identifier.to_owned());
+                seen.insert(fingerprint.clone());
+                let status = if finding["status"].as_str() == Some("obsolete") {
+                    "obsolete"
+                } else {
+                    "fixed"
+                };
+                self.conn.execute(
+                    "UPDATE agent_findings
+                     SET status=?1, last_head_sha=?2, resolution_note=?3, updated_at=?4
+                     WHERE repo=?5 AND number=?6 AND fingerprint=?7",
+                    params![
+                        status,
+                        run["head_sha"].as_str().unwrap_or(""),
+                        text(&finding["note"]),
+                        ts,
+                        repo,
+                        number,
+                        fingerprint,
+                    ],
+                )?;
+            }
+            let missing = expected.difference(&seen).cloned().collect::<Vec<_>>();
+            if !missing.is_empty() {
+                let mut stmt = self.conn.prepare(
+                    "UPDATE agent_findings
+                     SET status='stale', last_head_sha=?1,
+                         resolution_note='missing from re-review', updated_at=?2
+                     WHERE repo=?3 AND number=?4 AND fingerprint=?5 AND status='open'",
+                )?;
+                for fingerprint in &missing {
+                    stmt.execute(params![
+                        run["head_sha"].as_str().unwrap_or(""),
+                        ts,
+                        repo,
+                        number,
+                        fingerprint
+                    ])?;
+                }
+                reconciliation_error = Some(format!(
+                    "re-review omitted {} previously open finding(s)",
+                    missing.len()
+                ));
+            }
+        }
+
+        let waiting = clarification;
+        let failed = reconciliation_error.is_some();
+        let advance_baseline = !failed
+            && !waiting
+            && !matches!(run["kind"].as_str(), Some("ci_recheck") | Some("edit"));
+        let run_status = if failed {
+            "failed"
+        } else if waiting {
+            "waiting_decision"
+        } else {
+            "completed"
+        };
+        self.conn.execute(
+            "UPDATE agent_review_runs
+             SET scope_complete=?1, report_json=?2, status=?3, error=?4,
+                 finished_at=CASE WHEN ?3 IN ('completed','failed') THEN ?5 ELSE NULL END
+             WHERE id=?6",
+            params![
+                scope_complete,
+                report_json,
+                run_status,
+                reconciliation_error,
+                ts,
+                run_id
+            ],
+        )?;
+        if failed || !waiting {
+            self.conn.execute(
+                "UPDATE agent_reviews SET
+                    session_id=COALESCE(?1, session_id), workspace=?2,
+                    reviewed_base_sha=CASE WHEN ?3 THEN ?4 ELSE reviewed_base_sha END,
+                    reviewed_head_sha=CASE WHEN ?3 THEN ?5 ELSE reviewed_head_sha END,
+                    active_run_id=NULL, status=?6, verdict=?7, summary=?8, validation=?9,
+                    acknowledged_at=CASE WHEN ?3 THEN NULL ELSE acknowledged_at END,
+                    error=?10, updated_at=?11
+                 WHERE repo=?12 AND number=?13",
+                params![
+                    run["session_id"].as_str(),
+                    run["workspace"].as_str(),
+                    advance_baseline,
+                    run["base_sha"].as_str(),
+                    run["head_sha"].as_str(),
+                    run_status,
+                    verdict,
+                    summary,
+                    validation,
+                    reconciliation_error,
+                    ts,
+                    repo,
+                    number,
+                ],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE agent_reviews SET
+                    session_id=COALESCE(?1, session_id), workspace=?2,
+                    status='waiting_decision', verdict=?3, summary=?4, validation=?5,
+                    error=NULL, updated_at=?6
+                 WHERE repo=?7 AND number=?8 AND active_run_id=?9",
+                params![
+                    run["session_id"].as_str(),
+                    run["workspace"].as_str(),
+                    verdict,
+                    summary,
+                    validation,
+                    ts,
+                    repo,
+                    number,
+                    run_id,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    fn finish_agent_run(&self, run_id: i64, status: &str, error: Option<&str>) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(run) = Self::agent_run_by_id(&self.conn, run_id)? else {
+            return Ok(false);
+        };
+        let ts = now();
+        let n = self.conn.execute(
+            "UPDATE agent_review_runs SET status=?1, error=?2, finished_at=?3
+             WHERE id=?4 AND status IN ('queued','running','preparing','validating','waiting_decision')",
+            params![status, error, ts, run_id],
+        )?;
+        if n > 0 {
+            self.conn.execute(
+                "UPDATE agent_reviews SET status=?1, error=?2, active_run_id=NULL, updated_at=?3
+                 WHERE repo=?4 AND number=?5 AND active_run_id=?6",
+                params![
+                    status,
+                    error,
+                    ts,
+                    run["repo"].as_str().unwrap_or(""),
+                    run["number"].as_i64().unwrap_or(0),
+                    run_id,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    pub fn fail_agent_run(&self, run_id: i64, error: &str) -> Result<bool> {
+        self.finish_agent_run(run_id, "failed", Some(error))
+    }
+
+    pub fn supersede_agent_run(&self, run_id: i64, error: &str) -> Result<bool> {
+        self.finish_agent_run(run_id, "superseded", Some(error))
+    }
+
+    pub fn cancel_agent_run(&self, run_id: i64) -> Result<bool> {
+        self.finish_agent_run(run_id, "cancelled", None)
+    }
+
+    pub fn recover_agent_runs(&self, active_run_ids: &[i64]) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+        let candidates = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM agent_review_runs
+                 WHERE status IN ('running','preparing','validating') ORDER BY id",
+            )?;
+            stmt.query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let ts = now();
+        let mut recovered = 0;
+        for run_id in candidates {
+            if active_run_ids.contains(&run_id) {
+                continue;
+            }
+            let Some(run) = Self::agent_run_by_id(&self.conn, run_id)? else {
+                continue;
+            };
+            let n = self.conn.execute(
+                "UPDATE agent_review_runs
+                 SET status='queued', started_at=NULL, finished_at=NULL, error=NULL
+                 WHERE id=?1 AND status IN ('running','preparing','validating')",
+                params![run_id],
+            )?;
+            if n > 0 {
+                self.conn.execute(
+                    "UPDATE agent_reviews SET status='queued', error=NULL, updated_at=?1
+                     WHERE repo=?2 AND number=?3 AND active_run_id=?4",
+                    params![
+                        ts,
+                        run["repo"].as_str().unwrap_or(""),
+                        run["number"].as_i64().unwrap_or(0),
+                        run_id
+                    ],
+                )?;
+                recovered += n;
+            }
+        }
+        tx.commit()?;
+        Ok(recovered)
+    }
+
+    pub fn load_agent_review(&self, repo: &str, number: i64) -> Result<Option<serde_json::Value>> {
+        Self::agent_review_on(&self.conn, repo, number)
+    }
+
+    pub fn list_agent_reviews(&self) -> Result<Vec<serde_json::Value>> {
+        let sql = format!("SELECT {} FROM agent_reviews", Self::AGENT_REVIEW_COLUMNS);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |row| Self::agent_review_from_row(row, 0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_agent_findings(&self, repo: &str, number: i64) -> Result<Vec<serde_json::Value>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, repo, number, fingerprint, severity, category, path, start_line, end_line,
+                    title, evidence, suggestion, status, human_status, first_head_sha,
+                    last_head_sha, resolution_note, updated_at
+             FROM agent_findings WHERE repo=?1 AND number=?2 ORDER BY id",
+        )?;
+        let rows = stmt
+            .query_map(params![repo, number], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "repo": r.get::<_, String>(1)?,
+                    "number": r.get::<_, i64>(2)?,
+                    "fingerprint": r.get::<_, String>(3)?,
+                    "severity": r.get::<_, Option<String>>(4)?,
+                    "category": r.get::<_, Option<String>>(5)?,
+                    "path": r.get::<_, Option<String>>(6)?,
+                    "start_line": r.get::<_, Option<i64>>(7)?,
+                    "end_line": r.get::<_, Option<i64>>(8)?,
+                    "title": r.get::<_, Option<String>>(9)?,
+                    "evidence": r.get::<_, Option<String>>(10)?,
+                    "suggestion": r.get::<_, Option<String>>(11)?,
+                    "status": r.get::<_, Option<String>>(12)?,
+                    "human_status": r.get::<_, Option<String>>(13)?,
+                    "first_head_sha": r.get::<_, Option<String>>(14)?,
+                    "last_head_sha": r.get::<_, Option<String>>(15)?,
+                    "resolution_note": r.get::<_, Option<String>>(16)?,
+                    "updated_at": r.get::<_, Option<String>>(17)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn agent_decision_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<serde_json::Value> {
+        Ok(serde_json::json!({
+            "id": r.get::<_, i64>(0)?,
+            "repo": r.get::<_, String>(1)?,
+            "number": r.get::<_, i64>(2)?,
+            "run_id": r.get::<_, Option<i64>>(3)?,
+            "kind": r.get::<_, Option<String>>(4)?,
+            "title": r.get::<_, Option<String>>(5)?,
+            "context": r.get::<_, Option<String>>(6)?,
+            "options": r.get::<_, Option<String>>(7)?
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .unwrap_or_else(|| serde_json::json!([])),
+            "review_event": r.get::<_, Option<String>>(8)?,
+            "merge_method": r.get::<_, Option<String>>(9)?,
+            "status": r.get::<_, Option<String>>(10)?,
+            "answer": r.get::<_, Option<String>>(11)?,
+            "result": r.get::<_, Option<String>>(12)?,
+            "created_at": r.get::<_, Option<String>>(13)?,
+            "resolved_at": r.get::<_, Option<String>>(14)?,
+        }))
+    }
+
+    const AGENT_DECISION_COLUMNS: &'static str =
+        "id, repo, number, run_id, kind, title, context, options_json, review_event,
+         merge_method, status, answer, result, created_at, resolved_at";
+
+    fn agent_decision_by_id(&self, id: i64) -> Result<Option<serde_json::Value>> {
+        let sql = format!(
+            "SELECT {} FROM agent_decisions WHERE id=?1",
+            Self::AGENT_DECISION_COLUMNS
+        );
+        Ok(self
+            .conn
+            .query_row(&sql, params![id], Self::agent_decision_from_row)
+            .optional()?)
+    }
+
+    pub fn list_agent_decisions(&self, repo: &str, number: i64) -> Result<Vec<serde_json::Value>> {
+        let sql = format!(
+            "SELECT {} FROM agent_decisions WHERE repo=?1 AND number=?2 ORDER BY id",
+            Self::AGENT_DECISION_COLUMNS
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![repo, number], Self::agent_decision_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_needs_you(&self) -> Result<Vec<serde_json::Value>> {
+        let review_columns = Self::AGENT_REVIEW_COLUMNS
+            .split(',')
+            .map(|column| format!("ar.{}", column.trim()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {review_columns}, p.head_sha, COALESCE(ar.last_ci_status, p.ci_status),
+                (SELECT COUNT(*) FROM agent_decisions d
+                 WHERE d.repo=ar.repo AND d.number=ar.number AND d.status='open')
+             FROM agent_reviews ar LEFT JOIN prs p
+               ON p.repo=ar.repo AND p.number=ar.number
+             ORDER BY ar.updated_at DESC"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([], |r| {
+                let mut review = Self::agent_review_from_row(r, 0)?;
+                let pr_head = r.get::<_, Option<String>>(18)?;
+                let ci = r.get::<_, Option<String>>(19)?;
+                let open_decisions = r.get::<_, i64>(20)?;
+                let reviewed = review["reviewed_head_sha"].as_str();
+                let stale = reviewed.is_some_and(|head| {
+                    !head.is_empty() && pr_head.as_deref().is_some_and(|current| current != head)
+                });
+                let ci_failure = reviewed.is_some()
+                    && reviewed == pr_head.as_deref()
+                    && ci.as_deref().is_some_and(|ci| {
+                        matches!(
+                            ci.to_ascii_lowercase().as_str(),
+                            "failure" | "failed" | "error"
+                        )
+                    });
+                let mut reasons = Vec::new();
+                if open_decisions > 0 {
+                    reasons.push("open_decision");
+                }
+                if review["status"].as_str() == Some("completed")
+                    && review["acknowledged_at"].is_null()
+                {
+                    reasons.push("unacknowledged");
+                }
+                if review["status"].as_str() == Some("failed") {
+                    reasons.push("failed");
+                }
+                if stale {
+                    reasons.push("stale");
+                }
+                if ci_failure {
+                    reasons.push("ci_failure");
+                }
+                review["open_decisions"] = serde_json::json!(open_decisions);
+                review["reason"] = reasons.first().copied().into();
+                review["reasons"] = serde_json::json!(reasons);
+                Ok(review)
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|review| {
+                review["reasons"]
+                    .as_array()
+                    .is_some_and(|reasons| !reasons.is_empty())
+            })
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn acknowledge_agent_review(&self, repo: &str, number: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE agent_reviews SET acknowledged_at=?1, updated_at=?1
+             WHERE repo=?2 AND number=?3",
+            params![now(), repo, number],
+        )? > 0)
+    }
+
+    pub fn answer_agent_decision(
+        &self,
+        id: i64,
+        answer: &str,
+    ) -> Result<Option<serde_json::Value>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(decision) = self.agent_decision_by_id(id)? else {
+            return Ok(None);
+        };
+        if decision["status"].as_str() != Some("open") {
+            return Ok(None);
+        }
+        let ts = now();
+        let answered = self.conn.execute(
+            "UPDATE agent_decisions
+             SET status='answered', answer=?1, resolved_at=?2 WHERE id=?3 AND status='open'",
+            params![answer, ts, id],
+        )?;
+        if answered == 0 {
+            return Ok(None);
+        }
+        if let Some(run_id) = decision["run_id"].as_i64() {
+            let n = self.conn.execute(
+                "UPDATE agent_review_runs
+                 SET status='queued', started_at=NULL, finished_at=NULL, error=NULL
+                 WHERE id=?1 AND status='waiting_decision'",
+                params![run_id],
+            )?;
+            if n > 0 {
+                self.conn.execute(
+                    "UPDATE agent_reviews SET status='queued', updated_at=?1
+                     WHERE repo=?2 AND number=?3 AND active_run_id=?4",
+                    params![
+                        ts,
+                        decision["repo"].as_str().unwrap_or(""),
+                        decision["number"].as_i64().unwrap_or(0),
+                        run_id
+                    ],
+                )?;
+            }
+        }
+        let decision = self.agent_decision_by_id(id)?;
+        tx.commit()?;
+        Ok(decision)
+    }
+
+    pub fn observe_agent_pr(
+        &self,
+        repo: &str,
+        number: i64,
+        current_head: &str,
+        ci: Option<&str>,
+        closed: bool,
+        auto_rereview: bool,
+    ) -> Result<Option<i64>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(review) = Self::agent_review_on(&self.conn, repo, number)? else {
+            return Ok(None);
+        };
+        let ts = now();
+        if closed {
+            self.conn.execute(
+                "UPDATE agent_review_runs SET status='cancelled', finished_at=?1
+                 WHERE repo=?2 AND number=?3
+                   AND status IN ('queued','running','preparing','validating','waiting_decision')",
+                params![ts, repo, number],
+            )?;
+            self.conn.execute(
+                "UPDATE agent_reviews
+                 SET status='closed', active_run_id=NULL, last_ci_status=?1, updated_at=?2
+                 WHERE repo=?3 AND number=?4",
+                params![ci, ts, repo, number],
+            )?;
+            tx.commit()?;
+            return Ok(None);
+        }
+
+        let reviewed = review["reviewed_head_sha"].as_str();
+        let stale = !current_head.is_empty()
+            && reviewed.is_some_and(|reviewed| !reviewed.is_empty() && reviewed != current_head);
+        if stale {
+            self.conn.execute(
+                "UPDATE agent_review_runs SET status='superseded', finished_at=?1,
+                        error='superseded by a newer PR head'
+                 WHERE repo=?2 AND number=?3 AND head_sha<>?4
+                   AND status IN ('queued','running','preparing','validating','waiting_decision')",
+                params![ts, repo, number, current_head],
+            )?;
+            self.conn.execute(
+                "UPDATE agent_decisions SET status='superseded', resolved_at=?1
+                 WHERE repo=?2 AND number=?3 AND status='open'",
+                params![ts, repo, number],
+            )?;
+            self.conn.execute(
+                "UPDATE agent_reviews
+                 SET status='stale', active_run_id=NULL, acknowledged_at=NULL, updated_at=?1
+                 WHERE repo=?2 AND number=?3",
+                params![ts, repo, number],
+            )?;
+        } else if !current_head.is_empty()
+            && reviewed == Some(current_head)
+            && review["status"].as_str() == Some("stale")
+        {
+            self.conn.execute(
+                "UPDATE agent_reviews SET status='completed', updated_at=?1
+                 WHERE repo=?2 AND number=?3",
+                params![ts, repo, number],
+            )?;
+        }
+
+        let ci_changed = review["last_ci_status"].as_str() != ci;
+        let ci_failure = ci.is_some_and(|ci| {
+            matches!(
+                ci.to_ascii_lowercase().as_str(),
+                "failure" | "failed" | "error"
+            )
+        });
+        if ci_changed {
+            self.conn.execute(
+                "UPDATE agent_reviews SET last_ci_status=?1,
+                    acknowledged_at=CASE WHEN ?2 THEN NULL ELSE acknowledged_at END,
+                    updated_at=?3
+                 WHERE repo=?4 AND number=?5",
+                params![ci, ci_failure, ts, repo, number],
+            )?;
+        }
+
+        let mut queued = None;
+        if stale && auto_rereview {
+            let already_attempted: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM agent_review_runs
+                 WHERE repo=?1 AND number=?2 AND kind='rereview' AND head_sha=?3
+                   AND status IN ('failed','cancelled')",
+                params![repo, number, current_head],
+                |r| r.get(0),
+            )?;
+            if already_attempted == 0 {
+                let base = review["requested_base_sha"]
+                    .as_str()
+                    .or_else(|| review["reviewed_base_sha"].as_str())
+                    .unwrap_or("");
+                let workspace = review["workspace"].as_str().unwrap_or("");
+                queued = Some(self.enqueue_agent_review_inner(
+                    repo,
+                    number,
+                    "rereview",
+                    base,
+                    current_head,
+                    reviewed,
+                    workspace,
+                )?);
+            }
+        } else if ci_changed && ci_failure && reviewed == Some(current_head) && auto_rereview {
+            let base = review["requested_base_sha"]
+                .as_str()
+                .or_else(|| review["reviewed_base_sha"].as_str())
+                .unwrap_or("");
+            let workspace = review["workspace"].as_str().unwrap_or("");
+            queued = Some(self.enqueue_agent_review_inner(
+                repo,
+                number,
+                "ci_recheck",
+                base,
+                current_head,
+                None,
+                workspace,
+            )?);
+        }
+        tx.commit()?;
+        Ok(queued)
+    }
+
+    pub fn prepare_agent_run_snapshot(
+        &self,
+        run_id: i64,
+        base_sha: &str,
+        head_sha: &str,
+        workspace: &str,
+    ) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(run) = Self::agent_run_by_id(&self.conn, run_id)? else {
+            return Ok(false);
+        };
+        if run["status"].as_str() != Some("queued") {
+            return Ok(false);
+        }
+        let repo = run["repo"].as_str().unwrap_or("");
+        let number = run["number"].as_i64().unwrap_or(0);
+        let review = Self::agent_review_on(&self.conn, repo, number)?;
+        let reviewed = review
+            .as_ref()
+            .and_then(|review| review["reviewed_head_sha"].as_str())
+            .filter(|head| !head.is_empty());
+        let special_kind = matches!(
+            run["kind"].as_str(),
+            Some("ci_recheck") | Some("edit") | Some("followup")
+        );
+        let parent = if special_kind {
+            run["parent_head_sha"].as_str()
+        } else {
+            reviewed.filter(|reviewed| Some(*reviewed) != Some(head_sha))
+        };
+        let kind = if special_kind {
+            run["kind"].as_str().unwrap_or("initial")
+        } else if parent.is_some() {
+            "rereview"
+        } else {
+            "initial"
+        };
+        let n = self.conn.execute(
+            "UPDATE agent_review_runs
+             SET kind=?1, base_sha=?2, head_sha=?3, parent_head_sha=?4, workspace=?5
+             WHERE id=?6 AND status='queued'",
+            params![kind, base_sha, head_sha, parent, workspace, run_id],
+        )?;
+        self.conn.execute(
+            "UPDATE agent_reviews
+             SET requested_base_sha=?1, requested_head_sha=?2, workspace=?3, updated_at=?4
+             WHERE repo=?5 AND number=?6 AND active_run_id=?7",
+            params![base_sha, head_sha, workspace, now(), repo, number, run_id],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    pub fn set_agent_run_parent(&self, run_id: i64, parent_head_sha: Option<&str>) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE agent_review_runs SET parent_head_sha=?1
+             WHERE id=?2 AND status IN ('queued','running','preparing')",
+            params![parent_head_sha, run_id],
+        )? > 0)
+    }
+
+    pub fn set_agent_run_session(&self, run_id: i64, session_id: &str) -> Result<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let Some(run) = Self::agent_run_by_id(&self.conn, run_id)? else {
+            return Ok(false);
+        };
+        let n = self.conn.execute(
+            "UPDATE agent_review_runs SET session_id=?1 WHERE id=?2",
+            params![session_id, run_id],
+        )?;
+        self.conn.execute(
+            "UPDATE agent_reviews SET session_id=?1, updated_at=?2
+             WHERE repo=?3 AND number=?4 AND active_run_id=?5",
+            params![
+                session_id,
+                now(),
+                run["repo"].as_str().unwrap_or(""),
+                run["number"].as_i64().unwrap_or(0),
+                run_id
+            ],
+        )?;
+        tx.commit()?;
+        Ok(n > 0)
+    }
+
+    pub fn record_agent_decision_result(
+        &self,
+        decision_id: i64,
+        result: &str,
+        success: bool,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE agent_decisions SET result=?1, status=?2, resolved_at=?3 WHERE id=?4",
+            params![
+                result,
+                if success { "executed" } else { "failed" },
+                now(),
+                decision_id
+            ],
+        )? > 0)
+    }
+
+    pub fn set_finding_human_status(&self, id: i64, status: &str) -> Result<bool> {
+        let status = (!status.is_empty()).then_some(status);
+        Ok(self.conn.execute(
+            "UPDATE agent_findings SET human_status=?1, updated_at=?2 WHERE id=?3",
+            params![status, now(), id],
+        )? > 0)
+    }
+
+    pub fn mark_local_review_success(&self, repo: &str, number: i64) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE prs SET status='reviewed', updated_at=?1
+             WHERE repo=?2 AND number=?3 AND status IN ('pending','failed')",
+            params![now(), repo, number],
+        )? > 0)
+    }
+
     // ── diff 缓存 ──
-    pub fn get_diff(&self, repo: &str, number: i64) -> Result<Option<String>> {
+    pub fn get_diff(&self, repo: &str, number: i64, head_sha: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
-            .prepare("SELECT diff FROM diff_cache WHERE repo=?1 AND number=?2")?;
-        let mut rows = stmt.query(params![repo, number])?;
+            .prepare("SELECT diff FROM diff_cache WHERE repo=?1 AND number=?2 AND head_sha=?3")?;
+        let mut rows = stmt.query(params![repo, number, head_sha])?;
         Ok(rows.next()?.map(|r| r.get(0)).transpose()?)
     }
 
-    pub fn put_diff(&self, repo: &str, number: i64, diff: &str) -> Result<()> {
+    pub fn put_diff(&self, repo: &str, number: i64, head_sha: &str, diff: &str) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO diff_cache(repo, number, diff, fetched_at) VALUES (?1,?2,?3,?4)
-             ON CONFLICT(repo, number) DO UPDATE SET diff=excluded.diff, fetched_at=excluded.fetched_at",
-            params![repo, number, diff, now()],
+            "INSERT INTO diff_cache(repo, number, head_sha, diff, fetched_at)
+             VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(repo, number, head_sha) DO UPDATE SET
+                diff=excluded.diff, fetched_at=excluded.fetched_at",
+            params![repo, number, head_sha, diff, now()],
         )?;
         Ok(())
     }
@@ -1107,7 +2406,12 @@ mod tests {
     #[test]
     fn migrate_adds_source_column_to_old_db() {
         // 模拟老库：prs 表无 source 列（含 v2 extras 列）→ Db::open 迁移后默认 'github'
-        let dir = std::env::temp_dir().join(format!("prdesk-db-mig-src-{}", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("prdesk-db-mig-src-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.db");
         {
@@ -1149,6 +2453,7 @@ mod tests {
         db.upsert_pr(&pr_json_src("o/r", 1, "srv", "server"))
             .unwrap();
         assert_eq!(db.list_prs(&["server", "inbox"]).unwrap().len(), 1);
+        drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1302,7 +2607,21 @@ mod tests {
         db.upsert_pr(&pr_json("o/r", 2, "t2")).unwrap();
         db.upsert_review(&review_json("o/r", 1, "sha-a", 8.0))
             .unwrap();
-        db.put_diff("o/r", 1, "diff text").unwrap();
+        db.put_diff("o/r", 1, "sha-a", "diff text").unwrap();
+        db.enqueue_agent_review("o/r", 1, "initial", "b", "s", None, "w")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO agent_findings(repo,number,fingerprint) VALUES ('o/r',1,'f')",
+                [],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO agent_decisions(repo,number,kind) VALUES ('o/r',1,'clarification')",
+                [],
+            )
+            .unwrap();
 
         let keys = vec![("o/r".to_string(), 1)];
         let deleted = db.delete_prs(&keys).unwrap();
@@ -1310,7 +2629,13 @@ mod tests {
         assert!(!db.pr_exists("o/r", 1).unwrap());
         assert!(db.pr_exists("o/r", 2).unwrap(), "未删除的行不受影响");
         assert_eq!(db.list_reviews_of("o/r", 1).unwrap().len(), 0, "评审随删");
-        assert!(db.get_diff("o/r", 1).unwrap().is_none(), "diff 缓存随删");
+        assert!(
+            db.get_diff("o/r", 1, "sha-a").unwrap().is_none(),
+            "diff 缓存随删"
+        );
+        assert!(db.load_agent_review("o/r", 1).unwrap().is_none());
+        assert!(db.list_agent_findings("o/r", 1).unwrap().is_empty());
+        assert!(db.list_agent_decisions("o/r", 1).unwrap().is_empty());
         assert!(db.is_tombstoned("o/r", 1).unwrap());
         assert!(!db.is_tombstoned("o/r", 2).unwrap());
         assert_eq!(db.tombstone_count().unwrap(), 1);
@@ -1336,13 +2661,28 @@ mod tests {
     }
 
     #[test]
-    fn diff_cache_roundtrip() {
+    fn diff_cache_roundtrip_is_scoped_by_head() {
         let db = Db::open_memory().unwrap();
-        assert!(db.get_diff("o/r", 1).unwrap().is_none());
-        db.put_diff("o/r", 1, "diff text").unwrap();
-        assert_eq!(db.get_diff("o/r", 1).unwrap().as_deref(), Some("diff text"));
-        db.put_diff("o/r", 1, "v2").unwrap();
-        assert_eq!(db.get_diff("o/r", 1).unwrap().as_deref(), Some("v2"));
+        assert!(db.get_diff("o/r", 1, "h1").unwrap().is_none());
+        db.put_diff("o/r", 1, "h1", "diff text").unwrap();
+        db.put_diff("o/r", 1, "h2", "new head").unwrap();
+        assert_eq!(
+            db.get_diff("o/r", 1, "h1").unwrap().as_deref(),
+            Some("diff text")
+        );
+        assert_eq!(
+            db.get_diff("o/r", 1, "h2").unwrap().as_deref(),
+            Some("new head")
+        );
+        db.put_diff("o/r", 1, "h1", "v2").unwrap();
+        assert_eq!(db.get_diff("o/r", 1, "h1").unwrap().as_deref(), Some("v2"));
+        let cached = db.list_diff_cache().unwrap();
+        assert_eq!(cached.len(), 2);
+        assert!(
+            cached
+                .iter()
+                .any(|(_, _, head, diff)| head == "h2" && diff == "new head")
+        );
     }
 
     fn review_json(repo: &str, n: i64, sha: &str, score: f64) -> serde_json::Value {
@@ -1444,7 +2784,12 @@ mod tests {
     #[test]
     fn migrate_adds_comments_column_to_old_db() {
         // 模拟老库：reviews 表无 comments 列 → Db::open 迁移后可用
-        let dir = std::env::temp_dir().join(format!("prdesk-db-mig-{}", std::process::id()));
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("prdesk-db-mig-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("old.db");
         {
@@ -1467,6 +2812,7 @@ mod tests {
         db.upsert_review(&review_json("o/r", 1, "s1", 8.5)).unwrap();
         let r = db.get_review("o/r", 1).unwrap().unwrap();
         assert_eq!(r["comments"].as_array().unwrap().len(), 1);
+        drop(db);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1709,5 +3055,729 @@ mod tests {
             .unwrap();
         assert_eq!(new_tables, 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn agent_pr(db: &Db, number: i64, head: &str) {
+        let mut pr = pr_json("o/r", number, "agent");
+        pr["head_sha"] = serde_json::json!(head);
+        db.upsert_pr(&pr).unwrap();
+    }
+
+    fn agent_report_json(head: &str, parent: Option<&str>, complete: bool) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": 1,
+            "repo": "o/r",
+            "number": 1,
+            "base_sha": "b",
+            "head_sha": head,
+            "parent_head_sha": parent,
+            "scope_complete": complete,
+            "verdict": "ready",
+            "summary": "summary",
+            "validation": "cargo test",
+            "findings": [],
+            "resolved_findings": [],
+            "decision": null
+        })
+    }
+
+    fn agent_finding(fingerprint: &str, title: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": null,
+            "fingerprint": fingerprint,
+            "severity": "high",
+            "category": "bug",
+            "path": "src/lib.rs",
+            "start_line": 10,
+            "end_line": 12,
+            "title": title,
+            "evidence": "evidence",
+            "suggestion": "suggestion"
+        })
+    }
+
+    fn apply_report(db: &Db, run_id: i64, value: serde_json::Value) -> bool {
+        let report: crate::agent_review::AgentReport = serde_json::from_value(value).unwrap();
+        db.apply_agent_report(run_id, &report).unwrap()
+    }
+
+    fn start_run(db: &Db, run_id: i64) {
+        assert!(db.mark_agent_run_running(run_id).unwrap());
+    }
+
+    fn complete_initial(db: &Db, number: i64, head: &str) -> i64 {
+        agent_pr(db, number, head);
+        let run_id = db
+            .enqueue_agent_review("o/r", number, "initial", "b", head, None, "workspace")
+            .unwrap();
+        start_run(db, run_id);
+        let mut report = agent_report_json(head, None, true);
+        report["number"] = serde_json::json!(number);
+        assert!(apply_report(db, run_id, report));
+        run_id
+    }
+
+    #[test]
+    fn migrate_v8_clears_legacy_diff_and_creates_agent_tables() {
+        let dir = std::env::temp_dir().join(format!("prdesk-db-v8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO diff_cache(repo,number,diff,fetched_at) VALUES ('o/r',1,'old','t')",
+                [],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        assert!(db.list_diff_cache().unwrap().is_empty());
+        db.put_diff("o/r", 1, "h1", "one").unwrap();
+        db.put_diff("o/r", 1, "h2", "two").unwrap();
+        assert_eq!(db.list_diff_cache().unwrap().len(), 2);
+        for table in [
+            "agent_reviews",
+            "agent_review_runs",
+            "agent_findings",
+            "agent_decisions",
+        ] {
+            let count: i64 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing {table}");
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn agent_queue_is_idempotent_and_recovers_interrupted_runs() {
+        let db = Db::open_memory().unwrap();
+        for number in 1..=3 {
+            agent_pr(&db, number, "h1");
+        }
+        let first = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        assert_eq!(
+            db.enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+                .unwrap(),
+            first
+        );
+        let second = db
+            .enqueue_agent_review("o/r", 2, "initial", "b", "h1", None, "w")
+            .unwrap();
+        let third = db
+            .enqueue_agent_review("o/r", 3, "initial", "b", "h1", None, "w")
+            .unwrap();
+        assert_eq!(db.next_agent_run().unwrap().unwrap()["id"], first);
+        for id in [first, second, third] {
+            start_run(&db, id);
+        }
+        db.conn
+            .execute(
+                "UPDATE agent_review_runs SET status='preparing' WHERE id=?1",
+                params![second],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE agent_review_runs SET status='validating' WHERE id=?1",
+                params![third],
+            )
+            .unwrap();
+        assert_eq!(db.recover_agent_runs(&[first]).unwrap(), 2);
+        assert_eq!(db.next_agent_run().unwrap().unwrap()["id"], second);
+        assert_eq!(
+            db.get_agent_run(first).unwrap().unwrap()["status"],
+            "running"
+        );
+        assert_eq!(
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["status"],
+            "running",
+            "仍在活跃进程中的 run 及其 review 不得被恢复"
+        );
+        assert_eq!(
+            db.load_agent_review("o/r", 2).unwrap().unwrap()["status"],
+            "queued"
+        );
+        assert!(!db.mark_agent_run_running(first).unwrap());
+        start_run(&db, second);
+        assert_eq!(db.next_agent_run().unwrap().unwrap()["id"], third);
+    }
+
+    #[test]
+    fn partial_and_failed_runs_never_advance_reviewed_head() {
+        let db = Db::open_memory().unwrap();
+        agent_pr(&db, 1, "h1");
+        let run_id = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        start_run(&db, run_id);
+        let mut partial = agent_report_json("h1", None, false);
+        partial["findings"] = serde_json::json!([agent_finding("partial", "not committed")]);
+        assert!(apply_report(&db, run_id, partial));
+        let review = db.load_agent_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(review["status"], "failed");
+        assert!(
+            review["error"]
+                .as_str()
+                .unwrap()
+                .contains("scope incomplete")
+        );
+        assert!(review["active_run_id"].is_null());
+        assert!(review["reviewed_head_sha"].is_null());
+        assert!(db.list_agent_findings("o/r", 1).unwrap().is_empty());
+        let failed_run = db.get_agent_run(run_id).unwrap().unwrap();
+        assert_eq!(failed_run["status"], "failed");
+        assert!(failed_run["report"].is_object());
+        assert!(
+            failed_run["error"]
+                .as_str()
+                .unwrap()
+                .contains("retry required")
+        );
+        assert!(db.load_agent_review("o/r", 1).unwrap().unwrap()["reviewed_head_sha"].is_null());
+        assert!(
+            db.list_needs_you()
+                .unwrap()
+                .iter()
+                .any(|r| r["number"] == 1 && r["reason"] == "failed")
+        );
+
+        let complete = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        start_run(&db, complete);
+        assert!(apply_report(
+            &db,
+            complete,
+            agent_report_json("h1", None, true)
+        ));
+        assert_eq!(
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["reviewed_head_sha"],
+            "h1"
+        );
+    }
+
+    #[test]
+    fn findings_reconcile_open_fixed_obsolete_and_missing() {
+        let db = Db::open_memory().unwrap();
+        agent_pr(&db, 1, "h1");
+        let first = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        start_run(&db, first);
+        let mut initial = agent_report_json("h1", None, true);
+        initial["findings"] = serde_json::json!([
+            agent_finding("f1", "old title"),
+            agent_finding("f2", "fixed"),
+            agent_finding("f3", "obsolete")
+        ]);
+        assert!(apply_report(&db, first, initial));
+        let f1 = db
+            .list_agent_findings("o/r", 1)
+            .unwrap()
+            .into_iter()
+            .find(|f| f["fingerprint"] == "f1")
+            .unwrap();
+        assert!(
+            db.set_finding_human_status(f1["id"].as_i64().unwrap(), "confirmed")
+                .unwrap()
+        );
+
+        agent_pr(&db, 1, "h2");
+        let second = db
+            .enqueue_agent_review("o/r", 1, "rereview", "b", "h2", Some("h1"), "w")
+            .unwrap();
+        start_run(&db, second);
+        let mut re_review = agent_report_json("h2", Some("h1"), true);
+        re_review["findings"] = serde_json::json!([agent_finding("f1", "new title")]);
+        re_review["resolved_findings"] = serde_json::json!([
+            {"fingerprint":"f2", "status":"fixed", "note":"fixed in h2"},
+            {"fingerprint":"f3", "status":"obsolete", "note":"code removed"}
+        ]);
+        assert!(apply_report(&db, second, re_review));
+        let findings = db.list_agent_findings("o/r", 1).unwrap();
+        let f1 = findings.iter().find(|f| f["fingerprint"] == "f1").unwrap();
+        assert_eq!(f1["title"], "new title");
+        assert_eq!(f1["human_status"], "confirmed");
+        assert_eq!(f1["first_head_sha"], "h1");
+        assert_eq!(f1["last_head_sha"], "h2");
+        assert_eq!(
+            findings.iter().find(|f| f["fingerprint"] == "f2").unwrap()["status"],
+            "fixed"
+        );
+        assert_eq!(
+            findings.iter().find(|f| f["fingerprint"] == "f3").unwrap()["status"],
+            "obsolete"
+        );
+        assert_eq!(
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["reviewed_head_sha"],
+            "h2"
+        );
+
+        agent_pr(&db, 1, "h3");
+        let third = db
+            .enqueue_agent_review("o/r", 1, "rereview", "b", "h3", Some("h2"), "w")
+            .unwrap();
+        start_run(&db, third);
+        assert!(apply_report(
+            &db,
+            third,
+            agent_report_json("h3", Some("h2"), true)
+        ));
+        let review = db.load_agent_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(review["status"], "failed");
+        assert_eq!(review["reviewed_head_sha"], "h2");
+        assert_eq!(
+            db.list_agent_findings("o/r", 1)
+                .unwrap()
+                .iter()
+                .find(|f| f["fingerprint"] == "f1")
+                .unwrap()["status"],
+            "stale"
+        );
+    }
+
+    #[test]
+    fn late_run_is_superseded_without_overwriting_new_baseline() {
+        let db = Db::open_memory().unwrap();
+        complete_initial(&db, 1, "h0");
+        agent_pr(&db, 1, "h1");
+        let old = db
+            .enqueue_agent_review("o/r", 1, "rereview", "b", "h1", Some("h0"), "w")
+            .unwrap();
+        start_run(&db, old);
+        agent_pr(&db, 1, "h2");
+        let new = db
+            .observe_agent_pr("o/r", 1, "h2", None, false, true)
+            .unwrap()
+            .unwrap();
+        assert_ne!(new, old);
+        assert_eq!(db.next_agent_run().unwrap().unwrap()["id"], new);
+        assert!(!apply_report(
+            &db,
+            old,
+            agent_report_json("h1", Some("h0"), true)
+        ));
+        let review = db.load_agent_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(review["active_run_id"], new);
+        assert_eq!(review["requested_head_sha"], "h2");
+        assert_eq!(review["reviewed_head_sha"], "h0");
+        start_run(&db, new);
+        assert!(apply_report(
+            &db,
+            new,
+            agent_report_json("h2", Some("h0"), true)
+        ));
+        assert_eq!(
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["reviewed_head_sha"],
+            "h2"
+        );
+    }
+
+    fn decision_json(kind: &str) -> serde_json::Value {
+        serde_json::json!({
+            "kind": kind,
+            "title": "choose",
+            "context": "context",
+            "options": [
+                {"id":"yes", "label":"Yes", "detail":"continue", "recommended":true},
+                {"id":"no", "label":"No", "detail":"stop", "recommended":false}
+            ],
+            "review_event": if kind == "submit_review" { Some("approve") } else { None },
+            "merge_method": null
+        })
+    }
+
+    #[test]
+    fn decisions_acknowledgement_ci_and_needs_you_follow_lifecycle() {
+        let db = Db::open_memory().unwrap();
+        agent_pr(&db, 1, "h1");
+        let run = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        start_run(&db, run);
+        let mut report = agent_report_json("h1", None, true);
+        report["decision"] = decision_json("submit_review");
+        assert!(apply_report(&db, run, report));
+        let review = db.load_agent_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(review["status"], "completed");
+        assert_eq!(review["reviewed_head_sha"], "h1");
+        let decisions = db.list_agent_decisions("o/r", 1).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["status"], "open");
+        let needs = db.list_needs_you().unwrap();
+        assert!(
+            needs[0]["reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("open_decision"))
+        );
+        assert!(
+            needs[0]["reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("unacknowledged"))
+        );
+        assert!(db.acknowledge_agent_review("o/r", 1).unwrap());
+        assert_eq!(db.list_needs_you().unwrap()[0]["reason"], "open_decision");
+        let answered = db
+            .answer_agent_decision(decisions[0]["id"].as_i64().unwrap(), "yes")
+            .unwrap()
+            .unwrap();
+        assert_eq!(answered["status"], "answered");
+        assert_eq!(answered["answer"], "yes");
+        assert_eq!(db.next_agent_run().unwrap(), None);
+        assert!(db.list_needs_you().unwrap().is_empty());
+
+        db.observe_agent_pr("o/r", 1, "h1", Some("failure"), false, false)
+            .unwrap();
+        assert!(
+            db.list_needs_you().unwrap()[0]["reasons"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("ci_failure"))
+        );
+        db.acknowledge_agent_review("o/r", 1).unwrap();
+        let acknowledged =
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["acknowledged_at"].clone();
+        db.observe_agent_pr("o/r", 1, "h1", Some("failure"), false, false)
+            .unwrap();
+        assert_eq!(
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["acknowledged_at"],
+            acknowledged
+        );
+        db.observe_agent_pr("o/r", 1, "h1", Some("success"), false, false)
+            .unwrap();
+        db.observe_agent_pr("o/r", 1, "h1", Some("failure"), false, false)
+            .unwrap();
+        assert!(db.load_agent_review("o/r", 1).unwrap().unwrap()["acknowledged_at"].is_null());
+    }
+
+    #[test]
+    fn clarification_waits_then_answer_requeues_same_run() {
+        let db = Db::open_memory().unwrap();
+        agent_pr(&db, 1, "h1");
+        let run = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        start_run(&db, run);
+        let mut report = agent_report_json("h1", None, false);
+        report["findings"] = serde_json::json!([agent_finding("partial", "not committed")]);
+        report["decision"] = decision_json("clarification");
+        assert!(apply_report(&db, run, report));
+        let review = db.load_agent_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(review["status"], "waiting_decision");
+        assert!(review["reviewed_head_sha"].is_null());
+        assert!(db.list_agent_findings("o/r", 1).unwrap().is_empty());
+        let decision = db.list_agent_decisions("o/r", 1).unwrap().remove(0);
+        db.answer_agent_decision(decision["id"].as_i64().unwrap(), "more context")
+            .unwrap();
+        assert_eq!(db.next_agent_run().unwrap().unwrap()["id"], run);
+        assert!(
+            db.answer_agent_decision(decision["id"].as_i64().unwrap(), "duplicate")
+                .unwrap()
+                .is_none(),
+            "重复回答不得再次触发后续执行"
+        );
+        start_run(&db, run);
+        assert!(apply_report(&db, run, agent_report_json("h1", None, true)));
+        assert_eq!(
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["reviewed_head_sha"],
+            "h1"
+        );
+    }
+
+    #[test]
+    fn observe_rereview_is_idempotent_and_initial_inherits_parent() {
+        let db = Db::open_memory().unwrap();
+        complete_initial(&db, 1, "h0");
+        agent_pr(&db, 1, "h1");
+        let first = db
+            .observe_agent_pr("o/r", 1, "h1", Some("success"), false, true)
+            .unwrap()
+            .unwrap();
+        let second = db
+            .observe_agent_pr("o/r", 1, "h1", Some("success"), false, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, second);
+        let queued = db.next_agent_run().unwrap().unwrap();
+        assert_eq!(queued["kind"], "rereview");
+        assert_eq!(queued["parent_head_sha"], "h0");
+        assert!(db.fail_agent_run(first, "failed").unwrap());
+        assert_eq!(
+            db.observe_agent_pr("o/r", 1, "h1", Some("success"), false, true)
+                .unwrap(),
+            None
+        );
+
+        let manual = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        assert_eq!(
+            db.next_agent_run().unwrap().unwrap()["parent_head_sha"],
+            "h0"
+        );
+        assert!(db.cancel_agent_run(manual).unwrap());
+        assert_eq!(
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["status"],
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn copy_carries_agent_snapshot_without_run_history() {
+        let src = Db::open_memory().unwrap();
+        let dst = Db::open_memory().unwrap();
+        agent_pr(&src, 1, "h1");
+        let run = src
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        start_run(&src, run);
+        let mut report = agent_report_json("h1", None, true);
+        report["findings"] = serde_json::json!([agent_finding("f1", "finding")]);
+        report["decision"] = decision_json("submit_review");
+        assert!(apply_report(&src, run, report));
+        let keys = [("o/r".to_string(), 1)];
+        Db::copy_prs_to(&src, &dst, &keys).unwrap();
+        Db::copy_prs_to(&src, &dst, &keys).unwrap();
+        assert_eq!(
+            dst.load_agent_review("o/r", 1).unwrap().unwrap()["reviewed_head_sha"],
+            "h1"
+        );
+        assert_eq!(dst.list_agent_findings("o/r", 1).unwrap().len(), 1);
+        let decisions = dst.list_agent_decisions("o/r", 1).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0]["run_id"].is_null());
+        let runs: i64 = dst
+            .conn
+            .query_row("SELECT COUNT(*) FROM agent_review_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs, 0);
+
+        src.enqueue_agent_review("o/r", 1, "rereview", "b", "h2", Some("h1"), "w")
+            .unwrap();
+        Db::copy_prs_to(&src, &dst, &keys).unwrap();
+        let copied = dst.load_agent_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(copied["status"], "stale");
+        assert!(copied["active_run_id"].is_null());
+    }
+
+    #[test]
+    fn queued_snapshot_preparation_selects_incremental_parent() {
+        let db = Db::open_memory().unwrap();
+        complete_initial(&db, 1, "h1");
+        let run_id = db
+            .enqueue_agent_review("o/r", 1, "initial", "", "", None, "")
+            .unwrap();
+        assert!(
+            db.prepare_agent_run_snapshot(run_id, "b2", "h2", "w2")
+                .unwrap()
+        );
+        let run = db.get_agent_run(run_id).unwrap().unwrap();
+        assert_eq!(run["kind"], "rereview");
+        assert_eq!(run["parent_head_sha"], "h1");
+        assert_eq!(run["base_sha"], "b2");
+        assert_eq!(run["head_sha"], "h2");
+        assert_eq!(run["workspace"], "w2");
+        let review = db.load_agent_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(review["requested_head_sha"], "h2");
+        assert_eq!(review["reviewed_head_sha"], "h1");
+    }
+
+    #[test]
+    fn ci_and_edit_runs_never_advance_reviewed_head() {
+        for (kind, parent) in [("ci_recheck", None), ("edit", Some("h1"))] {
+            let db = Db::open_memory().unwrap();
+            complete_initial(&db, 1, "h1");
+            agent_pr(&db, 1, "h2");
+            let run_id = db
+                .enqueue_agent_review("o/r", 1, kind, "b", "h2", parent, "w")
+                .unwrap();
+            start_run(&db, run_id);
+            let mut report = agent_report_json("h2", parent, true);
+            report["findings"] =
+                serde_json::json!([agent_finding("ci-or-edit-finding", "must not be merged")]);
+            assert!(apply_report(&db, run_id, report));
+            let review = db.load_agent_review("o/r", 1).unwrap().unwrap();
+            assert_eq!(review["reviewed_head_sha"], "h1", "{kind}");
+            assert_eq!(review["requested_head_sha"], "h2", "{kind}");
+            assert!(
+                db.list_agent_findings("o/r", 1).unwrap().is_empty(),
+                "{kind} 不得合并代码 findings"
+            );
+        }
+    }
+
+    #[test]
+    fn set_agent_run_parent_accepts_queued_running_and_preparing() {
+        let db = Db::open_memory().unwrap();
+        agent_pr(&db, 1, "h1");
+        let run_id = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        for status in ["queued", "running", "preparing"] {
+            db.conn
+                .execute(
+                    "UPDATE agent_review_runs SET status=?1 WHERE id=?2",
+                    params![status, run_id],
+                )
+                .unwrap();
+            assert!(db.set_agent_run_parent(run_id, Some(status)).unwrap());
+            assert_eq!(
+                db.get_agent_run(run_id).unwrap().unwrap()["parent_head_sha"],
+                status
+            );
+        }
+        db.conn
+            .execute(
+                "UPDATE agent_review_runs SET status='validating' WHERE id=?1",
+                params![run_id],
+            )
+            .unwrap();
+        assert!(!db.set_agent_run_parent(run_id, Some("too-late")).unwrap());
+        assert_eq!(
+            db.get_agent_run(run_id).unwrap().unwrap()["parent_head_sha"],
+            "preparing"
+        );
+    }
+
+    #[test]
+    fn finding_with_same_id_inherits_fingerprint_after_title_and_location_change() {
+        let db = Db::open_memory().unwrap();
+        agent_pr(&db, 1, "h1");
+        let first = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        start_run(&db, first);
+        let mut initial = agent_report_json("h1", None, true);
+        initial["findings"] = serde_json::json!([agent_finding("old-fingerprint", "old title")]);
+        assert!(apply_report(&db, first, initial));
+        let old = db.list_agent_findings("o/r", 1).unwrap().remove(0);
+        let old_id = old["id"].as_i64().unwrap();
+
+        agent_pr(&db, 1, "h2");
+        let second = db
+            .enqueue_agent_review("o/r", 1, "rereview", "b", "h2", Some("h1"), "w")
+            .unwrap();
+        start_run(&db, second);
+        let mut retained = agent_finding("new-fingerprint", "new title");
+        retained["id"] = serde_json::json!(old_id.to_string());
+        retained["path"] = serde_json::json!("src/moved.rs");
+        retained["start_line"] = serde_json::json!(99);
+        retained["end_line"] = serde_json::json!(100);
+        let mut report = agent_report_json("h2", Some("h1"), true);
+        report["findings"] = serde_json::json!([retained]);
+        assert!(apply_report(&db, second, report));
+
+        let review = db.load_agent_review("o/r", 1).unwrap().unwrap();
+        assert_eq!(review["status"], "completed");
+        assert_eq!(review["reviewed_head_sha"], "h2");
+        let findings = db.list_agent_findings("o/r", 1).unwrap();
+        assert_eq!(findings.len(), 1, "同 ID 不得新增 finding 或误标 missing");
+        assert_eq!(findings[0]["id"], old_id);
+        assert_eq!(findings[0]["fingerprint"], "old-fingerprint");
+        assert_eq!(findings[0]["title"], "new title");
+        assert_eq!(findings[0]["path"], "src/moved.rs");
+        assert_eq!(findings[0]["start_line"], 99);
+        assert_eq!(findings[0]["status"], "open");
+    }
+
+    #[test]
+    fn ci_failure_queues_once_and_stale_supersedes_open_decisions() {
+        let db = Db::open_memory().unwrap();
+        agent_pr(&db, 1, "h1");
+        let initial = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        start_run(&db, initial);
+        let mut report = agent_report_json("h1", None, true);
+        report["decision"] = decision_json("submit_review");
+        assert!(apply_report(&db, initial, report));
+
+        let ci_run = db
+            .observe_agent_pr("o/r", 1, "h1", Some("failure"), false, true)
+            .unwrap()
+            .unwrap();
+        let queued = db.get_agent_run(ci_run).unwrap().unwrap();
+        assert_eq!(queued["kind"], "ci_recheck");
+        assert_eq!(queued["status"], "queued");
+        assert!(queued["parent_head_sha"].is_null());
+        assert_eq!(
+            db.observe_agent_pr("o/r", 1, "h1", Some("failure"), false, true)
+                .unwrap(),
+            None,
+            "相同 CI 状态的轮询不得重复唤醒 run"
+        );
+        let ci_runs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_review_runs WHERE kind='ci_recheck'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ci_runs, 1);
+
+        start_run(&db, ci_run);
+        let mut ci_report = agent_report_json("h1", None, true);
+        ci_report["findings"] = serde_json::json!([agent_finding(
+            "ci-finding",
+            "CI recheck must not merge code findings"
+        )]);
+        assert!(apply_report(&db, ci_run, ci_report));
+        assert!(db.list_agent_findings("o/r", 1).unwrap().is_empty());
+        assert_eq!(
+            db.load_agent_review("o/r", 1).unwrap().unwrap()["reviewed_head_sha"],
+            "h1"
+        );
+        assert_eq!(
+            db.list_agent_decisions("o/r", 1).unwrap()[0]["status"],
+            "open"
+        );
+
+        agent_pr(&db, 1, "h2");
+        db.observe_agent_pr("o/r", 1, "h2", Some("failure"), false, false)
+            .unwrap();
+        let decision = db.list_agent_decisions("o/r", 1).unwrap().remove(0);
+        assert_eq!(decision["status"], "superseded");
+        assert!(!decision["resolved_at"].is_null());
+        assert!(
+            db.answer_agent_decision(decision["id"].as_i64().unwrap(), "too-late")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn local_review_success_does_not_write_outbox() {
+        let db = Db::open_memory().unwrap();
+        agent_pr(&db, 1, "h1");
+        assert!(db.mark_local_review_success("o/r", 1).unwrap());
+        assert_eq!(
+            db.get_pr_full("o/r", 1).unwrap().unwrap()["status"],
+            "reviewed"
+        );
+        assert!(db.outbox_drain().unwrap().is_empty());
+        assert!(!db.mark_local_review_success("o/r", 1).unwrap());
+        db.conn
+            .execute(
+                "UPDATE prs SET status='failed' WHERE repo='o/r' AND number=1",
+                [],
+            )
+            .unwrap();
+        assert!(db.mark_local_review_success("o/r", 1).unwrap());
+        assert!(db.outbox_drain().unwrap().is_empty());
     }
 }

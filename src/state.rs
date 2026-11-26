@@ -85,6 +85,40 @@ pub enum Cmd {
         repo: String,
         number: i64,
     }, // 详情面板「AI 评审」：LLM 评审并入库
+    StartAgentReview {
+        repo: String,
+        number: i64,
+    },
+    RereviewAgent {
+        repo: String,
+        number: i64,
+    },
+    CancelAgentRun {
+        repo: String,
+        number: i64,
+    },
+    AnswerAgentDecision {
+        repo: String,
+        number: i64,
+        decision_id: i64,
+        answer: String,
+        execute: bool,
+    },
+    AcknowledgeAgentReview {
+        repo: String,
+        number: i64,
+    },
+    SetFindingHumanStatus {
+        repo: String,
+        number: i64,
+        finding_id: i64,
+        status: String,
+    },
+    LoadNeedsYou,
+    AgentRunSettled {
+        profile: String,
+        run_id: i64,
+    },
     QueueAutoReviews {
         profile: String,
         keys: Vec<(String, i64)>,
@@ -161,6 +195,12 @@ pub enum Msg {
         number: i64,
         err: String,
     },
+    AgentReviewUpdated {
+        profile: String,
+        repo: String,
+        number: i64,
+    },
+    NeedsYouLoaded(Vec<NeedsYouRow>),
     KimiContextReady {
         key: crate::kimi_terminal::KimiKey,
         context: Box<crate::kimi_terminal::PrContext>,
@@ -174,6 +214,7 @@ pub enum Msg {
     DiffParsed {
         repo: String,
         number: i64,
+        head_sha: String,
         files: Vec<DiffFileData>,
     },
     InboxRows(Vec<Value>),
@@ -275,6 +316,151 @@ pub struct ReviewProps {
     pub comments: Vec<OcrCommentRow>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AgentFindingRow {
+    pub id: i64,
+    pub fingerprint: String,
+    pub severity: String,
+    pub category: String,
+    pub location: String,
+    pub title: String,
+    pub evidence: String,
+    pub suggestion: String,
+    pub status: String,
+    pub human_status: String,
+    pub resolution_note: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AgentDecisionRow {
+    pub id: i64,
+    pub run_id: i64,
+    pub kind: String,
+    pub title: String,
+    pub context: String,
+    pub options: Vec<(String, String)>,
+    pub status: String,
+    pub result: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct AgentReviewProps {
+    pub has: bool,
+    pub run_id: i64,
+    pub session_id: String,
+    pub status: String,
+    pub requested_head_sha: String,
+    pub reviewed_head_sha: String,
+    pub verdict: String,
+    pub summary: String,
+    pub validation: String,
+    pub error: String,
+    pub stale: bool,
+    pub findings: Vec<AgentFindingRow>,
+    pub decisions: Vec<AgentDecisionRow>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct NeedsYouRow {
+    pub kind: String,
+    pub repo: String,
+    pub number: i64,
+    pub title: String,
+    pub detail: String,
+    pub run_id: i64,
+    pub decision_id: i64,
+    pub decision_kind: String,
+    pub options: Vec<(String, String)>,
+}
+
+pub fn agent_finding_row(value: &Value) -> AgentFindingRow {
+    let start = value["start_line"].as_u64().unwrap_or(0);
+    let end = value["end_line"].as_u64().unwrap_or(start);
+    let path = value["path"].as_str().unwrap_or("");
+    AgentFindingRow {
+        id: value["id"].as_i64().unwrap_or(0),
+        fingerprint: value["fingerprint"].as_str().unwrap_or("").into(),
+        severity: value["severity"].as_str().unwrap_or("other").into(),
+        category: value["category"].as_str().unwrap_or("other").into(),
+        location: if start == 0 {
+            path.into()
+        } else if start == end {
+            format!("{path}:{start}")
+        } else {
+            format!("{path}:{start}-{end}")
+        },
+        title: value["title"].as_str().unwrap_or("").into(),
+        evidence: value["evidence"].as_str().unwrap_or("").into(),
+        suggestion: value["suggestion"].as_str().unwrap_or("").into(),
+        status: value["status"].as_str().unwrap_or("open").into(),
+        human_status: value["human_status"].as_str().unwrap_or("undecided").into(),
+        resolution_note: value["resolution_note"].as_str().unwrap_or("").into(),
+    }
+}
+
+pub fn agent_decision_row(value: &Value) -> AgentDecisionRow {
+    let options = value["options"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|option| {
+                    (
+                        option["id"].as_str().unwrap_or("").to_string(),
+                        option["label"].as_str().unwrap_or("").to_string(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    AgentDecisionRow {
+        id: value["id"].as_i64().unwrap_or(0),
+        run_id: value["run_id"].as_i64().unwrap_or(0),
+        kind: value["kind"].as_str().unwrap_or("clarification").into(),
+        title: value["title"].as_str().unwrap_or("").into(),
+        context: value["context"].as_str().unwrap_or("").into(),
+        options,
+        status: value["status"].as_str().unwrap_or("open").into(),
+        result: value["result"].as_str().unwrap_or("").into(),
+    }
+}
+
+pub fn agent_review_props(
+    review: Option<&Value>,
+    findings: &[Value],
+    decisions: &[Value],
+    current_head: &str,
+) -> AgentReviewProps {
+    let Some(review) = review else {
+        return AgentReviewProps::default();
+    };
+    let reviewed_head = review["reviewed_head_sha"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    AgentReviewProps {
+        has: true,
+        run_id: review["active_run_id"].as_i64().unwrap_or(0),
+        session_id: review["session_id"].as_str().unwrap_or("").into(),
+        status: review["status"].as_str().unwrap_or("").into(),
+        requested_head_sha: review["requested_head_sha"].as_str().unwrap_or("").into(),
+        reviewed_head_sha: reviewed_head.clone(),
+        verdict: review["verdict"].as_str().unwrap_or("").into(),
+        summary: review["summary"].as_str().unwrap_or("").into(),
+        validation: review["validation"].as_str().unwrap_or("").into(),
+        error: review["error"].as_str().unwrap_or("").into(),
+        stale: !reviewed_head.is_empty()
+            && !current_head.is_empty()
+            && reviewed_head != current_head,
+        findings: findings.iter().map(agent_finding_row).collect(),
+        decisions: decisions
+            .iter()
+            .filter(|decision| decision["status"].as_str() == Some("open"))
+            .map(agent_decision_row)
+            .collect(),
+    }
+}
+
 /// 详情面板一次装配的全部数据（Msg::Panel 负载）。
 pub struct PanelData {
     pub repo: String,
@@ -291,6 +477,7 @@ pub struct PanelData {
     pub checks_json: String,
     pub files_json: String,
     pub review: ReviewProps,
+    pub agent_review: AgentReviewProps,
     // 评审三态："" = 无活动；"running" / "failed" / "done"
     pub review_status: String,
     pub review_progress: String,
@@ -621,6 +808,8 @@ pub struct App {
     pub rate_limit: Arc<Mutex<Option<u64>>>, // GitHub X-RateLimit-Remaining 共享状态
     pub last_sync: sync::SharedLastSync, // 最近同步成功时间
     pub review_slots: Arc<Mutex<ReviewSlots>>, // 预评审并发槽（worker 与 UI 侧共享）
+    pub needs_you: Vec<NeedsYouRow>,
+    pub needs_you_loading: bool,
 }
 
 impl App {
@@ -661,6 +850,8 @@ impl App {
             total: 0,
             rate_limit: Arc::new(Mutex::new(None)),
             last_sync: sync::shared_last_sync(),
+            needs_you: Vec::new(),
+            needs_you_loading: false,
         }
     }
 }

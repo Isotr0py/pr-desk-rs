@@ -1,11 +1,12 @@
 #!/bin/bash
 # PR Desk egui 全量验证驱动（PR_DESK_TEST=1 实例 + 指令文件 + 状态快照 + F12 截图）
-T=/c/Users/20370/AppData/Local/Temp
+T="${PR_DESK_TEST_DIR:-/c/Users/20370/AppData/Local/Temp}"
 CMD="$T/prdesk-cmd.txt"
 STATE="$T/prdesk-state.json"
 SHOT="$T/prdesk-shot.png"
 LOG="${PD_LOG:-/tmp/pd.log}"
-mkdir -p /tmp/pd-shots
+SHOT_DIR="${PD_SHOT_DIR:-/tmp/pd-shots}"
+mkdir -p "$SHOT_DIR"
 
 cmd() {
   local before
@@ -32,10 +33,15 @@ shot() {
   for i in $(seq 1 30); do
     local now
     now=$(grep -c "截图已存" "$LOG" 2>/dev/null)
+    now=${now:-0}
     [ "$now" -gt "$before" ] && break
     sleep 0.3
   done
-  cp "$SHOT" "/tmp/pd-shots/$1.png" && echo "  [shot] $1 ($(stat -c%s /tmp/pd-shots/$1.png) bytes)"
+  if [ -f "$SHOT" ]; then
+    cp "$SHOT" "$SHOT_DIR/$1.png" && echo "  [shot] $1 ($(stat -c%s "$SHOT_DIR/$1.png") bytes)"
+  else
+    echo "  [shot] $1 skipped (no drawable surface)"
+  fi
 }
 
 state() {

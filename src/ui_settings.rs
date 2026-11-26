@@ -35,6 +35,8 @@ pub fn open_settings(app: &mut EguiApp) {
     app.s_ocr_path = cfg.ocr_path.clone();
     app.s_review_conc = cfg.review_concurrency as i64;
     app.s_auto_review_on_insert = cfg.auto_review_on_insert;
+    app.s_auto_agent_rereview = cfg.auto_agent_rereview;
+    app.s_agent_review_conc = cfg.agent_review_concurrency as i64;
     app.s_kimi_cli_path = cfg.kimi_cli_path.clone();
     app.s_kimi_workspace_root = cfg.kimi_workspace_root.clone();
     // 弹窗内联错误行清空（上一次失败的残留不带进本次会话）
@@ -162,6 +164,8 @@ fn save_settings(app: &mut EguiApp) -> bool {
         },
         review_concurrency,
         auto_review_on_insert: app.s_auto_review_on_insert,
+        auto_agent_rereview: app.s_auto_agent_rereview,
+        agent_review_concurrency: app.s_agent_review_conc.clamp(1, 4) as u64,
         kimi_cli_path: {
             let path = app.s_kimi_cli_path.trim();
             if path.is_empty() {
@@ -748,6 +752,17 @@ fn tab_llm(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
         tr(lang, "settings_auto_review_on_insert"),
     );
     ui.weak(tr(lang, "settings_auto_review_on_insert_hint"));
+    field(ui, tr(lang, "settings_agent_review_concurrency"), |ui| {
+        ui.horizontal(|ui| {
+            ui.add(egui::DragValue::new(&mut app.s_agent_review_conc).range(1..=4));
+            ui.weak(tr(lang, "settings_agent_concurrency_hint"));
+        });
+    });
+    ui.checkbox(
+        &mut app.s_auto_agent_rereview,
+        tr(lang, "settings_auto_agent_rereview"),
+    );
+    ui.weak(tr(lang, "settings_auto_agent_rereview_hint"));
     field(ui, tr(lang, "settings_kimi_cli_path"), |ui| {
         ui.add(
             egui::TextEdit::singleline(&mut app.s_kimi_cli_path)
