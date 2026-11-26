@@ -203,7 +203,7 @@ async fn git_output(repo: &Path, args: &[&str]) -> Result<std::process::Output> 
         .current_dir(repo)
         .output()
         .await
-        .context("启动 git 失败")?;
+        .with_context(|| format!("启动 git {args:?} 失败（工作目录：{}）", repo.display()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let tail: String = stderr
@@ -422,7 +422,7 @@ fn git_mirror(root: &Path, url: &str) -> GitMirror {
 }
 
 fn git_path(path: &Path) -> String {
-    let absolute = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let absolute = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     let text = absolute.to_string_lossy();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
     text.replace('\\', "/")
@@ -861,6 +861,37 @@ pub async fn run_ocr_review_with_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_paths_are_absolute_before_creation() {
+        let relative = PathBuf::from("data/kimi-workspaces/.git-mirrors/not-created.git");
+        let resolved = git_path(&relative);
+        assert!(Path::new(&resolved).is_absolute(), "{resolved}");
+    }
+
+    #[tokio::test]
+    async fn relative_mirror_initialization_does_not_nest_data_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = PathBuf::from(format!(
+            "target/pr-desk-relative-mirror-{}-{unique}",
+            std::process::id()
+        ));
+        let mirror = git_mirror(&root, "file:///definitely-not-a-pr-desk-repository");
+        let result = prepare_git_mirror(
+            &mirror,
+            &["0000000000000000000000000000000000000000"],
+            None,
+            "zh",
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(mirror.path.join("HEAD").is_file());
+        assert!(!mirror.path.join("data").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn parse_result_complete() {
