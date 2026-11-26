@@ -1,159 +1,210 @@
 # PR Desk (pr-desk-rs)
 
-A high-density GitHub PR pre-review workbench for the desktop (Rust + egui).
+A high-density GitHub PR review workbench for the desktop, built with Rust and
+egui/eframe. It combines a conventional LLM/OCR pre-review pipeline with a real,
+embedded Kimi CLI for repository-aware reviews and follow-up work.
 
-The desktop UI uses egui/eframe and includes PR management, review, inbox,
-settings, batch actions, and tray integration.
-
-Pairs with the AstrBot plugin
-[`astrbot_plugin_github_pr_review`](../astrbot_plugin_github_pr_review):
-the plugin runs the review pipeline (LLM reviews, SQLite storage, QQ push),
-while this app provides the local workbench UI and syncs state back to the
-plugin over its sync API (pins / priorities / board / tags / todos).
+PR Desk can optionally pair with
+[`astrbot_plugin_github_pr_review`](../astrbot_plugin_github_pr_review). The
+plugin provides remote review storage, synchronization and QQ push; the desktop
+app provides the interactive workbench. A remote plugin is not required for
+local-only use.
 
 ![PR list](docs/screenshot-list.png)
 ![Diff view](docs/screenshot-diff.png)
 
 ## Features
 
-**PR workspace**
+### PR workspace
 
-- Grouped PR list (pinned / board / to-review / reviewed / merged-closed)
-  with avatars, org icons, review scores, CI state, size and +/- columns
-- Excel-style column sorting, high-score quick filter, `/` search
-- Detail panel with tabs: Review (dimension scores, summary, flagged files,
-  line-level comments), Conversation, Checks, Files/Diff, and an embedded Kimi
-  CLI session
-- Diff viewer with real line numbers (parsed from hunk headers), per-file
-  collapse, compact variable-height files, and GitHub-style horizontal scrolling
-- One-click LLM pre-review with concurrency slots, live progress and cancellation;
-  optionally run pre-review automatically when a PR is added
-- Embedded Kimi CLI provides the full terminal experience, including plugins,
-  slash commands and session resume. Each PR receives a persistent complete Git
-  worktree with base/head history, the PR description and diff, so reviews are
-  not limited to the changed hunks. The workspace root is configurable, and the
-  terminal follows the app's light/dark and Glass themes.
+- Grouped PR list: pinned, board, to-review, reviewed, and merged/closed.
+- Avatars, organization icons, review scores, CI status, change size and +/-
+  columns, with sortable headers and a high-score filter.
+- Fast search and keyboard navigation; Ctrl/Shift multi-selection for batch
+  actions, copying links, deleting, or copying PRs between data-source profiles.
+- Detail tabs for Review, Conversation, Checks, Files/Diff, and Kimi CLI.
+- Diff viewer with real hunk line numbers, per-file collapse, compact
+  variable-height files and horizontal scrolling for long lines.
+- Import a PR by URL with `+ URL` or `Ctrl+V` (`Cmd+V` on macOS).
 
-**Inbox**
+### Review workflows
 
-- GitHub notifications with repo filter, unread-only toggle, and pagination
-- Preview pane (conversation / files / diff) without leaving the inbox
-- Mark-all-read (two-step confirm), one-click "add to pre-review"
+**Conventional pre-review**
 
-**Sync & data sources**
+- Scored LLM reports with summaries, dimensions, flagged files and OCR line-level
+  comments.
+- Configurable concurrency, live progress and child-process cancellation.
+- Optional automatic pre-review when a PR is added; this runs only the
+  conventional pre-review, not a second agent pipeline.
 
-- Bidirectional sync with the AstrBot plugin: local changes queue in an
-  outbox and push; conflicts resolve server-wins
-- Multiple data-source profiles (local + remote) with instant switching
-- Local mode: manual curation only — a GitHub token and a repo list are
-  enough, no server required
+**Embedded Kimi CLI**
 
-**UX**
+- A real terminal running the installed Kimi CLI, not a reduced chat wrapper.
+- Plugins, MCP tools, slash commands and native commands such as `/new`.
+- Each PR gets a persistent Git worktree containing base/head commits, the
+  history needed for merge-base, `pr-body.md`, `pr.diff` and `pr.json`.
+- Sessions resume with `--continue`. Switching PRs does not terminate existing
+  sessions, and new commits on a PR do not force a session reset.
+- The current terminal plus up to four recently used background terminals are
+  kept alive. Older entries are closed least-recently-used first and can later
+  resume from their saved session and worktree.
+- Worktrees use the real GitHub remote and track `refs/pull/<number>/head` with
+  tags disabled, so `git pull` updates only the current PR.
+- On Windows the terminal uses ConPTY. Terminal colors and background opacity
+  follow the application's regular and Glass themes.
 
-- Bilingual UI (zh/en) with live switch, light/dark theme, font scaling
-- Import a GitHub PR directly from its URL with the `+ URL` dialog, or press
-  `Ctrl+V` (`Cmd+V` on macOS) to import the PR URL currently on the clipboard
-- Keyboard-first: arrow keys navigate, `PgUp`/`PgDn` move by page,
-  `Enter` open, `Esc` close/back, `p` pin, `1`/`2`/`3` priority,
-  `o` open in browser
-- Window size and panel width persist across restarts
+### Inbox
 
-## Build & run
+- GitHub notifications with repository filtering, unread-only mode and
+  pagination.
+- Conversation and file previews without leaving the inbox.
+- Two-step mark-all-read confirmation and one-click add to pre-review.
 
-- Toolchain: **x86_64-pc-windows-gnu** (pure Rust, no MSVC/OpenSSL)
-- Stack: reqwest + rustls, rusqlite (bundled), egui/eframe (glow renderer)
+### Data sources and backups
+
+- Multiple local/remote data-source profiles with instant switching.
+- Optional bidirectional AstrBot synchronization using an outbox; conflicts
+  resolve server-wins.
+- Local mode works without a server: curate PRs by URL or from the inbox instead
+  of downloading a repository-wide open-PR list.
+- Export the active database to a user-selected destination using SQLite's
+  online backup, including WAL contents; existing files are never overwritten.
+- Import a database as a **copy in a new profile**, after integrity and schema
+  validation. The current database is not replaced.
+
+### Desktop experience
+
+- Chinese and English UI with live language switching.
+- `light`, `dark`, `glass-light` and `glass-dark` themes, with native backdrop
+  support where available and safe fallbacks.
+- Font scaling, persistent window size, panel width and centered settings.
+- Tray integration, URL import, keyboard shortcuts and clipboard export of
+  review reports.
+
+## Build and run
+
+Requirements:
+
+- A Rust toolchain supporting the 2024 edition.
+- `git` on PATH.
+- An installed, signed-in `kimi` CLI for embedded sessions. Conventional
+  pre-review can be used without it.
+- `bin/ocr.exe` for OCR line-level comments. Scored LLM reviews still work
+  without OCR, but comments are unavailable. OCR lookup order: explicit
+  `ocr_path` → `bin/ocr.exe` beside the executable → `bin/ocr.exe` in the working
+  directory → PATH.
+- An OpenAI-compatible LLM endpoint for conventional pre-review. Kimi CLI uses
+  its own account and configuration.
 
 ```bash
 cargo run --release
-# low-memory machines (Windows page-file pressure crashes rustc):
-scripts/build-release.sh   # = CARGO_INCREMENTAL=0 cargo build --release -j2
+
+# Lower-memory release build (CARGO_INCREMENTAL=0, -j2):
+scripts/build-release.sh
 ```
 
-Runtime requirements:
+The release script requires Bash. The primary development and end-to-end test
+target is `x86_64-pc-windows-gnu`.
 
-- `git` on PATH — local pre-review and Kimi sessions use a persistent PR
-  worktree containing the base/head commits and their history (see `src/ocr.rs`)
-- An installed, signed-in `kimi` CLI — required only for the embedded terminal;
-  configure a custom executable with `kimi_cli_path` and a durable workspace
-  location with `kimi_workspace_root`
-- `bin/ocr.exe` (open-code-review CLI, bundled sidecar) — the line-comment
-  review engine. Lookup order: `ocr_path` config (when non-default) →
-  `bin/ocr.exe` next to the exe → `bin/ocr.exe` in the working directory →
-  PATH. Without it only line-level comments are unavailable; scored reviews
-  (pure LLM) still work.
-
-### Shared Git object cache
-
-PR worktrees share one bare Git mirror per remote repository under
-`<kimi_workspace_root>/.git-mirrors/`. Their `.git/objects/info/alternates`
-entries reference these mirrors, so base/head history is downloaded once rather
-than duplicated for every PR. Checked-out files, branches and local edits remain
-independent for each PR, and `git pull` still uses the real GitHub remote.
-
-Deleting a mirror does not delete checked-out files, but worktrees that reference
-it can lose access to their Git history. Keep mirrors together with the workspace
-when moving or backing it up; rebuild missing mirrors before relying on offline
-history.
-
-### Renderer note
-
-The UI renders with eframe's **glow** backend. The wgpu stack is not
-compiled in (`eframe` default-features off): it was the single largest
-contributor to binary size and build memory (its static link could blow
-the Windows page file). Text uses native system fonts with Source Han
-Sans/Noto and JetBrains Mono preferred when installed, including correct
-variable-font weight selection.
+The UI uses eframe's **glow** renderer. The wgpu/naga stack is intentionally not
+compiled, keeping binary size and build memory down. Text rendering uses native
+system fonts with Source Han Sans/Noto and JetBrains Mono fallbacks.
 
 ## Configuration
 
-On first launch a `config.toml` template is created next to the exe.
-**Prefer editing it from the in-app ⚙ settings page** (hot-reloads, no
-restart) — it covers server URL, sync token, GitHub token, proxy, repo list,
-poll interval, LLM settings, and data-source profiles. When unconfigured, the
-app shows an onboarding card and opens settings (skippable for local mode).
+On first launch, a commented `config.toml` template is created. Prefer editing
+settings in the app; changes are saved and applied without a restart where
+possible.
 
-The database and avatar cache live in `data/` next to the config file.
-Config resolution: `config.toml` next to the exe wins; if absent, a
-`config.toml` in the working directory is used in place (so dev runs from
-the repo root keep their data outside `target/` where `cargo clean` can't
-eat it).
+Configuration lookup order:
+
+1. `config.toml` beside the executable.
+2. Otherwise, `config.toml` in the working directory, used in place.
+
+The database, avatar cache and default Kimi workspace live in `data/` beside the
+active configuration file.
+
+A typical configuration looks like:
 
 ```toml
-server_url = "http://127.0.0.1:6185"   # AstrBot address
-sync_token = ""                        # sync_token from the plugin config (empty = local browsing only)
-github_token = ""                      # stored in plaintext (personal use); GITHUB_TOKEN env var takes precedence
-proxy = ""                             # http:// or socks5:// proxy for GitHub / LLM requests only (empty = direct; sync server always direct)
-repos = ["owner/repo"]                 # repos to watch (open PRs)
-poll_interval_min = 5                  # auto-sync interval (minutes)
-# renderer: REMOVED — the software renderer is now the only one compiled in;
-# the field is still parsed for backward compatibility but its value is ignored.
+server_url = "http://127.0.0.1:6185"
+sync_token = ""
+astrbot_api_key = ""
+github_token = ""
+proxy = ""                         # http:// or socks5://; empty = direct
+repos = ["owner/repo"]
+poll_interval_min = 5
+
+theme = "glass-dark"              # light / dark / glass-light / glass-dark
+language = "zh"                   # zh / en
+font_scale = 1.0                  # 0.9 / 1.0 / 1.15
+
+llm_base_url = "https://api.openai.com/v1"
+llm_api_key = ""
+llm_model = ""
+ocr_path = "ocr"
+review_concurrency = 16           # 1-16
+auto_review_on_insert = false
+
+kimi_cli_path = "kimi"
+kimi_workspace_root = ""          # empty = data/kimi-workspaces
+active_profile = "local"
 ```
 
-> **Token storage**: `github_token` / `sync_token` / `llm_api_key` are stored
-> in plaintext in `config.toml` (this is a personal-use app). Don't commit or
-> share a config file containing tokens. Windows has no reliable `0600`
-> equivalent — use the `GITHUB_TOKEN` environment variable if you want the
-> token to never touch disk (it takes precedence over the file).
+Environment variables `GITHUB_TOKEN` and `LLM_API_KEY` take precedence over the
+corresponding configuration values. Token values are otherwise stored in
+plaintext in `config.toml`; do not commit or share that file. Proxy settings are
+explicit: GitHub and LLM requests use `proxy`, while synchronization requests
+connect directly.
+
+Remote profiles use `profile.<name>.server_url`, `profile.<name>.sync_token` and
+`profile.<name>.api_key`. The `default` profile maps to the top-level server
+fields, while `local` is the built-in local database.
+
+### Kimi workspaces and shared Git objects
+
+`kimi_workspace_root` may be absolute or relative; relative paths are anchored
+to the data directory. Each PR context has its own worktree and session files.
+
+All contexts also share bare mirrors under:
+
+```text
+<kimi_workspace_root>/.git-mirrors/
+```
+
+There is one mirror per remote repository. New worktrees reference mirror
+objects through `.git/objects/info/alternates`, avoiding duplicate history and
+pack files. Mirror updates are serialized per repository within the app, and
+only missing commits or insufficient history are fetched.
+
+Keep mirrors together with the workspace when moving or backing it up. Deleting
+a mirror does not delete checked-out files, but dependent worktrees can lose
+access to Git history until the mirror is rebuilt. Automatic mirror capacity
+cleanup is not currently implemented.
 
 ## Testing
 
 ```bash
-cargo test --lib                          # logic suite (no UI dependency)
-cargo test                                # full suite (compiles the egui UI)
+cargo test --all-targets
+cargo check --all-targets
 ```
 
-Coverage includes: sync merge semantics (server-wins / applied not
-overwritten / outbox merge / pull upsert), idempotent local upserts,
-cursor/outbox/diff cache, diff parsing (hunk line numbers, file splitting),
-config round-trip (escapes, inline comments, atomic writes), review-comment
-preservation on re-review, legacy database compatibility, automatic pre-review
-queueing, persistent Kimi workspace paths, real terminal I/O, and UI-side
-identity guards against stale async deliveries.
+The suites cover synchronization, database migration and backup, configuration,
+review parsing and queueing, diff parsing, deep Git history, shared mirror reuse,
+offline worktree rebuilding, concurrent context creation, real terminal I/O,
+and stale asynchronous UI delivery.
 
-## Roadmap
+Optional desktop end-to-end drivers (Windows, `PR_DESK_TEST=1`) are in
+`scripts/`:
 
-- Desktop versions of the todo / queue / board tabs
-- Packaging & distribution (cargo-dist / installer)
+- `verify1_list.sh`
+- `verify2_detail.sh`
+- `verify3_inbox.sh`
+- `verify4_kimi_terminal.sh`
+- `verify4_settings_tray.sh`
+
+They use the shared helpers in `scripts/verify.sh` for command injection, state
+assertions and screenshots.
 
 ## License
 
