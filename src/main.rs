@@ -1938,6 +1938,7 @@ impl eframe::App for EguiApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         // 真正退出（托盘「退出」）：通知 worker 停命令循环 + 收托盘线程
         let _ = self.cmd_tx.send(Cmd::Shutdown);
+        #[cfg(windows)]
         if let Some(t) = self.tray.as_mut() {
             t.stop();
         }
@@ -2068,13 +2069,16 @@ fn main() -> anyhow::Result<()> {
                 cfg_path.clone(),
             );
             // 托盘：左键还原 / 右键菜单「显示 / 退出」
-            let lang = cfg.language.clone();
-            let tray = tray::Tray::start(
-                msg_tx.clone(),
-                cc.egui_ctx.clone(),
-                tr(&lang, "tray_show"),
-                tr(&lang, "tray_quit"),
-            );
+            #[cfg(windows)]
+            let tray = {
+                let lang = cfg.language.clone();
+                tray::Tray::start(
+                    msg_tx.clone(),
+                    cc.egui_ctx.clone(),
+                    tr(&lang, "tray_show"),
+                    tr(&lang, "tray_quit"),
+                )
+            };
 
             // 自动化验证：指令文件监听（仅显式开启；指令经消息泵走 logic()，与 UI 回调同线程）
             if std::env::var_os("PR_DESK_TEST").is_some() {
@@ -2187,6 +2191,7 @@ fn main() -> anyhow::Result<()> {
                 import_url_open: false,
                 import_url_buf: String::new(),
                 allow_close: false,
+                #[cfg(windows)]
                 tray: Some(tray),
             }))
         }),
