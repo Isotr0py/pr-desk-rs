@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -23,10 +23,12 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-gnu
             name: windows-x86_64
-          # macOS 本地验证通过后取消注释（ocr sidecar 由 fetch_ocr.py 自动选对平台资产）：
-          # - os: macos-latest
-          #   target: aarch64-apple-darwin
-          #   name: macos-arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            name: linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            name: macos-arm64
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -40,6 +42,22 @@ jobs:
       - name: Add MinGW to PATH (windows-gnu linker)
         if: runner.os == 'Windows'
         run: echo "C:\msys64\mingw64\bin" >> $env:GITHUB_PATH
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxi-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgl1-mesa-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -86,9 +104,23 @@ jobs:
           name: pr-desk-rs-${{ matrix.name }}
           path: dist/pr-desk-rs-${{ matrix.name }}.*
 
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pr-desk-rs-*
+          path: dist
+
       - name: Create GitHub Release
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/pr-desk-rs-${{ matrix.name }}.*
+          files: |
+            dist/**/*.zip
+            dist/**/*.tar.gz
           generate_release_notes: true
