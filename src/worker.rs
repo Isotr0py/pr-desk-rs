@@ -553,11 +553,23 @@ async fn run_review_task(
     let custom_prompt = std::fs::read_to_string(pr_desk_rs::exe_dir().join("review_prompt.md"))
         .ok()
         .filter(|s| !s.trim().is_empty());
+    let snapshot = match g.fetch_pr_snapshot(repo, number).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            send(
+                msg_tx,
+                Msg::ReviewFailed {
+                    repo: repo.to_string(),
+                    number,
+                    err: error.to_string(),
+                },
+            );
+            return false;
+        }
+    };
     match reviewer::run_review(
         llm,
-        g,
-        repo,
-        number,
+        &snapshot,
         &mut progress,
         lang,
         custom_prompt.as_deref(),
@@ -565,49 +577,53 @@ async fn run_review_task(
     .await
     {
         Ok(mut v) => {
-            // 第二段：OCR 行级评论（评分已拿到，OCR 失败不拖垮整单）
-            match g.fetch_pr_meta(repo, number).await {
-                Ok(meta) => {
-                    match ocr::run_ocr_review(cfg, g, repo, number, &meta, &mut progress, lang)
-                        .await
-                    {
-                        Ok(outcome) => {
-                            send(
-                                msg_tx,
-                                Msg::ReviewProgress {
-                                    repo: repo.to_string(),
-                                    number,
-                                    text: trf(
-                                        lang,
-                                        "ocr_done_status",
-                                        &[
-                                            &outcome.comments.len().to_string(),
-                                            &outcome.files_reviewed.to_string(),
-                                        ],
-                                    ),
-                                },
-                            );
-                            v["comments"] = Value::Array(outcome.comments);
-                        }
-                        Err(e) => {
-                            // 状态栏一闪而过很难捉到，同步写日志
-                            tracing::warn!("OCR 明细获取失败 {repo} #{number}: {e}");
-                            send(
-                                msg_tx,
-                                Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])),
-                            );
-                        }
-                    }
+            // 第二段：OCR 与评分严格复用同一冻结快照，失败不拖垮已有评分。
+            match ocr::run_ocr_review_with_diff(
+                cfg,
+                g,
+                repo,
+                &snapshot.meta,
+                &snapshot.diff,
+                &mut progress,
+                lang,
+                None,
+                None,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    send(
+                        msg_tx,
+                        Msg::ReviewProgress {
+                            repo: repo.to_string(),
+                            number,
+                            text: trf(
+                                lang,
+                                "ocr_done_status",
+                                &[
+                                    &outcome.comments.len().to_string(),
+                                    &outcome.files_reviewed.to_string(),
+                                ],
+                            ),
+                        },
+                    );
+                    v["comments"] = Value::Array(outcome.comments);
                 }
                 Err(e) => {
-                    tracing::warn!("OCR 前置 meta 拉取失败 {repo} #{number}: {e}");
+                    tracing::warn!("OCR 明细获取失败 {repo} #{number}: {e}");
                     send(
                         msg_tx,
                         Msg::Status(trf(lang, "ocr_detail_failed", &[&e.to_string()])),
                     );
                 }
             }
-            let ok = lock_for_profile(app, profile).is_some_and(|a| a.db.upsert_review(&v).is_ok());
+            let ok = lock_for_profile(app, profile).is_some_and(|a| {
+                a.db.upsert_review(&v).is_ok()
+                    && a.db
+                        .put_diff(repo, number, &snapshot.head_sha, &snapshot.diff)
+                        .is_ok()
+                    && a.db.mark_local_review_success(repo, number).is_ok()
+            });
             if ok {
                 send(
                     msg_tx,
@@ -783,6 +799,580 @@ fn pump_auto_reviews(
     }
 }
 
+// ── Kimi agent 深审 ──
+
+type AgentRunning = std::collections::HashMap<
+    String,
+    std::collections::HashMap<i64, (String, i64, Arc<std::sync::atomic::AtomicBool>)>,
+>;
+
+fn notify_agent_review(msg_tx: &mpsc::Sender<Msg>, profile: &str, repo: &str, number: i64) {
+    send(
+        msg_tx,
+        Msg::AgentReviewUpdated {
+            profile: profile.to_string(),
+            repo: repo.to_string(),
+            number,
+        },
+    );
+}
+
+async fn agent_git_output(
+    worktree: &std::path::Path,
+    args: &[&str],
+) -> anyhow::Result<std::process::Output> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(worktree)
+            .output(),
+    )
+    .await??;
+    if !output.status.success() {
+        anyhow::bail!(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+    Ok(output)
+}
+
+async fn incremental_agent_diff(
+    worktree: &std::path::Path,
+    parent: &str,
+    head: &str,
+) -> Option<String> {
+    agent_git_output(worktree, &["merge-base", "--is-ancestor", parent, head])
+        .await
+        .ok()?;
+    let output = agent_git_output(worktree, &["diff", "--unified=20", parent, head])
+        .await
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn edit_snapshot_is_approved(run: &Value, snapshot: &github::PrSnapshot) -> bool {
+    run["kind"].as_str() != Some("edit")
+        || (run["base_sha"].as_str() == Some(snapshot.base_sha.as_str())
+            && run["head_sha"].as_str() == Some(snapshot.head_sha.as_str()))
+}
+
+async fn execute_agent_run(
+    cfg: Config,
+    gh: github::GitHub,
+    profile: String,
+    run: Value,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+    msg_tx: mpsc::Sender<Msg>,
+) -> anyhow::Result<()> {
+    let run_id = run["id"].as_i64().unwrap_or(0);
+    let repo = run["repo"].as_str().unwrap_or("").to_string();
+    let number = run["number"].as_i64().unwrap_or(0);
+    let db_path = profile_db_path(&pr_desk_rs::data_dir(), &profile);
+    let db = Db::open(&db_path)?;
+    let snapshot = gh.fetch_pr_snapshot(&repo, number).await?;
+    if !edit_snapshot_is_approved(&run, &snapshot) {
+        db.supersede_agent_run(run_id, "approved head changed before edit")?;
+        anyhow::bail!("批准的 head 已变化，edit_code 未启动");
+    }
+    db.put_diff(&repo, number, &snapshot.head_sha, &snapshot.diff)?;
+    db.conn.execute(
+        "UPDATE prs SET head_sha=?1 WHERE repo=?2 AND number=?3",
+        rusqlite::params![snapshot.head_sha, repo, number],
+    )?;
+    let git_snapshot = ocr::build_ocr_git_snapshot(
+        &gh,
+        &repo,
+        &snapshot.meta,
+        &snapshot.diff,
+        &cfg.kimi_workspace_root_path(),
+        &mut |_| {},
+        &cfg.language,
+        Some(cancel.clone()),
+    )
+    .await?;
+    let workspace = git_snapshot.path().to_string_lossy().into_owned();
+    if !db.prepare_agent_run_snapshot(run_id, &snapshot.base_sha, &snapshot.head_sha, &workspace)? {
+        anyhow::bail!("agent run 已被其他任务取代");
+    }
+    if !db.mark_agent_run_running(run_id)? {
+        anyhow::bail!("agent run 无法启动");
+    }
+    notify_agent_review(&msg_tx, &profile, &repo, number);
+    let run = db
+        .get_agent_run(run_id)?
+        .ok_or_else(|| anyhow::anyhow!("agent run 在启动后消失"))?;
+    let current = db.load_agent_review(&repo, number)?.unwrap_or(run.clone());
+    let kind = run["kind"].as_str().unwrap_or("initial").to_string();
+    let parent = run["parent_head_sha"].as_str().map(str::to_string);
+    let incremental = if let Some(parent_sha) = parent.as_deref() {
+        let diff =
+            incremental_agent_diff(git_snapshot.path(), parent_sha, &snapshot.head_sha).await;
+        if diff.is_none() && !db.set_agent_run_parent(run_id, None)? {
+            anyhow::bail!("增量 parent 不可用且无法回退为完整评审");
+        }
+        diff
+    } else {
+        None
+    };
+    let effective_parent = if parent.is_some() && incremental.is_some() {
+        parent.as_deref()
+    } else {
+        None
+    };
+    let previous = db
+        .list_agent_findings(&repo, number)?
+        .into_iter()
+        .filter(|finding| matches!(finding["status"].as_str(), Some("open") | Some("stale")))
+        .collect::<Vec<_>>();
+    let previous_json = (!previous.is_empty())
+        .then(|| serde_json::to_string_pretty(&previous))
+        .transpose()?;
+    let mut prompt = pr_desk_rs::agent_review::build_review_prompt(
+        &snapshot,
+        effective_parent,
+        incremental.as_deref(),
+        previous_json.as_deref(),
+    );
+    let decisions = db.list_agent_decisions(&repo, number)?;
+    let answered = decisions
+        .iter()
+        .filter(|decision| decision["status"].as_str() == Some("answered"))
+        .map(|decision| {
+            serde_json::json!({
+                "kind": decision["kind"],
+                "title": decision["title"],
+                "answer": decision["answer"],
+            })
+        })
+        .collect::<Vec<_>>();
+    if !answered.is_empty() {
+        prompt.push_str("\n用户已经回答此前的决策，请在原任务上继续：\n");
+        prompt.push_str(&serde_json::to_string_pretty(&answered)?);
+    }
+    let allow_edit = kind == "edit";
+    if allow_edit {
+        prompt.push_str(
+            "\n用户已明确批准这一次 edit_code。只能修改当前 PR worktree，完成后如实验证并输出报告；不得 push、merge 或发布评论。",
+        );
+    }
+    let session_id = current["session_id"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| run["session_id"].as_str().map(str::to_string));
+    let request = pr_desk_rs::agent_review::AgentRunRequest {
+        cli_path: std::path::PathBuf::from(&cfg.kimi_cli_path),
+        cwd: git_snapshot.path().to_path_buf(),
+        prompt,
+        session_id,
+        allow_edit,
+        timeout: std::time::Duration::from_secs(30 * 60),
+    };
+    let mut progress = |_text: String| {};
+    let outcome = pr_desk_rs::agent_review::run_kimi(
+        request,
+        &snapshot,
+        effective_parent,
+        &mut progress,
+        cancel,
+    )
+    .await?;
+    if let Some(session_id) = outcome.session_id {
+        db.set_agent_run_session(run_id, &session_id)?;
+    }
+    if !db.apply_agent_report(run_id, &outcome.report)? {
+        anyhow::bail!("agent 报告到达时基线已变化，已仅保留历史记录");
+    }
+    if kind != "edit" {
+        db.mark_local_review_success(&repo, number)?;
+    }
+    Ok(())
+}
+
+fn spawn_agent_run(
+    cfg: Config,
+    gh: github::GitHub,
+    _app: Arc<Mutex<App>>,
+    msg_tx: mpsc::Sender<Msg>,
+    cmd_tx: UnboundedSender<Cmd>,
+    profile: String,
+    run: Value,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
+) {
+    tokio::spawn(async move {
+        let run_id = run["id"].as_i64().unwrap_or(0);
+        let repo = run["repo"].as_str().unwrap_or("").to_string();
+        let number = run["number"].as_i64().unwrap_or(0);
+        let cancelled = cancel.clone();
+        let result = execute_agent_run(cfg, gh, profile.clone(), run, cancel, msg_tx.clone()).await;
+        if let Ok(db) = Db::open(&profile_db_path(&pr_desk_rs::data_dir(), &profile)) {
+            match result {
+                Ok(()) => {}
+                Err(_error) if cancelled.load(std::sync::atomic::Ordering::Relaxed) => {
+                    let _ = db.cancel_agent_run(run_id);
+                }
+                Err(error) => {
+                    let _ = db.fail_agent_run(run_id, &error.to_string());
+                }
+            }
+        }
+        notify_agent_review(&msg_tx, &profile, &repo, number);
+        let _ = cmd_tx.send(Cmd::AgentRunSettled { profile, run_id });
+    });
+}
+
+fn pump_agent_reviews(
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    cmd_tx: &UnboundedSender<Cmd>,
+    running: &mut AgentRunning,
+) {
+    loop {
+        let (cfg, profile, run) = {
+            let a = app.lock_recover();
+            let profile = a.cfg.active_profile.clone();
+            let capacity = a.cfg.agent_review_concurrency as usize;
+            if running
+                .get(&profile)
+                .is_some_and(|tasks| tasks.len() >= capacity)
+            {
+                break;
+            }
+            let run = a.db.next_agent_run().ok().flatten();
+            (a.cfg.clone(), profile, run)
+        };
+        let Some(run) = run else {
+            break;
+        };
+        let run_id = run["id"].as_i64().unwrap_or(0);
+        let repo = run["repo"].as_str().unwrap_or("").to_string();
+        let number = run["number"].as_i64().unwrap_or(0);
+        let profile_tasks = running.entry(profile.clone()).or_default();
+        if profile_tasks.contains_key(&run_id)
+            || profile_tasks
+                .values()
+                .any(|(active_repo, active_number, _)| {
+                    active_repo == &repo && *active_number == number
+                })
+        {
+            break;
+        }
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        profile_tasks.insert(run_id, (repo, number, cancel.clone()));
+        let Some(gh) = github::GitHub::new(cfg.token(), &cfg.proxy).ok() else {
+            if let Ok(db) = Db::open(&profile_db_path(&pr_desk_rs::data_dir(), &profile)) {
+                let _ = db.fail_agent_run(run_id, "GitHub 客户端初始化失败");
+            }
+            profile_tasks.remove(&run_id);
+            continue;
+        };
+        spawn_agent_run(
+            cfg,
+            gh,
+            app.clone(),
+            msg_tx.clone(),
+            cmd_tx.clone(),
+            profile,
+            run,
+            cancel,
+        );
+    }
+}
+
+fn load_needs_you_rows(app: &Arc<Mutex<App>>) -> Vec<NeedsYouRow> {
+    let a = app.lock_recover();
+    let reviews = a.db.list_needs_you().unwrap_or_default();
+    let mut rows = Vec::new();
+    for review in reviews {
+        let repo = review["repo"].as_str().unwrap_or("").to_string();
+        let number = review["number"].as_i64().unwrap_or(0);
+        let reasons = review["reasons"].as_array().cloned().unwrap_or_default();
+        if reasons.iter().any(|reason| reason == "open_decision") {
+            for decision in
+                a.db.list_agent_decisions(&repo, number)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|decision| decision["status"].as_str() == Some("open"))
+            {
+                let decision = agent_decision_row(&decision);
+                rows.push(NeedsYouRow {
+                    kind: "decision".into(),
+                    repo: repo.clone(),
+                    number,
+                    title: decision.title.clone(),
+                    detail: decision.context.clone(),
+                    run_id: decision.run_id,
+                    decision_id: decision.id,
+                    decision_kind: decision.kind.clone(),
+                    options: decision.options,
+                });
+            }
+        }
+        for (reason, kind) in [
+            ("unacknowledged", "completed"),
+            ("failed", "failed"),
+            ("stale", "stale"),
+            ("ci_failure", "ci_failure"),
+        ] {
+            if !reasons.iter().any(|value| value == reason) {
+                continue;
+            }
+            let title = match kind {
+                "failed" => review["error"].as_str().unwrap_or("agent review failed"),
+                "stale" => "PR has new commits",
+                "ci_failure" => "CI failed on the reviewed head",
+                _ => review["summary"]
+                    .as_str()
+                    .unwrap_or("agent review completed"),
+            };
+            rows.push(NeedsYouRow {
+                kind: kind.into(),
+                repo: repo.clone(),
+                number,
+                title: title.chars().take(240).collect(),
+                detail: review["validation"].as_str().unwrap_or("").into(),
+                run_id: review["active_run_id"].as_i64().unwrap_or(0),
+                ..Default::default()
+            });
+        }
+    }
+    rows
+}
+
+fn agent_decision_markdown(db: &Db, repo: &str, number: i64) -> String {
+    let review = db.load_agent_review(repo, number).ok().flatten();
+    let mut markdown = review
+        .as_ref()
+        .and_then(|review| review["summary"].as_str())
+        .unwrap_or("## Kimi deep review")
+        .to_string();
+    if let Some(validation) = review
+        .as_ref()
+        .and_then(|review| review["validation"].as_str())
+        .filter(|validation| !validation.trim().is_empty())
+    {
+        markdown.push_str("\n\n### Validation\n\n");
+        markdown.push_str(validation);
+    }
+    let findings = db.list_agent_findings(repo, number).unwrap_or_default();
+    if !findings.is_empty() {
+        markdown.push_str("\n\n### Findings\n");
+        for finding in findings
+            .into_iter()
+            .filter(|finding| finding["status"].as_str() == Some("open"))
+        {
+            markdown.push_str(&format!(
+                "\n- **[{}]** `{}`: {} — {}",
+                finding["severity"].as_str().unwrap_or("other"),
+                finding["path"].as_str().unwrap_or(""),
+                finding["title"].as_str().unwrap_or(""),
+                finding["suggestion"].as_str().unwrap_or(""),
+            ));
+        }
+    }
+    markdown
+}
+
+async fn execute_external_decision(
+    cfg: Config,
+    gh: github::GitHub,
+    profile: String,
+    decision: Value,
+    execute: bool,
+) -> String {
+    let decision_id = decision["id"].as_i64().unwrap_or(0);
+    let result = async {
+        if !execute {
+            return Ok::<_, anyhow::Error>("用户选择暂不执行".to_string());
+        }
+        let repo = decision["repo"].as_str().unwrap_or("").to_string();
+        let number = decision["number"].as_i64().unwrap_or(0);
+        let db = Db::open(&profile_db_path(&pr_desk_rs::data_dir(), &profile))?;
+        let kind = decision["kind"].as_str().unwrap_or("");
+        let review = db
+            .load_agent_review(&repo, number)?
+            .ok_or_else(|| anyhow::anyhow!("找不到 agent review"))?;
+        let run_id = decision["run_id"]
+            .as_i64()
+            .ok_or_else(|| anyhow::anyhow!("决策缺少 run，拒绝执行外部动作"))?;
+        let run = db
+            .get_agent_run(run_id)?
+            .ok_or_else(|| anyhow::anyhow!("决策对应的 run 不存在"))?;
+        let decision_head = run["head_sha"]
+            .as_str()
+            .filter(|head| !head.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("决策缺少 head，拒绝执行"))?;
+        anyhow::ensure!(
+            review["reviewed_head_sha"].as_str() == Some(decision_head),
+            "审查基线已变化，拒绝执行旧决策"
+        );
+        let remote = gh.fetch_pr_meta(&repo, number).await?;
+        anyhow::ensure!(
+            remote["head"]["sha"].as_str() == Some(decision_head),
+            "远端 head 已变化，拒绝执行旧决策"
+        );
+        match kind {
+            "post_comment" => {
+                let body = agent_decision_markdown(&db, &repo, number);
+                gh.post_issue_comment(&repo, number, &body).await?;
+                Ok("GitHub 评论已发布".to_string())
+            }
+            "submit_review" => {
+                let body = agent_decision_markdown(&db, &repo, number);
+                let event = decision["review_event"].as_str().unwrap_or("COMMENT");
+                gh.submit_pr_review(&repo, number, &body, event, decision_head)
+                    .await?;
+                Ok(format!("GitHub review 已提交：{event}"))
+            }
+            "merge" => {
+                let head = review["reviewed_head_sha"]
+                    .as_str()
+                    .filter(|head| !head.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("没有已成功审查的 head，拒绝 merge"))?;
+                let method = decision["merge_method"].as_str().unwrap_or("merge");
+                gh.merge_pr(&repo, number, head, method).await?;
+                Ok(format!("PR 已按 {method} 合并"))
+            }
+            "push" => {
+                let expected = review["reviewed_head_sha"]
+                    .as_str()
+                    .filter(|head| !head.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("没有审查基线，拒绝 push"))?;
+                let meta = gh.fetch_pr_meta(&repo, number).await?;
+                if meta["head"]["sha"].as_str() != Some(expected) {
+                    anyhow::bail!("PR head 已变化，拒绝 push");
+                }
+                let branch = meta["head"]["ref"]
+                    .as_str()
+                    .filter(|branch| !branch.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("PR 缺少 head branch"))?;
+                let head_repo = meta["head"]["repo"]["full_name"].as_str().unwrap_or(&repo);
+                let workspace = review["workspace"].as_str().unwrap_or("");
+                if workspace.is_empty() {
+                    anyhow::bail!("agent workspace 不可用");
+                }
+                let remote = format!("https://github.com/{head_repo}.git");
+                let lease = format!("--force-with-lease=refs/heads/{branch}:{expected}");
+                let refspec = format!("HEAD:refs/heads/{branch}");
+                let output = agent_git_output(
+                    std::path::Path::new(workspace),
+                    &["push", &lease, &remote, &refspec],
+                )
+                .await?;
+                Ok(format!(
+                    "已 push：{}",
+                    String::from_utf8_lossy(&output.stdout)
+                ))
+            }
+            "edit_code" => {
+                let base = review["reviewed_base_sha"].as_str().unwrap_or("");
+                let head = review["reviewed_head_sha"]
+                    .as_str()
+                    .filter(|head| !head.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("没有审查基线，拒绝 edit_code"))?;
+                let run_id = db.enqueue_agent_review(
+                    &repo,
+                    number,
+                    "edit",
+                    base,
+                    head,
+                    Some(head),
+                    review["workspace"].as_str().unwrap_or(""),
+                )?;
+                Ok(format!("修改任务已排队：run #{run_id}"))
+            }
+            other => anyhow::bail!("不支持的外部动作：{other}"),
+        }
+    }
+    .await;
+    let (text, success) = match result {
+        Ok(text) => (text, true),
+        Err(error) => (error.to_string(), false),
+    };
+    if let Ok(db) = Db::open(&profile_db_path(&pr_desk_rs::data_dir(), &profile)) {
+        let _ = db.record_agent_decision_result(decision_id, &text, success);
+    }
+    let _ = cfg;
+    text
+}
+
+async fn poll_agent_watchers(
+    app: &Arc<Mutex<App>>,
+    gh: &github::GitHub,
+    msg_tx: &mpsc::Sender<Msg>,
+    profile: &str,
+) {
+    let (auto_rereview, reviews) = {
+        let Some(a) = lock_for_profile(app, profile) else {
+            return;
+        };
+        (
+            a.cfg.auto_agent_rereview,
+            a.db.list_agent_reviews().unwrap_or_default(),
+        )
+    };
+    for review in reviews {
+        let repo = review["repo"].as_str().unwrap_or("").to_string();
+        let number = review["number"].as_i64().unwrap_or(0);
+        let Ok(meta) = gh.fetch_pr_meta(&repo, number).await else {
+            continue;
+        };
+        let head = meta["head"]["sha"].as_str().unwrap_or("").to_string();
+        if head.is_empty() {
+            continue;
+        }
+        let state = if meta["merged_at"].is_null() {
+            meta["state"].as_str().unwrap_or("open")
+        } else {
+            "merged"
+        };
+        let closed = matches!(state, "closed" | "merged");
+        let checks = if review["reviewed_head_sha"]
+            .as_str()
+            .is_some_and(|reviewed| !reviewed.is_empty())
+        {
+            gh.fetch_pr_checks(&repo, &head)
+                .await
+                .ok()
+                .map(|(ci, _)| ci)
+        } else {
+            None
+        };
+        {
+            let Some(a) = lock_for_profile(app, profile) else {
+                return;
+            };
+            let _ = a.db.conn.execute(
+                "UPDATE prs SET head_sha=?1, ci_status=COALESCE(?2, ci_status), updated_at=?3
+                 WHERE repo=?4 AND number=?5",
+                rusqlite::params![
+                    &head,
+                    &checks,
+                    meta["updated_at"].as_str().unwrap_or(""),
+                    repo,
+                    number
+                ],
+            );
+            if closed {
+                let _ = a.db.conn.execute(
+                    "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3",
+                    rusqlite::params![state, repo, number],
+                );
+            }
+            if let Err(error) = a.db.observe_agent_pr(
+                &repo,
+                number,
+                &head,
+                checks.as_deref(),
+                closed,
+                auto_rereview,
+            ) {
+                tracing::warn!("agent watch 更新失败 {repo} #{number}: {error}");
+            }
+        }
+        notify_agent_review(msg_tx, profile, &repo, number);
+    }
+}
+
 // ── 刷新 / 同步 ──
 
 /// 本地模式刷新：本地库是手动策展的（只有 Inbox「+ 预评审」加入的 PR），
@@ -817,7 +1407,7 @@ async fn refresh_from_github(
             };
             let sums: Vec<(String, i64, i64, i64)> = cached
                 .iter()
-                .map(|(repo, number, diff)| {
+                .map(|(repo, number, _head_sha, diff)| {
                     let (adds, dels) = diffview::split_files(diff).iter().fold(
                         (0i64, 0i64),
                         |(a, d), (_p, text)| {
@@ -1081,7 +1671,7 @@ fn open_drawer_work(
         (priority, idx.and_then(|i| a.rows.get(i).cloned()))
     };
 
-    let (review, diff_cached, head_sha) = {
+    let (review, diff_cached, head_sha, agent_review) = {
         let a = app.lock_recover();
         let review = match a.db.get_review(&repo, number) {
             Ok(r) => r,
@@ -1090,19 +1680,23 @@ fn open_drawer_work(
                 None
             }
         };
-        let diff = match a.db.get_diff(&repo, number) {
+        let head_sha =
+            a.db.pr_head_sha(&repo, number)
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+        let diff = match a.db.get_diff(&repo, number, &head_sha) {
             Ok(d) => d,
             Err(e) => {
                 tracing::warn!("读取 diff 缓存失败 {repo} #{number}: {e}");
                 None
             }
         };
-        let head_sha =
-            a.db.pr_head_sha(&repo, number)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-        (review, diff, head_sha)
+        let agent = a.db.load_agent_review(&repo, number).ok().flatten();
+        let findings = a.db.list_agent_findings(&repo, number).unwrap_or_default();
+        let decisions = a.db.list_agent_decisions(&repo, number).unwrap_or_default();
+        let agent = agent_review_props(agent.as_ref(), &findings, &decisions, &head_sha);
+        (review, diff, head_sha, agent)
     };
 
     // 会话条目在 worker 装配（纯数据过界）；Checks/Files 保持 JSON，UI 线程解析
@@ -1225,9 +1819,10 @@ fn open_drawer_work(
             checks_json,
             files_json,
             review: review_props(review.as_ref(), &lang),
+            agent_review,
             review_status: String::new(),
             review_progress: String::new(),
-            head_sha,
+            head_sha: head_sha.clone(),
         })),
     );
 
@@ -1258,6 +1853,7 @@ fn open_drawer_work(
                 Msg::DiffParsed {
                     repo: repo.clone(),
                     number,
+                    head_sha,
                     files,
                 },
             );
@@ -1339,6 +1935,13 @@ async fn worker(
     let meta_healed: Arc<Mutex<std::collections::HashMap<(String, i64), std::time::Instant>>> =
         Default::default();
     let mut auto_reviews = AutoReviewQueue::default();
+    let mut agent_running = AgentRunning::new();
+    if let Err(error) = app.lock_recover().db.recover_agent_runs(&[]) {
+        tracing::warn!("恢复 agent 队列失败: {error}");
+    }
+    let needs_you = load_needs_you_rows(&app);
+    send(&msg_tx, Msg::NeedsYouLoaded(needs_you));
+    pump_agent_reviews(&app, &msg_tx, &cmd_tx, &mut agent_running);
 
     // unbounded channel + recv().await：不在 tokio 工作线程上做 std 阻塞 recv；
     // 所有发送端 drop（UI 退出）或收到 Shutdown 时循环退出——进程不再做僵尸
@@ -1385,6 +1988,7 @@ async fn worker(
                             // 顺便拉一次通知
                             fetch_inbox(&g, &app2, &tx).await;
                         }
+                        poll_agent_watchers(&app2, &g, &tx, &for_profile).await;
                         // 收尾：复位连点去重标志 + 停顶栏转圈 + 状态栏报结果（open PR 数）
                         finish(&app2, &tx);
                     });
@@ -1407,6 +2011,9 @@ async fn worker(
                         fetch_inbox(g, &app2, &tx).await;
                     }
                     do_sync(&app2, &sc, &tx, &cmd2, &for_profile).await;
+                    if let Some(g) = &g {
+                        poll_agent_watchers(&app2, g, &tx, &for_profile).await;
+                    }
                     // 收尾：复位去重标志 + 停顶栏转圈（结果文案由 do_sync 自己的 Status 负责；
                     // 本地模式 sync 未启用时 do_sync 静默跳过，这里也不打扰状态栏）
                     app2.lock_recover().sync_inflight = false;
@@ -1418,26 +2025,25 @@ async fn worker(
                 if let Some(g) = gh.clone() {
                     let app2 = app.clone();
                     let tx = msg_tx.clone();
+                    let profile = app.lock_recover().cfg.active_profile.clone();
                     tokio::spawn(async move {
-                        match g.fetch_diff(&repo, number).await {
-                            Ok(diff) => {
-                                {
-                                    let a = app2.lock_recover();
-                                    if let Err(e) = a.db.put_diff(&repo, number, &diff) {
-                                        tracing::warn!("diff 缓存写入失败 {repo} #{number}: {e}");
-                                    }
+                        match g.fetch_pr_snapshot(&repo, number).await {
+                            Ok(snapshot) => {
+                                if lock_for_profile(&app2, &profile).is_some_and(|a| {
+                                    a.db.put_diff(&repo, number, &snapshot.head_sha, &snapshot.diff)
+                                        .is_ok()
+                                }) {
+                                    let files = parse_diff(&snapshot.diff);
+                                    send(
+                                        &tx,
+                                        Msg::DiffParsed {
+                                            repo,
+                                            number,
+                                            head_sha: snapshot.head_sha,
+                                            files,
+                                        },
+                                    );
                                 }
-                                // 解析在 task 内完成；消息带身份，面板已切走时 apply 丢弃上屏
-                                let files = parse_diff(&diff);
-                                send(
-                                    &tx,
-                                    Msg::DiffParsed {
-                                        repo,
-                                        number,
-                                        files,
-                                    },
-                                );
-                                // diff 响应也带配额头，状态栏重组刷新配额
                                 send(&tx, Msg::StatusBarRefresh);
                             }
                             Err(e) => {
@@ -1795,6 +2401,169 @@ async fn worker(
                 let rows = app.lock_recover().inbox.clone();
                 send(&msg_tx, Msg::InboxRows(rows));
             }
+            cmd @ (Cmd::StartAgentReview { .. } | Cmd::RereviewAgent { .. }) => {
+                let (repo, number, is_rereview) = match &cmd {
+                    Cmd::StartAgentReview { repo, number } => (repo.clone(), *number, false),
+                    Cmd::RereviewAgent { repo, number } => (repo.clone(), *number, true),
+                    _ => unreachable!(),
+                };
+                let (profile, result) = {
+                    let a = app.lock_recover();
+                    let profile = a.cfg.active_profile.clone();
+                    let review = a.db.load_agent_review(&repo, number).ok().flatten();
+                    let head =
+                        a.db.pr_head_sha(&repo, number)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default();
+                    let base = review
+                        .as_ref()
+                        .and_then(|review| {
+                            review["reviewed_base_sha"]
+                                .as_str()
+                                .or_else(|| review["requested_base_sha"].as_str())
+                        })
+                        .unwrap_or("");
+                    let parent = if is_rereview {
+                        review
+                            .as_ref()
+                            .and_then(|review| review["reviewed_head_sha"].as_str())
+                    } else {
+                        None
+                    };
+                    let workspace = review
+                        .as_ref()
+                        .and_then(|review| review["workspace"].as_str())
+                        .unwrap_or("");
+                    let result = a.db.enqueue_agent_review(
+                        &repo,
+                        number,
+                        if is_rereview { "rereview" } else { "initial" },
+                        base,
+                        &head,
+                        parent,
+                        workspace,
+                    );
+                    (profile, result)
+                };
+                match result {
+                    Ok(run_id) => {
+                        send(
+                            &msg_tx,
+                            Msg::Status(format!("Kimi 深审已排队：run #{run_id}")),
+                        );
+                    }
+                    Err(error) => {
+                        send(&msg_tx, Msg::Status(format!("Kimi 深审排队失败：{error}")));
+                    }
+                }
+                notify_agent_review(&msg_tx, &profile, &repo, number);
+            }
+            Cmd::CancelAgentRun { repo, number } => {
+                let (profile, run_id) = {
+                    let a = app.lock_recover();
+                    (
+                        a.cfg.active_profile.clone(),
+                        a.db.load_agent_review(&repo, number)
+                            .ok()
+                            .flatten()
+                            .and_then(|review| review["active_run_id"].as_i64()),
+                    )
+                };
+                if let Some(run_id) = run_id {
+                    if let Some(cancel) = agent_running
+                        .get(&profile)
+                        .and_then(|tasks| tasks.get(&run_id).map(|(_, _, cancel)| cancel))
+                    {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    let _ = app.lock_recover().db.cancel_agent_run(run_id);
+                }
+                notify_agent_review(&msg_tx, &profile, &repo, number);
+            }
+            Cmd::AnswerAgentDecision {
+                repo,
+                number,
+                decision_id,
+                answer,
+                execute,
+            } => {
+                let (profile, decision) = {
+                    let a = app.lock_recover();
+                    let decision =
+                        a.db.answer_agent_decision(decision_id, &answer)
+                            .ok()
+                            .flatten();
+                    (a.cfg.active_profile.clone(), decision)
+                };
+                if let Some(decision) = decision {
+                    let kind = decision["kind"].as_str().unwrap_or("").to_string();
+                    if kind != "clarification" {
+                        let decision_id = decision["id"].as_i64().unwrap_or(0);
+                        let cfg = app.lock_recover().cfg.clone();
+                        if let Some(gh) = gh.clone() {
+                            let tx = msg_tx.clone();
+                            let profile2 = profile.clone();
+                            let repo2 = repo.clone();
+                            tokio::spawn(async move {
+                                let text = execute_external_decision(
+                                    cfg,
+                                    gh,
+                                    profile2.clone(),
+                                    decision,
+                                    execute,
+                                )
+                                .await;
+                                send(&tx, Msg::Status(text));
+                                notify_agent_review(&tx, &profile2, &repo2, number);
+                            });
+                        } else {
+                            let text = if execute {
+                                "GitHub 客户端不可用，动作未执行"
+                            } else {
+                                "用户选择暂不执行"
+                            };
+                            let _ = app.lock_recover().db.record_agent_decision_result(
+                                decision_id,
+                                text,
+                                !execute,
+                            );
+                            send(&msg_tx, Msg::Status(text.into()));
+                        }
+                    }
+                }
+                notify_agent_review(&msg_tx, &profile, &repo, number);
+            }
+            Cmd::AcknowledgeAgentReview { repo, number } => {
+                let profile = {
+                    let a = app.lock_recover();
+                    let _ = a.db.acknowledge_agent_review(&repo, number);
+                    a.cfg.active_profile.clone()
+                };
+                notify_agent_review(&msg_tx, &profile, &repo, number);
+            }
+            Cmd::SetFindingHumanStatus {
+                repo,
+                number,
+                finding_id,
+                status,
+            } => {
+                let profile = {
+                    let a = app.lock_recover();
+                    let _ = a.db.set_finding_human_status(finding_id, &status);
+                    a.cfg.active_profile.clone()
+                };
+                notify_agent_review(&msg_tx, &profile, &repo, number);
+            }
+            Cmd::LoadNeedsYou => {
+                let rows = load_needs_you_rows(&app);
+                send(&msg_tx, Msg::NeedsYouLoaded(rows));
+            }
+            Cmd::AgentRunSettled { profile, run_id } => {
+                if let Some(tasks) = agent_running.get_mut(&profile) {
+                    tasks.remove(&run_id);
+                }
+            }
             Cmd::QueueAutoReviews { profile, keys } => {
                 if app.lock_recover().cfg.auto_review_on_insert {
                     auto_reviews.enqueue(profile, keys);
@@ -1901,33 +2670,60 @@ async fn worker(
                     }
                 };
                 let tx = msg_tx.clone();
+                let app2 = app.clone();
                 tokio::spawn(async move {
                     let result = async {
-                        let (meta, diff) = tokio::try_join!(
-                            g.fetch_pr_meta(&key.repo, key.number),
-                            g.fetch_diff(&key.repo, key.number),
-                        )?;
-                        let context = crate::kimi_terminal::PrContext {
-                            repo: key.repo.clone(),
-                            number: key.number,
-                            base_sha: meta["base"]["sha"].as_str().unwrap_or("").to_string(),
-                            head_sha: meta["head"]["sha"].as_str().unwrap_or("").to_string(),
-                            title: meta["title"].as_str().unwrap_or("").to_string(),
-                            body: meta["body"].as_str().unwrap_or("").to_string(),
-                            diff,
+                        let agent_session_id = if cfg.active_profile == key.profile {
+                            app2.lock_recover()
+                                .db
+                                .load_agent_review(&key.repo, key.number)
+                                .ok()
+                                .flatten()
+                                .and_then(|review| {
+                                    review["session_id"].as_str().map(str::to_string)
+                                })
+                        } else {
+                            None
                         };
-                        ocr::build_ocr_git_snapshot(
-                            &g,
-                            &key.repo,
-                            &meta,
-                            &context.diff,
-                            &cfg.kimi_workspace_root_path(),
-                            &mut |_| {},
-                            &cfg.language,
-                            None,
-                        )
-                        .await?;
-                        Ok::<_, anyhow::Error>(context)
+                        match g.fetch_pr_snapshot(&key.repo, key.number).await {
+                            Ok(snapshot) => {
+                                let context = crate::kimi_terminal::PrContext {
+                                    repo: key.repo.clone(),
+                                    number: key.number,
+                                    base_sha: snapshot.base_sha.clone(),
+                                    head_sha: snapshot.head_sha.clone(),
+                                    title: snapshot.meta["title"]
+                                        .as_str()
+                                        .unwrap_or("")
+                                        .to_string(),
+                                    body: snapshot.meta["body"].as_str().unwrap_or("").to_string(),
+                                    diff: snapshot.diff.clone(),
+                                    agent_session_id,
+                                };
+                                ocr::build_ocr_git_snapshot(
+                                    &g,
+                                    &key.repo,
+                                    &snapshot.meta,
+                                    &context.diff,
+                                    &cfg.kimi_workspace_root_path(),
+                                    &mut |_| {},
+                                    &cfg.language,
+                                    None,
+                                )
+                                .await?;
+                                Ok::<_, anyhow::Error>(context)
+                            }
+                            Err(error) => crate::kimi_terminal::load_cached_context(
+                                &crate::kimi_terminal::PrContext {
+                                    repo: key.repo.clone(),
+                                    number: key.number,
+                                    agent_session_id,
+                                    ..Default::default()
+                                },
+                                &cfg.kimi_workspace_root_path(),
+                            )
+                            .ok_or(error),
+                        }
                     }
                     .await;
                     match result {
@@ -2134,7 +2930,11 @@ async fn worker(
                     let app = app.clone();
                     let msg_tx = msg_tx.clone();
                     let live_fetched = live_fetched.clone();
+                    let for_profile = app.lock_recover().cfg.active_profile.clone();
                     tokio::spawn(async move {
+                        if lock_for_profile(&app, &for_profile).is_none() {
+                            return;
+                        }
                         // meta 只在 checks 部分需要（head.sha → check runs；state/updated → 面板头部）
                         let meta = if want_checks {
                             match g.fetch_pr_meta(&repo, number).await {
@@ -2248,6 +3048,9 @@ async fn worker(
                         let mut files_json_out: Option<String> = None;
                         let mut dirty = false;
 
+                        if lock_for_profile(&app, &for_profile).is_none() {
+                            return;
+                        }
                         // 落库（直改 DB，不进 outbox：非用户改动，不该推送）
                         if let Some(meta) = &meta {
                             let author = meta["user"]["login"].as_str().unwrap_or("").to_string();
@@ -2264,7 +3067,9 @@ async fn worker(
                                 "merged".to_string()
                             };
                             {
-                                let a = app.lock_recover();
+                                let Some(a) = lock_for_profile(&app, &for_profile) else {
+                                    return;
+                                };
                                 let _ = a.db.fill_pr_meta_if_empty(
                                     &repo, number, &author, &url, &sha, &title,
                                 );
@@ -2304,7 +3109,20 @@ async fn worker(
                                     ).ok().flatten();
                                     }
                                 }
+                                if let Err(error) = a.db.observe_agent_pr(
+                                    &repo,
+                                    number,
+                                    &sha,
+                                    ci_out.as_deref(),
+                                    matches!(gh_state.as_str(), "merged" | "closed"),
+                                    a.cfg.auto_agent_rereview,
+                                ) {
+                                    tracing::warn!(
+                                        "更新 agent 观察状态失败 {repo} #{number}: {error}"
+                                    );
+                                }
                             }
+                            notify_agent_review(&msg_tx, &for_profile, &repo, number);
                             state_out = Some(gh_state.clone());
                             updated_out = Some(crate::state::rel_time(&meta_updated));
                             checks_json_out = checks.map(|(_, items)| {
@@ -2519,6 +3337,10 @@ async fn worker(
                         continue;
                     }
                 };
+                let active_run_ids = agent_running
+                    .get(&name)
+                    .map(|tasks| tasks.keys().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
                 {
                     let mut a = app.lock_recover();
                     a.cfg.active_profile = name.clone();
@@ -2530,6 +3352,11 @@ async fn worker(
                         );
                     }
                     a.db = new_db; // 旧 Db 随 drop 关闭连接
+                    if let Err(error) = a.db.recover_agent_runs(&active_run_ids) {
+                        tracing::warn!("恢复 agent 队列失败: {error}");
+                    }
+                    a.needs_you.clear();
+                    a.needs_you_loading = false;
                     a.selected = None;
                     a.selection.clear();
                     a.anchor = None;
@@ -2554,6 +3381,8 @@ async fn worker(
                     },
                 );
                 send(&msg_tx, Msg::ClosePanel);
+                let needs_you = load_needs_you_rows(&app);
+                send(&msg_tx, Msg::NeedsYouLoaded(needs_you));
                 send(
                     &msg_tx,
                     Msg::Status(trf(&lang, "profile_switched", &[&name])),
@@ -2581,6 +3410,7 @@ async fn worker(
                             refresh_from_github(&g, &app2, &msg_tx2, &prof).await;
                             fetch_inbox(&g, &app2, &msg_tx2).await;
                         }
+                        poll_agent_watchers(&app2, &g, &msg_tx2, &prof).await;
                     });
                 }
             }
@@ -2623,11 +3453,13 @@ async fn worker(
                             refresh_from_github(&g, &app2, &msg_tx2, &for_profile).await;
                             fetch_inbox(&g, &app2, &msg_tx2).await;
                         }
+                        poll_agent_watchers(&app2, &g, &msg_tx2, &for_profile).await;
                     });
                 }
             }
         }
         pump_auto_reviews(&app, &msg_tx, &cmd_tx, &mut auto_reviews);
+        pump_agent_reviews(&app, &msg_tx, &cmd_tx, &mut agent_running);
     }
     tracing::info!("worker 退出（Shutdown / 命令通道断开）");
 }
@@ -2783,5 +3615,66 @@ mod tests {
             a.db.get_cursor().unwrap().is_none(),
             "sync 游标泄漏进了 local 库"
         );
+    }
+
+    #[test]
+    fn needs_you_preserves_clarification_kind() {
+        let app = Arc::new(Mutex::new(App::new(
+            Config::default(),
+            Db::open_memory().unwrap(),
+        )));
+        let guard = app.lock_recover();
+        let db = &guard.db;
+        db.upsert_pr(&serde_json::json!({
+            "repo": "o/r", "number": 1, "title": "t", "head_sha": "h1"
+        }))
+        .unwrap();
+        let run_id = db
+            .enqueue_agent_review("o/r", 1, "initial", "b", "h1", None, "w")
+            .unwrap();
+        assert!(db.mark_agent_run_running(run_id).unwrap());
+        let report: pr_desk_rs::agent_review::AgentReport =
+            serde_json::from_value(serde_json::json!({
+                "schema_version": 1,
+                "repo": "o/r", "number": 1, "base_sha": "b", "head_sha": "h1",
+                "parent_head_sha": null, "scope_complete": true, "verdict": "needs_discussion",
+                "summary": "s", "validation": "v", "findings": [], "resolved_findings": [],
+                "decision": {
+                    "kind": "clarification", "title": "Choose", "context": "Why",
+                    "options": [
+                        {"id": "a", "label": "A", "detail": "", "recommended": true},
+                        {"id": "b", "label": "B", "detail": "", "recommended": false}
+                    ],
+                    "review_event": null, "merge_method": null
+                }
+            }))
+            .unwrap();
+        assert!(db.apply_agent_report(run_id, &report).unwrap());
+        drop(guard);
+        let rows = load_needs_you_rows(&app);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "decision");
+        assert_eq!(rows[0].decision_kind, "clarification");
+    }
+
+    #[test]
+    fn edit_snapshot_must_match_the_approved_head() {
+        let snapshot = github::PrSnapshot {
+            repo: "o/r".into(),
+            number: 1,
+            meta: serde_json::json!({}),
+            base_sha: "b1".into(),
+            head_sha: "h1".into(),
+            diff: String::new(),
+            captured_at: String::new(),
+        };
+        let approved = serde_json::json!({
+            "kind": "edit", "base_sha": "b1", "head_sha": "h1"
+        });
+        assert!(edit_snapshot_is_approved(&approved, &snapshot));
+        let stale = serde_json::json!({
+            "kind": "edit", "base_sha": "b1", "head_sha": "h0"
+        });
+        assert!(!edit_snapshot_is_approved(&stale, &snapshot));
     }
 }

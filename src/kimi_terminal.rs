@@ -14,6 +14,7 @@ pub struct PrContext {
     pub title: String,
     pub body: String,
     pub diff: String,
+    pub agent_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -22,6 +23,72 @@ pub struct KimiKey {
     pub repo: String,
     pub number: i64,
     pub request_id: u64,
+}
+
+pub fn load_cached_context(context: &PrContext, root: &Path) -> Option<PrContext> {
+    let mut candidates = std::fs::read_dir(root)
+        .ok()?
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pr-desk-acp-context-v2-")
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|entry| {
+        entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    candidates.reverse();
+    for entry in candidates {
+        let directory = entry.path();
+        let Ok(pr_json) = std::fs::read_to_string(directory.join("pr.json")) else {
+            continue;
+        };
+        let Ok(pr_json) = serde_json::from_str::<serde_json::Value>(&pr_json) else {
+            continue;
+        };
+        if pr_json["repo"].as_str() != Some(context.repo.as_str())
+            || pr_json["number"].as_i64() != Some(context.number)
+        {
+            continue;
+        }
+        let base_sha = pr_json["base_sha"].as_str().unwrap_or("").to_string();
+        let head_sha = pr_json["head_sha"].as_str().unwrap_or("").to_string();
+        if !pr_desk_rs::ocr::context_manifest_matches(
+            &context.repo,
+            context.number,
+            &base_sha,
+            &head_sha,
+            &directory,
+        ) || !directory.join("worktree/.git").exists()
+        {
+            continue;
+        }
+        let Ok(body) = std::fs::read_to_string(directory.join("pr-body.md")) else {
+            continue;
+        };
+        let Ok(diff) = std::fs::read_to_string(directory.join("pr.diff")) else {
+            continue;
+        };
+        return Some(PrContext {
+            repo: context.repo.clone(),
+            number: context.number,
+            base_sha,
+            head_sha,
+            title: pr_json["title"].as_str().unwrap_or("").to_string(),
+            body,
+            diff,
+            agent_session_id: context
+                .agent_session_id
+                .clone()
+                .or_else(|| pr_json["agent_session_id"].as_str().map(str::to_string)),
+        });
+    }
+    None
 }
 
 pub fn prepare_context_dir(context: &PrContext, root: &Path) -> Result<PathBuf> {
@@ -44,9 +111,9 @@ pub fn prepare_context_dir(context: &PrContext, root: &Path) -> Result<PathBuf> 
             "head_sha": context.head_sha,
             "title": context.title,
             "pull_ref": format!("refs/pull/{}/head", context.number),
+            "agent_session_id": context.agent_session_id,
         }))?,
     )?;
-    let _ = std::fs::remove_file(path.join("findings.json"));
     let worktree = path.join("worktree");
     if worktree.join(".git").is_dir() {
         let git = |args: &[&str]| -> Result<()> {
@@ -65,12 +132,14 @@ pub fn prepare_context_dir(context: &PrContext, root: &Path) -> Result<PathBuf> 
             .args(["remote", "get-url", "origin"])
             .output()
             .context("检查 Kimi 工作区 Git 远端失败")?;
-        if !origin.status.success() {
-            let url = if context.repo.starts_with("file://") {
-                context.repo.clone()
-            } else {
-                format!("https://github.com/{}.git", context.repo)
-            };
+        let url = if context.repo.starts_with("file://") {
+            context.repo.clone()
+        } else {
+            format!("https://github.com/{}.git", context.repo)
+        };
+        if origin.status.success() {
+            git(&["remote", "set-url", "origin", &url])?;
+        } else {
             git(&["remote", "add", "origin", &url])?;
         }
         let pull_ref = format!("refs/pull/{}/head", context.number);
@@ -82,6 +151,8 @@ pub fn prepare_context_dir(context: &PrContext, root: &Path) -> Result<PathBuf> 
             &fetch_refspec,
         ])?;
         git(&["config", "remote.origin.tagOpt", "--no-tags"])?;
+        git(&["update-ref", "refs/heads/base", &context.base_sha])?;
+        git(&["update-ref", "refs/heads/pr-desk", &context.head_sha])?;
         git(&["symbolic-ref", "HEAD", "refs/heads/pr-desk"])?;
         git(&["config", "branch.pr-desk.remote", "origin"])?;
         git(&["config", "branch.pr-desk.merge", &pull_ref])?;
@@ -93,6 +164,21 @@ pub struct KimiTerminal {
     key: KimiKey,
     runtime: TerminalRuntime<PtyBackend>,
     last_response: Option<TerminalResponse>,
+    initial_size: (u16, u16),
+}
+
+fn cli_args(context: &PrContext, fresh: bool) -> Vec<String> {
+    if fresh {
+        Vec::new()
+    } else if let Some(session_id) = context
+        .agent_session_id
+        .as_deref()
+        .filter(|id| !id.trim().is_empty())
+    {
+        vec!["--session".into(), session_id.to_string()]
+    } else {
+        vec!["--continue".into()]
+    }
 }
 
 impl KimiTerminal {
@@ -104,11 +190,7 @@ impl KimiTerminal {
         fresh: bool,
     ) -> Result<Self> {
         let cwd = prepare_context_dir(context, &cfg.kimi_workspace_root_path())?;
-        let args = if fresh {
-            Vec::new()
-        } else {
-            vec!["--continue".into()]
-        };
+        let args = cli_args(context, fresh);
         let repaint = ctx.clone();
         let backend = PtyBackend::spawn_with_repaint(
             PtyConfig {
@@ -128,6 +210,7 @@ impl KimiTerminal {
             key,
             runtime: TerminalRuntime::with_config(backend, config),
             last_response: None,
+            initial_size: (100, 32),
         })
     }
 
@@ -154,9 +237,12 @@ impl KimiTerminal {
     }
 
     pub fn dimensions(&self) -> Option<(u16, u16)> {
-        self.last_response
-            .as_ref()
-            .map(|response| (response.cols, response.rows))
+        Some(
+            self.last_response
+                .as_ref()
+                .map(|response| (response.cols, response.rows))
+                .unwrap_or(self.initial_size),
+        )
     }
 }
 
@@ -194,25 +280,137 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        std::fs::write(first.join("lib.rs"), "fn answer() -> u32 { 42 }\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&first)
+                .args(["add", "lib.rs"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&first)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@local",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "head",
+                ])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let head = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&first)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        context.base_sha = head.clone();
+        context.head_sha = head.clone();
         std::fs::write(first.parent().unwrap().join("findings.json"), b"[]").unwrap();
+        let expected = pr_desk_rs::ocr::context_dir_for(
+            &context.repo,
+            context.number,
+            &context.base_sha,
+            &context.head_sha,
+            &root,
+        );
+        std::fs::create_dir_all(&expected).unwrap();
+        std::fs::write(expected.join("findings.json"), b"[]").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["clone", "--quiet"])
+                .arg(&first)
+                .arg(expected.join("worktree"))
+                .status()
+                .unwrap()
+                .success()
+        );
         let second = prepare_context_dir(&context, &root).unwrap();
-        assert_eq!(first, second);
+        assert_eq!(second, expected.join("worktree"));
+        assert_ne!(first, second);
+        assert_eq!(second, prepare_context_dir(&context, &root).unwrap());
         assert!(first.starts_with(&root));
-        let context_root = first.parent().unwrap();
+        let current = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&second)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&current.stdout).trim(), head);
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&second)
+                .args(["merge-base", "refs/heads/base", "HEAD"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let context_root = second.parent().unwrap();
         assert_eq!(
             std::fs::read_to_string(context_root.join("pr-body.md")).unwrap(),
             "PR body"
         );
         assert!(context_root.join("pr.diff").is_file());
         assert!(context_root.join("pr.json").is_file());
-        assert!(!context_root.join("findings.json").exists());
+        assert!(context_root.join("findings.json").is_file());
         let pr_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(context_root.join("pr.json")).unwrap())
                 .unwrap();
         assert_eq!(pr_json["pull_ref"].as_str(), Some("refs/pull/42/head"));
+        assert!(pr_json["agent_session_id"].is_null());
+        std::fs::write(
+            context_root.join("context.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 2,
+                "ready": true,
+                "repo": context.repo,
+                "number": context.number,
+                "base_sha": context.base_sha,
+                "head_sha": context.head_sha,
+                "base_repo": "owner/repo",
+                "head_repo": "owner/repo"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let cached = load_cached_context(
+            &PrContext {
+                repo: context.repo.clone(),
+                number: context.number,
+                ..Default::default()
+            },
+            &root,
+        )
+        .unwrap();
+        assert_eq!(cached.base_sha, context.base_sha);
+        assert_eq!(cached.head_sha, context.head_sha);
+        assert_eq!(cached.body, "PR body");
+        assert!(
+            load_cached_context(
+                &PrContext {
+                    repo: "owner/other".into(),
+                    number: 42,
+                    ..Default::default()
+                },
+                &root
+            )
+            .is_none()
+        );
         let origin = std::process::Command::new("git")
             .arg("-C")
-            .arg(&first)
+            .arg(&second)
             .args(["remote", "get-url", "origin"])
             .output()
             .unwrap();
@@ -223,7 +421,7 @@ mod tests {
         );
         let upstream = std::process::Command::new("git")
             .arg("-C")
-            .arg(&first)
+            .arg(&second)
             .args(["config", "--get-regexp", "^branch\\.pr-desk\\."])
             .output()
             .unwrap();
@@ -233,7 +431,7 @@ mod tests {
         assert!(upstream.contains("branch.pr-desk.merge refs/pull/42/head"));
         let fetch = std::process::Command::new("git")
             .arg("-C")
-            .arg(&first)
+            .arg(&second)
             .args(["config", "--get-all", "remote.origin.fetch"])
             .output()
             .unwrap();
@@ -243,14 +441,27 @@ mod tests {
         );
         let tag_opt = std::process::Command::new("git")
             .arg("-C")
-            .arg(&first)
+            .arg(&second)
             .args(["config", "remote.origin.tagOpt"])
             .output()
             .unwrap();
         assert_eq!(String::from_utf8_lossy(&tag_opt.stdout).trim(), "--no-tags");
         context.head_sha = "head-2".into();
-        assert_ne!(prepare_context_dir(&context, &root).unwrap(), first);
+        assert_ne!(prepare_context_dir(&context, &root).unwrap(), second);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persistent_session_controls_resume_arguments() {
+        let mut context = PrContext::default();
+        assert_eq!(cli_args(&context, false), vec!["--continue"]);
+        assert!(cli_args(&context, true).is_empty());
+        context.agent_session_id = Some("session-42".into());
+        assert_eq!(
+            cli_args(&context, false),
+            vec!["--session".to_string(), "session-42".to_string()]
+        );
+        assert!(cli_args(&context, true).is_empty());
     }
 
     #[test]

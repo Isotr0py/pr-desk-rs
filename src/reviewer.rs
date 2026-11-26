@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::config::Config;
-use crate::github::GitHub;
+use crate::github::PrSnapshot;
 
 /// 单次评审纳入的 diff 上限（对齐插件 max_diff_files / max_diff_chars 默认值）。
 pub const MAX_DIFF_FILES: usize = 30;
@@ -454,30 +454,31 @@ async fn chat_completion(
     chat_completion_messages(llm, chat_messages(user_prompt, previous_reply)).await
 }
 
-/// 本地预评审主流程：拉 PR 元信息 + diff → 过滤 → LLM 评审 → 组装结果 JSON。
+/// 本地预评审主流程：消费调用方冻结的同一 PR 快照 → 过滤 → LLM 评审 → 组装结果 JSON。
 /// 返回的 JSON 可直接传给 Db::upsert_review。
 /// lang："zh"/"en"，进度回调与失败摘要的文案语言（LLM prompt 本身保持中文）。
 /// custom_prompt：用户在设置里自定义的评审模板（None/空 = 用默认模板）；
 /// 自定义模板自动追加输出契约（OUTPUT_CONTRACT），JSON 格式不会被破坏。
 pub async fn run_review(
     llm: &LlmSettings,
-    gh: &GitHub,
-    repo: &str,
-    number: i64,
+    snapshot: &PrSnapshot,
     progress: &mut (dyn FnMut(String) + Send),
     lang: &str,
     custom_prompt: Option<&str>,
 ) -> Result<Value> {
     use crate::i18n::{tr, trf};
-    progress(tr(lang, "prog_fetch_pr").into());
-    let meta_raw = gh.fetch_pr_meta(repo, number).await?;
-    let head_sha = meta_raw["head"]["sha"].as_str().unwrap_or("").to_string();
-    if head_sha.is_empty() {
-        // 评审主键含 head_sha，空 sha 入库会互相覆盖——缺 sha 直接不评审
-        anyhow::bail!("{}", tr(lang, "err_missing_sha"));
-    }
+    let PrSnapshot {
+        repo,
+        number,
+        meta: meta_raw,
+        base_sha: _,
+        head_sha,
+        diff: diff_full,
+        captured_at: _,
+    } = snapshot;
+    let number = *number;
     let meta = PrMeta {
-        repo: repo.to_string(),
+        repo: repo.clone(),
         number,
         title: meta_raw["title"].as_str().unwrap_or("").to_string(),
         author: meta_raw["user"]["login"].as_str().unwrap_or("").to_string(),
@@ -485,8 +486,7 @@ pub async fn run_review(
     };
 
     progress(tr(lang, "prog_fetch_diff").into());
-    let diff_full = gh.fetch_diff(repo, number).await?;
-    let (diff_text, included, omitted) = filter_diff(&diff_full, MAX_DIFF_FILES, MAX_DIFF_CHARS);
+    let (diff_text, included, omitted) = filter_diff(diff_full, MAX_DIFF_FILES, MAX_DIFF_CHARS);
 
     let (additions, deletions) = diff_line_stats(&diff_text);
     let files_changed = included.len() as i64;

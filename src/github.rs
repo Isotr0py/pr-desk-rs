@@ -1,4 +1,4 @@
-//! GitHub API 客户端（只读）：open PR 列表 + PR diff（带 Accept: diff header）。
+//! GitHub API 客户端：PR 快照、评论、评审、合并及仓库状态查询。
 //! 每次响应解析 X-RateLimit-Remaining 写入共享状态（rate_limit_handle），供 UI 状态栏展示。
 
 use std::path::{Path, PathBuf};
@@ -94,8 +94,21 @@ pub fn aggregate_ci(runs: &[Value]) -> String {
 #[derive(Clone)]
 pub struct GitHub {
     client: reqwest::Client,
+    api_base: String,
     /// 最近一次响应的 X-RateLimit-Remaining（worker 写入，UI 状态栏读取）。
     rate_limit: Arc<Mutex<Option<u64>>>,
+}
+
+/// 同一 base/head 下采集的 PR 元信息与 diff；captured_at 为 UTC RFC 3339 时间。
+#[derive(Debug, Clone)]
+pub struct PrSnapshot {
+    pub repo: String,
+    pub number: i64,
+    pub meta: Value,
+    pub base_sha: String,
+    pub head_sha: String,
+    pub diff: String,
+    pub captured_at: String,
 }
 
 /// GitHub 通知（/notifications）：kind 为 subject.type（PullRequest/Issue/Release/…）。
@@ -130,8 +143,16 @@ impl GitHub {
             .build()?;
         Ok(Self {
             client,
+            api_base: API.to_string(),
             rate_limit: Arc::new(Mutex::new(None)),
         })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(api_base: &str) -> Self {
+        let mut client = Self::new(None, "").unwrap();
+        client.api_base = api_base.trim_end_matches('/').to_string();
+        client
     }
 
     /// 配额共享句柄：最近一次响应的 X-RateLimit-Remaining。
@@ -241,6 +262,109 @@ impl GitHub {
             anyhow::bail!("GitHub PR meta {} #{}: {}", resp.status(), repo, number);
         }
         Ok(resp.json().await?)
+    }
+
+    /// 拉取一致 PR 快照：meta → diff → meta，base/head 变化时最多重试三轮。
+    pub async fn fetch_pr_snapshot(&self, repo: &str, number: i64) -> Result<PrSnapshot> {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let first_meta = self.fetch_pr_meta(repo, number).await?;
+            let (first_base, first_head) = pr_snapshot_refs(&first_meta)
+                .with_context(|| format!("GitHub PR snapshot {repo} #{number}"))?;
+            let diff = self.fetch_diff(repo, number).await?;
+            let final_meta = self.fetch_pr_meta(repo, number).await?;
+            let (base_sha, head_sha) = pr_snapshot_refs(&final_meta)
+                .with_context(|| format!("GitHub PR snapshot {repo} #{number}"))?;
+            if first_base == base_sha && first_head == head_sha {
+                return Ok(PrSnapshot {
+                    repo: repo.to_string(),
+                    number,
+                    meta: final_meta,
+                    base_sha,
+                    head_sha,
+                    diff,
+                    captured_at: chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                });
+            }
+            if attempt == 3 {
+                anyhow::bail!(
+                    "GitHub PR snapshot {repo} #{number}: base/head SHA 连续 3 轮采样不一致，无法获得稳定快照"
+                );
+            }
+        }
+    }
+
+    /// 发布 Issue/PR 评论（POST /repos/{repo}/issues/{number}/comments）。
+    pub async fn post_issue_comment(&self, repo: &str, number: i64, body: &str) -> Result<()> {
+        let url = format!("{}/repos/{repo}/issues/{number}/comments", self.api_base);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({ "body": body }))
+            .send()
+            .await?;
+        self.record_rate_limit(resp.headers());
+        check_write_response(resp, &format!("GitHub issue comment {repo} #{number}")).await
+    }
+
+    /// 提交 PR 评审；event 仅允许 COMMENT、APPROVE、REQUEST_CHANGES。
+    pub async fn submit_pr_review(
+        &self,
+        repo: &str,
+        number: i64,
+        body: &str,
+        event: &str,
+        expected_head_sha: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(event, "COMMENT" | "APPROVE" | "REQUEST_CHANGES"),
+            "GitHub review event 仅允许 COMMENT/APPROVE/REQUEST_CHANGES，收到 {event:?}"
+        );
+        anyhow::ensure!(
+            !expected_head_sha.trim().is_empty(),
+            "GitHub review expected head SHA 不能为空"
+        );
+        let url = format!("{}/repos/{repo}/pulls/{number}/reviews", self.api_base);
+        let resp = self
+            .client
+            .post(&url)
+            .json(&serde_json::json!({
+                "body": body,
+                "event": event,
+                "commit_id": expected_head_sha,
+            }))
+            .send()
+            .await?;
+        self.record_rate_limit(resp.headers());
+        check_write_response(resp, &format!("GitHub PR review {repo} #{number}")).await
+    }
+
+    /// 按预期 head SHA 合并 PR；method 仅允许 merge、squash、rebase。
+    pub async fn merge_pr(
+        &self,
+        repo: &str,
+        number: i64,
+        expected_head_sha: &str,
+        method: &str,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            matches!(method, "merge" | "squash" | "rebase"),
+            "GitHub merge method 仅允许 merge/squash/rebase，收到 {method:?}"
+        );
+        let url = format!("{}/repos/{repo}/pulls/{number}/merge", self.api_base);
+        let resp = self
+            .client
+            .put(&url)
+            .json(&serde_json::json!({
+                "sha": expected_head_sha,
+                "merge_method": method,
+            }))
+            .send()
+            .await?;
+        self.record_rate_limit(resp.headers());
+        check_write_response(resp, &format!("GitHub merge {repo} #{number}")).await
     }
 
     /// 拉取通知列表（all=true 连已读也拉，否则只返回未读；需要 token，匿名调用会 401）。
@@ -482,6 +606,37 @@ impl GitHub {
     }
 }
 
+fn pr_snapshot_refs(meta: &Value) -> Result<(String, String)> {
+    let base = meta["base"]["sha"].as_str().unwrap_or("").trim();
+    let head = meta["head"]["sha"].as_str().unwrap_or("").trim();
+    anyhow::ensure!(!base.is_empty(), "PR 元信息 base.sha 为空");
+    anyhow::ensure!(!head.is_empty(), "PR 元信息 head.sha 为空");
+    Ok((base.to_string(), head.to_string()))
+}
+
+async fn check_write_response(resp: reqwest::Response, action: &str) -> Result<()> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(());
+    }
+    let summary = match resp.text().await {
+        Ok(body) => {
+            let collapsed = body.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut chars = collapsed.chars();
+            let summary = chars.by_ref().take(500).collect::<String>();
+            if collapsed.is_empty() {
+                "<空响应>".to_string()
+            } else if chars.next().is_some() {
+                format!("{summary}…")
+            } else {
+                summary
+            }
+        }
+        Err(error) => format!("<响应读取失败: {error}>"),
+    };
+    anyhow::bail!("{action}: {status}: {summary}")
+}
+
 /// owner/name 的字符白名单（GitHub 合法字符）：repo 名来自远程 API 响应，
 /// 要 format! 进 GraphQL 查询字符串，白名单校验防注入。
 fn valid_repo_part(s: &str) -> bool {
@@ -556,6 +711,202 @@ fn parse_states_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read as _, Write as _};
+
+    #[derive(Debug)]
+    struct RecordedRequest {
+        method: String,
+        path: String,
+        body: Value,
+    }
+
+    fn spawn_mock(
+        status: u16,
+        response_body: &str,
+    ) -> (
+        String,
+        std::sync::mpsc::Receiver<RecordedRequest>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let response_body = response_body.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut bytes = Vec::new();
+            let mut buf = [0_u8; 1024];
+            let mut expected_len = None;
+            loop {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+                if expected_len.is_none() {
+                    if let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+                        let content_length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        expected_len = Some(header_end + 4 + content_length);
+                    }
+                }
+                if expected_len.is_some_and(|len| bytes.len() >= len) {
+                    break;
+                }
+            }
+            let header_end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            let headers = std::str::from_utf8(&bytes[..header_end]).unwrap();
+            let mut request_line = headers.lines().next().unwrap().split_whitespace();
+            let request = RecordedRequest {
+                method: request_line.next().unwrap().to_string(),
+                path: request_line.next().unwrap().to_string(),
+                body: serde_json::from_slice(
+                    &bytes[header_end + 4..expected_len.unwrap_or(bytes.len())],
+                )
+                .unwrap(),
+            };
+            tx.send(request).unwrap();
+            let reason = match status {
+                200 => "OK",
+                201 => "Created",
+                422 => "Unprocessable Entity",
+                _ => "Error",
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+        });
+        (format!("http://{addr}"), rx, handle)
+    }
+
+    #[test]
+    fn snapshot_refs_require_nonempty_base_and_head() {
+        let meta = serde_json::json!({
+            "base": { "sha": " base-sha " },
+            "head": { "sha": " head-sha " }
+        });
+        assert_eq!(
+            pr_snapshot_refs(&meta).unwrap(),
+            ("base-sha".to_string(), "head-sha".to_string())
+        );
+        for meta in [
+            serde_json::json!({"base": {"sha": ""}, "head": {"sha": "head"}}),
+            serde_json::json!({"base": {"sha": "base"}, "head": {"sha": "  "}}),
+            serde_json::json!({"base": {}, "head": {}}),
+        ] {
+            assert!(pr_snapshot_refs(&meta).is_err(), "应拒绝 {meta}");
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_comment_uses_expected_request() {
+        let (api_base, rx, server) = spawn_mock(201, "{}");
+        GitHub::new_for_test(&api_base)
+            .post_issue_comment("octo/repo", 42, "looks good")
+            .await
+            .unwrap();
+        let request = rx.recv().unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/repos/octo/repo/issues/42/comments");
+        assert_eq!(request.body, serde_json::json!({"body": "looks good"}));
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pr_review_uses_expected_request() {
+        let (api_base, rx, server) = spawn_mock(200, "{}");
+        GitHub::new_for_test(&api_base)
+            .submit_pr_review(
+                "octo/repo",
+                42,
+                "needs work",
+                "REQUEST_CHANGES",
+                "expected-head-sha",
+            )
+            .await
+            .unwrap();
+        let request = rx.recv().unwrap();
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.path, "/repos/octo/repo/pulls/42/reviews");
+        assert_eq!(
+            request.body,
+            serde_json::json!({
+                "body": "needs work",
+                "event": "REQUEST_CHANGES",
+                "commit_id": "expected-head-sha"
+            })
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn merge_uses_expected_head_and_method() {
+        let (api_base, rx, server) = spawn_mock(200, "{}");
+        GitHub::new_for_test(&api_base)
+            .merge_pr("octo/repo", 42, "expected-head-sha", "squash")
+            .await
+            .unwrap();
+        let request = rx.recv().unwrap();
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.path, "/repos/octo/repo/pulls/42/merge");
+        assert_eq!(
+            request.body,
+            serde_json::json!({"sha": "expected-head-sha", "merge_method": "squash"})
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn write_methods_reject_invalid_parameters() {
+        let github = GitHub::new_for_test("http://127.0.0.1:9");
+        for event in ["comment", "APPROVED", ""] {
+            let error = github
+                .submit_pr_review("octo/repo", 42, "body", event, "head")
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("COMMENT/APPROVE/REQUEST_CHANGES"));
+        }
+        for head in ["", "   "] {
+            let error = github
+                .submit_pr_review("octo/repo", 42, "body", "COMMENT", head)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("head SHA 不能为空"));
+        }
+        for method in ["MERGE", "fast-forward", ""] {
+            let error = github
+                .merge_pr("octo/repo", 42, "head", method)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("merge/squash/rebase"));
+        }
+    }
+
+    #[tokio::test]
+    async fn write_errors_include_response_summary() {
+        let (api_base, _rx, server) = spawn_mock(422, "{\"message\":\"Validation Failed\"}");
+        let error = GitHub::new_for_test(&api_base)
+            .merge_pr("octo/repo", 42, "stale-head", "merge")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("422"));
+        assert!(error.contains("Validation Failed"));
+        assert!(error.contains("GitHub merge octo/repo #42"));
+        server.join().unwrap();
+    }
 
     #[test]
     fn encode_path_segment_encodes_non_unreserved() {

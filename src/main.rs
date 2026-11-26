@@ -12,6 +12,7 @@ mod state;
 mod system_fonts;
 mod theme;
 mod tray;
+mod ui_agent;
 mod ui_detail;
 mod ui_inbox;
 mod ui_list;
@@ -33,6 +34,14 @@ use pr_desk_rs::i18n::{tr, trf};
 use state::*;
 
 const MAX_PARKED_KIMI_TERMINALS: usize = 4;
+
+fn test_artifact_path(name: &str) -> PathBuf {
+    let directory = std::env::var_os("PR_DESK_TEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let _ = std::fs::create_dir_all(&directory);
+    directory.join(name)
+}
 
 struct ParkedKimiTerminal {
     terminal: kimi_terminal::KimiTerminal,
@@ -71,6 +80,7 @@ pub struct EguiApp {
     pub panel_tab: usize,
     pub panel_width_cur: f32,
     pub review_run_started: Option<Instant>,
+    pub agent_confirm: Option<(i64, String)>,
     pub next_kimi_request_id: u64,
     pub kimi_terminal: Option<kimi_terminal::KimiTerminal>,
     pub kimi_terminal_error: String,
@@ -112,6 +122,8 @@ pub struct EguiApp {
     pub s_ocr_path: String,
     pub s_review_conc: i64,
     pub s_auto_review_on_insert: bool,
+    pub s_auto_agent_rereview: bool,
+    pub s_agent_review_conc: i64,
     pub s_kimi_cli_path: String,
     pub s_kimi_workspace_root: String,
     pub s_review_prompt: String,
@@ -884,6 +896,7 @@ impl EguiApp {
             }
             Msg::Profiles { names, active: _ } => {
                 self.profile_names = names;
+                self.agent_confirm = None;
                 // active 已在 worker 写进 app.cfg.active_profile（顶栏现读）
             }
             Msg::SettingsProfile(name) => {
@@ -996,6 +1009,27 @@ impl EguiApp {
                     }
                 }
             }
+            Msg::AgentReviewUpdated {
+                profile,
+                repo,
+                number,
+            } => {
+                if self.app.lock_recover().cfg.active_profile == profile {
+                    if panel_matches(&self.app, &repo, number) {
+                        let _ = self.cmd_tx.send(Cmd::OpenDrawer {
+                            repo,
+                            number,
+                            refetch: false,
+                        });
+                    }
+                    let _ = self.cmd_tx.send(Cmd::LoadNeedsYou);
+                }
+            }
+            Msg::NeedsYouLoaded(rows) => {
+                let mut a = self.app.lock_recover();
+                a.needs_you = rows;
+                a.needs_you_loading = false;
+            }
             Msg::KimiContextReady { key, context } => {
                 if self.kimi_key == Some(key.clone()) && self.kimi_terminal_preparing {
                     self.kimi_terminal_preparing = false;
@@ -1098,7 +1132,17 @@ impl EguiApp {
                             p.updated = updated;
                         }
                         if let Some(head_sha) = head_sha {
-                            p.head_sha = head_sha;
+                            if !head_sha.is_empty() && p.head_sha != head_sha {
+                                p.head_sha = head_sha;
+                                p.agent_review.stale = !p.agent_review.reviewed_head_sha.is_empty()
+                                    && p.agent_review.reviewed_head_sha != p.head_sha;
+                                self.diff_files.clear();
+                                self.diff_requested = None;
+                                let _ = self.cmd_tx.send(Cmd::FetchDiff {
+                                    repo: repo.clone(),
+                                    number,
+                                });
+                            }
                         }
                         if let Some(convo) = convo {
                             p.convo = convo;
@@ -1115,11 +1159,14 @@ impl EguiApp {
             Msg::DiffParsed {
                 repo,
                 number,
+                head_sha,
                 files,
             } => {
-                // 身份守卫：快速切换 PR 时，A 的 diff 不得覆盖正在看的 B；
-                // 不匹配时不上屏（diff 缓存已在 worker 落库，下次打开能用）。
-                if panel_matches(&self.app, &repo, number) {
+                if panel_matches(&self.app, &repo, number)
+                    && self.panel.as_ref().is_some_and(|panel| {
+                        panel.head_sha.is_empty() || panel.head_sha == head_sha
+                    })
+                {
                     self.diff_files = files;
                 }
             }
@@ -1129,6 +1176,7 @@ impl EguiApp {
             }
             Msg::TrayShow => {
                 tracing::info!("托盘：还原窗口");
+                self.backdrop.restore();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1143,9 +1191,9 @@ impl EguiApp {
         }
     }
 
-    /// ── 自动化验证指令（PR_DESK_TEST=1 时启用；%TEMP%/prdesk-cmd.txt 逐行指令）──
+    /// ── 自动化验证指令（PR_DESK_TEST=1 时启用；PR_DESK_TEST_DIR 或 %TEMP% 下的指令文件）──
     /// 每条指令调用的就是对应 UI 控件背后的处理器（同函数同路径）。
-    /// `dumpstate` 把关键状态写成 JSON（%TEMP%/prdesk-state.json）供断言。
+    /// `dumpstate` 把关键状态写成 JSON，供同目录下的验证脚本断言。
     pub fn handle_test_cmd(&mut self, ctx: &egui::Context, line: &str) {
         let mut it = line.split_whitespace();
         let Some(cmd) = it.next() else { return };
@@ -1288,6 +1336,43 @@ impl EguiApp {
                 let sel = self.app.lock_recover().selected.clone();
                 if let Some((repo, number)) = sel {
                     let _ = self.cmd_tx.send(Cmd::RunReview { repo, number });
+                }
+            }
+            "agentreview" | "rereview" => {
+                let sel = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = sel {
+                    if cmd == "agentreview" {
+                        let _ = self.cmd_tx.send(Cmd::StartAgentReview { repo, number });
+                    } else {
+                        let _ = self.cmd_tx.send(Cmd::RereviewAgent { repo, number });
+                    }
+                }
+            }
+            "needsyou" => {
+                self.view_mode = 2;
+                self.app.lock_recover().needs_you_loading = true;
+                let _ = self.cmd_tx.send(Cmd::LoadNeedsYou);
+            }
+            "ackagent" => {
+                let sel = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = sel {
+                    let _ = self
+                        .cmd_tx
+                        .send(Cmd::AcknowledgeAgentReview { repo, number });
+                }
+            }
+            "answeragent" => {
+                let decision_id = arg.parse().unwrap_or(0);
+                let answer = it.collect::<Vec<_>>().join(" ");
+                let sel = self.app.lock_recover().selected.clone();
+                if let Some((repo, number)) = sel {
+                    let _ = self.cmd_tx.send(Cmd::AnswerAgentDecision {
+                        repo,
+                        number,
+                        decision_id,
+                        execute: true,
+                        answer,
+                    });
                 }
             }
             "copyreview" => {
@@ -1490,6 +1575,7 @@ impl EguiApp {
                 self.save_geometry(ctx);
             }
             "trayshow" => {
+                self.backdrop.restore();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -1509,6 +1595,7 @@ impl EguiApp {
     /// F12 / `shot` 指令共用：置位挂起，ui() 里发 ViewportCommand::Screenshot
     ///（窗口隐藏时 GL surface 尺寸为 0，直接发会让 egui_glow 回读 panic）。
     pub fn request_shot(&self, ctx: &egui::Context) {
+        self.backdrop.restore();
         if ctx.input(|i| {
             i.viewport()
                 .inner_rect
@@ -1520,7 +1607,7 @@ impl EguiApp {
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(
             egui::ScreenshotCallback::new(|image| {
-                let path = std::env::temp_dir().join("prdesk-shot.png");
+                let path = test_artifact_path("prdesk-shot.png");
                 let img = image::DynamicImage::ImageRgba8(
                     image::RgbaImage::from_raw(
                         image.width() as u32,
@@ -1563,6 +1650,13 @@ impl EguiApp {
             "panel_review_has": self.panel.as_ref().map(|p| p.review.has),
             "panel_review_status": self.panel.as_ref().map(|p| p.review_status.clone()),
             "panel_review_progress": self.panel.as_ref().map(|p| p.review_progress.clone()),
+            "agent_review_status": self.panel.as_ref().map(|p| p.agent_review.status.clone()),
+            "agent_reviewed_head": self.panel.as_ref().map(|p| p.agent_review.reviewed_head_sha.clone()),
+            "agent_requested_head": self.panel.as_ref().map(|p| p.agent_review.requested_head_sha.clone()),
+            "agent_session_id": self.panel.as_ref().map(|p| p.agent_review.session_id.clone()),
+            "agent_findings": self.panel.as_ref().map(|p| p.agent_review.findings.len()),
+            "agent_decisions": self.panel.as_ref().map(|p| p.agent_review.decisions.len()),
+            "needs_you_count": a.needs_you.len(),
             "review_elapsed_secs": self.review_run_started.map(|started| started.elapsed().as_secs()),
             "kimi_terminal_active": self.kimi_terminal.is_some(),
             "kimi_terminal_preparing": self.kimi_terminal_preparing,
@@ -1611,7 +1705,7 @@ impl EguiApp {
             "language": a.cfg.language,
             "total": a.total,
         });
-        let path = std::env::temp_dir().join("prdesk-state.json");
+        let path = test_artifact_path("prdesk-state.json");
         if let Err(e) = std::fs::write(&path, serde_json::to_string_pretty(&v).unwrap()) {
             tracing::warn!("状态快照写入失败: {e}");
         }
@@ -1921,9 +2015,12 @@ impl eframe::App for EguiApp {
                 ui_detail::detail_panel(self, ui);
                 ui_list::pr_list_view(self, ui);
             }
-            _ => {
+            1 => {
                 ui_inbox::notif_preview(self, ui);
                 ui_inbox::inbox_view(self, ui);
+            }
+            _ => {
+                ui_agent::needs_you_view(self, ui);
             }
         }
 
@@ -2081,7 +2178,7 @@ fn main() -> anyhow::Result<()> {
                 let tx = msg_tx.clone();
                 let ctx2 = cc.egui_ctx.clone();
                 std::thread::spawn(move || {
-                    let path = std::env::temp_dir().join("prdesk-cmd.txt");
+                    let path = test_artifact_path("prdesk-cmd.txt");
                     loop {
                         if let Ok(text) = std::fs::read_to_string(&path) {
                             if !text.trim().is_empty() {
@@ -2124,6 +2221,7 @@ fn main() -> anyhow::Result<()> {
                 panel_tab: 0,
                 panel_width_cur: cfg.panel_width.unwrap_or(420.0).max(320.0) as f32,
                 review_run_started: None,
+                agent_confirm: None,
                 next_kimi_request_id: 0,
                 kimi_terminal: None,
                 kimi_terminal_error: String::new(),
@@ -2168,6 +2266,8 @@ fn main() -> anyhow::Result<()> {
                 s_ocr_path: String::new(),
                 s_review_conc: 3,
                 s_auto_review_on_insert: false,
+                s_auto_agent_rereview: false,
+                s_agent_review_conc: 2,
                 s_kimi_cli_path: "kimi".into(),
                 s_kimi_workspace_root: String::new(),
                 s_review_prompt,

@@ -15,6 +15,8 @@ impl Default for PlatformBackdrop {
 }
 
 impl PlatformBackdrop {
+    pub fn restore(&self) {}
+
     pub fn sync(
         &mut self,
         _handle: Option<RawWindowHandle>,

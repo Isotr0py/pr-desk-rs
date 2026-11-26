@@ -503,6 +503,8 @@ pub fn avatar_chip(ui: &mut Ui, author: &str) {
 }
 
 fn review_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
+    crate::ui_agent::agent_review_section(app, ui);
+    ui.separator();
     let (running, progress) = app
         .panel
         .as_ref()
