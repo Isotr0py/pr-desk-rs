@@ -10,8 +10,7 @@ plugin provides remote review storage, synchronization and QQ push; the desktop
 app provides the interactive workbench. A remote plugin is not required for
 local-only use.
 
-![PR list](docs/screenshot-list.png)
-![Diff view](docs/screenshot-diff.png)
+![PR list and review details](docs/screenshot-review.png)
 
 ## Features
 
