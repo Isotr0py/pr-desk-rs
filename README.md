@@ -4,12 +4,6 @@ A high-density GitHub PR review workbench for the desktop, built with Rust and
 egui/eframe. It combines a conventional LLM/OCR pre-review pipeline with a real,
 embedded Kimi CLI for repository-aware reviews and follow-up work.
 
-PR Desk can optionally pair with
-[`astrbot_plugin_github_pr_review`](../astrbot_plugin_github_pr_review). The
-plugin provides remote review storage, synchronization and QQ push; the desktop
-app provides the interactive workbench. A remote plugin is not required for
-local-only use.
-
 ![PR list and review details](docs/screenshot-review.png)
 
 ## Features
@@ -62,8 +56,8 @@ local-only use.
 ### Data sources and backups
 
 - Multiple local/remote data-source profiles with instant switching.
-- Optional bidirectional AstrBot synchronization using an outbox; conflicts
-  resolve server-wins.
+- Optional bidirectional synchronization with a remote data source using an
+  outbox; conflicts resolve server-wins.
 - Local mode works without a server: curate PRs by URL or from the inbox instead
   of downloading a repository-wide open-PR list.
 - Export the active database to a user-selected destination using SQLite's
@@ -126,9 +120,6 @@ active configuration file.
 A typical configuration looks like:
 
 ```toml
-server_url = "http://127.0.0.1:6185"
-sync_token = ""
-astrbot_api_key = ""
 github_token = ""
 proxy = ""                         # http:// or socks5://; empty = direct
 repos = ["owner/repo"]
