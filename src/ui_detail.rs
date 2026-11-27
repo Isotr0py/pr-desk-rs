@@ -541,7 +541,7 @@ fn importance_rule_evidence_tooltip(ui: &mut Ui, importance: &ImportanceProps, g
         .filter(|factor| factor.group == group)
     {
         ui.horizontal_wrapped(|ui| {
-            ui.weak(format!("Rule evidence: {}", factor.rule_evidence));
+            ui.weak(&factor.rule_evidence);
             ui.weak(format!("{:+.1}", factor.points as f32 / 10.0));
         });
     }
