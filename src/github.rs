@@ -345,7 +345,8 @@ impl GitHub {
     pub async fn fetch_importance_scores(
         &self,
         items: &[(String, i64)],
-    ) -> Result<std::collections::HashMap<(String, i64), crate::importance::ImportanceScore>> {
+    ) -> Result<std::collections::HashMap<(String, i64), crate::importance::ImportanceCandidate>>
+    {
         let mut out = std::collections::HashMap::new();
         for chunk in items.chunks(25) {
             let body = self.graphql(build_importance_query(chunk)?).await?;
@@ -390,8 +391,12 @@ impl GitHub {
                     nodes.push(issue.clone());
                 }
             }
-            for (key, pr) in inputs {
-                out.insert(key, crate::importance::score_pr(&pr));
+            for (key, mut pr) in inputs {
+                pr["repo"] = serde_json::json!(key.0);
+                pr["number"] = serde_json::json!(key.1);
+                let input = crate::importance::importance_input(&pr);
+                let score = crate::importance::score_pr(&pr);
+                out.insert(key, crate::importance::ImportanceCandidate { score, input });
             }
         }
         Ok(out)

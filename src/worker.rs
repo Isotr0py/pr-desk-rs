@@ -805,6 +805,124 @@ fn store_importance_scores(
     updated
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ImportanceCacheState {
+    method: String,
+    input_hash: String,
+    updated_at: String,
+}
+
+fn failed_recently(
+    cache: &ImportanceCacheState,
+    model: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    if cache.method != format!("llm_failed:{model}") {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(&cache.updated_at)
+        .map(|updated| (now - updated.with_timezone(&chrono::Utc)).num_seconds() < 3600)
+        .unwrap_or(false)
+}
+
+fn reuse_importance(
+    candidate: &pr_desk_rs::importance::ImportanceCandidate,
+    cache: Option<&ImportanceCacheState>,
+    model: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(cache) = cache.filter(|cache| cache.input_hash == candidate.score.input_hash) else {
+        return false;
+    };
+    match model {
+        Some(model) => cache.method == format!("llm:{model}") || failed_recently(cache, model, now),
+        None => cache.method.starts_with("llm:") || cache.method == "rules",
+    }
+}
+
+fn should_refine_importance(
+    candidate: &pr_desk_rs::importance::ImportanceCandidate,
+    cache: Option<&ImportanceCacheState>,
+    model: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let Some(cache) = cache.filter(|cache| cache.input_hash == candidate.score.input_hash) else {
+        return true;
+    };
+    cache.method != format!("llm:{model}") && !failed_recently(cache, model, now)
+}
+
+fn importance_cache_states(
+    app: &Arc<Mutex<App>>,
+    for_profile: &str,
+) -> std::collections::HashMap<(String, i64), ImportanceCacheState> {
+    let Some(a) = lock_for_profile(app, for_profile) else {
+        return Default::default();
+    };
+    let sources = list_sources(&a.cfg);
+    a.db.list_prs(sources)
+        .unwrap_or_default()
+        .iter()
+        .map(|row| {
+            (
+                (
+                    row["repo"].as_str().unwrap_or("").to_string(),
+                    row["number"].as_i64().unwrap_or(0),
+                ),
+                ImportanceCacheState {
+                    method: row["importance_method"].as_str().unwrap_or("").to_string(),
+                    input_hash: row["importance_input_hash"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                    updated_at: row["importance_updated_at"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string(),
+                },
+            )
+        })
+        .collect()
+}
+
+async fn refine_importance_scores(
+    llm: std::sync::Arc<pr_desk_rs::reviewer::LlmSettings>,
+    candidates: Vec<((String, i64), pr_desk_rs::importance::ImportanceCandidate)>,
+) -> std::collections::HashMap<(String, i64), pr_desk_rs::importance::ImportanceScore> {
+    let mut pending = std::collections::VecDeque::from(candidates);
+    let mut running = tokio::task::JoinSet::new();
+    let mut out = std::collections::HashMap::new();
+    loop {
+        while running.len() < 4 {
+            let Some((key, candidate)) = pending.pop_front() else {
+                break;
+            };
+            let llm = llm.clone();
+            running.spawn(async move {
+                let score = match pr_desk_rs::importance_llm::refine_importance(&llm, &candidate)
+                    .await
+                {
+                    Ok(score) => score,
+                    Err(e) => {
+                        tracing::warn!("K3 重要性校准失败 {}/#{}，回退规则分: {e}", key.0, key.1);
+                        let mut fallback = candidate.score;
+                        fallback.method = format!("llm_failed:{}", llm.model);
+                        fallback
+                    }
+                };
+                (key, score)
+            });
+        }
+        let Some(result) = running.join_next().await else {
+            break;
+        };
+        if let Ok((key, score)) = result {
+            out.insert(key, score);
+        }
+    }
+    out
+}
+
 async fn refresh_importance_for_keys(
     gh: &github::GitHub,
     app: &Arc<Mutex<App>>,
@@ -815,16 +933,44 @@ async fn refresh_importance_for_keys(
     if keys.is_empty() {
         return;
     }
+    let llm = {
+        let Some(a) = lock_for_profile(app, for_profile) else {
+            return;
+        };
+        pr_desk_rs::reviewer::LlmSettings::from_config(&a.cfg)
+    };
     match gh.fetch_importance_scores(&keys).await {
-        Ok(scores) => {
-            if store_importance_scores(app, for_profile, &scores) > 0 {
-                reload_rows(app, msg_tx);
-                if keys
-                    .iter()
-                    .any(|(repo, number)| panel_matches(app, repo, *number))
-                {
-                    send(msg_tx, Msg::ReopenPanel);
+        Ok(candidates) => {
+            let cache = importance_cache_states(app, for_profile);
+            let now = chrono::Utc::now();
+            let model = llm.as_ref().map(|llm| llm.model.as_str());
+            let mut baseline = std::collections::HashMap::new();
+            let mut refine = Vec::new();
+            for (key, candidate) in candidates {
+                let cached = cache.get(&key);
+                if !reuse_importance(&candidate, cached, model, now) {
+                    baseline.insert(key.clone(), candidate.score.clone());
                 }
+                if let Some(model) = model
+                    && should_refine_importance(&candidate, cached, model, now)
+                {
+                    refine.push((key, candidate));
+                }
+            }
+            if store_importance_scores(app, for_profile, &baseline) > 0 {
+                reload_rows(app, msg_tx);
+            }
+            if let Some(llm) = llm {
+                let refined = refine_importance_scores(std::sync::Arc::new(llm), refine).await;
+                if store_importance_scores(app, for_profile, &refined) > 0 {
+                    reload_rows(app, msg_tx);
+                }
+            }
+            if keys
+                .iter()
+                .any(|(repo, number)| panel_matches(app, repo, *number))
+            {
+                send(msg_tx, Msg::ReopenPanel);
             }
         }
         Err(e) => tracing::warn!("批量计算 PR 重要性失败（保留旧结果）: {e}"),
@@ -2821,6 +2967,84 @@ mod tests {
             a.db.list_prs(&[]).unwrap()[0]["importance_score"].as_f64(),
             Some(2.9)
         );
+    }
+
+    #[test]
+    fn importance_cache_reuses_matching_model_and_backs_off_failures() {
+        let pr = serde_json::json!({
+            "repo": "o/r", "number": 1, "title": "Fix bug", "baseRefName": "main",
+            "files": {"nodes": []}, "closingIssuesReferences": {"nodes": []}
+        });
+        let candidate = pr_desk_rs::importance::ImportanceCandidate {
+            score: pr_desk_rs::importance::score_pr(&pr),
+            input: pr_desk_rs::importance::importance_input(&pr),
+        };
+        let now = chrono::Utc::now();
+        let cache = ImportanceCacheState {
+            method: "llm:k3".into(),
+            input_hash: candidate.score.input_hash.clone(),
+            updated_at: now.to_rfc3339(),
+        };
+        assert!(reuse_importance(&candidate, Some(&cache), Some("k3"), now));
+        assert!(!should_refine_importance(
+            &candidate,
+            Some(&cache),
+            "k3",
+            now
+        ));
+        assert!(!reuse_importance(
+            &candidate,
+            Some(&cache),
+            Some("other"),
+            now
+        ));
+        assert!(should_refine_importance(
+            &candidate,
+            Some(&cache),
+            "other",
+            now
+        ));
+
+        let rules = ImportanceCacheState {
+            method: "rules".into(),
+            ..cache.clone()
+        };
+        assert!(reuse_importance(&candidate, Some(&rules), None, now));
+        assert!(!reuse_importance(&candidate, Some(&rules), Some("k3"), now));
+        assert!(should_refine_importance(
+            &candidate,
+            Some(&rules),
+            "k3",
+            now
+        ));
+
+        let failed = ImportanceCacheState {
+            method: "llm_failed:k3".into(),
+            ..cache.clone()
+        };
+        assert!(reuse_importance(&candidate, Some(&failed), Some("k3"), now));
+        assert!(!should_refine_importance(
+            &candidate,
+            Some(&failed),
+            "k3",
+            now
+        ));
+        let old_failure = ImportanceCacheState {
+            updated_at: (now - chrono::Duration::hours(2)).to_rfc3339(),
+            ..failed
+        };
+        assert!(!reuse_importance(
+            &candidate,
+            Some(&old_failure),
+            Some("k3"),
+            now
+        ));
+        assert!(should_refine_importance(
+            &candidate,
+            Some(&old_failure),
+            "k3",
+            now
+        ));
     }
 
     /// 微型 sync 服务器：收到一次请求后延迟 delay 再返回 body（模拟网络在途）。

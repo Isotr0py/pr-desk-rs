@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 pub const SCORING_VERSION: &str = "2026-11-27.2";
 
@@ -22,6 +23,37 @@ pub struct ImportanceScore {
     pub raw_score: u32,
     pub scoring_version: &'static str,
     pub factors: Vec<ImportanceFactor>,
+    pub method: String,
+    pub input_hash: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ImportanceCandidate {
+    pub score: ImportanceScore,
+    pub input: Value,
+}
+
+pub fn importance_input(pr: &Value) -> Value {
+    let mut input = pr.clone();
+    if let Some(body) = input["body"].as_str() {
+        input["body"] = json!(body.chars().take(6_000).collect::<String>());
+    }
+    if let Some(issues) = input["closingIssuesReferences"]["nodes"].as_array_mut() {
+        for issue in issues.iter_mut().take(5) {
+            if let Some(body) = issue["body"].as_str() {
+                issue["body"] = json!(body.chars().take(3_000).collect::<String>());
+            }
+        }
+    }
+    input
+}
+
+pub fn importance_input_hash(pr: &Value) -> String {
+    let input = json!({
+        "scoring_version": SCORING_VERSION,
+        "input": importance_input(pr),
+    });
+    hex::encode(Sha256::digest(input.to_string().as_bytes()))
 }
 
 fn factor(
@@ -761,6 +793,8 @@ pub fn score_pr(pr: &Value) -> ImportanceScore {
         raw_score,
         scoring_version: SCORING_VERSION,
         factors,
+        method: "rules".into(),
+        input_hash: importance_input_hash(pr),
     }
 }
 

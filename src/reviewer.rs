@@ -116,6 +116,14 @@ impl LlmSettings {
             client,
         })
     }
+
+    pub async fn complete_text(&self, system: &str, user: &str) -> Result<String> {
+        let messages = json!([
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]);
+        chat_completion_messages(self, messages).await
+    }
 }
 
 /// 评审 prompt 的 PR 元信息。

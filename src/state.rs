@@ -288,6 +288,7 @@ pub struct ImportanceFactorProps {
 pub struct ImportanceProps {
     pub score: Option<f32>,
     pub factors: Vec<ImportanceFactorProps>,
+    pub method: String,
     pub version: String,
     pub updated_at: String,
 }
@@ -561,6 +562,7 @@ pub fn importance_props(row: Option<&Value>, lang: &str) -> ImportanceProps {
     ImportanceProps {
         score: Some(score as f32),
         factors,
+        method: row["importance_method"].as_str().unwrap_or("").to_string(),
         version: row["importance_version"].as_str().unwrap_or("").to_string(),
         updated_at: row["importance_updated_at"]
             .as_str()

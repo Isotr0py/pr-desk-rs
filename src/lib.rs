@@ -8,6 +8,7 @@ pub mod diffview;
 pub mod github;
 pub mod i18n;
 pub mod importance;
+pub mod importance_llm;
 pub mod markdown;
 pub mod ocr;
 pub mod reviewer;

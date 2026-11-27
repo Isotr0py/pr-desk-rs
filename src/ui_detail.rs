@@ -698,9 +698,14 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             });
         }
     }
-    if !importance.version.is_empty() {
-        ui.weak(format!("scoring {}", importance.version));
-    }
+    let method = if let Some(model) = importance.method.strip_prefix("llm:") {
+        tr(lang, "importance_method_llm").replacen("{0}", model, 1)
+    } else if importance.method.starts_with("llm_failed") {
+        tr(lang, "importance_method_failed").to_string()
+    } else {
+        tr(lang, "importance_method_rules").to_string()
+    };
+    ui.weak(format!("{method} · scoring {}", importance.version));
 }
 
 fn importance_tab(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
