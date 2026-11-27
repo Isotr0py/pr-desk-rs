@@ -322,6 +322,81 @@ impl GitHub {
         Ok(out)
     }
 
+    async fn graphql(&self, query: String) -> Result<Value> {
+        let resp = self
+            .client
+            .post(format!("{API}/graphql"))
+            .json(&serde_json::json!({ "query": query }))
+            .send()
+            .await?;
+        self.record_rate_limit(resp.headers());
+        if !resp.status().is_success() {
+            anyhow::bail!("GitHub graphql: {}", resp.status());
+        }
+        let body: Value = resp.json().await?;
+        if body["data"].is_null() {
+            anyhow::bail!("GitHub graphql errors: {}", body["errors"]);
+        }
+        Ok(body)
+    }
+
+    /// 批量读取 PR 及其 closing issues 的重要性信号，并在本地按固定规则计分。
+    /// 每 25 个 PR 一次请求；正文引用但 GraphQL 未关联的 Issue 再用一批查询补齐。
+    pub async fn fetch_importance_scores(
+        &self,
+        items: &[(String, i64)],
+    ) -> Result<std::collections::HashMap<(String, i64), crate::importance::ImportanceScore>> {
+        let mut out = std::collections::HashMap::new();
+        for chunk in items.chunks(25) {
+            let body = self.graphql(build_importance_query(chunk)?).await?;
+            let mut inputs = std::collections::HashMap::new();
+            parse_importance_inputs(&body, chunk, &mut inputs);
+
+            let mut references = Vec::new();
+            for (key, pr) in &inputs {
+                for issue_key in crate::importance::closing_issue_references(
+                    pr["body"].as_str().unwrap_or(""),
+                    &key.0,
+                ) {
+                    references.push((key.clone(), issue_key));
+                }
+            }
+            let mut issue_keys: Vec<(String, i64)> =
+                references.iter().map(|(_, issue)| issue.clone()).collect();
+            issue_keys.sort();
+            issue_keys.dedup();
+            let mut issues = std::collections::HashMap::new();
+            for issue_chunk in issue_keys.chunks(50) {
+                let body = self.graphql(build_issue_query(issue_chunk)?).await?;
+                parse_issue_response(&body, issue_chunk, &mut issues);
+            }
+            for (pr_key, issue_key) in references {
+                let Some(issue) = issues.get(&issue_key) else {
+                    continue;
+                };
+                let Some(pr) = inputs.get_mut(&pr_key) else {
+                    continue;
+                };
+                let Some(nodes) = pr["closingIssuesReferences"]["nodes"].as_array_mut() else {
+                    continue;
+                };
+                let already_present = nodes.iter().any(|node| {
+                    node["number"].as_i64() == Some(issue_key.1)
+                        && (node["repository"]["nameWithOwner"]
+                            .as_str()
+                            .is_none_or(|repo| repo == issue_key.0))
+                });
+                if !already_present && nodes.len() < 5 {
+                    nodes.push(issue.clone());
+                }
+            }
+            for (key, pr) in inputs {
+                out.insert(key, crate::importance::score_pr(&pr));
+            }
+        }
+        Ok(out)
+    }
+
     /// 拉用户的公开组织成员关系（GET /users/{login}/orgs）→ org login 列表。
     pub async fn fetch_user_orgs(&self, login: &str) -> Result<Vec<String>> {
         let url = format!("{API}/users/{}/orgs", encode_path_segment(login));
@@ -553,6 +628,79 @@ fn parse_states_response(
     }
 }
 
+const IMPORTANCE_ISSUE_FIELDS: &str = "number title repository { nameWithOwner } labels(first: 50) { nodes { name } } milestone { title } comments { totalCount } reactions { totalCount }";
+
+fn build_importance_query(items: &[(String, i64)]) -> Result<String> {
+    let mut q = String::from("query {");
+    for (i, (repo, number)) in items.iter().enumerate() {
+        let (owner, name) = repo.split_once('/').unwrap_or(("", repo.as_str()));
+        if !valid_repo_part(owner) || !valid_repo_part(name) || *number <= 0 {
+            anyhow::bail!("GraphQL 重要性查询：非法 PR 标识 {repo}#{number}");
+        }
+        q.push_str(&format!(
+            "r{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ n{i}: pullRequest(number: {number}) {{ ...ImportancePrFields }} }}"
+        ));
+    }
+    q.push_str(&format!(
+        "}} fragment ImportancePrFields on PullRequest {{ title body baseRefName labels(first: 50) {{ nodes {{ name }} }} milestone {{ title }} closingIssuesReferences(first: 5) {{ nodes {{ {IMPORTANCE_ISSUE_FIELDS} }} }} }}"
+    ));
+    Ok(q)
+}
+
+fn build_issue_query(items: &[(String, i64)]) -> Result<String> {
+    let mut q = String::from("query {");
+    for (i, (repo, number)) in items.iter().enumerate() {
+        let (owner, name) = repo.split_once('/').unwrap_or(("", repo.as_str()));
+        if !valid_repo_part(owner) || !valid_repo_part(name) || *number <= 0 {
+            anyhow::bail!("GraphQL Issue 查询：非法 Issue 标识 {repo}#{number}");
+        }
+        q.push_str(&format!(
+            "r{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ n{i}: issue(number: {number}) {{ {IMPORTANCE_ISSUE_FIELDS} }} }}"
+        ));
+    }
+    q.push('}');
+    Ok(q)
+}
+
+fn parse_importance_inputs(
+    body: &Value,
+    items: &[(String, i64)],
+    out: &mut std::collections::HashMap<(String, i64), Value>,
+) {
+    for (i, (repo, number)) in items.iter().enumerate() {
+        let pr = &body["data"][format!("r{i}")][format!("n{i}")];
+        if pr.is_object() && pr["title"].is_string() {
+            out.insert((repo.clone(), *number), pr.clone());
+        }
+    }
+}
+
+fn parse_issue_response(
+    body: &Value,
+    items: &[(String, i64)],
+    out: &mut std::collections::HashMap<(String, i64), Value>,
+) {
+    for (i, (repo, number)) in items.iter().enumerate() {
+        let issue = &body["data"][format!("r{i}")][format!("n{i}")];
+        if issue.is_object() && issue["title"].is_string() {
+            out.insert((repo.clone(), *number), issue.clone());
+        }
+    }
+}
+
+#[cfg(test)]
+fn parse_importance_response(
+    body: &Value,
+    items: &[(String, i64)],
+    out: &mut std::collections::HashMap<(String, i64), crate::importance::ImportanceScore>,
+) {
+    let mut inputs = std::collections::HashMap::new();
+    parse_importance_inputs(body, items, &mut inputs);
+    for (key, pr) in inputs {
+        out.insert(key, crate::importance::score_pr(&pr));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,6 +864,55 @@ mod tests {
         assert_eq!(out.get("o/r#1").map(String::as_str), Some("merged"));
         assert_eq!(out.get("o/r#3").map(String::as_str), Some("closed"));
         assert!(!out.contains_key("o/r#2"));
+    }
+
+    #[test]
+    fn importance_query_batches_prs_and_validates_identity() {
+        let items = vec![("o/r".to_string(), 42), ("other/repo".to_string(), 7)];
+        let query = build_importance_query(&items).unwrap();
+        assert!(query.contains("r0: repository(owner: \"o\", name: \"r\")"));
+        assert!(query.contains("n1: pullRequest(number: 7)"));
+        assert!(query.contains("title body baseRefName"));
+        assert!(query.contains("closingIssuesReferences(first: 5)"));
+        assert!(query.contains("reactions { totalCount }"));
+        assert!(build_importance_query(&[("bad/repo;query".into(), 1)]).is_err());
+        assert!(build_importance_query(&[("o/r".into(), 0)]).is_err());
+        let issue_query = build_issue_query(&[("o/r".into(), 9)]).unwrap();
+        assert!(issue_query.contains("n0: issue(number: 9)"));
+        assert!(issue_query.contains("repository { nameWithOwner }"));
+        assert!(build_issue_query(&[("o/r".into(), -1)]).is_err());
+    }
+
+    #[test]
+    fn importance_response_scores_present_prs_and_skips_missing_nodes() {
+        let items = vec![("o/r".to_string(), 42), ("o/r".to_string(), 43)];
+        let body = serde_json::json!({
+            "data": {
+                "r0": {"n0": {
+                    "title": "Fix regression",
+                    "baseRefName": "main",
+                    "labels": {"nodes": []},
+                    "milestone": null,
+                    "closingIssuesReferences": {"nodes": [{
+                        "number": 9,
+                        "title": "Wrong output",
+                        "labels": {"nodes": [{"name": "wrong-output"}]},
+                        "milestone": {"title": "v1.0"},
+                        "comments": {"totalCount": 4},
+                        "reactions": {"totalCount": 2}
+                    }]}
+                }},
+                "r1": {"n1": null}
+            },
+            "errors": [{"message": "one PR is unavailable"}]
+        });
+        let mut out = std::collections::HashMap::new();
+        parse_importance_response(&body, &items, &mut out);
+        assert_eq!(out.len(), 1);
+        let score = &out[&("o/r".to_string(), 42)];
+        assert_eq!(score.raw_score, 45 + 18 + 12);
+        assert_eq!(score.score, 7.5);
+        assert_eq!(score.factors.len(), 3);
     }
 
     #[test]

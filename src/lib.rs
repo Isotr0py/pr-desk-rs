@@ -7,6 +7,7 @@ pub mod db;
 pub mod diffview;
 pub mod github;
 pub mod i18n;
+pub mod importance;
 pub mod markdown;
 pub mod ocr;
 pub mod reviewer;
@@ -112,10 +113,7 @@ pub fn build_sections(
                 .collect();
             if sort_col != "upd" {
                 // 默认列之外才重排（upd 降序 = SQL 输入序，省一次排序且零风险）
-                idx.sort_by(|&a, &b| {
-                    let o = col_cmp(&rows[a], &rows[b], sort_col);
-                    if sort_asc { o } else { o.reverse() }
-                });
+                idx.sort_by(|&a, &b| col_cmp(&rows[a], &rows[b], sort_col, sort_asc));
             } else if sort_asc {
                 // upd 升序（最旧在前）：输入序反转
                 idx.reverse();
@@ -158,13 +156,17 @@ pub fn build_sections(
     out
 }
 
-/// 列排序比较器（升序语义；调用方按 sort_asc 决定是否反转）。
-/// 未知列回退 updated_at。
-fn col_cmp(a: &serde_json::Value, b: &serde_json::Value, col: &str) -> std::cmp::Ordering {
+/// 列排序比较器；importance 缺失值始终排最后。未知列回退 updated_at。
+fn col_cmp(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    col: &str,
+    sort_asc: bool,
+) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let str_of = |r: &serde_json::Value, k: &str| r[k].as_str().unwrap_or("").to_lowercase();
     let num = |r: &serde_json::Value, k: &str| r[k].as_i64().unwrap_or(0);
-    match col {
+    let ordering = match col {
         "priority" => num(a, "priority").cmp(&num(b, "priority")),
         "num" => num(a, "number").cmp(&num(b, "number")),
         "title" => str_of(a, "title").cmp(&str_of(b, "title")),
@@ -198,6 +200,19 @@ fn col_cmp(a: &serde_json::Value, b: &serde_json::Value, col: &str) -> std::cmp:
             let cb = num(b, "additions") + num(b, "deletions");
             ca.cmp(&cb)
         }
+        "importance" => {
+            let ia = a["importance_score"].as_f64();
+            let ib = b["importance_score"].as_f64();
+            return match (ia, ib) {
+                (Some(ia), Some(ib)) => {
+                    let o = ia.partial_cmp(&ib).unwrap_or(Ordering::Equal);
+                    if sort_asc { o } else { o.reverse() }
+                }
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            };
+        }
         "score" => {
             let sa = a["score"].as_f64().unwrap_or(0.0);
             let sb = b["score"].as_f64().unwrap_or(0.0);
@@ -205,6 +220,11 @@ fn col_cmp(a: &serde_json::Value, b: &serde_json::Value, col: &str) -> std::cmp:
         }
         // "upd"/"age"/默认：updated_at 是 ISO8601 字符串，字典序即时间序
         _ => str_of(a, "updated_at").cmp(&str_of(b, "updated_at")),
+    };
+    if sort_asc {
+        ordering
+    } else {
+        ordering.reverse()
     }
 }
 
@@ -257,6 +277,29 @@ mod tests {
         assert_eq!(sections[1].title, "Board");
         assert_eq!(sections[2].key, "needs-review");
         assert_eq!(sections[2].title, "To Review");
+    }
+
+    #[test]
+    fn importance_sort_keeps_missing_last_and_score_sorts_quality() {
+        let mut low = row(1, 0, 0, "pending");
+        low["importance_score"] = serde_json::json!(2.0);
+        low["score"] = serde_json::json!(9.0);
+        let mut high = row(2, 0, 0, "pending");
+        high["importance_score"] = serde_json::json!(8.0);
+        high["score"] = serde_json::json!(1.0);
+        let mut missing = row(3, 0, 0, "pending");
+        missing["importance_score"] = serde_json::Value::Null;
+
+        assert_eq!(
+            col_cmp(&low, &high, "score", true),
+            std::cmp::Ordering::Greater,
+            "质量排序必须继续读取 score，而不是 importance_score"
+        );
+        let rows = vec![missing, high, low];
+        for (sort_asc, expected) in [(true, vec![2, 1, 0]), (false, vec![1, 2, 0])] {
+            let sections = build_sections(&rows, "zh", "importance", sort_asc);
+            assert_eq!(sections[0].idxs, expected);
+        }
     }
 
     #[test]

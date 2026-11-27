@@ -785,6 +785,73 @@ fn pump_auto_reviews(
 
 // ── 刷新 / 同步 ──
 
+fn store_importance_scores(
+    app: &Arc<Mutex<App>>,
+    for_profile: &str,
+    scores: &std::collections::HashMap<(String, i64), pr_desk_rs::importance::ImportanceScore>,
+) -> usize {
+    let Some(a) = lock_for_profile(app, for_profile) else {
+        return 0;
+    };
+    let now = db::now();
+    let mut updated = 0;
+    for ((repo, number), score) in scores {
+        match a.db.set_importance(repo, *number, score, &now) {
+            Ok(true) => updated += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!("重要性评分落库失败 {repo} #{number}: {e}"),
+        }
+    }
+    updated
+}
+
+async fn refresh_importance_for_keys(
+    gh: &github::GitHub,
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    for_profile: &str,
+    keys: Vec<(String, i64)>,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    match gh.fetch_importance_scores(&keys).await {
+        Ok(scores) => {
+            if store_importance_scores(app, for_profile, &scores) > 0 {
+                reload_rows(app, msg_tx);
+                if keys
+                    .iter()
+                    .any(|(repo, number)| panel_matches(app, repo, *number))
+                {
+                    send(msg_tx, Msg::ReopenPanel);
+                }
+            }
+        }
+        Err(e) => tracing::warn!("批量计算 PR 重要性失败（保留旧结果）: {e}"),
+    }
+}
+
+async fn refresh_importance(
+    gh: &github::GitHub,
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    for_profile: &str,
+) {
+    let keys = {
+        let Some(a) = lock_for_profile(app, for_profile) else {
+            return;
+        };
+        match a.db.list_pr_keys() {
+            Ok(keys) => keys,
+            Err(e) => {
+                tracing::warn!("列出 PR 键失败，跳过重要性刷新: {e}");
+                return;
+            }
+        }
+    };
+    refresh_importance_for_keys(gh, app, msg_tx, for_profile, keys).await;
+}
+
 /// 本地模式刷新：本地库是手动策展的（只有 Inbox「+ 预评审」加入的 PR），
 /// 不从 GitHub 自动拉任何 PR 列表——这里只刷新在库行的 GitHub 状态 + 通知收件箱。
 /// sync 启用时不走这条路——列表以服务器插件数据库为准。
@@ -921,6 +988,7 @@ async fn refresh_from_github(
             }
         }
     }
+    refresh_importance(gh, app, msg_tx, for_profile).await;
     // 本地库是手动策展的：不从 GitHub 拉列表，但必须把库里的现有行装进 UI
     reload_rows(app, msg_tx);
 }
@@ -1224,6 +1292,7 @@ fn open_drawer_work(
             convo,
             checks_json,
             files_json,
+            importance: importance_props(row.as_ref(), &lang),
             review: review_props(review.as_ref(), &lang),
             review_status: String::new(),
             review_progress: String::new(),
@@ -1380,6 +1449,7 @@ async fn worker(
                             // 不再把配置仓库的全部 open PR 灌进列表库；通知仍从 GitHub 拉
                             fetch_inbox(&g, &app2, &tx).await;
                             do_sync(&app2, &sc, &tx, &cmd2, &for_profile).await;
+                            refresh_importance(&g, &app2, &tx, &for_profile).await;
                         } else {
                             refresh_from_github(&g, &app2, &tx, &for_profile).await;
                             // 顺便拉一次通知
@@ -1407,6 +1477,9 @@ async fn worker(
                         fetch_inbox(g, &app2, &tx).await;
                     }
                     do_sync(&app2, &sc, &tx, &cmd2, &for_profile).await;
+                    if let Some(g) = &g {
+                        refresh_importance(g, &app2, &tx, &for_profile).await;
+                    }
                     // 收尾：复位去重标志 + 停顶栏转圈（结果文案由 do_sync 自己的 Status 负责；
                     // 本地模式 sync 未启用时 do_sync 静默跳过，这里也不打扰状态栏）
                     app2.lock_recover().sync_inflight = false;
@@ -2031,6 +2104,7 @@ async fn worker(
                     let app2 = app.clone();
                     let tx = msg_tx.clone();
                     let healed = meta_healed.clone();
+                    let for_profile = app.lock_recover().cfg.active_profile.clone();
                     tokio::spawn(async move {
                         match g.fetch_pr_meta(&repo, number).await {
                             Ok(meta) => {
@@ -2060,6 +2134,14 @@ async fn worker(
                                         send(&tx, Msg::ReopenPanel);
                                     }
                                 }
+                                refresh_importance_for_keys(
+                                    &g,
+                                    &app2,
+                                    &tx,
+                                    &for_profile,
+                                    vec![(repo.clone(), number)],
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 // 失败：移除节流标记（下次可立即重试）+ 状态栏报错
@@ -2577,6 +2659,7 @@ async fn worker(
                         if sc.enabled() {
                             fetch_inbox(&g, &app2, &msg_tx2).await;
                             do_sync(&app2, &sc, &msg_tx2, &cmd2, &prof).await;
+                            refresh_importance(&g, &app2, &msg_tx2, &prof).await;
                         } else {
                             refresh_from_github(&g, &app2, &msg_tx2, &prof).await;
                             fetch_inbox(&g, &app2, &msg_tx2).await;
@@ -2619,6 +2702,7 @@ async fn worker(
                         if sc.enabled() {
                             fetch_inbox(&g, &app2, &msg_tx2).await;
                             do_sync(&app2, &sc, &msg_tx2, &cmd2, &for_profile).await;
+                            refresh_importance(&g, &app2, &msg_tx2, &for_profile).await;
                         } else {
                             refresh_from_github(&g, &app2, &msg_tx2, &for_profile).await;
                             fetch_inbox(&g, &app2, &msg_tx2).await;
@@ -2697,6 +2781,46 @@ mod tests {
         pump_auto_reviews(&app, &msg_tx, &cmd_tx, &mut queue);
         assert_eq!(queue.pending.len(), 1);
         assert!(queue.running.is_empty());
+    }
+
+    #[test]
+    fn importance_store_preserves_quality_and_profile_isolation() {
+        let app = Arc::new(Mutex::new(App::new(
+            Config::default(),
+            Db::open_memory().unwrap(),
+        )));
+        {
+            let a = app.lock_recover();
+            a.db.upsert_pr(&serde_json::json!({
+                "repo": "o/r", "number": 1, "title": "Fix bug", "source": "github"
+            }))
+            .unwrap();
+        }
+        let input = serde_json::json!({
+            "title": "Fix regression",
+            "labels": {"nodes": []},
+            "baseRefName": "main",
+            "milestone": null,
+            "closingIssuesReferences": {"nodes": []}
+        });
+        let score = pr_desk_rs::importance::score_pr(&input);
+        let mut scores = std::collections::HashMap::new();
+        scores.insert(("o/r".to_string(), 1), score);
+        assert_eq!(store_importance_scores(&app, "local", &scores), 1);
+        {
+            let a = app.lock_recover();
+            let row = &a.db.list_prs(&[]).unwrap()[0];
+            assert_eq!(row["importance_score"].as_f64(), Some(4.5));
+            assert!(row["score"].is_null());
+        }
+        scores.get_mut(&("o/r".to_string(), 1)).unwrap().score = 9.9;
+        app.lock_recover().cfg.active_profile = "another-profile".into();
+        assert_eq!(store_importance_scores(&app, "local", &scores), 0);
+        let a = app.lock_recover();
+        assert_eq!(
+            a.db.list_prs(&[]).unwrap()[0]["importance_score"].as_f64(),
+            Some(4.5)
+        );
     }
 
     /// 微型 sync 服务器：收到一次请求后延迟 delay 再返回 body（模拟网络在途）。

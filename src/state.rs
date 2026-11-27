@@ -275,6 +275,22 @@ pub struct ReviewProps {
     pub comments: Vec<OcrCommentRow>,
 }
 
+#[derive(Clone, Default)]
+pub struct ImportanceFactorProps {
+    pub label: String,
+    pub points: u32,
+    pub max_points: u32,
+    pub evidence: String,
+}
+
+#[derive(Clone, Default)]
+pub struct ImportanceProps {
+    pub score: Option<f32>,
+    pub factors: Vec<ImportanceFactorProps>,
+    pub version: String,
+    pub updated_at: String,
+}
+
 /// 详情面板一次装配的全部数据（Msg::Panel 负载）。
 pub struct PanelData {
     pub repo: String,
@@ -290,6 +306,7 @@ pub struct PanelData {
     pub convo: Vec<PlainConvoEntry>,
     pub checks_json: String,
     pub files_json: String,
+    pub importance: ImportanceProps,
     pub review: ReviewProps,
     // 评审三态："" = 无活动；"running" / "failed" / "done"
     pub review_status: String,
@@ -499,6 +516,44 @@ pub fn review_props(review: Option<&Value>, lang: &str) -> ReviewProps {
         flagged,
         reviewed_at: rv["reviewed_at"].as_str().unwrap_or("").to_string(),
         comments: ocr_comment_rows(rv),
+    }
+}
+
+pub fn importance_props(row: Option<&Value>, lang: &str) -> ImportanceProps {
+    let Some(row) = row else {
+        return ImportanceProps::default();
+    };
+    let Some(score) = row["importance_score"].as_f64() else {
+        return ImportanceProps::default();
+    };
+    let factors = json_field(row, "importance_factors")
+        .and_then(|factors| factors.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|factor| {
+            let key = factor["key"].as_str().unwrap_or("");
+            let label_key = match key {
+                "severity" => "importance_factor_severity",
+                "reach" => "importance_factor_reach",
+                "release" => "importance_factor_release",
+                _ => "importance_factor_unknown",
+            };
+            ImportanceFactorProps {
+                label: tr(lang, label_key).to_string(),
+                points: factor["points"].as_u64().unwrap_or(0) as u32,
+                max_points: factor["max_points"].as_u64().unwrap_or(0) as u32,
+                evidence: factor["evidence"].as_str().unwrap_or("").to_string(),
+            }
+        })
+        .collect();
+    ImportanceProps {
+        score: Some(score as f32),
+        factors,
+        version: row["importance_version"].as_str().unwrap_or("").to_string(),
+        updated_at: row["importance_updated_at"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
     }
 }
 
@@ -1373,6 +1428,34 @@ mod tests {
         assert!(!p0.has);
         assert!(p0.dimensions.is_empty());
         assert_eq!(p0.size_line, "");
+    }
+
+    #[test]
+    fn importance_props_distinguishes_missing_and_zero_scores() {
+        assert!(importance_props(None, "zh").score.is_none());
+        assert!(
+            importance_props(Some(&serde_json::json!({})), "zh")
+                .score
+                .is_none()
+        );
+        let row = serde_json::json!({
+            "importance_score": 0.0,
+            "importance_factors": [
+                {"key": "severity", "points": 0, "max_points": 50, "evidence": "No signal"},
+                {"key": "reach", "points": 0, "max_points": 30, "evidence": "No issue"}
+            ],
+            "importance_version": "v1",
+            "importance_updated_at": "2026-11-27T00:00:00Z"
+        });
+        let props = importance_props(Some(&row), "zh");
+        assert_eq!(props.score, Some(0.0));
+        assert_eq!(props.factors.len(), 2);
+        assert_eq!(props.factors[0].label, "严重度");
+        assert_eq!(props.factors[1].label, "影响范围");
+        assert_eq!(props.version, "v1");
+        let english = importance_props(Some(&row), "en");
+        assert_eq!(english.factors[0].label, "Severity");
+        assert_eq!(english.factors[1].label, "Audience reach");
     }
 
     fn review(state: &str, time: &str) -> Value {

@@ -29,7 +29,7 @@ const SKIP_PATTERNS: &[&str] = &[
     "*.snap",
 ];
 
-/// 默认评分标准（plugin_metadata.py DEFAULT_SCORE_RUBRIC 原样移植）
+/// 默认评分标准：模型只评四维，综合总分由应用按固定权重本地计算。
 pub const DEFAULT_SCORE_RUBRIC: &str = "\
 评分标准（每项 0-10 分）：
 - readability（可读性）：命名、结构、注释是否清晰易读
@@ -37,9 +37,9 @@ pub const DEFAULT_SCORE_RUBRIC: &str = "\
 - test_coverage（测试覆盖）：改动是否有相应测试，测试是否覆盖关键路径
 - security（安全）：是否引入注入、越权、敏感信息泄露等安全隐患
 
-体量与简洁度也是评分维度之一：在变更目的相同的前提下，更小更聚焦的 PR 应得更高分；
-巨型 PR（XL 体量）因可评审性差应酌情扣分，显著影响 overall_score。
-overall_score 为综合加权总分（0-10），请客观严格打分。
+权重：readability 20%，correctness_risk 40%，test_coverage 20%，security 20%。
+请只评定四个分项，综合总分由应用按上述权重在本地计算。
+变更体量仅用于判断评审覆盖范围，不作为加分或扣分依据。
 ";
 
 /// 评审主 Prompt 模板（plugin_metadata.py DEFAULT_REVIEW_PROMPT 移植 + 强化：
@@ -63,12 +63,12 @@ PR：#{{number}} {{title}}
 {{note}}
 
 请只输出一个严格的 JSON 对象（不要输出任何其他文字、不要使用 markdown 代码块），格式：
-{\"overall_score\": 8.5,
- \"dimensions\": {\"readability\": 8, \"correctness_risk\": 9, \"test_coverage\": 6, \"security\": 9},
+{\"dimensions\": {\"readability\": 8, \"correctness_risk\": 9, \"test_coverage\": 6, \"security\": 9},
  \"summary\": \"……\",
  \"flagged_files\": [{\"path\": \"src/foo.py\", \"issue\": \"具体问题描述\"}]}
 硬性要求：
-- dimensions 必须完整包含 readability、correctness_risk、test_coverage、security 四个键，缺一不可；
+- dimensions 必须完整包含 readability、correctness_risk、test_coverage、security 四个键，缺一不可，值必须为 0-10 的有限数值；
+- 变更规模仅用于判断评审覆盖范围，不据此加分或扣分；
 - summary 用中文、Markdown 分点格式，两节：「**优点**」逐条列点；「**风险与建议**」逐条列点并指出具体文件/位置（无风险写「无明显风险」）；总共不超过 300 字，禁止写成一整段；
 - flagged_files 只列出确有问题的文件，没有问题则为空数组。
 ";
@@ -76,10 +76,10 @@ PR：#{{number}} {{title}}
 /// JSON 解析失败后的重试纠正消息（plugin_metadata.py RETRY_SUFFIX 文案移植）
 pub const RETRY_SUFFIX: &str = "\n\n你上一次的回复无法被解析为 JSON。请严格只输出一个 JSON 对象，不要包含任何解释文字或 markdown 代码块标记。";
 
-/// LLM 评审使用的系统提示词（plugin_metadata.py DEFAULT_REVIEWER_PERSONA 原样移植）
+/// LLM 评审使用的系统提示词。
 pub const DEFAULT_REVIEWER_PERSONA: &str = "\
 你是一位资深代码评审专家，擅长快速发现代码中的逻辑错误、安全风险与可维护性问题。\
-评审时兼顾体量与简洁度：同等目的下更小更聚焦的 PR 更优，巨型 PR 因可评审性差应酌情扣分。\
+评审时请检查 diff 覆盖是否完整，并在覆盖不足时明确说明。\
 评审请用中文，客观严格，结论必须是指定格式的 JSON。";
 
 /// LLM 连接参数；api_key 或 model 缺失时 from_config 返回 None（预评审不可用）。
@@ -252,12 +252,12 @@ pub fn filter_diff(
 /// 输出格式约定（自定义 prompt 模板时自动附加，保证 JSON 输出契约不被破坏）。
 pub const OUTPUT_CONTRACT: &str = "\
 请只输出一个严格的 JSON 对象（不要输出任何其他文字、不要使用 markdown 代码块），格式：
-{\"overall_score\": 8.5,
- \"dimensions\": {\"readability\": 8, \"correctness_risk\": 9, \"test_coverage\": 6, \"security\": 9},
+{\"dimensions\": {\"readability\": 8, \"correctness_risk\": 9, \"test_coverage\": 6, \"security\": 9},
  \"summary\": \"……\",
  \"flagged_files\": [{\"path\": \"src/foo.py\", \"issue\": \"具体问题描述\"}]}
 硬性要求：
-- dimensions 必须完整包含 readability、correctness_risk、test_coverage、security 四个键，缺一不可；
+- dimensions 必须完整包含 readability、correctness_risk、test_coverage、security 四个键，缺一不可，值必须为 0-10 的有限数值；
+- 变更规模仅用于判断评审覆盖范围，不据此加分或扣分；
 - summary 用中文、Markdown 分点格式，两节：「**优点**」逐条列点；「**风险与建议**」逐条列点并指出具体文件/位置（无风险写「无明显风险」）；
 - flagged_files 只列出确有问题的文件，没有问题则为空数组。
 ";
@@ -326,8 +326,29 @@ fn jstr(v: Option<&Value>) -> String {
     }
 }
 
+const DIMENSION_WEIGHTS: &[(&str, f64)] = &[
+    ("readability", 0.2),
+    ("correctness_risk", 0.4),
+    ("test_coverage", 0.2),
+    ("security", 0.2),
+];
+
+/// 校验四维评分并在本地计算综合总分，四舍五入保留一位小数。
+fn calculate_overall_score(dimensions: &Value) -> Option<f64> {
+    let dimensions = dimensions.as_object()?;
+    let mut score = 0.0;
+    for (name, weight) in DIMENSION_WEIGHTS {
+        let value = dimensions.get(*name)?.as_f64()?;
+        if !value.is_finite() || !(0.0..=10.0).contains(&value) {
+            return None;
+        }
+        score += value * weight;
+    }
+    Some((score * 10.0).round() / 10.0)
+}
+
 /// 从 LLM 回复中提取严格 JSON 评审结果。
-/// 剥离 markdown 代码块围栏后解析；校验 overall_score 必填。失败返回 None。
+/// 剥离 markdown 代码块围栏后解析；四维必须完整有效，模型总分不参与计算。失败返回 None。
 pub fn parse_review_json(text: &str) -> Option<Value> {
     let s = text.trim();
     if s.is_empty() {
@@ -360,11 +381,8 @@ pub fn parse_review_json(text: &str) -> Option<Value> {
     if !data.is_object() {
         return None;
     }
-    let score = data.get("overall_score")?.as_f64()?;
-    let dimensions = match data.get("dimensions") {
-        Some(d) if d.is_object() => d.clone(),
-        _ => json!({}),
-    };
+    let dimensions = data.get("dimensions")?;
+    let score = calculate_overall_score(dimensions)?;
     let flagged_files: Vec<Value> = match data.get("flagged_files") {
         Some(Value::Array(items)) => items
             .iter()
@@ -746,6 +764,9 @@ index 555..666 100644
         assert!(p.contains("变更规模：+1/-0，共 1 个文件，体量 XS"));
         assert!(p.contains("```diff\nDIFF_BODY\n```"));
         assert!(p.contains("评分标准（每项 0-10 分）：")); // 默认 rubric
+        assert!(p.contains("readability 20%，correctness_risk 40%"));
+        assert!(p.contains("变更体量仅用于判断评审覆盖范围，不作为加分或扣分依据"));
+        assert!(!p.contains("overall_score"));
         assert!(!p.contains("{{"));
 
         let custom = build_prompt(&meta, "D", &[], "自定义标准", None, None);
@@ -773,9 +794,24 @@ index 555..666 100644
         assert!(p.contains("自定义视角评审 o/r#42"));
         assert!(p.contains("DIFF"));
         // 输出契约自动附加：dimensions 四维硬性要求必须在
-        assert!(p.contains("overall_score"));
+        assert!(!p.contains("overall_score"));
         assert!(p.contains("dimensions 必须完整包含"));
+        assert!(p.contains("值必须为 0-10 的有限数值"));
         assert!(!p.contains("{{")); // 变量已替换
+    }
+
+    #[test]
+    fn review_prompts_exclude_model_total_and_size_scoring() {
+        for prompt in [
+            DEFAULT_SCORE_RUBRIC,
+            DEFAULT_REVIEW_PROMPT,
+            OUTPUT_CONTRACT,
+            DEFAULT_REVIEWER_PERSONA,
+        ] {
+            assert!(!prompt.contains("overall_score"));
+            assert!(!prompt.contains("更小更聚焦"));
+            assert!(!prompt.contains("酌情扣分"));
+        }
     }
 
     #[test]
@@ -815,29 +851,64 @@ index 555..666 100644
         assert!(!p.contains("f20.rs"));
     }
 
+    fn all_dimensions(value: f64) -> Value {
+        json!({
+            "readability": value,
+            "correctness_risk": value,
+            "test_coverage": value,
+            "security": value,
+        })
+    }
+
+    fn review_json(dimensions: &Value) -> String {
+        json!({"dimensions": dimensions}).to_string()
+    }
+
     #[test]
     fn parse_review_json_plain() {
         let v = parse_review_json(
-            r#"{"overall_score": 8.5, "dimensions": {"readability": 8}, "summary": "好", "flagged_files": [{"path": "a.rs", "issue": "x"}]}"#,
+            r#"{"dimensions": {"readability": 8, "correctness_risk": 9, "test_coverage": 6, "security": 9}, "summary": "好", "flagged_files": [{"path": "a.rs", "issue": "x"}]}"#,
         )
         .unwrap();
-        assert_eq!(v["score"].as_f64(), Some(8.5));
+        assert_eq!(v["score"].as_f64(), Some(8.2));
         assert_eq!(v["dimensions"]["readability"].as_i64(), Some(8));
         assert_eq!(v["summary"].as_str(), Some("好"));
         assert_eq!(v["flagged_files"][0]["path"].as_str(), Some("a.rs"));
     }
 
     #[test]
-    fn parse_review_json_fenced_and_noisy() {
+    fn overall_score_uses_fixed_weights_and_one_decimal() {
+        for (name, weight) in DIMENSION_WEIGHTS {
+            let mut dimensions = all_dimensions(0.0);
+            dimensions[*name] = json!(10);
+            assert_eq!(
+                calculate_overall_score(&dimensions),
+                Some(*weight * 10.0),
+                "{name} 的权重不正确"
+            );
+        }
+        assert_eq!(calculate_overall_score(&all_dimensions(10.0)), Some(10.0));
+
         let v = parse_review_json(
-            "前言\n```json\n{\"overall_score\": 7, \"summary\": \"s\"}\n```\n后语",
+            r#"{"overall_score": "忽略模型总分", "dimensions": {"readability": 7.3, "correctness_risk": 8.2, "test_coverage": 6.1, "security": 9.4}}"#,
         )
         .unwrap();
+        assert_eq!(v["score"].as_f64(), Some(7.8));
+    }
+
+    #[test]
+    fn parse_review_json_fenced_and_noisy() {
+        let raw = format!(
+            "前言\n```json\n{}\n```\n后语",
+            review_json(&all_dimensions(7.0))
+        );
+        let v = parse_review_json(&raw).unwrap();
         assert_eq!(v["score"].as_f64(), Some(7.0));
-        assert_eq!(v["dimensions"], json!({}));
+        assert_eq!(v["dimensions"], all_dimensions(7.0));
         assert_eq!(v["flagged_files"], json!([]));
 
-        let v = parse_review_json("结果是 {\"overall_score\": 6} 完").unwrap();
+        let raw = format!("结果是 {} 完", review_json(&all_dimensions(6.0)));
+        let v = parse_review_json(&raw).unwrap();
         assert_eq!(v["score"].as_f64(), Some(6.0));
     }
 
@@ -845,16 +916,58 @@ index 555..666 100644
     fn parse_review_json_failures() {
         assert!(parse_review_json("").is_none());
         assert!(parse_review_json("没有 JSON").is_none());
-        assert!(parse_review_json("{}").is_none()); // 缺 overall_score
-        assert!(parse_review_json("{\"overall_score\": \"高\"}").is_none()); // 非数字
+        assert!(parse_review_json("{}").is_none()); // 缺 dimensions
+        assert!(parse_review_json("{\"dimensions\": {}}").is_none()); // 四维为空
+        assert!(parse_review_json("{\"dimensions\": []}").is_none()); // 非对象
         assert!(parse_review_json("[1,2]").is_none()); // 非对象
-        assert!(parse_review_json("{\"overall_score\": 8,").is_none()); // 截断 JSON
+        assert!(parse_review_json("{\"dimensions\": {").is_none()); // 截断 JSON
+    }
+
+    #[test]
+    fn parse_review_json_requires_every_dimension() {
+        for (name, _) in DIMENSION_WEIGHTS {
+            let mut dimensions = all_dimensions(8.0);
+            dimensions.as_object_mut().unwrap().remove(*name);
+            assert!(
+                parse_review_json(&review_json(&dimensions)).is_none(),
+                "缺少 {name} 时应解析失败"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_review_json_rejects_out_of_range_dimensions() {
+        for (name, _) in DIMENSION_WEIGHTS {
+            for value in [-0.1, 10.1] {
+                let mut dimensions = all_dimensions(8.0);
+                dimensions[*name] = json!(value);
+                assert!(
+                    parse_review_json(&review_json(&dimensions)).is_none(),
+                    "{name}={value} 越界时应解析失败"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_review_json_rejects_non_numeric_and_non_finite_dimensions() {
+        for value in [json!("8"), json!(null), json!(true), json!([8])] {
+            let mut dimensions = all_dimensions(8.0);
+            dimensions["readability"] = value;
+            assert!(parse_review_json(&review_json(&dimensions)).is_none());
+        }
+        for literal in ["NaN", "Infinity", "-Infinity", "1e400"] {
+            let raw = format!(
+                r#"{{"dimensions":{{"readability":{literal},"correctness_risk":8,"test_coverage":8,"security":8}}}}"#
+            );
+            assert!(parse_review_json(&raw).is_none(), "{literal} 应解析失败");
+        }
     }
 
     #[test]
     fn parse_review_json_flagged_files_normalized() {
         let v = parse_review_json(
-            r#"{"overall_score": 5, "flagged_files": [{"path": "a.rs", "issue": "i"}, "junk", {"path": "b.rs"}]}"#,
+            r#"{"dimensions": {"readability": 5, "correctness_risk": 5, "test_coverage": 5, "security": 5}, "flagged_files": [{"path": "a.rs", "issue": "i"}, "junk", {"path": "b.rs"}]}"#,
         )
         .unwrap();
         let flagged = v["flagged_files"].as_array().unwrap();

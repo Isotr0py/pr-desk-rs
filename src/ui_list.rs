@@ -344,6 +344,7 @@ struct RowData {
     size: String,
     adds: i64,
     dels: i64,
+    importance: Option<f64>,
     score: f64,
     age: String,
     activity: String,
@@ -368,6 +369,7 @@ fn row_data(a: &App, idx: usize) -> RowData {
         size: r["size_label"].as_str().unwrap_or("").to_string(),
         adds: r["additions"].as_i64().unwrap_or(0),
         dels: r["deletions"].as_i64().unwrap_or(0),
+        importance: r["importance_score"].as_f64(),
         score: r["score"].as_f64().unwrap_or(0.0),
         age: rel_time(r["updated_at"].as_str().unwrap_or("")),
         activity: activity_text(r, &a.cfg.language),
@@ -407,7 +409,8 @@ pub const COL_SPECS: &[ColSpec] = &[
     ColSpec { id: "ci", label: "CI", def_w: 40.0, min_w: 32.0, flex: false },
     ColSpec { id: "size", label: "col_size", def_w: 40.0, min_w: 32.0, flex: false },
     ColSpec { id: "changes", label: "+/-", def_w: 70.0, min_w: 52.0, flex: false },
-    ColSpec { id: "score", label: "★", def_w: 40.0, min_w: 32.0, flex: false },
+    ColSpec { id: "importance", label: "col_importance", def_w: 44.0, min_w: 32.0, flex: false },
+    ColSpec { id: "score", label: "col_quality", def_w: 40.0, min_w: 32.0, flex: false },
     ColSpec { id: "upd", label: "col_updated", def_w: 48.0, min_w: 40.0, flex: false },
 ];
 
@@ -418,9 +421,8 @@ pub fn default_col_widths() -> Vec<f32> {
 
 fn col_label<'a>(key: &'a str, lang: &str) -> &'a str {
     match key {
-        "col_title" | "col_author" | "col_turn" | "col_review" | "col_size" | "col_updated" => {
-            tr(lang, key)
-        }
+        "col_title" | "col_author" | "col_turn" | "col_review" | "col_size" | "col_importance"
+        | "col_quality" | "col_updated" => tr(lang, key),
         other => other,
     }
 }
@@ -1014,9 +1016,21 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     }
     paint_size_badge(ui, cell(7), &row.size, small.clone(), weak, dark);
     paint_diff_count(ui, cell(8), row.adds, row.dels, small.clone(), weak, dark);
-    // ★ 评分列：列内居中（图标列语义）
-    if row.score > 0.0 {
+    // 重要性评分列：NULL/缺失留空，0 分也正常显示
+    if let Some(importance) = row.importance {
         let c = cell(9);
+        let t = ellipsize(ui, &format!("{importance:.1}"), small.clone(), c.width() - 4.0);
+        ui.painter().with_clip_rect(c).text(
+            egui::pos2(icon_center_x(c), c.center().y),
+            Align2::CENTER_CENTER,
+            t,
+            small.clone(),
+            ui_detail::score_color(importance, dark),
+        );
+    }
+    // 代码质量列：列内居中（图标列语义）
+    if row.score > 0.0 {
+        let c = cell(10);
         let t = ellipsize(ui, &format!("{:.1}", row.score), small.clone(), c.width() - 4.0);
         ui.painter().with_clip_rect(c).text(
             egui::pos2(icon_center_x(c), c.center().y),
@@ -1026,7 +1040,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             ui_detail::score_color(row.score, dark),
         );
     }
-    paint_cell(ui, cell(10), &row.age, small.clone(), weak);
+    paint_cell(ui, cell(11), &row.age, small.clone(), weak);
 
     // 点击（带修饰键语义）
     if resp.clicked() {
@@ -1300,6 +1314,20 @@ pub fn delete_confirm_window(app: &mut EguiApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn importance_column_precedes_quality_and_updated() {
+        assert_eq!(COL_SPECS[9].id, "importance");
+        assert_eq!(COL_SPECS[9].label, "col_importance");
+        assert_eq!(COL_SPECS[10].id, "score");
+        assert_eq!(COL_SPECS[10].label, "col_quality");
+        assert_eq!(COL_SPECS[11].id, "upd");
+        let widths = default_col_widths();
+        assert_eq!(widths.len(), COL_SPECS.len());
+        assert_eq!(widths[9], COL_SPECS[9].def_w);
+        assert_eq!(widths[10], COL_SPECS[10].def_w);
+        assert_eq!(widths[11], COL_SPECS[11].def_w);
+    }
 
     #[test]
     fn header_zones_symmetric_and_disjoint() {

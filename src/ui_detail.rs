@@ -502,7 +502,67 @@ pub fn avatar_chip(ui: &mut Ui, author: &str) {
     }
 }
 
+fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
+    ui.horizontal(|ui| {
+        if let Some(score) = importance.score {
+            ui.label(
+                RichText::new(format!("{score:.1}"))
+                    .size(22.0)
+                    .strong()
+                    .color(score_color(score as f64, ui.visuals().dark_mode)),
+            );
+        } else {
+            ui.label(RichText::new("—").size(22.0).strong());
+        }
+        ui.weak(format!("/10 · {}", tr(lang, "importance_title")));
+    });
+    ui.weak(tr(lang, "importance_subtitle"));
+    let Some(_) = importance.score else {
+        ui.weak(tr(lang, "importance_pending"));
+        return;
+    };
+    for factor in &importance.factors {
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.monospace(&factor.label);
+            let frac = if factor.max_points == 0 {
+                0.0
+            } else {
+                factor.points as f32 / factor.max_points as f32
+            };
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 8.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+            let mut fill = rect;
+            fill.set_width(rect.width() * frac.clamp(0.0, 1.0));
+            ui.painter().rect_filled(
+                fill,
+                4.0,
+                score_color(frac as f64 * 10.0, ui.visuals().dark_mode),
+            );
+            ui.weak(format!(
+                "+{:.1}/{:.1}",
+                factor.points as f32 / 10.0,
+                factor.max_points as f32 / 10.0
+            ));
+        });
+        if !factor.evidence.is_empty() {
+            ui.weak(&factor.evidence);
+        }
+    }
+    if !importance.version.is_empty() {
+        ui.weak(format!("scoring {}", importance.version));
+    }
+}
+
 fn review_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
+    let importance = app
+        .panel
+        .as_ref()
+        .map(|panel| panel.importance.clone())
+        .unwrap_or_default();
+    importance_section(ui, &importance, lang);
+    ui.separator();
     let (running, progress) = app
         .panel
         .as_ref()
