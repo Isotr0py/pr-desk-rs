@@ -282,6 +282,7 @@ pub struct ImportanceFactorProps {
     pub points: i32,
     pub max_points: u32,
     pub evidence: String,
+    pub rule_evidence: String,
 }
 
 #[derive(Clone, Default)]
@@ -550,19 +551,22 @@ pub fn importance_props(row: Option<&Value>, lang: &str) -> ImportanceProps {
                 "penalty" => "importance_group_penalty",
                 _ => "importance_factor_unknown",
             };
+            let evidence = factor["evidence"].as_str().unwrap_or("");
+            let evidence = evidence
+                .strip_prefix("智能校准: ")
+                .or_else(|| evidence.strip_prefix("K3: "))
+                .unwrap_or(evidence);
+            let (reason, rule_evidence) = evidence
+                .split_once(" | Rule evidence: ")
+                .map(|(reason, rule)| (reason.to_string(), rule.to_string()))
+                .unwrap_or_else(|| (evidence.to_string(), evidence.to_string()));
             ImportanceFactorProps {
                 group: group.to_string(),
                 label: tr(lang, label_key).to_string(),
                 points: factor["points"].as_i64().unwrap_or(0) as i32,
                 max_points: factor["max_points"].as_u64().unwrap_or(0) as u32,
-                evidence: {
-                    let evidence = factor["evidence"].as_str().unwrap_or("");
-                    evidence
-                        .strip_prefix("智能校准: ")
-                        .or_else(|| evidence.strip_prefix("K3: "))
-                        .unwrap_or(evidence)
-                        .to_string()
-                },
+                evidence: reason,
+                rule_evidence,
             }
         })
         .collect();
@@ -1464,7 +1468,7 @@ mod tests {
             "importance_factors": [
                 {"key": "severity", "points": 0, "max_points": 50, "evidence": "K3: calibrated"},
                 {"key": "reach", "points": 0, "max_points": 30, "evidence": "No issue"},
-                {"group": "penalty", "key": "change_penalties", "points": -5, "max_points": 15, "evidence": "Large change"}
+                {"group": "penalty", "key": "change_penalties", "points": -5, "max_points": 15, "evidence": "Model rationale | Rule evidence: raw evidence"}
             ],
             "importance_version": "v1",
             "importance_updated_at": "2026-11-27T00:00:00Z"
@@ -1474,8 +1478,11 @@ mod tests {
         assert_eq!(props.factors.len(), 3);
         assert_eq!(props.factors[0].label, "缺陷严重度");
         assert_eq!(props.factors[0].evidence, "calibrated");
+        assert_eq!(props.factors[0].rule_evidence, "calibrated");
         assert_eq!(props.factors[1].label, "社区关注");
         assert_eq!(props.factors[2].label, "惩罚");
+        assert_eq!(props.factors[2].evidence, "Model rationale");
+        assert_eq!(props.factors[2].rule_evidence, "raw evidence");
         assert_eq!(props.factors[2].points, -5);
         assert_eq!(props.version, "v1");
         let english = importance_props(Some(&row), "en");

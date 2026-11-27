@@ -626,6 +626,7 @@ fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str)
 }
 
 fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
+    ui.style_mut().interaction.tooltip_delay = 0.1;
     ui.horizontal(|ui| {
         if let Some(score) = importance.score {
             ui.label(
@@ -700,7 +701,7 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             ui.set_max_width(420.0);
             for factor in &factors {
                 ui.horizontal_wrapped(|ui| {
-                    ui.weak(&factor.evidence);
+                    ui.weak(format!("Rule evidence: {}", factor.rule_evidence));
                     ui.weak(format!("{:+.1}", factor.points as f32 / 10.0));
                 });
             }
