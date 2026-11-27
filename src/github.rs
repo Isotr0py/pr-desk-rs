@@ -642,12 +642,14 @@ fn build_importance_query(items: &[(String, i64)]) -> Result<String> {
         if !valid_repo_part(owner) || !valid_repo_part(name) || *number <= 0 {
             anyhow::bail!("GraphQL 重要性查询：非法 PR 标识 {repo}#{number}");
         }
+        let search = serde_json::to_string(&format!("repo:{repo} is:issue \"#{number}\""))?;
         q.push_str(&format!(
-            "r{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ n{i}: pullRequest(number: {number}) {{ ...ImportancePrFields }} }}"
+            "r{i}: repository(owner: \"{owner}\", name: \"{name}\") {{ n{i}: pullRequest(number: {number}) {{ ...ImportancePrFields }} }}
+            t{i}: search(query: {search}, first: 5, type: ISSUE) {{ nodes {{ ... on Issue {{ {IMPORTANCE_ISSUE_FIELDS} }} }} }}"
         ));
     }
     q.push_str(&format!(
-        "}} fragment ImportancePrFields on PullRequest {{ title body baseRefName additions deletions changedFiles isDraft labels(first: 50) {{ nodes {{ name }} }} milestone {{ title }} files(first: 100) {{ nodes {{ path }} }} closingIssuesReferences(first: 5) {{ nodes {{ {IMPORTANCE_ISSUE_FIELDS} }} }} }}"
+        "}} fragment ImportancePrFields on PullRequest {{ title body baseRefName additions deletions changedFiles isDraft labels(first: 50) {{ nodes {{ name }} }} milestone {{ title }} files(first: 100) {{ nodes {{ path }} }} author {{ login }} authorAssociation closingIssuesReferences(first: 5) {{ nodes {{ {IMPORTANCE_ISSUE_FIELDS} }} }} }}"
     ));
     Ok(q)
 }
@@ -667,6 +669,18 @@ fn build_issue_query(items: &[(String, i64)]) -> Result<String> {
     Ok(q)
 }
 
+fn is_roadmap_issue(issue: &Value, pr_number: i64) -> bool {
+    let title = issue["title"].as_str().unwrap_or("").to_ascii_lowercase();
+    let roadmap_title = ["tracking", "roadmap", "epic", "umbrella", "规划", "路线"]
+        .iter()
+        .any(|keyword| title.contains(keyword));
+    roadmap_title
+        && issue["body"]
+            .as_str()
+            .unwrap_or("")
+            .contains(&format!("#{pr_number}"))
+}
+
 fn parse_importance_inputs(
     body: &Value,
     items: &[(String, i64)],
@@ -675,7 +689,17 @@ fn parse_importance_inputs(
     for (i, (repo, number)) in items.iter().enumerate() {
         let pr = &body["data"][format!("r{i}")][format!("n{i}")];
         if pr.is_object() && pr["title"].is_string() {
-            out.insert((repo.clone(), *number), pr.clone());
+            let mut pr = pr.clone();
+            let tracking = body["data"][format!("t{i}")]["nodes"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|issue| is_roadmap_issue(issue, *number))
+                .take(3)
+                .collect::<Vec<_>>();
+            pr["trackingIssuesReferences"] = serde_json::json!({"nodes": tracking});
+            out.insert((repo.clone(), *number), pr);
         }
     }
 }
@@ -882,6 +906,8 @@ mod tests {
         assert!(query.contains("additions deletions changedFiles isDraft"));
         assert!(query.contains("files(first: 100) { nodes { path } }"));
         assert!(query.contains("number title body repository"));
+        assert!(query.contains("t0: search(query:"));
+        assert!(query.contains("author { login } authorAssociation"));
         assert!(query.contains("reactions { totalCount }"));
         assert!(build_importance_query(&[("bad/repo;query".into(), 1)]).is_err());
         assert!(build_importance_query(&[("o/r".into(), 0)]).is_err());
@@ -889,6 +915,21 @@ mod tests {
         assert!(issue_query.contains("n0: issue(number: 9)"));
         assert!(issue_query.contains("repository { nameWithOwner }"));
         assert!(build_issue_query(&[("o/r".into(), -1)]).is_err());
+    }
+
+    #[test]
+    fn roadmap_filter_requires_tracking_title_and_pr_backlink() {
+        let roadmap = serde_json::json!({
+            "title": "[Tracking] Rust frontend as default",
+            "body": "- [ ] readiness: #70361"
+        });
+        assert!(is_roadmap_issue(&roadmap, 70361));
+        assert!(!is_roadmap_issue(&roadmap, 999));
+        let ordinary = serde_json::json!({
+            "title": "Implement readiness",
+            "body": "Related: #70361"
+        });
+        assert!(!is_roadmap_issue(&ordinary, 70361));
     }
 
     #[test]

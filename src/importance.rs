@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-pub const SCORING_VERSION: &str = "2026-11-27.2";
+pub const SCORING_VERSION: &str = "2026-11-27.3";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ImportanceFactor {
@@ -38,10 +38,12 @@ pub fn importance_input(pr: &Value) -> Value {
     if let Some(body) = input["body"].as_str() {
         input["body"] = json!(body.chars().take(6_000).collect::<String>());
     }
-    if let Some(issues) = input["closingIssuesReferences"]["nodes"].as_array_mut() {
-        for issue in issues.iter_mut().take(5) {
-            if let Some(body) = issue["body"].as_str() {
-                issue["body"] = json!(body.chars().take(3_000).collect::<String>());
+    for field in ["closingIssuesReferences", "trackingIssuesReferences"] {
+        if let Some(issues) = input[field]["nodes"].as_array_mut() {
+            for issue in issues.iter_mut().take(5) {
+                if let Some(body) = issue["body"].as_str() {
+                    issue["body"] = json!(body.chars().take(3_000).collect::<String>());
+                }
             }
         }
     }
@@ -649,7 +651,7 @@ fn reactions_factor(issues: &[Value]) -> ImportanceFactor {
     )
 }
 
-fn linked_issue_factor(issues: &[Value]) -> ImportanceFactor {
+fn linked_issue_factor(issues: &[Value], tracking_issues: &[Value]) -> ImportanceFactor {
     let numbers = issues
         .iter()
         .filter_map(|issue| issue["number"].as_i64())
@@ -657,16 +659,32 @@ fn linked_issue_factor(issues: &[Value]) -> ImportanceFactor {
         .map(|number| format!("#{number}"))
         .collect::<Vec<_>>()
         .join(", ");
+    let tracking = tracking_issues
+        .iter()
+        .map(|issue| {
+            format!(
+                "#{} {}",
+                issue["number"].as_i64().unwrap_or(0),
+                issue["title"].as_str().unwrap_or("")
+            )
+        })
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let has_context = !issues.is_empty() || !tracking_issues.is_empty();
+    let evidence = if !issues.is_empty() {
+        format!("Closes {numbers}; link counted once without inheriting the issue score")
+    } else if !tracking_issues.is_empty() {
+        format!("Roadmap context: {tracking}; counted once without a closing-link bonus")
+    } else {
+        "No closing issue or roadmap reference".to_string()
+    };
     factor(
         "pr_signals",
         "linked_issue",
-        if issues.is_empty() { 0 } else { 10 },
+        if has_context { 10 } else { 0 },
         10,
-        if issues.is_empty() {
-            "No closing issue reference".to_string()
-        } else {
-            format!("Closes {numbers}; link counted once without inheriting the issue score")
-        },
+        evidence,
     )
 }
 
@@ -768,6 +786,10 @@ pub fn score_pr(pr: &Value) -> ImportanceScore {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let tracking_issues = pr["trackingIssuesReferences"]["nodes"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let files = file_summary(pr);
     let factors = vec![
         severity_factor(pr, &issues),
@@ -777,7 +799,7 @@ pub fn score_pr(pr: &Value) -> ImportanceScore {
         issue_evidence_factor(&issues, false),
         comments_factor(&issues),
         reactions_factor(&issues),
-        linked_issue_factor(&issues),
+        linked_issue_factor(&issues, &tracking_issues),
         tests_factor(&files),
         focused_factor(&files),
         production_factor(&files),
@@ -917,6 +939,21 @@ mod tests {
         ));
         assert_eq!(points(&score, "comments"), 6);
         assert_eq!(points(&score, "reactions"), 4);
+    }
+
+    #[test]
+    fn roadmap_context_counts_once_without_a_closing_link_bonus() {
+        let mut input = pr("Feature", &[], vec![]);
+        input["trackingIssuesReferences"] = json!({"nodes": [
+            issue(68784, "[Tracking] Rust frontend as default", &[], 7, 2)
+        ]});
+        let score = score_pr(&input);
+        assert_eq!(points(&score, "linked_issue"), 10);
+        assert!(score.factors.iter().any(|factor| {
+            factor.key == "linked_issue" && factor.evidence.contains("Roadmap context")
+        }));
+        input["closingIssuesReferences"]["nodes"] = json!([issue(1, "Closing bug", &[], 0, 0)]);
+        assert_eq!(points(&score_pr(&input), "linked_issue"), 10);
     }
 
     #[test]

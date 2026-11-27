@@ -26,6 +26,8 @@ const FACTOR_LIMITS: &[(&str, i32, i32)] = &[
 const SYSTEM_PROMPT: &str = "你是资深开源仓库维护者，负责校准 PR 的重要性。\
 你只能使用输入中的 GitHub 证据和规则因子，不得虚构模型热度、用户规模、硬件影响或业务背景。\
 你的职责是纠正机械规则的误判，而不是机械照抄基线。区分仓库影响与代码质量，不评价实现好坏。\
+trackingIssuesReferences 是 roadmap/tracking 上下文而非关闭关联，应评估其战略影响；不得重复计关闭奖励。\
+authorAssociation 仅用于判断证据可信度，作者身份本身不得直接加分。\
 所有分值必须为整数且位于给定范围，惩罚只能为负或零；无证据的因子保持 0。\
 只输出严格 JSON，不要 Markdown 或额外解释。";
 
