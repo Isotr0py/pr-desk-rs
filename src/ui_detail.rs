@@ -698,8 +698,8 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             });
         }
     }
-    let method = if let Some(model) = importance.method.strip_prefix("llm:") {
-        tr(lang, "importance_method_llm").replacen("{0}", model, 1)
+    let method = if importance.method.starts_with("llm:") {
+        tr(lang, "importance_method_llm").to_string()
     } else if importance.method.starts_with("llm_failed") {
         tr(lang, "importance_method_failed").to_string()
     } else {

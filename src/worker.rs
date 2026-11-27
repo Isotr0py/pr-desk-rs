@@ -904,7 +904,7 @@ async fn refine_importance_scores(
                 {
                     Ok(score) => score,
                     Err(e) => {
-                        tracing::warn!("K3 重要性校准失败 {}/#{}，回退规则分: {e}", key.0, key.1);
+                        tracing::warn!("LLM 重要性校准失败 {}/#{}，回退规则分: {e}", key.0, key.1);
                         let mut fallback = candidate.score;
                         fallback.method = format!("llm_failed:{}", llm.model);
                         fallback

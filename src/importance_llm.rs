@@ -89,7 +89,7 @@ fn parse_response(
         }
         let factor = score.factors.iter_mut().find(|factor| factor.key == *key)?;
         factor.points = points;
-        factor.evidence = format!("K3: {rationale} | Rule evidence: {}", factor.evidence);
+        factor.evidence = format!("智能校准: {rationale} | Rule evidence: {}", factor.evidence);
     }
     score.raw_score = score
         .factors
@@ -120,13 +120,13 @@ pub async fn refine_importance(
         let raw = llm
             .complete_text(SYSTEM_PROMPT, &user)
             .await
-            .context("K3 重要性校准请求失败")?;
+            .context("LLM 重要性校准请求失败")?;
         last_raw = raw;
         if let Some(score) = parse_response(candidate, &last_raw, &llm.model) {
             return Ok(score);
         }
     }
-    anyhow::bail!("K3 重要性校准结果缺少有效 12 因子")
+    anyhow::bail!("LLM 重要性校准结果缺少有效 12 因子")
 }
 
 #[cfg(test)]
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(score.factors.len(), 12);
         assert_eq!(score.raw_score, 43);
         assert_eq!(score.score, 4.3);
-        assert!(score.factors[0].evidence.contains("K3:"));
+        assert!(score.factors[0].evidence.contains("智能校准:"));
         assert!(score.factors[0].evidence.contains("Rule evidence:"));
         assert_eq!(score.input_hash, candidate.score.input_hash);
     }
