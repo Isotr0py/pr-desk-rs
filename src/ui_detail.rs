@@ -672,7 +672,7 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             _ => 15,
         };
         ui.add_space(6.0);
-        ui.horizontal_wrapped(|ui| {
+        let row = ui.horizontal_wrapped(|ui| {
             ui.monospace(&factors[0].label);
             let frac = points.abs() as f32 / max_points as f32;
             let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 8.0), egui::Sense::hover());
@@ -691,11 +691,16 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
                 max_points as f32 / 10.0
             ));
         });
+        row.response.on_hover_ui(|ui| {
+            for factor in &factors {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(&factor.evidence);
+                    ui.weak(format!("{:+.1}", factor.points as f32 / 10.0));
+                });
+            }
+        });
         for factor in factors {
-            ui.horizontal_wrapped(|ui| {
-                ui.weak(&factor.evidence);
-                ui.weak(format!("{:+.1}", factor.points as f32 / 10.0));
-            });
+            ui.weak(&factor.evidence);
         }
     }
     let method = if importance.method.starts_with("llm:") {
