@@ -628,7 +628,7 @@ fn parse_states_response(
     }
 }
 
-const IMPORTANCE_ISSUE_FIELDS: &str = "number title repository { nameWithOwner } labels(first: 50) { nodes { name } } milestone { title } comments { totalCount } reactions { totalCount }";
+const IMPORTANCE_ISSUE_FIELDS: &str = "number title body repository { nameWithOwner } labels(first: 50) { nodes { name } } milestone { title } comments { totalCount } reactions { totalCount }";
 
 fn build_importance_query(items: &[(String, i64)]) -> Result<String> {
     let mut q = String::from("query {");
@@ -642,7 +642,7 @@ fn build_importance_query(items: &[(String, i64)]) -> Result<String> {
         ));
     }
     q.push_str(&format!(
-        "}} fragment ImportancePrFields on PullRequest {{ title body baseRefName labels(first: 50) {{ nodes {{ name }} }} milestone {{ title }} closingIssuesReferences(first: 5) {{ nodes {{ {IMPORTANCE_ISSUE_FIELDS} }} }} }}"
+        "}} fragment ImportancePrFields on PullRequest {{ title body baseRefName additions deletions changedFiles isDraft labels(first: 50) {{ nodes {{ name }} }} milestone {{ title }} files(first: 100) {{ nodes {{ path }} }} closingIssuesReferences(first: 5) {{ nodes {{ {IMPORTANCE_ISSUE_FIELDS} }} }} }}"
     ));
     Ok(q)
 }
@@ -874,6 +874,9 @@ mod tests {
         assert!(query.contains("n1: pullRequest(number: 7)"));
         assert!(query.contains("title body baseRefName"));
         assert!(query.contains("closingIssuesReferences(first: 5)"));
+        assert!(query.contains("additions deletions changedFiles isDraft"));
+        assert!(query.contains("files(first: 100) { nodes { path } }"));
+        assert!(query.contains("number title body repository"));
         assert!(query.contains("reactions { totalCount }"));
         assert!(build_importance_query(&[("bad/repo;query".into(), 1)]).is_err());
         assert!(build_importance_query(&[("o/r".into(), 0)]).is_err());
@@ -910,9 +913,9 @@ mod tests {
         parse_importance_response(&body, &items, &mut out);
         assert_eq!(out.len(), 1);
         let score = &out[&("o/r".to_string(), 42)];
-        assert_eq!(score.raw_score, 45 + 18 + 12);
-        assert_eq!(score.score, 7.5);
-        assert_eq!(score.factors.len(), 3);
+        assert_eq!(score.raw_score, 30 + 8 + 4 + 1 + 10);
+        assert_eq!(score.score, 5.3);
+        assert_eq!(score.factors.len(), 12);
     }
 
     #[test]

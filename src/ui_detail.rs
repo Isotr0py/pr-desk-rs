@@ -516,7 +516,15 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
         }
         ui.weak(format!("/10 · {}", tr(lang, "importance_title")));
     });
-    ui.weak(tr(lang, "importance_subtitle"));
+    ui.weak(format!(
+        "{} · {}",
+        tr(lang, "importance_subtitle"),
+        tr(lang, "importance_factor_count").replacen(
+            "{0}",
+            &importance.factors.len().to_string(),
+            1
+        )
+    ));
     let Some(_) = importance.score else {
         ui.weak(tr(lang, "importance_pending"));
         return;
@@ -528,7 +536,7 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             let frac = if factor.max_points == 0 {
                 0.0
             } else {
-                factor.points as f32 / factor.max_points as f32
+                factor.points.abs() as f32 / factor.max_points as f32
             };
             let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 8.0), egui::Sense::hover());
             ui.painter()
@@ -538,10 +546,14 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             ui.painter().rect_filled(
                 fill,
                 4.0,
-                score_color(frac as f64 * 10.0, ui.visuals().dark_mode),
+                if factor.points < 0 {
+                    kind_color(LineKind::Del, ui.visuals().dark_mode)
+                } else {
+                    score_color(frac as f64 * 10.0, ui.visuals().dark_mode)
+                },
             );
             ui.weak(format!(
-                "+{:.1}/{:.1}",
+                "{:+.1}/{:.1}",
                 factor.points as f32 / 10.0,
                 factor.max_points as f32 / 10.0
             ));

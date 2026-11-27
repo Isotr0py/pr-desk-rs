@@ -1,14 +1,17 @@
-//! PR 对仓库的重要性评分：确定性规则 + 可展示证据，与 LLM 代码质量分相互独立。
+//! PR 对仓库的重要性评分：确定性多因子规则 + 可展示证据，与 LLM 代码质量分独立。
+
+use std::collections::BTreeSet;
 
 use serde::Serialize;
 use serde_json::Value;
 
-pub const SCORING_VERSION: &str = "2026-11-27.1";
+pub const SCORING_VERSION: &str = "2026-11-27.2";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ImportanceFactor {
+    pub group: &'static str,
     pub key: &'static str,
-    pub points: u32,
+    pub points: i32,
     pub max_points: u32,
     pub evidence: String,
 }
@@ -19,6 +22,22 @@ pub struct ImportanceScore {
     pub raw_score: u32,
     pub scoring_version: &'static str,
     pub factors: Vec<ImportanceFactor>,
+}
+
+fn factor(
+    group: &'static str,
+    key: &'static str,
+    points: i32,
+    max_points: u32,
+    evidence: impl Into<String>,
+) -> ImportanceFactor {
+    ImportanceFactor {
+        group,
+        key,
+        points,
+        max_points,
+        evidence: evidence.into(),
+    }
 }
 
 fn valid_repo(repo: &str) -> bool {
@@ -143,43 +162,52 @@ fn severity_candidate(title: &str, labels: &[String], source: &str) -> Option<Ca
     let title = title.to_ascii_lowercase();
     let rules: &[(u32, &[&str], &[&str], &[&str])] = &[
         (
-            50,
-            &["security", "vulnerability", "data-loss", "data loss"],
-            &["security", "vulnerability"],
-            &["data loss", "remote code execution", "数据丢失", "安全漏洞"],
-        ),
-        (
-            45,
-            &["regression", "crash", "wrong-output", "wrong output"],
-            &["regression", "crash", "crashes"],
+            30,
             &[
+                "security",
+                "vulnerability",
+                "data-loss",
+                "data loss",
+                "wrong-output",
+                "wrong output",
+            ],
+            &["security", "vulnerability"],
+            &[
+                "data loss",
+                "remote code execution",
                 "wrong output",
                 "incorrect output",
-                "回归",
-                "崩溃",
+                "数据丢失",
+                "安全漏洞",
                 "输出错误",
             ],
         ),
         (
-            35,
+            25,
+            &["regression", "crash"],
+            &["regression", "crash", "crashes"],
+            &["回归", "崩溃"],
+        ),
+        (
+            20,
             &["bug", "bugfix", "defect"],
             &["bug", "bugfix", "fix", "fixes", "fixed"],
             &["修复"],
         ),
         (
-            25,
+            15,
             &["performance", "perf", "latency", "memory"],
             &["performance", "perf", "latency"],
             &["性能", "延迟"],
         ),
         (
-            15,
+            8,
             &["enhancement", "feature", "feature-request"],
             &["feature", "enhancement", "support", "add"],
             &["功能", "支持"],
         ),
         (
-            5,
+            2,
             &["documentation", "docs", "chore", "tests", "ci"],
             &[
                 "docs",
@@ -213,11 +241,9 @@ fn severity_candidate(title: &str, labels: &[String], source: &str) -> Option<Ca
 }
 
 fn severity_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
-    let pr_title = pr["title"].as_str().unwrap_or("");
-    let mut best = severity_candidate(pr_title, &label_names(pr), "PR");
+    let mut best = severity_candidate(pr["title"].as_str().unwrap_or(""), &label_names(pr), "PR");
     for issue in issues {
-        let number = issue["number"].as_i64().unwrap_or(0);
-        let source = format!("issue #{number}");
+        let source = format!("issue #{}", issue["number"].as_i64().unwrap_or(0));
         let candidate = severity_candidate(
             issue["title"].as_str().unwrap_or(""),
             &label_names(issue),
@@ -234,51 +260,162 @@ fn severity_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
         points: 0,
         evidence: "No severity signal in PR or linked issues".into(),
     });
-    ImportanceFactor {
-        key: "severity",
-        points: candidate.points,
-        max_points: 50,
-        evidence: candidate.evidence,
+    factor(
+        "how_bad",
+        "severity",
+        candidate.points as i32,
+        30,
+        candidate.evidence,
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileKind {
+    Production,
+    Test,
+    Other,
+}
+
+fn file_kind(path: &str) -> FileKind {
+    let path = path.to_ascii_lowercase();
+    let base = path.rsplit('/').next().unwrap_or(&path);
+    if base.ends_with(".lock")
+        || matches!(base, "package-lock.json" | "yarn.lock" | "pnpm-lock.yaml")
+        || base.ends_with(".min.js")
+        || base.ends_with(".min.css")
+        || base.ends_with(".pb.go")
+        || base.ends_with(".snap")
+        || base.contains(".generated.")
+        || path.starts_with("dist/")
+        || path.contains("/dist/")
+    {
+        return FileKind::Other;
+    }
+    let in_test_dir = path.starts_with("tests/")
+        || path.starts_with("test/")
+        || path.contains("/tests/")
+        || path.contains("/test/");
+    let test_file = base.starts_with("test_")
+        || base.ends_with("_test.rs")
+        || base.ends_with("_test.go")
+        || base.ends_with("_test.py")
+        || base.ends_with(".test.js")
+        || base.ends_with(".test.ts")
+        || base.ends_with(".spec.js")
+        || base.ends_with(".spec.ts");
+    if in_test_dir || test_file {
+        return FileKind::Test;
+    }
+    if path.starts_with("docs/")
+        || path.contains("/docs/")
+        || base.ends_with(".md")
+        || base.ends_with(".rst")
+        || base == "license"
+    {
+        return FileKind::Other;
+    }
+    FileKind::Production
+}
+
+fn production_area(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() > 2
+        && matches!(
+            parts[0],
+            "src" | "vllm" | "crates" | "packages" | "pkg" | "libs"
+        )
+    {
+        format!("{}/{}", parts[0], parts[1])
+    } else {
+        parts[0].to_string()
     }
 }
 
-fn engagement_points(engagement: u64) -> u32 {
-    match engagement {
-        0 => 0,
-        1..=2 => 6,
-        3..=5 => 12,
-        6..=15 => 18,
-        16..=30 => 24,
-        _ => 30,
-    }
+#[derive(Default)]
+struct FileSummary {
+    files_present: bool,
+    size_present: bool,
+    production_files: usize,
+    test_files: usize,
+    areas: BTreeSet<String>,
+    changed_files: u64,
+    lines: u64,
 }
 
-fn reach_factor(issues: &[Value]) -> ImportanceFactor {
-    let best = issues
-        .iter()
-        .map(|issue| {
-            let comments = issue["comments"]["totalCount"].as_u64().unwrap_or(0);
-            let reactions = issue["reactions"]["totalCount"].as_u64().unwrap_or(0);
-            let engagement = comments.saturating_add(reactions);
-            (
-                engagement,
-                format!(
-                    "issue #{}: {comments} comments + {reactions} reactions",
-                    issue["number"].as_i64().unwrap_or(0)
-                ),
-            )
-        })
-        .max_by_key(|(engagement, _)| *engagement);
-    let (points, evidence) = match best {
-        Some((engagement, evidence)) => (engagement_points(engagement), evidence),
-        None => (0, "No linked issue; audience reach is unknown".into()),
+fn file_summary(pr: &Value) -> FileSummary {
+    let mut summary = FileSummary {
+        files_present: pr["files"]["nodes"].as_array().is_some(),
+        size_present: pr["changedFiles"].as_u64().is_some()
+            || pr["additions"].as_u64().is_some()
+            || pr["deletions"].as_u64().is_some(),
+        changed_files: pr["changedFiles"].as_u64().unwrap_or(0),
+        lines: pr["additions"]
+            .as_u64()
+            .unwrap_or(0)
+            .saturating_add(pr["deletions"].as_u64().unwrap_or(0)),
+        ..Default::default()
     };
-    ImportanceFactor {
-        key: "reach",
-        points,
-        max_points: 30,
-        evidence,
+    if let Some(files) = pr["files"]["nodes"].as_array() {
+        if !summary.size_present {
+            summary.changed_files = files.len() as u64;
+        }
+        for path in files.iter().filter_map(|file| file["path"].as_str()) {
+            match file_kind(path) {
+                FileKind::Production => {
+                    summary.production_files += 1;
+                    summary.areas.insert(production_area(path));
+                }
+                FileKind::Test => summary.test_files += 1,
+                FileKind::Other => {}
+            }
+        }
     }
+    summary
+}
+
+fn surface_factor(summary: &FileSummary) -> ImportanceFactor {
+    if !summary.files_present {
+        return factor(
+            "who_it_hits",
+            "production_surface",
+            0,
+            15,
+            "File details unavailable",
+        );
+    }
+    if summary.production_files == 0 {
+        return factor(
+            "who_it_hits",
+            "production_surface",
+            2,
+            15,
+            "No production code changed",
+        );
+    }
+    let points = match summary.areas.len() {
+        0 | 1 => 4,
+        2 => 8,
+        3 => 12,
+        _ => 15,
+    };
+    let areas = summary
+        .areas
+        .iter()
+        .take(4)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    factor(
+        "who_it_hits",
+        "production_surface",
+        points,
+        15,
+        format!(
+            "{} production files across {} areas: {areas}",
+            summary.production_files,
+            summary.areas.len()
+        ),
+    )
 }
 
 fn release_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
@@ -291,35 +428,26 @@ fn release_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
             best = Some(candidate);
         }
     };
-    let pr_labels = label_names(pr);
-    if let Some(label) = label_matches(
-        &pr_labels,
-        &[
-            "release-blocker",
-            "release blocker",
-            "blocker",
-            "release-critical",
-        ],
-    ) {
+    let release_labels = [
+        "release-blocker",
+        "release blocker",
+        "blocker",
+        "release-critical",
+    ];
+    if let Some(label) = label_matches(&label_names(pr), &release_labels) {
         consider(Candidate {
-            points: 20,
+            points: 10,
             evidence: format!("PR label: {label}"),
         });
     }
     for issue in issues {
-        let number = issue["number"].as_i64().unwrap_or(0);
-        if let Some(label) = label_matches(
-            &label_names(issue),
-            &[
-                "release-blocker",
-                "release blocker",
-                "blocker",
-                "release-critical",
-            ],
-        ) {
+        if let Some(label) = label_matches(&label_names(issue), &release_labels) {
             consider(Candidate {
-                points: 20,
-                evidence: format!("issue #{number} label: {label}"),
+                points: 10,
+                evidence: format!(
+                    "issue #{} label: {label}",
+                    issue["number"].as_i64().unwrap_or(0)
+                ),
             });
         }
     }
@@ -328,7 +456,7 @@ fn release_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
         .filter(|title| !title.is_empty())
     {
         consider(Candidate {
-            points: 12,
+            points: 8,
             evidence: format!("PR milestone: {milestone}"),
         });
     }
@@ -338,7 +466,7 @@ fn release_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
             .filter(|title| !title.is_empty())
         {
             consider(Candidate {
-                points: 12,
+                points: 8,
                 evidence: format!(
                     "issue #{} milestone: {milestone}",
                     issue["number"].as_i64().unwrap_or(0)
@@ -352,20 +480,255 @@ fn release_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
         .any(|prefix| base.starts_with(prefix))
     {
         consider(Candidate {
-            points: 10,
+            points: 6,
             evidence: format!("PR targets release branch: {base}"),
+        });
+    } else if matches!(base, "main" | "master") {
+        consider(Candidate {
+            points: 4,
+            evidence: format!("PR targets {base} (nightly development)"),
         });
     }
     let candidate = best.unwrap_or(Candidate {
         points: 0,
-        evidence: "No release blocker, milestone, or release branch signal".into(),
+        evidence: "No release signal".into(),
     });
-    ImportanceFactor {
-        key: "release",
-        points: candidate.points,
-        max_points: 20,
-        evidence: candidate.evidence,
+    factor(
+        "release",
+        "release_urgency",
+        candidate.points as i32,
+        10,
+        candidate.evidence,
+    )
+}
+
+fn issue_evidence_factor(issues: &[Value], reproduction: bool) -> ImportanceFactor {
+    let (group, key, max_points, needles): (&str, &str, i32, &[&str]) = if reproduction {
+        (
+            "evidence",
+            "reproduction",
+            6,
+            &[
+                "steps to reproduce",
+                "reproduction steps",
+                "minimal repro",
+                "reproducer",
+                "reproduction",
+                "复现",
+            ],
+        )
+    } else {
+        (
+            "evidence",
+            "diagnostics",
+            4,
+            &[
+                "expected behavior",
+                "actual behavior",
+                "expected result",
+                "actual result",
+                "expected:",
+                "actual:",
+                "traceback",
+                "stack trace",
+                "error log",
+                "logs",
+                "预期",
+                "实际",
+                "日志",
+            ],
+        )
+    };
+    for issue in issues {
+        let body = issue["body"].as_str().unwrap_or("").to_ascii_lowercase();
+        if let Some(needle) = needles.iter().find(|needle| body.contains(**needle)) {
+            return factor(
+                group,
+                key,
+                max_points,
+                max_points as u32,
+                format!(
+                    "issue #{} contains {needle}",
+                    issue["number"].as_i64().unwrap_or(0)
+                ),
+            );
+        }
     }
+    let evidence = if issues.is_empty() {
+        "No linked issue evidence".to_string()
+    } else if reproduction {
+        "No reproduction steps found in linked issues".to_string()
+    } else {
+        "No expected/actual behavior or diagnostic logs found".to_string()
+    };
+    factor(group, key, 0, max_points as u32, evidence)
+}
+
+fn comments_factor(issues: &[Value]) -> ImportanceFactor {
+    let best = issues
+        .iter()
+        .max_by_key(|issue| issue["comments"]["totalCount"].as_u64().unwrap_or(0));
+    let Some(issue) = best else {
+        return factor("community", "comments", 0, 6, "No linked issue");
+    };
+    let comments = issue["comments"]["totalCount"].as_u64().unwrap_or(0);
+    let points = match comments {
+        0 => 0,
+        1..=2 => 2,
+        3..=5 => 4,
+        _ => 6,
+    };
+    factor(
+        "community",
+        "comments",
+        points,
+        6,
+        format!(
+            "issue #{}: {comments} comments",
+            issue["number"].as_i64().unwrap_or(0)
+        ),
+    )
+}
+
+fn reactions_factor(issues: &[Value]) -> ImportanceFactor {
+    let best = issues
+        .iter()
+        .max_by_key(|issue| issue["reactions"]["totalCount"].as_u64().unwrap_or(0));
+    let Some(issue) = best else {
+        return factor("community", "reactions", 0, 4, "No linked issue");
+    };
+    let reactions = issue["reactions"]["totalCount"].as_u64().unwrap_or(0);
+    let points = match reactions {
+        0 => 0,
+        1..=4 => 1,
+        5..=9 => 2,
+        10..=19 => 3,
+        _ => 4,
+    };
+    factor(
+        "community",
+        "reactions",
+        points,
+        4,
+        format!(
+            "issue #{}: {reactions} reactions",
+            issue["number"].as_i64().unwrap_or(0)
+        ),
+    )
+}
+
+fn linked_issue_factor(issues: &[Value]) -> ImportanceFactor {
+    let numbers = issues
+        .iter()
+        .filter_map(|issue| issue["number"].as_i64())
+        .take(3)
+        .map(|number| format!("#{number}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    factor(
+        "pr_signals",
+        "linked_issue",
+        if issues.is_empty() { 0 } else { 10 },
+        10,
+        if issues.is_empty() {
+            "No closing issue reference".to_string()
+        } else {
+            format!("Closes {numbers}; link counted once without inheriting the issue score")
+        },
+    )
+}
+
+fn tests_factor(summary: &FileSummary) -> ImportanceFactor {
+    factor(
+        "pr_signals",
+        "includes_tests",
+        if summary.test_files > 0 { 5 } else { 0 },
+        5,
+        if summary.test_files > 0 {
+            format!(
+                "Includes {} test files (validation maturity)",
+                summary.test_files
+            )
+        } else {
+            "No test files in the fetched file list".to_string()
+        },
+    )
+}
+
+fn focused_factor(summary: &FileSummary) -> ImportanceFactor {
+    let points = if !summary.size_present {
+        0
+    } else if summary.lines <= 50 && summary.changed_files <= 5 {
+        5
+    } else if summary.lines <= 200 && summary.changed_files <= 10 {
+        3
+    } else {
+        0
+    };
+    factor(
+        "pr_signals",
+        "focused_change",
+        points,
+        5,
+        if summary.size_present {
+            format!(
+                "{} changed files, +/− {} lines total",
+                summary.changed_files, summary.lines
+            )
+        } else {
+            "Change size unavailable".to_string()
+        },
+    )
+}
+
+fn production_factor(summary: &FileSummary) -> ImportanceFactor {
+    factor(
+        "pr_signals",
+        "production_change",
+        if summary.production_files > 0 { 5 } else { 0 },
+        5,
+        if summary.production_files > 0 {
+            format!("Touches {} production files", summary.production_files)
+        } else {
+            "No production code change in the fetched file list".to_string()
+        },
+    )
+}
+
+fn penalties_factor(pr: &Value, summary: &FileSummary) -> ImportanceFactor {
+    let large = if summary.size_present && (summary.lines >= 1000 || summary.changed_files >= 30) {
+        10
+    } else if summary.size_present && (summary.lines >= 500 || summary.changed_files >= 20) {
+        5
+    } else {
+        0
+    };
+    let draft = if pr["isDraft"].as_bool() == Some(true) {
+        5
+    } else {
+        0
+    };
+    let mut reasons = Vec::new();
+    if large > 0 {
+        reasons.push(format!(
+            "large change: {} files, {} lines (-{large})",
+            summary.changed_files, summary.lines
+        ));
+    }
+    if draft > 0 {
+        reasons.push("draft PR (-5)".to_string());
+    }
+    factor(
+        "penalty",
+        "change_penalties",
+        -((large + draft) as i32),
+        15,
+        if reasons.is_empty() {
+            "No large-change or draft penalty".to_string()
+        } else {
+            reasons.join("; ")
+        },
+    )
 }
 
 pub fn score_pr(pr: &Value) -> ImportanceScore {
@@ -373,12 +736,26 @@ pub fn score_pr(pr: &Value) -> ImportanceScore {
         .as_array()
         .cloned()
         .unwrap_or_default();
+    let files = file_summary(pr);
     let factors = vec![
         severity_factor(pr, &issues),
-        reach_factor(&issues),
+        surface_factor(&files),
         release_factor(pr, &issues),
+        issue_evidence_factor(&issues, true),
+        issue_evidence_factor(&issues, false),
+        comments_factor(&issues),
+        reactions_factor(&issues),
+        linked_issue_factor(&issues),
+        tests_factor(&files),
+        focused_factor(&files),
+        production_factor(&files),
+        penalties_factor(pr, &files),
     ];
-    let raw_score = factors.iter().map(|factor| factor.points).sum();
+    let raw_score = factors
+        .iter()
+        .map(|factor| factor.points)
+        .sum::<i32>()
+        .clamp(0, 100) as u32;
     ImportanceScore {
         score: raw_score as f64 / 10.0,
         raw_score,
@@ -397,6 +774,7 @@ mod tests {
         json!({
             "number": number,
             "title": title,
+            "body": "",
             "labels": {"nodes": labels},
             "comments": {"totalCount": comments},
             "reactions": {"totalCount": reactions},
@@ -408,11 +786,31 @@ mod tests {
         let labels: Vec<Value> = labels.iter().map(|name| json!({"name": name})).collect();
         json!({
             "title": title,
+            "body": "",
             "labels": {"nodes": labels},
             "baseRefName": "main",
             "milestone": null,
+            "changedFiles": 0,
+            "additions": 0,
+            "deletions": 0,
+            "isDraft": false,
+            "files": {"nodes": []},
             "closingIssuesReferences": {"nodes": issues}
         })
+    }
+
+    fn set_files(input: &mut Value, paths: &[&str]) {
+        input["files"]["nodes"] = paths.iter().map(|path| json!({"path": path})).collect();
+        input["changedFiles"] = json!(paths.len());
+    }
+
+    fn points(score: &ImportanceScore, key: &str) -> i32 {
+        score
+            .factors
+            .iter()
+            .find(|factor| factor.key == key)
+            .map(|factor| factor.points)
+            .unwrap()
     }
 
     #[test]
@@ -422,57 +820,107 @@ mod tests {
             &["bug"],
             vec![issue(7, "Incorrect results", &["wrong-output"], 0, 0)],
         ));
-        assert_eq!(score.factors[0].points, 45);
-        assert_eq!(score.raw_score, 45);
-        assert_eq!(score.score, 4.5);
+        assert_eq!(points(&score, "severity"), 30);
         assert!(score.factors[0].evidence.contains("wrong-output"));
     }
 
     #[test]
     fn title_matching_does_not_treat_prefix_as_fix() {
         let score = score_pr(&pr("Add prefix support", &[], vec![]));
-        assert_eq!(score.factors[0].points, 15);
+        assert_eq!(points(&score, "severity"), 8);
     }
 
     #[test]
-    fn reach_uses_highest_issue_engagement_and_caps_at_thirty() {
+    fn surface_counts_production_areas_not_tests_or_docs() {
+        let mut input = pr("Feature", &[], vec![]);
+        set_files(
+            &mut input,
+            &[
+                "src/api/server.rs",
+                "src/core/engine.rs",
+                "vllm/renderers/online.py",
+                "tests/api/test_server.py",
+                "docs/guide.md",
+            ],
+        );
+        let score = score_pr(&input);
+        assert_eq!(points(&score, "production_surface"), 12);
+        assert_eq!(points(&score, "includes_tests"), 5);
+        assert_eq!(points(&score, "production_change"), 5);
+    }
+
+    #[test]
+    fn release_uses_strongest_signal_and_main_has_a_baseline() {
+        let mut input = pr("Feature", &[], vec![issue(1, "Feature", &[], 0, 0)]);
+        assert_eq!(points(&score_pr(&input), "release_urgency"), 4);
+        input["milestone"] = json!({"title": "v1.0"});
+        assert_eq!(points(&score_pr(&input), "release_urgency"), 8);
+        input["baseRefName"] = json!("release/v1");
+        assert_eq!(points(&score_pr(&input), "release_urgency"), 8);
+        input["closingIssuesReferences"]["nodes"][0]["labels"]["nodes"] =
+            json!([{"name": "release-blocker"}]);
+        assert_eq!(points(&score_pr(&input), "release_urgency"), 10);
+    }
+
+    #[test]
+    fn issue_evidence_has_independent_reproduction_and_diagnostic_factors() {
+        let mut linked = issue(7, "Bug", &[], 0, 0);
+        linked["body"] = json!("Steps to reproduce:\n1. run server\n**Expected:** success");
+        let score = score_pr(&pr("Fix bug", &[], vec![linked]));
+        assert_eq!(points(&score, "reproduction"), 6);
+        assert_eq!(points(&score, "diagnostics"), 4);
+    }
+
+    #[test]
+    fn community_uses_separate_comment_and_reaction_tiers() {
         let score = score_pr(&pr(
             "Feature",
             &[],
             vec![
-                issue(1, "Feature request", &[], 2, 1),
-                issue(2, "Popular request", &[], 40, 20),
+                issue(1, "Feature request", &[], 2, 20),
+                issue(2, "Popular request", &[], 40, 1),
             ],
         ));
-        assert_eq!(score.factors[1].points, 30);
-        assert!(score.factors[1].evidence.contains("issue #2"));
+        assert_eq!(points(&score, "comments"), 6);
+        assert_eq!(points(&score, "reactions"), 4);
     }
 
     #[test]
-    fn reach_tiers_and_missing_issue_are_explicit() {
-        for (engagement, expected) in [(0, 0), (1, 6), (3, 12), (6, 18), (16, 24), (31, 30)] {
-            let score = score_pr(&pr(
-                "Feature",
-                &[],
-                vec![issue(1, "Feature", &[], engagement, 0)],
-            ));
-            assert_eq!(score.factors[1].points, expected);
-        }
-        let score = score_pr(&pr("Unclassified", &[], vec![]));
-        assert_eq!(score.factors[1].points, 0);
-        assert!(score.factors[1].evidence.contains("unknown"));
+    fn pr_signals_cover_link_tests_focus_and_production_code() {
+        let mut input = pr("Fix bug", &[], vec![issue(1, "Bug", &[], 0, 0)]);
+        set_files(
+            &mut input,
+            &["src/api/server.rs", "tests/api/test_server.py"],
+        );
+        input["additions"] = json!(30);
+        input["deletions"] = json!(10);
+        let score = score_pr(&input);
+        assert_eq!(points(&score, "linked_issue"), 10);
+        assert_eq!(points(&score, "includes_tests"), 5);
+        assert_eq!(points(&score, "focused_change"), 5);
+        assert_eq!(points(&score, "production_change"), 5);
+        assert_eq!(points(&score, "change_penalties"), 0);
     }
 
     #[test]
-    fn release_uses_strongest_signal_across_pr_and_issues() {
-        let mut input = pr("Feature", &[], vec![issue(1, "Feature", &[], 0, 0)]);
-        input["milestone"] = json!({"title": "v1.0"});
-        assert_eq!(score_pr(&input).factors[2].points, 12);
-        input["baseRefName"] = json!("release/v1");
-        assert_eq!(score_pr(&input).factors[2].points, 12);
-        input["closingIssuesReferences"]["nodes"][0]["labels"]["nodes"] =
-            json!([{"name": "release-blocker"}]);
-        assert_eq!(score_pr(&input).factors[2].points, 20);
+    fn large_and_draft_penalties_accumulate_and_total_is_clamped() {
+        let mut input = pr("Unclassified", &[], vec![]);
+        set_files(&mut input, &["src/api/server.rs"]);
+        input["changedFiles"] = json!(30);
+        input["additions"] = json!(900);
+        input["deletions"] = json!(200);
+        input["isDraft"] = json!(true);
+        let score = score_pr(&input);
+        assert_eq!(points(&score, "focused_change"), 0);
+        assert_eq!(points(&score, "change_penalties"), -15);
+        assert!(score.raw_score <= 100);
+
+        let mut negative = pr("Unclassified", &[], vec![]);
+        negative["baseRefName"] = json!("feature-branch");
+        negative["changedFiles"] = json!(30);
+        negative["additions"] = json!(1100);
+        negative["isDraft"] = json!(true);
+        assert_eq!(score_pr(&negative).score, 0.0);
     }
 
     #[test]
@@ -509,7 +957,8 @@ mod tests {
         assert_eq!(score.score, 0.0);
         assert_eq!(score.raw_score, 0);
         assert_eq!(score.scoring_version, SCORING_VERSION);
-        assert_eq!(score.factors.len(), 3);
+        assert_eq!(score.factors.len(), 12);
         assert!(score.factors.iter().all(|factor| factor.points == 0));
+        assert!(score.factors.iter().any(|factor| factor.group == "penalty"));
     }
 }

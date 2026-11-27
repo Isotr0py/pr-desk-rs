@@ -1122,9 +1122,10 @@ mod tests {
             raw_score: 83,
             scoring_version: "test-v1",
             factors: vec![crate::importance::ImportanceFactor {
+                group: "how_bad",
                 key: "severity",
-                points: 50,
-                max_points: 50,
+                points: 30,
+                max_points: 30,
                 evidence: "security label".to_string(),
             }],
         }
