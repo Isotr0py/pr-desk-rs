@@ -352,15 +352,15 @@ impl EguiApp {
     /// 详情面板 tab 切换 → 惰性拉取对应数据（会话/Checks/Files；各自 120s 节流）。
     /// Files（合并 diff 视图）tab：diff 缓存缺失时补发 FetchDiff（每 PR 一次去重）。
     pub fn panel_tab_changed(&mut self, t: usize, ctx: &egui::Context) {
-        if t == 4 {
+        if t == 5 {
             self.ensure_kimi_terminal(ctx);
             return;
         }
         let parts = match t {
-            1 => PART_CONVO,
-            2 => PART_CHECKS,
-            3 => PART_FILES,
-            _ => return, // 评审用本地数据
+            2 => PART_CONVO,
+            3 => PART_CHECKS,
+            4 => PART_FILES,
+            _ => return, // 重要性/质量用本地数据
         };
         let sel = self.app.lock_recover().selected.clone();
         if let Some((repo, number)) = sel {
@@ -369,7 +369,7 @@ impl EguiApp {
                 number,
                 parts,
             });
-            if t == 3
+            if t == 4
                 && self.diff_files.is_empty()
                 && self.diff_requested != Some((repo.clone(), number))
             {

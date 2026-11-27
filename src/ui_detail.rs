@@ -264,7 +264,7 @@ pub fn detail_panel(app: &mut EguiApp, ui: &mut Ui) {
                 .as_ref()
                 .map(|p| format!("detail-scroll-{}#{}", p.repo, p.number))
                 .unwrap_or_default();
-            if app.panel_tab == 4 {
+            if app.panel_tab == 5 {
                 detail_body(app, ui);
             } else {
                 egui::ScrollArea::vertical()
@@ -445,7 +445,8 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
 
     // ── tab 条 ──
     let tabs = [
-        tr(&lang, "tab_review"),
+        tr(&lang, "tab_importance"),
+        tr(&lang, "tab_quality"),
         tr(&lang, "tab_conversation"),
         tr(&lang, "tab_checks"),
         // Files 与 Diff 合并：文件清单（路径+增删计数）可折叠展开看行内容
@@ -463,20 +464,21 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
     ui.separator();
 
     match app.panel_tab {
-        0 => review_tab(app, ui, &review, &lang),
-        1 => convo_tab(app, ui, &convo, &lang),
-        2 => checks_tab(ui, &checks, &lang),
+        0 => importance_tab(app, ui, &lang),
+        1 => quality_tab(app, ui, &review, &lang),
+        2 => convo_tab(app, ui, &convo, &lang),
+        3 => checks_tab(ui, &checks, &lang),
         // 合并的 Files changed：有解析后 diff 用折叠 diff 视图；
         // 没有（缓存缺失且实时 files 已到）退回纯文件清单
-        3 => {
+        4 => {
             if !app.diff_files.is_empty() {
                 diff_view(ui, &mut app.diff_files, &lang, "detail");
             } else {
                 files_tab(ui, &files, &lang);
             }
         }
-        4 => kimi_session_tab(app, ui, &lang),
-        _ => review_tab(app, ui, &review, &lang),
+        5 => kimi_session_tab(app, ui, &lang),
+        _ => importance_tab(app, ui, &lang),
     }
 }
 
@@ -651,15 +653,28 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
         return;
     };
     importance_summary_bar(ui, importance, lang);
-    for factor in &importance.factors {
-        ui.add_space(4.0);
+    for group in IMPORTANCE_GROUPS {
+        let factors: Vec<&ImportanceFactorProps> = importance
+            .factors
+            .iter()
+            .filter(|factor| factor.group == *group)
+            .collect();
+        if factors.is_empty() {
+            continue;
+        }
+        let points: i32 = factors.iter().map(|factor| factor.points).sum();
+        let max_points = match *group {
+            "how_bad" => 30,
+            "release" => 10,
+            "who_it_hits" => 15,
+            "evidence" | "community" => 10,
+            "pr_signals" => 25,
+            _ => 15,
+        };
+        ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
-            ui.monospace(&factor.label);
-            let frac = if factor.max_points == 0 {
-                0.0
-            } else {
-                factor.points.abs() as f32 / factor.max_points as f32
-            };
+            ui.monospace(&factors[0].label);
+            let frac = points.abs() as f32 / max_points as f32;
             let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 8.0), egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
@@ -668,16 +683,19 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             ui.painter().rect_filled(
                 fill,
                 4.0,
-                importance_group_color(&factor.group, ui.visuals().dark_mode),
+                importance_group_color(group, ui.visuals().dark_mode),
             );
             ui.weak(format!(
                 "{:+.1}/{:.1}",
-                factor.points as f32 / 10.0,
-                factor.max_points as f32 / 10.0
+                points as f32 / 10.0,
+                max_points as f32 / 10.0
             ));
         });
-        if !factor.evidence.is_empty() {
-            ui.weak(&factor.evidence);
+        for factor in factors {
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(&factor.evidence);
+                ui.weak(format!("{:+.1}", factor.points as f32 / 10.0));
+            });
         }
     }
     if !importance.version.is_empty() {
@@ -685,14 +703,16 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
     }
 }
 
-fn review_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
+fn importance_tab(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
     let importance = app
         .panel
         .as_ref()
         .map(|panel| panel.importance.clone())
         .unwrap_or_default();
     importance_section(ui, &importance, lang);
-    ui.separator();
+}
+
+fn quality_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
     let (running, progress) = app
         .panel
         .as_ref()
