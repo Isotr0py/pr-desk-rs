@@ -1573,7 +1573,7 @@ impl EguiApp {
             "kimi_cache_limit": MAX_PARKED_KIMI_TERMINALS,
             "kimi_cached_live": self.kimi_terminal_cache.values().filter(|parked| !parked.terminal.is_closed()).count(),
             "kimi_request_id": self.kimi_key.as_ref().map(|key| key.request_id),
-            "kimi_workspace": self.kimi_context.as_ref().map(|context| pr_desk_rs::ocr::context_dir_for(&context.repo, context.number, &context.base_sha, &context.head_sha, &a.cfg.kimi_workspace_root_path()).join("worktree").to_string_lossy().into_owned()),
+            "kimi_workspace": self.kimi_context.as_ref().map(|context| pr_desk_rs::ocr::context_dir_for(&context.repo, context.number, &context.base_sha, &context.head_sha, &a.cfg.kimi_workspace_root_path()).join("repository").to_string_lossy().into_owned()),
             "panel_convo": self.panel.as_ref().map(|p| p.convo.len()),
             "panel_checks": self.panel.as_ref().map(|p| p.checks_json.len()),
             "diff_files": self.diff_files.len(),

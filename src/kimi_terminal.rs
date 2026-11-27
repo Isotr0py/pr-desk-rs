@@ -32,11 +32,15 @@ pub fn prepare_context_dir(context: &PrContext, root: &Path) -> Result<PathBuf> 
         &context.head_sha,
         root,
     );
-    std::fs::create_dir_all(&path).context("创建 PR 问答只读上下文失败")?;
-    std::fs::write(path.join("pr-body.md"), &context.body)?;
-    std::fs::write(path.join("pr.diff"), &context.diff)?;
+    let repository = path.join("repository");
+    let mirror = pr_desk_rs::ocr::repository_mirror_path(root, &context.repo);
+    pr_desk_rs::ocr::write_repository_gitdir(&repository, &mirror)
+        .context("创建 PR 问答只读上下文失败")?;
+    std::fs::write(repository.join("pr-body.md"), &context.body)?;
+    std::fs::write(repository.join("pr.diff"), &context.diff)?;
+    let remote = format!("pr-desk-pr-{}", context.number);
     std::fs::write(
-        path.join("pr.json"),
+        repository.join("pr.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
             "repo": context.repo,
             "number": context.number,
@@ -44,49 +48,26 @@ pub fn prepare_context_dir(context: &PrContext, root: &Path) -> Result<PathBuf> 
             "head_sha": context.head_sha,
             "title": context.title,
             "pull_ref": format!("refs/pull/{}/head", context.number),
+            "remote": remote,
         }))?,
     )?;
+    std::fs::write(
+        repository.join("AGENTS.md"),
+        format!(
+            "# Read-only PR context\n\n\
+             This directory has no source checkout. Do not edit files, checkout branches, commit, pull, or merge.\n\
+             Read `base_sha` and `head_sha` from `pr.json`; the PR body and diff are in `pr-body.md` and `pr.diff`.\n\n\
+             - Read a file: `git show <sha>:path`\n\
+             - Search a revision: `git grep <pattern> <sha>`\n\
+             - Compare the PR: `git diff <base_sha> <head_sha>`\n\
+             - Find history: `git merge-base <base_sha> <head_sha>`\n\n\
+             To update only this PR, run `git fetch {remote} refs/pull/{}/head`.\n\
+             Do not use `git pull` or merge another branch. Other PRs use different remotes and fetch refspecs.\n",
+            context.number
+        ),
+    )?;
     let _ = std::fs::remove_file(path.join("findings.json"));
-    let worktree = path.join("worktree");
-    if worktree.join(".git").is_dir() {
-        let git = |args: &[&str]| -> Result<()> {
-            let status = std::process::Command::new("git")
-                .arg("-C")
-                .arg(&worktree)
-                .args(args)
-                .status()
-                .context("配置 Kimi 工作区 Git 失败")?;
-            anyhow::ensure!(status.success(), "配置 Kimi 工作区 Git 失败: {args:?}");
-            Ok(())
-        };
-        let origin = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&worktree)
-            .args(["remote", "get-url", "origin"])
-            .output()
-            .context("检查 Kimi 工作区 Git 远端失败")?;
-        if !origin.status.success() {
-            let url = if context.repo.starts_with("file://") {
-                context.repo.clone()
-            } else {
-                format!("https://github.com/{}.git", context.repo)
-            };
-            git(&["remote", "add", "origin", &url])?;
-        }
-        let pull_ref = format!("refs/pull/{}/head", context.number);
-        let fetch_refspec = format!("+{pull_ref}:refs/remotes/origin/pr/{}", context.number);
-        git(&[
-            "config",
-            "--replace-all",
-            "remote.origin.fetch",
-            &fetch_refspec,
-        ])?;
-        git(&["config", "remote.origin.tagOpt", "--no-tags"])?;
-        git(&["symbolic-ref", "HEAD", "refs/heads/pr-desk"])?;
-        git(&["config", "branch.pr-desk.remote", "origin"])?;
-        git(&["config", "branch.pr-desk.merge", &pull_ref])?;
-    }
-    Ok(worktree)
+    Ok(repository)
 }
 
 pub struct KimiTerminal {
@@ -165,7 +146,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn context_dir_is_stable_scoped_and_persistent() {
+    fn context_dir_is_stable_lightweight_and_session_scoped() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -184,72 +165,55 @@ mod tests {
             ..Default::default()
         };
         let first = prepare_context_dir(&context, &root).unwrap();
-        std::fs::create_dir_all(&first).unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&first)
-                .args(["init", "--quiet"])
-                .status()
-                .unwrap()
-                .success()
-        );
         std::fs::write(first.parent().unwrap().join("findings.json"), b"[]").unwrap();
         let second = prepare_context_dir(&context, &root).unwrap();
         assert_eq!(first, second);
         assert!(first.starts_with(&root));
+        assert_eq!(first.file_name().unwrap(), "repository");
+        assert!(first.join(".git").is_file());
+        let pointer = std::fs::read_to_string(first.join(".git")).unwrap();
+        let pointer = pointer.strip_prefix("gitdir: ").unwrap().trim();
+        assert!(Path::new(pointer).is_absolute());
+        let mirror = pr_desk_rs::ocr::repository_mirror_path(&root, &context.repo);
+        assert_eq!(Path::new(pointer), std::path::absolute(mirror).unwrap());
+        assert!(!first.join("src").exists());
+        assert!(!first.join("objects").exists());
+        assert!(!first.join("worktree").exists());
+        assert!(!first.parent().unwrap().join("worktree").exists());
         let context_root = first.parent().unwrap();
         assert_eq!(
-            std::fs::read_to_string(context_root.join("pr-body.md")).unwrap(),
+            std::fs::read_to_string(first.join("pr-body.md")).unwrap(),
             "PR body"
         );
-        assert!(context_root.join("pr.diff").is_file());
-        assert!(context_root.join("pr.json").is_file());
+        assert!(first.join("pr.diff").is_file());
+        assert!(first.join("pr.json").is_file());
+        assert!(!context_root.join("pr-body.md").exists());
         assert!(!context_root.join("findings.json").exists());
         let pr_json: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(context_root.join("pr.json")).unwrap())
-                .unwrap();
+            serde_json::from_str(&std::fs::read_to_string(first.join("pr.json")).unwrap()).unwrap();
         assert_eq!(pr_json["pull_ref"].as_str(), Some("refs/pull/42/head"));
-        let origin = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&first)
-            .args(["remote", "get-url", "origin"])
-            .output()
-            .unwrap();
-        assert!(origin.status.success());
+        assert_eq!(pr_json["remote"].as_str(), Some("pr-desk-pr-42"));
+        let agents = std::fs::read_to_string(first.join("AGENTS.md")).unwrap();
+        assert!(agents.contains("git show <sha>:path"));
+        assert!(agents.contains("git grep <pattern> <sha>"));
+        assert!(agents.contains("git diff <base_sha> <head_sha>"));
+        assert!(agents.contains("git fetch pr-desk-pr-42 refs/pull/42/head"));
+        assert!(agents.contains("Do not use `git pull`"));
+
+        context.number = 43;
+        context.body = "other PR".into();
+        let other = prepare_context_dir(&context, &root).unwrap();
+        assert_ne!(other, first);
         assert_eq!(
-            String::from_utf8_lossy(&origin.stdout).trim(),
-            "https://github.com/owner/repo.git"
+            std::fs::read_to_string(other.join("pr-body.md")).unwrap(),
+            "other PR"
         );
-        let upstream = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&first)
-            .args(["config", "--get-regexp", "^branch\\.pr-desk\\."])
-            .output()
-            .unwrap();
-        assert!(upstream.status.success());
-        let upstream = String::from_utf8_lossy(&upstream.stdout);
-        assert!(upstream.contains("branch.pr-desk.remote origin"));
-        assert!(upstream.contains("branch.pr-desk.merge refs/pull/42/head"));
-        let fetch = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&first)
-            .args(["config", "--get-all", "remote.origin.fetch"])
-            .output()
-            .unwrap();
         assert_eq!(
-            String::from_utf8_lossy(&fetch.stdout).trim(),
-            "+refs/pull/42/head:refs/remotes/origin/pr/42"
+            std::fs::read_to_string(first.join("pr-body.md")).unwrap(),
+            "PR body"
         );
-        let tag_opt = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&first)
-            .args(["config", "remote.origin.tagOpt"])
-            .output()
-            .unwrap();
-        assert_eq!(String::from_utf8_lossy(&tag_opt.stdout).trim(), "--no-tags");
         context.head_sha = "head-2".into();
-        assert_ne!(prepare_context_dir(&context, &root).unwrap(), first);
+        assert_ne!(prepare_context_dir(&context, &root).unwrap(), other);
         let _ = std::fs::remove_dir_all(root);
     }
 
