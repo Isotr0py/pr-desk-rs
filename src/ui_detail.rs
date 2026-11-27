@@ -502,6 +502,127 @@ pub fn avatar_chip(ui: &mut Ui, author: &str) {
     }
 }
 
+const IMPORTANCE_GROUPS: &[&str] = &[
+    "how_bad",
+    "release",
+    "who_it_hits",
+    "evidence",
+    "community",
+    "pr_signals",
+    "penalty",
+];
+
+fn importance_group_color(group: &str, dark: bool) -> Color32 {
+    match (group, dark) {
+        ("how_bad", true) => Color32::from_rgb(248, 81, 73),
+        ("how_bad", false) => Color32::from_rgb(207, 34, 46),
+        ("release", true) => Color32::from_rgb(210, 153, 34),
+        ("release", false) => Color32::from_rgb(154, 103, 0),
+        ("who_it_hits", true) => Color32::from_rgb(88, 166, 255),
+        ("who_it_hits", false) => Color32::from_rgb(9, 105, 218),
+        ("evidence", true) => Color32::from_rgb(126, 200, 80),
+        ("evidence", false) => Color32::from_rgb(63, 140, 40),
+        ("community", true) => Color32::from_rgb(219, 131, 209),
+        ("community", false) => Color32::from_rgb(163, 63, 163),
+        ("pr_signals", true) => Color32::from_rgb(57, 197, 215),
+        ("pr_signals", false) => Color32::from_rgb(9, 130, 150),
+        _ if dark => Color32::from_gray(120),
+        _ => Color32::from_gray(150),
+    }
+}
+
+fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
+    let dark = ui.visuals().dark_mode;
+    let groups: Vec<(&str, String, i32)> = IMPORTANCE_GROUPS
+        .iter()
+        .map(|group| {
+            let label = importance
+                .factors
+                .iter()
+                .find(|factor| factor.group == *group)
+                .map(|factor| factor.label.clone())
+                .unwrap_or_else(|| {
+                    let key = match *group {
+                        "how_bad" => "importance_group_how_bad",
+                        "release" => "importance_group_release",
+                        "who_it_hits" => "importance_group_who_it_hits",
+                        "evidence" => "importance_group_evidence",
+                        "community" => "importance_group_community",
+                        "pr_signals" => "importance_group_pr_signals",
+                        _ => "importance_group_penalty",
+                    };
+                    tr(lang, key).to_string()
+                });
+            let points = importance
+                .factors
+                .iter()
+                .filter(|factor| factor.group == *group)
+                .map(|factor| factor.points)
+                .sum();
+            (*group, label, points)
+        })
+        .collect();
+    let penalty = groups
+        .iter()
+        .map(|(_, _, points)| (-*points).max(0))
+        .sum::<i32>();
+    let units = 100 + penalty;
+    let (track, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(track, 3.0, ui.visuals().extreme_bg_color);
+    let mut left = track.left();
+    for (group, _, points) in &groups {
+        if *points <= 0 {
+            continue;
+        }
+        let width = track.width() * *points as f32 / units as f32;
+        let segment = egui::Rect::from_min_size(
+            egui::pos2(left, track.top()),
+            egui::vec2(width, track.height()),
+        );
+        ui.painter()
+            .rect_filled(segment, 0.0, importance_group_color(group, dark));
+        left += width;
+    }
+    if penalty > 0 {
+        let segment = egui::Rect::from_min_size(
+            egui::pos2(left, track.top()),
+            egui::vec2(track.right() - left, track.height()),
+        );
+        let painter = ui.painter().with_clip_rect(segment);
+        painter.rect_filled(segment, 0.0, importance_group_color("penalty", dark));
+        let stroke = egui::Stroke::new(1.0, ui.visuals().extreme_bg_color);
+        let mut x = segment.left() - segment.height();
+        while x < segment.right() {
+            painter.line_segment(
+                [
+                    egui::pos2(x, segment.bottom()),
+                    egui::pos2(x + segment.height(), segment.top()),
+                ],
+                stroke,
+            );
+            x += 6.0;
+        }
+    }
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        for (group, label, points) in &groups {
+            ui.label(
+                RichText::new("●")
+                    .size(10.0)
+                    .color(importance_group_color(group, dark)),
+            );
+            ui.weak(format!("{label} {:+.1}", *points as f32 / 10.0));
+            ui.add_space(8.0);
+        }
+        if let Some(score) = importance.score {
+            ui.strong(format!("= {score:.1}"));
+        }
+    });
+    ui.add_space(4.0);
+}
+
 fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
     ui.horizontal(|ui| {
         if let Some(score) = importance.score {
@@ -529,6 +650,7 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
         ui.weak(tr(lang, "importance_pending"));
         return;
     };
+    importance_summary_bar(ui, importance, lang);
     for factor in &importance.factors {
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
@@ -546,11 +668,7 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             ui.painter().rect_filled(
                 fill,
                 4.0,
-                if factor.points < 0 {
-                    kind_color(LineKind::Del, ui.visuals().dark_mode)
-                } else {
-                    score_color(frac as f64 * 10.0, ui.visuals().dark_mode)
-                },
+                importance_group_color(&factor.group, ui.visuals().dark_mode),
             );
             ui.weak(format!(
                 "{:+.1}/{:.1}",
@@ -838,6 +956,19 @@ mod tests {
             assert_eq!(score_color(6.9, dark), score_color(6.0, dark));
             assert_eq!(score_color(7.9, dark), score_color(7.0, dark));
             assert_eq!(score_color(8.9, dark), score_color(8.0, dark));
+        }
+    }
+
+    #[test]
+    fn importance_groups_have_distinct_colors() {
+        for dark in [false, true] {
+            let colors: Vec<Color32> = IMPORTANCE_GROUPS
+                .iter()
+                .map(|group| importance_group_color(group, dark))
+                .collect();
+            for (index, color) in colors.iter().enumerate() {
+                assert!(colors[..index].iter().all(|other| other != color));
+            }
         }
     }
 

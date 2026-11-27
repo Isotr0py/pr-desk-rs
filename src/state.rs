@@ -277,6 +277,7 @@ pub struct ReviewProps {
 
 #[derive(Clone, Default)]
 pub struct ImportanceFactorProps {
+    pub group: String,
     pub label: String,
     pub points: i32,
     pub max_points: u32,
@@ -533,17 +534,23 @@ pub fn importance_props(row: Option<&Value>, lang: &str) -> ImportanceProps {
         .map(|factor| {
             let key = factor["key"].as_str().unwrap_or("");
             let group = factor["group"].as_str().unwrap_or(key);
+            let group = match group {
+                "severity" => "how_bad",
+                "reach" => "community",
+                other => other,
+            };
             let label_key = match group {
-                "how_bad" | "severity" => "importance_group_how_bad",
+                "how_bad" => "importance_group_how_bad",
                 "who_it_hits" => "importance_group_who_it_hits",
                 "release" => "importance_group_release",
                 "evidence" => "importance_group_evidence",
-                "community" | "reach" => "importance_group_community",
+                "community" => "importance_group_community",
                 "pr_signals" => "importance_group_pr_signals",
                 "penalty" => "importance_group_penalty",
                 _ => "importance_factor_unknown",
             };
             ImportanceFactorProps {
+                group: group.to_string(),
                 label: tr(lang, label_key).to_string(),
                 points: factor["points"].as_i64().unwrap_or(0) as i32,
                 max_points: factor["max_points"].as_u64().unwrap_or(0) as u32,
