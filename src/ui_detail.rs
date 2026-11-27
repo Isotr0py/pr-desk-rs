@@ -691,7 +691,13 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
                 max_points as f32 / 10.0
             ));
         });
-        row.response.on_hover_ui(|ui| {
+        ui.interact(
+            row.response.rect,
+            egui::Id::unique(("importance-group", *group)),
+            egui::Sense::hover(),
+        )
+        .on_hover_ui_at_pointer(|ui| {
+            ui.set_max_width(420.0);
             for factor in &factors {
                 ui.horizontal_wrapped(|ui| {
                     ui.weak(&factor.evidence);
