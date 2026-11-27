@@ -275,6 +275,25 @@ pub struct ReviewProps {
     pub comments: Vec<OcrCommentRow>,
 }
 
+#[derive(Clone, Default)]
+pub struct ImportanceFactorProps {
+    pub group: String,
+    pub label: String,
+    pub points: i32,
+    pub max_points: u32,
+    pub evidence: String,
+    pub rule_evidence: String,
+}
+
+#[derive(Clone, Default)]
+pub struct ImportanceProps {
+    pub score: Option<f32>,
+    pub factors: Vec<ImportanceFactorProps>,
+    pub method: String,
+    pub version: String,
+    pub updated_at: String,
+}
+
 /// 详情面板一次装配的全部数据（Msg::Panel 负载）。
 pub struct PanelData {
     pub repo: String,
@@ -290,6 +309,7 @@ pub struct PanelData {
     pub convo: Vec<PlainConvoEntry>,
     pub checks_json: String,
     pub files_json: String,
+    pub importance: ImportanceProps,
     pub review: ReviewProps,
     // 评审三态："" = 无活动；"running" / "failed" / "done"
     pub review_status: String,
@@ -499,6 +519,66 @@ pub fn review_props(review: Option<&Value>, lang: &str) -> ReviewProps {
         flagged,
         reviewed_at: rv["reviewed_at"].as_str().unwrap_or("").to_string(),
         comments: ocr_comment_rows(rv),
+    }
+}
+
+pub fn importance_props(row: Option<&Value>, lang: &str) -> ImportanceProps {
+    let Some(row) = row else {
+        return ImportanceProps::default();
+    };
+    let Some(score) = row["importance_score"].as_f64() else {
+        return ImportanceProps::default();
+    };
+    let factors = json_field(row, "importance_factors")
+        .and_then(|factors| factors.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|factor| {
+            let key = factor["key"].as_str().unwrap_or("");
+            let group = factor["group"].as_str().unwrap_or(key);
+            let group = match group {
+                "severity" => "how_bad",
+                "reach" => "community",
+                other => other,
+            };
+            let label_key = match group {
+                "how_bad" => "importance_group_how_bad",
+                "who_it_hits" => "importance_group_who_it_hits",
+                "release" => "importance_group_release",
+                "evidence" => "importance_group_evidence",
+                "community" => "importance_group_community",
+                "pr_signals" => "importance_group_pr_signals",
+                "penalty" => "importance_group_penalty",
+                _ => "importance_factor_unknown",
+            };
+            let evidence = factor["evidence"].as_str().unwrap_or("");
+            let evidence = evidence
+                .strip_prefix("智能校准: ")
+                .or_else(|| evidence.strip_prefix("K3: "))
+                .unwrap_or(evidence);
+            let (reason, rule_evidence) = evidence
+                .split_once(" | Rule evidence: ")
+                .map(|(reason, rule)| (reason.to_string(), rule.to_string()))
+                .unwrap_or_else(|| (evidence.to_string(), evidence.to_string()));
+            ImportanceFactorProps {
+                group: group.to_string(),
+                label: tr(lang, label_key).to_string(),
+                points: factor["points"].as_i64().unwrap_or(0) as i32,
+                max_points: factor["max_points"].as_u64().unwrap_or(0) as u32,
+                evidence: reason,
+                rule_evidence,
+            }
+        })
+        .collect();
+    ImportanceProps {
+        score: Some(score as f32),
+        factors,
+        method: row["importance_method"].as_str().unwrap_or("").to_string(),
+        version: row["importance_version"].as_str().unwrap_or("").to_string(),
+        updated_at: row["importance_updated_at"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
     }
 }
 
@@ -1373,6 +1453,41 @@ mod tests {
         assert!(!p0.has);
         assert!(p0.dimensions.is_empty());
         assert_eq!(p0.size_line, "");
+    }
+
+    #[test]
+    fn importance_props_distinguishes_missing_and_zero_scores() {
+        assert!(importance_props(None, "zh").score.is_none());
+        assert!(
+            importance_props(Some(&serde_json::json!({})), "zh")
+                .score
+                .is_none()
+        );
+        let row = serde_json::json!({
+            "importance_score": 0.0,
+            "importance_factors": [
+                {"key": "severity", "points": 0, "max_points": 50, "evidence": "K3: calibrated"},
+                {"key": "reach", "points": 0, "max_points": 30, "evidence": "No issue"},
+                {"group": "penalty", "key": "change_penalties", "points": -5, "max_points": 15, "evidence": "Model rationale | Rule evidence: raw evidence"}
+            ],
+            "importance_version": "v1",
+            "importance_updated_at": "2026-11-27T00:00:00Z"
+        });
+        let props = importance_props(Some(&row), "zh");
+        assert_eq!(props.score, Some(0.0));
+        assert_eq!(props.factors.len(), 3);
+        assert_eq!(props.factors[0].label, "缺陷严重度");
+        assert_eq!(props.factors[0].evidence, "calibrated");
+        assert_eq!(props.factors[0].rule_evidence, "calibrated");
+        assert_eq!(props.factors[1].label, "社区关注");
+        assert_eq!(props.factors[2].label, "惩罚");
+        assert_eq!(props.factors[2].evidence, "Model rationale");
+        assert_eq!(props.factors[2].rule_evidence, "raw evidence");
+        assert_eq!(props.factors[2].points, -5);
+        assert_eq!(props.version, "v1");
+        let english = importance_props(Some(&row), "en");
+        assert_eq!(english.factors[0].label, "How bad");
+        assert_eq!(english.factors[1].label, "Community");
     }
 
     fn review(state: &str, time: &str) -> Value {

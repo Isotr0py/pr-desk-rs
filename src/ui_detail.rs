@@ -264,7 +264,7 @@ pub fn detail_panel(app: &mut EguiApp, ui: &mut Ui) {
                 .as_ref()
                 .map(|p| format!("detail-scroll-{}#{}", p.repo, p.number))
                 .unwrap_or_default();
-            if app.panel_tab == 4 {
+            if app.panel_tab == 5 {
                 detail_body(app, ui);
             } else {
                 egui::ScrollArea::vertical()
@@ -445,7 +445,8 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
 
     // ── tab 条 ──
     let tabs = [
-        tr(&lang, "tab_review"),
+        tr(&lang, "tab_importance"),
+        tr(&lang, "tab_quality"),
         tr(&lang, "tab_conversation"),
         tr(&lang, "tab_checks"),
         // Files 与 Diff 合并：文件清单（路径+增删计数）可折叠展开看行内容
@@ -463,20 +464,21 @@ fn detail_body(app: &mut EguiApp, ui: &mut Ui) {
     ui.separator();
 
     match app.panel_tab {
-        0 => review_tab(app, ui, &review, &lang),
-        1 => convo_tab(app, ui, &convo, &lang),
-        2 => checks_tab(ui, &checks, &lang),
+        0 => importance_tab(app, ui, &lang),
+        1 => quality_tab(app, ui, &review, &lang),
+        2 => convo_tab(app, ui, &convo, &lang),
+        3 => checks_tab(ui, &checks, &lang),
         // 合并的 Files changed：有解析后 diff 用折叠 diff 视图；
         // 没有（缓存缺失且实时 files 已到）退回纯文件清单
-        3 => {
+        4 => {
             if !app.diff_files.is_empty() {
                 diff_view(ui, &mut app.diff_files, &lang, "detail");
             } else {
                 files_tab(ui, &files, &lang);
             }
         }
-        4 => kimi_session_tab(app, ui, &lang),
-        _ => review_tab(app, ui, &review, &lang),
+        5 => kimi_session_tab(app, ui, &lang),
+        _ => importance_tab(app, ui, &lang),
     }
 }
 
@@ -502,7 +504,250 @@ pub fn avatar_chip(ui: &mut Ui, author: &str) {
     }
 }
 
-fn review_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
+const IMPORTANCE_GROUPS: &[&str] = &[
+    "how_bad",
+    "release",
+    "who_it_hits",
+    "evidence",
+    "community",
+    "pr_signals",
+    "penalty",
+];
+
+fn importance_group_color(group: &str, dark: bool) -> Color32 {
+    match (group, dark) {
+        ("how_bad", true) => Color32::from_rgb(248, 81, 73),
+        ("how_bad", false) => Color32::from_rgb(207, 34, 46),
+        ("release", true) => Color32::from_rgb(210, 153, 34),
+        ("release", false) => Color32::from_rgb(154, 103, 0),
+        ("who_it_hits", true) => Color32::from_rgb(88, 166, 255),
+        ("who_it_hits", false) => Color32::from_rgb(9, 105, 218),
+        ("evidence", true) => Color32::from_rgb(126, 200, 80),
+        ("evidence", false) => Color32::from_rgb(63, 140, 40),
+        ("community", true) => Color32::from_rgb(219, 131, 209),
+        ("community", false) => Color32::from_rgb(163, 63, 163),
+        ("pr_signals", true) => Color32::from_rgb(57, 197, 215),
+        ("pr_signals", false) => Color32::from_rgb(9, 130, 150),
+        _ if dark => Color32::from_gray(120),
+        _ => Color32::from_gray(150),
+    }
+}
+
+fn importance_rule_evidence_tooltip(ui: &mut Ui, importance: &ImportanceProps, group: &str) {
+    ui.set_max_width(420.0);
+    for factor in importance
+        .factors
+        .iter()
+        .filter(|factor| factor.group == group)
+    {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(&factor.rule_evidence);
+            ui.weak(format!("{:+.1}", factor.points as f32 / 10.0));
+        });
+    }
+}
+
+fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
+    let dark = ui.visuals().dark_mode;
+    let groups: Vec<(&str, String, i32)> = IMPORTANCE_GROUPS
+        .iter()
+        .map(|group| {
+            let label = importance
+                .factors
+                .iter()
+                .find(|factor| factor.group == *group)
+                .map(|factor| factor.label.clone())
+                .unwrap_or_else(|| {
+                    let key = match *group {
+                        "how_bad" => "importance_group_how_bad",
+                        "release" => "importance_group_release",
+                        "who_it_hits" => "importance_group_who_it_hits",
+                        "evidence" => "importance_group_evidence",
+                        "community" => "importance_group_community",
+                        "pr_signals" => "importance_group_pr_signals",
+                        _ => "importance_group_penalty",
+                    };
+                    tr(lang, key).to_string()
+                });
+            let points = importance
+                .factors
+                .iter()
+                .filter(|factor| factor.group == *group)
+                .map(|factor| factor.points)
+                .sum();
+            (*group, label, points)
+        })
+        .collect();
+    let penalty = groups
+        .iter()
+        .map(|(_, _, points)| (-*points).max(0))
+        .sum::<i32>();
+    let units = 100 + penalty;
+    let (track, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(track, 3.0, ui.visuals().extreme_bg_color);
+    let mut left = track.left();
+    for (group, _, points) in &groups {
+        if *points <= 0 {
+            continue;
+        }
+        let width = track.width() * *points as f32 / units as f32;
+        let segment = egui::Rect::from_min_size(
+            egui::pos2(left, track.top()),
+            egui::vec2(width, track.height()),
+        );
+        ui.painter()
+            .rect_filled(segment, 0.0, importance_group_color(group, dark));
+        ui.interact(
+            segment,
+            egui::Id::unique(("importance-summary-group", *group)),
+            egui::Sense::hover(),
+        )
+        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, group));
+        left += width;
+    }
+    if penalty > 0 {
+        let segment = egui::Rect::from_min_size(
+            egui::pos2(left, track.top()),
+            egui::vec2(track.right() - left, track.height()),
+        );
+        let painter = ui.painter().with_clip_rect(segment);
+        painter.rect_filled(segment, 0.0, importance_group_color("penalty", dark));
+        let stroke = egui::Stroke::new(1.0, ui.visuals().extreme_bg_color);
+        let mut x = segment.left() - segment.height();
+        while x < segment.right() {
+            painter.line_segment(
+                [
+                    egui::pos2(x, segment.bottom()),
+                    egui::pos2(x + segment.height(), segment.top()),
+                ],
+                stroke,
+            );
+            x += 6.0;
+        }
+        ui.interact(
+            segment,
+            egui::Id::unique("importance-summary-penalty"),
+            egui::Sense::hover(),
+        )
+        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, "penalty"));
+    }
+    ui.add_space(2.0);
+    ui.horizontal_wrapped(|ui| {
+        for (group, label, points) in &groups {
+            ui.label(
+                RichText::new("●")
+                    .size(10.0)
+                    .color(importance_group_color(group, dark)),
+            );
+            ui.weak(format!("{label} {:+.1}", *points as f32 / 10.0));
+            ui.add_space(8.0);
+        }
+        if let Some(score) = importance.score {
+            ui.strong(format!("= {score:.1}"));
+        }
+    });
+    ui.add_space(4.0);
+}
+
+fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
+    ui.style_mut().interaction.tooltip_delay = 0.1;
+    ui.horizontal(|ui| {
+        if let Some(score) = importance.score {
+            ui.label(
+                RichText::new(format!("{score:.1}"))
+                    .size(22.0)
+                    .strong()
+                    .color(score_color(score as f64, ui.visuals().dark_mode)),
+            );
+        } else {
+            ui.label(RichText::new("—").size(22.0).strong());
+        }
+        ui.weak(format!("/10 · {}", tr(lang, "importance_title")));
+    });
+    ui.weak(format!(
+        "{} · {}",
+        tr(lang, "importance_subtitle"),
+        tr(lang, "importance_factor_count").replacen(
+            "{0}",
+            &importance.factors.len().to_string(),
+            1
+        )
+    ));
+    let Some(_) = importance.score else {
+        ui.weak(tr(lang, "importance_pending"));
+        return;
+    };
+    importance_summary_bar(ui, importance, lang);
+    for group in IMPORTANCE_GROUPS {
+        let factors: Vec<&ImportanceFactorProps> = importance
+            .factors
+            .iter()
+            .filter(|factor| factor.group == *group)
+            .collect();
+        if factors.is_empty() {
+            continue;
+        }
+        let points: i32 = factors.iter().map(|factor| factor.points).sum();
+        let max_points = match *group {
+            "how_bad" => 30,
+            "release" => 10,
+            "who_it_hits" => 15,
+            "evidence" | "community" => 10,
+            "pr_signals" => 25,
+            _ => 15,
+        };
+        ui.add_space(6.0);
+        let row = ui.horizontal_wrapped(|ui| {
+            ui.monospace(&factors[0].label);
+            let frac = points.abs() as f32 / max_points as f32;
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 8.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
+            let mut fill = rect;
+            fill.set_width(rect.width() * frac.clamp(0.0, 1.0));
+            ui.painter().rect_filled(
+                fill,
+                4.0,
+                importance_group_color(group, ui.visuals().dark_mode),
+            );
+            ui.weak(format!(
+                "{:+.1}/{:.1}",
+                points as f32 / 10.0,
+                max_points as f32 / 10.0
+            ));
+        });
+        ui.interact(
+            row.response.rect,
+            egui::Id::unique(("importance-group", *group)),
+            egui::Sense::hover(),
+        )
+        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, group));
+        for factor in factors {
+            ui.weak(&factor.evidence);
+        }
+    }
+    let method = if importance.method.starts_with("llm:") {
+        tr(lang, "importance_method_llm").to_string()
+    } else if importance.method.starts_with("llm_failed") {
+        tr(lang, "importance_method_failed").to_string()
+    } else {
+        tr(lang, "importance_method_rules").to_string()
+    };
+    ui.weak(format!("{method} · scoring {}", importance.version));
+}
+
+fn importance_tab(app: &mut EguiApp, ui: &mut Ui, lang: &str) {
+    let importance = app
+        .panel
+        .as_ref()
+        .map(|panel| panel.importance.clone())
+        .unwrap_or_default();
+    importance_section(ui, &importance, lang);
+}
+
+fn quality_tab(app: &mut EguiApp, ui: &mut Ui, rv: &ReviewProps, lang: &str) {
     let (running, progress) = app
         .panel
         .as_ref()
@@ -766,6 +1011,19 @@ mod tests {
             assert_eq!(score_color(6.9, dark), score_color(6.0, dark));
             assert_eq!(score_color(7.9, dark), score_color(7.0, dark));
             assert_eq!(score_color(8.9, dark), score_color(8.0, dark));
+        }
+    }
+
+    #[test]
+    fn importance_groups_have_distinct_colors() {
+        for dark in [false, true] {
+            let colors: Vec<Color32> = IMPORTANCE_GROUPS
+                .iter()
+                .map(|group| importance_group_color(group, dark))
+                .collect();
+            for (index, color) in colors.iter().enumerate() {
+                assert!(colors[..index].iter().all(|other| other != color));
+            }
         }
     }
 

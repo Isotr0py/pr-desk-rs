@@ -22,9 +22,9 @@ cmd "openpr $REPO $NUMBER"
 wait_state "d['panel_open']==True and d.get('panel_number')==$NUMBER" || true
 assert "无需 Deep 工作区即可打开 PR" "d['panel_open']==True and d.get('panel_number')==$NUMBER"
 
-cmd "tab 4"
+cmd "tab 5"
 wait_state "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_dimensions') is not None" || true
-assert "Kimi 页签直接启动真实 CLI" "d['panel_tab']==4 and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_error')==''"
+assert "Kimi 页签直接启动真实 CLI" "d['panel_tab']==5 and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_error')==''"
 assert "ConPTY 已完成终端尺寸协商" "d.get('kimi_terminal_dimensions') is not None"
 REQUEST_ID=$(state | python -c "import json,sys; print(json.load(sys.stdin).get('kimi_request_id') or 0)")
 sleep 2
@@ -70,7 +70,7 @@ OTHER_NUMBER="${PD_NUMBER2:-2}"
 cmd "openpr $OTHER_REPO $OTHER_NUMBER"
 wait_state "d['panel_open']==True and d.get('panel_number')==$OTHER_NUMBER" || true
 assert "切到另一个 PR 后原 CLI 仍在后台" "d.get('kimi_cached_live')==1"
-cmd "tab 4"
+cmd "tab 5"
 wait_state "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False" || true
 OTHER_REQUEST_ID=$(state | python -c "import json,sys; print(json.load(sys.stdin).get('kimi_request_id') or 0)")
 assert "第二个 PR 使用独立 CLI" "$OTHER_REQUEST_ID > 0 and $OTHER_REQUEST_ID != $REQUEST_ID and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_error')==''"
@@ -78,7 +78,7 @@ assert "第二个 PR 使用独立 CLI" "$OTHER_REQUEST_ID > 0 and $OTHER_REQUEST
 cmd "openpr $REPO $NUMBER"
 wait_state "d['panel_open']==True and d.get('panel_number')==$NUMBER" || true
 assert "返回前两个 CLI 都保留在后台" "d.get('kimi_cached_live')==2"
-cmd "tab 4"
+cmd "tab 5"
 wait_state "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False" || true
 assert "切回立即恢复原 CLI 进程" "d.get('kimi_request_id')==$REQUEST_ID and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_error')==''"
 assert "两个 PR 的 CLI 可同时存活" "d.get('kimi_cached_live')==1 and d.get('kimi_terminal_closed')==False"

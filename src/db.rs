@@ -4,7 +4,7 @@
 use anyhow::Result;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-pub const SCHEMA_VERSION: i32 = 7;
+pub const SCHEMA_VERSION: i32 = 9;
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS prs (
@@ -176,6 +176,38 @@ impl Db {
                 "ALTER TABLE prs ADD COLUMN additions INTEGER;
                  ALTER TABLE prs ADD COLUMN deletions INTEGER;",
             )?;
+        }
+        // v8：PR 级重要性评分，与 reviews.score 的代码质量分独立。
+        for (column, sql) in [
+            (
+                "importance_score",
+                "ALTER TABLE prs ADD COLUMN importance_score REAL",
+            ),
+            (
+                "importance_factors",
+                "ALTER TABLE prs ADD COLUMN importance_factors TEXT NOT NULL DEFAULT '[]'",
+            ),
+            (
+                "importance_version",
+                "ALTER TABLE prs ADD COLUMN importance_version TEXT",
+            ),
+            (
+                "importance_updated_at",
+                "ALTER TABLE prs ADD COLUMN importance_updated_at TEXT",
+            ),
+            // v9：重要性校准方法与输入哈希。
+            (
+                "importance_method",
+                "ALTER TABLE prs ADD COLUMN importance_method TEXT",
+            ),
+            (
+                "importance_input_hash",
+                "ALTER TABLE prs ADD COLUMN importance_input_hash TEXT",
+            ),
+        ] {
+            if !prs_cols.is_empty() && !prs_cols.iter().any(|c| c == column) {
+                conn.execute_batch(sql)?;
+            }
         }
         if version < 2 {
             // v1 → v2：prs 加 extras 缓存列（幂等：列已存在则跳过）
@@ -410,7 +442,9 @@ impl Db {
                 p.on_board, p.priority, p.pinned, p.ci_status, p.review_decision, p.turn,
                 p.updated_at, p.recent_commits, p.extras_detail, p.source, p.author_orgs,
                 r.score, r.reviewed_at, r.size_label, r.additions, r.deletions,
-                p.additions, p.deletions
+                p.additions, p.deletions, p.importance_score, p.importance_factors,
+                p.importance_version, p.importance_updated_at,
+                p.importance_method, p.importance_input_hash
              FROM prs p
              LEFT JOIN reviews r ON r.rowid = (
                 SELECT r2.rowid FROM reviews r2
@@ -422,6 +456,11 @@ impl Db {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt
             .query_map(rusqlite::params_from_iter(sources.iter()), |row| {
+                let importance_factors =
+                    serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(27)?)
+                        .ok()
+                        .filter(|v| v.is_array())
+                        .unwrap_or_else(|| serde_json::json!([]));
                 Ok(serde_json::json!({
                     "repo": row.get::<_, String>(0)?,
                     "number": row.get::<_, i64>(1)?,
@@ -447,6 +486,12 @@ impl Db {
                     // +/- 列：评审记录的优先，否则用 Files 拉取落库的 PR 级增删（没评审过不再是 0）
                     "additions": row.get::<_, Option<i64>>(22)?.or(row.get::<_, Option<i64>>(24)?),
                     "deletions": row.get::<_, Option<i64>>(23)?.or(row.get::<_, Option<i64>>(25)?),
+                    "importance_score": row.get::<_, Option<f64>>(26)?,
+                    "importance_factors": importance_factors,
+                    "importance_version": row.get::<_, Option<String>>(28)?,
+                    "importance_updated_at": row.get::<_, Option<String>>(29)?,
+                    "importance_method": row.get::<_, Option<String>>(30)?,
+                    "importance_input_hash": row.get::<_, Option<String>>(31)?,
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -597,6 +642,33 @@ impl Db {
         Ok(())
     }
 
+    /// 回写 PR 级重要性评分；行不存在时不创建，返回 false。
+    pub fn set_importance(
+        &self,
+        repo: &str,
+        number: i64,
+        score: &crate::importance::ImportanceScore,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE prs SET importance_score=?1, importance_factors=?2,
+                importance_version=?3, importance_updated_at=?4,
+                importance_method=?5, importance_input_hash=?6
+             WHERE repo=?7 AND number=?8",
+            params![
+                score.score,
+                serde_json::to_string(&score.factors)?,
+                score.scoring_version,
+                updated_at,
+                score.method,
+                score.input_hash,
+                repo,
+                number,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     /// 只补空缺字段（Inbox「+ 预评审」入库的行缺 author/head_sha 等）：
     /// 空/NULL 才写入，已有值一律不动；行不存在返回 false。
     pub fn fill_pr_meta_if_empty(
@@ -712,7 +784,9 @@ impl Db {
             "SELECT repo, number, title, author, url, head_sha, status, tags, role,
                 on_board, priority, pinned, ci_status, review_decision, turn, updated_at,
                 recent_commits, extras_detail, extras_updated_at, source, author_orgs,
-                additions, deletions
+                additions, deletions, importance_score, importance_factors,
+                importance_version, importance_updated_at, importance_method,
+                importance_input_hash
              FROM prs WHERE repo=?1 AND number=?2",
         )?;
         let mut rows = stmt.query(params![repo, number])?;
@@ -743,6 +817,12 @@ impl Db {
             "author_orgs": r.get::<_, String>(20)?,
             "additions": r.get::<_, Option<i64>>(21)?,
             "deletions": r.get::<_, Option<i64>>(22)?,
+            "importance_score": r.get::<_, Option<f64>>(23)?,
+            "importance_factors": r.get::<_, String>(24)?,
+            "importance_version": r.get::<_, Option<String>>(25)?,
+            "importance_updated_at": r.get::<_, Option<String>>(26)?,
+            "importance_method": r.get::<_, Option<String>>(27)?,
+            "importance_input_hash": r.get::<_, Option<String>>(28)?,
         })))
     }
 
@@ -783,12 +863,19 @@ impl Db {
     /// 目标档案的 pinned/priority/on_board/status 等本地策展状态绝不能被源覆盖。
     /// 返回 true = 本次新插入。
     pub fn insert_pr_if_absent(&self, p: &serde_json::Value) -> Result<bool> {
+        let importance_factors = match &p["importance_factors"] {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Array(_) => serde_json::to_string(&p["importance_factors"])?,
+            _ => "[]".to_string(),
+        };
         let n = self.conn.execute(
             "INSERT OR IGNORE INTO prs(repo, number, title, author, url, head_sha, status, tags, role,
                 on_board, priority, pinned, ci_status, review_decision, turn, updated_at,
                 recent_commits, extras_detail, extras_updated_at, source, author_orgs,
-                additions, deletions)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                additions, deletions, importance_score, importance_factors,
+                importance_version, importance_updated_at, importance_method,
+                importance_input_hash)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
             params![
                 p["repo"].as_str().unwrap_or(""),
                 p["number"].as_i64().unwrap_or(0),
@@ -813,6 +900,12 @@ impl Db {
                 p["author_orgs"].as_str().unwrap_or("[]"),
                 p["additions"].as_i64(),
                 p["deletions"].as_i64(),
+                p["importance_score"].as_f64(),
+                importance_factors,
+                p["importance_version"].as_str(),
+                p["importance_updated_at"].as_str(),
+                p["importance_method"].as_str(),
+                p["importance_input_hash"].as_str(),
             ],
         )?;
         Ok(n > 0)
@@ -1042,6 +1135,149 @@ mod tests {
         assert_eq!(rows[0]["title"], "srv");
         // 无匹配来源
         assert_eq!(db.list_prs(&["nope"]).unwrap().len(), 0);
+    }
+
+    fn importance_fixture() -> crate::importance::ImportanceScore {
+        crate::importance::ImportanceScore {
+            score: 8.3,
+            raw_score: 83,
+            scoring_version: "test-v1",
+            factors: vec![crate::importance::ImportanceFactor {
+                group: "how_bad",
+                key: "severity",
+                points: 30,
+                max_points: 30,
+                evidence: "security label".to_string(),
+            }],
+            method: "test-rules".to_string(),
+            input_hash: "test-input-hash".to_string(),
+        }
+    }
+
+    #[test]
+    fn migrate_adds_importance_columns_idempotently() {
+        let dir =
+            std::env::temp_dir().join(format!("prdesk-db-mig-importance-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(MIGRATE_V2).unwrap();
+            conn.execute_batch(
+                "INSERT INTO prs(repo, number, title) VALUES ('o/r', 1, 'old');
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        let row = &db.list_prs(&[]).unwrap()[0];
+        assert!(row["importance_score"].is_null());
+        assert_eq!(row["importance_factors"], serde_json::json!([]));
+        assert!(row["importance_version"].is_null());
+        assert!(row["importance_updated_at"].is_null());
+        assert!(row["importance_method"].is_null());
+        assert!(row["importance_input_hash"].is_null());
+        db.set_importance("o/r", 1, &importance_fixture(), "2026-11-27T00:00:00Z")
+            .unwrap();
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        let row = &db.list_prs(&[]).unwrap()[0];
+        assert_eq!(row["importance_score"], 8.3);
+        assert_eq!(row["importance_version"], "test-v1");
+        assert_eq!(row["importance_method"], "test-rules");
+        assert_eq!(row["importance_input_hash"], "test-input-hash");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_importance_updates_existing_row_and_list_preserves_quality_score() {
+        let db = Db::open_memory().unwrap();
+        let score = importance_fixture();
+        assert!(
+            !db.set_importance("o/r", 99, &score, "2026-11-27T00:00:00Z")
+                .unwrap()
+        );
+        db.upsert_pr(&pr_json("o/r", 1, "t")).unwrap();
+        db.upsert_review(&review_json("o/r", 1, "s", 7.25)).unwrap();
+        assert!(
+            db.set_importance("o/r", 1, &score, "2026-11-27T00:00:00Z")
+                .unwrap()
+        );
+
+        let row = &db.list_prs(&[]).unwrap()[0];
+        assert_eq!(row["score"], 7.25);
+        assert_eq!(row["importance_score"], 8.3);
+        assert_eq!(row["importance_version"], "test-v1");
+        assert_eq!(row["importance_updated_at"], "2026-11-27T00:00:00Z");
+        assert_eq!(row["importance_method"], "test-rules");
+        assert_eq!(row["importance_input_hash"], "test-input-hash");
+        let factors = row["importance_factors"].as_array().unwrap();
+        assert_eq!(factors.len(), 1);
+        assert_eq!(factors[0]["key"], "severity");
+        assert_eq!(factors[0]["evidence"], "security label");
+    }
+
+    #[test]
+    fn upsert_pr_without_importance_preserves_existing_score() {
+        let db = Db::open_memory().unwrap();
+        db.upsert_pr(&pr_json("o/r", 1, "before")).unwrap();
+        db.set_importance("o/r", 1, &importance_fixture(), "2026-11-27T00:00:00Z")
+            .unwrap();
+
+        db.upsert_pr(&pr_json("o/r", 1, "after")).unwrap();
+
+        let row = &db.list_prs(&[]).unwrap()[0];
+        assert_eq!(row["title"], "after");
+        assert_eq!(row["importance_score"], 8.3);
+        assert_eq!(row["importance_factors"][0]["key"], "severity");
+        assert_eq!(row["importance_version"], "test-v1");
+        assert_eq!(row["importance_updated_at"], "2026-11-27T00:00:00Z");
+        assert_eq!(row["importance_method"], "test-rules");
+        assert_eq!(row["importance_input_hash"], "test-input-hash");
+    }
+
+    #[test]
+    fn copy_pr_carries_importance_and_insert_accepts_missing_fields() {
+        let src = Db::open_memory().unwrap();
+        let dst = Db::open_memory().unwrap();
+        src.upsert_pr(&pr_json("o/r", 1, "source")).unwrap();
+        src.set_importance("o/r", 1, &importance_fixture(), "2026-11-27T00:00:00Z")
+            .unwrap();
+
+        let (inserted, skipped, reviews) =
+            Db::copy_prs_to(&src, &dst, &[("o/r".to_string(), 1)]).unwrap();
+        assert_eq!((inserted, skipped, reviews), (1, 0, 0));
+        let copied = dst.get_pr_full("o/r", 1).unwrap().unwrap();
+        assert_eq!(copied["importance_score"], 8.3);
+        assert_eq!(
+            copied["importance_factors"],
+            serde_json::to_string(&importance_fixture().factors).unwrap()
+        );
+        assert_eq!(copied["importance_version"], "test-v1");
+        assert_eq!(copied["importance_updated_at"], "2026-11-27T00:00:00Z");
+        assert_eq!(copied["importance_method"], "test-rules");
+        assert_eq!(copied["importance_input_hash"], "test-input-hash");
+
+        assert!(
+            dst.insert_pr_if_absent(&pr_json("o/r", 2, "legacy input"))
+                .unwrap()
+        );
+        let rows = dst.list_prs(&[]).unwrap();
+        let legacy = rows.iter().find(|row| row["number"] == 2).unwrap();
+        assert!(legacy["importance_score"].is_null());
+        assert_eq!(legacy["importance_factors"], serde_json::json!([]));
+        assert!(legacy["importance_method"].is_null());
+        assert!(legacy["importance_input_hash"].is_null());
     }
 
     #[test]

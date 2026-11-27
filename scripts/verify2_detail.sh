@@ -35,27 +35,27 @@ assert "面板身份 = 选中行" "d['panel_number']==d['selected'][1]"
 shot "detail-review-tab"
 
 # tab 惰性加载：会话
-cmd "tab 1"; sleep 2.5
-assert "会话 tab：拉到会话内容（convo>0 或保持空数组但无错）" "d['panel_tab']==1"
+cmd "tab 2"; sleep 2.5
+assert "会话 tab：拉到会话内容（convo>0 或保持空数组但无错）" "d['panel_tab']==2"
 CONVO=$(state | python -c "import json,sys; print(json.load(sys.stdin)['panel_convo'])")
 echo "  [convo 条数] $CONVO"
 shot "detail-convo-tab"
 
 # Checks
-cmd "tab 2"; sleep 2.5
-assert "Checks tab 打开" "d['panel_tab']==2"
+cmd "tab 3"; sleep 2.5
+assert "Checks tab 打开" "d['panel_tab']==3"
 shot "detail-checks-tab"
 
 # Files + Diff（虚拟化）
-cmd "tab 3"; sleep 2.5
-assert "Files tab 打开" "d['panel_tab']==3"
+cmd "tab 4"; sleep 2.5
+assert "Files tab 打开" "d['panel_tab']==4"
 assert "Files tab：已解析文件数 >0" "d['diff_files']>0"
 shot "detail-files-tab"
 
 # Kimi CLI（无需预先创建任何评审工作区）
-cmd "tab 4"
+cmd "tab 5"
 wait_state "d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False" || true
-assert "Kimi 会话 tab 打开并启动真实 CLI" "d['panel_tab']==4 and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_error')==''"
+assert "Kimi 会话 tab 打开并启动真实 CLI" "d['panel_tab']==5 and d.get('kimi_terminal_active')==True and d.get('kimi_terminal_preparing')==False and d.get('kimi_terminal_error')==''"
 shot "detail-kimi-terminal-tab"
 
 # 复制评审（无评审记录 → 不应崩；剪贴板不变即正确跳过）
