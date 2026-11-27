@@ -68,10 +68,14 @@ beside the active configuration file.
 Other tokens are stored in plaintext, so do not commit or share the file.
 
 `kimi_workspace_root` defaults to `data/kimi-workspaces` and can be absolute or
-relative to the data directory. PR worktrees share one bare mirror per remote
-repository under `.git-mirrors/` through Git alternates, avoiding duplicate
-history and pack files. Keep mirrors with the workspace when moving or backing
-it up; deleting one can leave dependent worktrees without their Git history.
+relative to the data directory. Each PR has a lightweight context containing
+only metadata and a `.git` pointer to one shared bare mirror per remote
+repository under `.git-mirrors/`. Kimi reads the complete source and history with
+`git show`, `git grep` and `git diff`; there is no persistent source checkout or
+duplicate pack file. Conventional OCR uses a temporary checkout that is deleted
+when the task finishes or is cancelled. Keep mirrors with the workspace when
+moving or backing it up, and only delete legacy `worktree/` directories after
+confirming they contain no uncommitted changes.
 
 ## Testing
 
@@ -81,8 +85,9 @@ cargo check --all-targets
 ```
 
 Tests cover review and sync logic, configuration, database migration and backup,
-deep Git history, shared mirror reuse, offline worktree rebuilding, concurrent
-context creation and real terminal I/O. Windows desktop verification scripts
+deep Git history, shared mirror reuse, offline bare-context rebuilding,
+concurrent context creation, temporary OCR checkout cleanup and real terminal
+I/O. Windows desktop verification scripts
 are in `scripts/`.
 
 ## Third-party

@@ -1,6 +1,6 @@
 //! 本地预评审引擎：open-code-review（ocr CLI）。
 //!
-//! 流程：按 PR base/head 准备可复用的完整 Git 工作树
+//! 流程：按 PR base/head 准备共享 bare mirror 和轻量上下文，OCR 使用临时工作树
 //! → `ocr review --from <base> --to <head> --format json` → 解析 JSON 拿行级评论。
 //! 评分仍由 reviewer.rs 的 LLM 调用负责，本模块只产出行级评论。
 //! LLM 配置不落 ocr 全局配置：在临时目录写 config.json，子进程用
@@ -34,36 +34,6 @@ pub struct OcrRunOutcome {
     pub comments: Vec<Value>,
     pub files_reviewed: usize,
     pub status: String,
-}
-
-struct StagingDir {
-    path: PathBuf,
-    publish: bool,
-}
-
-impl StagingDir {
-    fn new(root: &Path) -> Result<Self> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let uniq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = root.join(format!(".staging-{}-{nanos:x}-{uniq}", std::process::id()));
-        std::fs::create_dir_all(&path).context("创建评审工作区 staging 失败")?;
-        Ok(Self {
-            path,
-            publish: false,
-        })
-    }
-}
-
-impl Drop for StagingDir {
-    fn drop(&mut self) {
-        if !self.publish {
-            let _ = std::fs::remove_dir_all(&self.path);
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -125,10 +95,11 @@ pub fn context_manifest_matches(
         && value["head_sha"].as_str() == Some(head_sha)
 }
 
-/// 普通 OCR 与内嵌 Kimi CLI 共用的持久 Git 工作树。
+/// 普通 OCR 与内嵌 Kimi CLI 共用的轻量只读 Git 上下文。
 #[derive(Debug)]
 pub struct OcrGitSnapshot {
     path: PathBuf,
+    mirror_path: PathBuf,
     base_sha: String,
     head_sha: String,
 }
@@ -164,33 +135,38 @@ async fn valid_context(path: &Path, identity: &ContextIdentity) -> bool {
     let Ok(actual) = serde_json::from_str::<Value>(&manifest) else {
         return false;
     };
-    if actual != identity.manifest() || !path.join("worktree/.git").exists() {
+    if actual != identity.manifest() {
         return false;
     }
-    let worktree = path.join("worktree");
-    let Ok(head) = git_output(&worktree, &["rev-parse", "HEAD"]).await else {
+    let repository = path.join("repository");
+    let Ok(metadata) = std::fs::symlink_metadata(&repository) else {
         return false;
     };
-    if String::from_utf8_lossy(&head.stdout).trim() != identity.head_sha {
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return false;
     }
-    for (reference, expected) in [
-        ("refs/heads/base", &identity.base_sha),
-        ("refs/heads/head", &identity.head_sha),
-    ] {
-        let Ok(output) = git_output(&worktree, &["rev-parse", reference]).await else {
-            return false;
-        };
-        if String::from_utf8_lossy(&output.stdout).trim() != expected {
+    let Ok(mirror_path) = read_gitdir_pointer(&repository) else {
+        return false;
+    };
+    let Some(root) = path.parent() else {
+        return false;
+    };
+    let expected_mirror = git_mirror(root, &git_repository_url(&identity.base_repo));
+    if git_path(&mirror_path) != git_path(&expected_mirror.path) {
+        return false;
+    }
+    for sha in [&identity.base_sha, &identity.head_sha] {
+        let object = format!("{sha}^{{commit}}");
+        if git_output(&mirror_path, &["cat-file", "-e", &object])
+            .await
+            .is_err()
+        {
             return false;
         }
     }
-    if git_output(&worktree, &["diff", "--quiet"]).await.is_err() {
-        return false;
-    }
     git_output(
-        &worktree,
-        &["merge-base", "refs/heads/base", "refs/heads/head"],
+        &mirror_path,
+        &["merge-base", &identity.base_sha, &identity.head_sha],
     )
     .await
     .is_ok_and(|output| !output.stdout.is_empty())
@@ -428,6 +404,38 @@ fn git_path(path: &Path) -> String {
     text.replace('\\', "/")
 }
 
+pub fn repository_mirror_path(root: &Path, repository: &str) -> PathBuf {
+    git_mirror(root, &git_repository_url(repository)).path
+}
+
+pub fn write_repository_gitdir(repository: &Path, mirror: &Path) -> Result<()> {
+    std::fs::create_dir_all(repository).context("创建轻量 Git repository 失败")?;
+    std::fs::write(
+        repository.join(".git"),
+        format!("gitdir: {}\n", git_path(mirror)),
+    )
+    .context("写入轻量 Git repository 指针失败")
+}
+
+fn read_gitdir_pointer(repository: &Path) -> Result<PathBuf> {
+    let pointer = repository.join(".git");
+    let metadata = std::fs::symlink_metadata(&pointer).context("读取 Git 指针元数据失败")?;
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Git 指针必须是普通文本文件"
+    );
+    let text = std::fs::read_to_string(pointer).context("读取 Git 指针失败")?;
+    let path = text
+        .strip_prefix("gitdir: ")
+        .context("Git 指针格式无效")?
+        .trim();
+    anyhow::ensure!(
+        !path.is_empty() && Path::new(path).is_absolute(),
+        "Git 指针必须指向绝对路径"
+    );
+    Ok(PathBuf::from(path))
+}
+
 fn git_mirror_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
     static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Weak<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
@@ -560,23 +568,43 @@ async fn unshallow_git_mirror(
     git(&mirror.path, &args).await
 }
 
-async fn update_worktree_refs(worktree: &Path, refs: &[(&str, &str)]) -> Result<()> {
-    for (sha, reference) in refs {
-        let object = format!("{sha}^{{commit}}");
-        git_output(worktree, &["cat-file", "-e", &object]).await?;
-        let worktree_ref = format!("refs/heads/{reference}");
-        git(worktree, &["update-ref", &worktree_ref, sha]).await?;
-    }
-    Ok(())
+async fn mirror_has_merge_base(mirror: &GitMirror, base_sha: &str, head_sha: &str) -> bool {
+    git_output(&mirror.path, &["merge-base", base_sha, head_sha])
+        .await
+        .is_ok_and(|output| !output.stdout.is_empty())
 }
 
-async fn worktree_has_merge_base(worktree: &Path) -> bool {
-    git_output(
-        worktree,
-        &["merge-base", "refs/heads/base", "refs/heads/head"],
+async fn configure_git_mirror(
+    mirror: &GitMirror,
+    pr_repository: &str,
+    number: i64,
+    cancel: Option<&Arc<AtomicBool>>,
+    lang: &str,
+) -> Result<()> {
+    let _guard = lock_git_mirror(mirror, cancel, lang).await?;
+    let remote = format!("pr-desk-pr-{number}");
+    let pull_ref = format!("refs/pull/{number}/head");
+    let fetch_refspec = format!("+{pull_ref}:refs/remotes/{remote}/head");
+    let remote_url = git_repository_url(pr_repository);
+    let remote_url_key = format!("remote.{remote}.url");
+    let remote_fetch_key = format!("remote.{remote}.fetch");
+    let remote_tags_key = format!("remote.{remote}.tagOpt");
+    git(
+        &mirror.path,
+        &["config", "--replace-all", "remote.origin.url", &mirror.url],
     )
-    .await
-    .is_ok()
+    .await?;
+    git(
+        &mirror.path,
+        &["config", "--replace-all", &remote_url_key, &remote_url],
+    )
+    .await?;
+    git(
+        &mirror.path,
+        &["config", "--replace-all", &remote_fetch_key, &fetch_refspec],
+    )
+    .await?;
+    git(&mirror.path, &["config", &remote_tags_key, "--no-tags"]).await
 }
 
 pub async fn build_ocr_git_snapshot(
@@ -615,36 +643,41 @@ pub async fn build_ocr_git_snapshot(
         head_repo,
     };
     let final_path = context_dir_for(repo, identity.number, &base_sha, &head_sha, root);
+    let base_mirror = git_mirror(root, &git_repository_url(&identity.base_repo));
     let snapshot = |path: PathBuf| OcrGitSnapshot {
-        path: path.join("worktree"),
+        path: path.join("repository"),
+        mirror_path: base_mirror.path.clone(),
         base_sha: base_sha.clone(),
         head_sha: head_sha.clone(),
     };
     if valid_context(&final_path, &identity).await {
+        configure_git_mirror(&base_mirror, repo, identity.number, cancel.as_ref(), lang).await?;
         return Ok(snapshot(final_path));
     }
     if std::fs::symlink_metadata(&final_path).is_ok() {
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let backup =
-            final_path.with_extension(format!("incomplete-{}-{nanos}", std::process::id()));
-        std::fs::rename(&final_path, &backup).context("备份未完成的评审工作区失败")?;
+        let metadata = std::fs::symlink_metadata(&final_path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0);
+            let backup =
+                final_path.with_extension(format!("incomplete-{}-{nanos}", std::process::id()));
+            std::fs::rename(&final_path, &backup).context("备份未完成的评审上下文失败")?;
+        }
     }
 
     check_cancel(cancel.as_ref(), lang)?;
-    std::fs::create_dir_all(root)?;
     progress(if lang == "en" {
-        "Preparing the full Git worktree…".into()
+        "Preparing the read-only Git context…".into()
     } else {
-        "正在准备完整 Git 工作区…".into()
+        "正在准备只读 Git 上下文…".into()
     });
-    let base_url = git_repository_url(&identity.base_repo);
-    let head_url = git_repository_url(&identity.head_repo);
-    let base_mirror = git_mirror(root, &base_url);
-    let head_mirror = git_mirror(root, &head_url);
-    let same_mirror = base_mirror.path == head_mirror.path;
+    let head_mirror = GitMirror {
+        path: base_mirror.path.clone(),
+        url: git_repository_url(&identity.head_repo),
+    };
+    let same_mirror = base_mirror.url == head_mirror.url;
     if same_mirror {
         prepare_git_mirror(
             &base_mirror,
@@ -663,43 +696,7 @@ pub async fn build_ocr_git_snapshot(
         }
     }
 
-    let mut staging = StagingDir::new(root)?;
-    let worktree = staging.path.join("worktree");
-    std::fs::create_dir_all(&worktree)?;
-    git(&worktree, &["init", "--quiet"]).await?;
-    git(&worktree, &["config", "core.longpaths", "true"]).await?;
-    git(&worktree, &["remote", "add", "origin", &base_url]).await?;
-    let alternates_dir = worktree.join(".git/objects/info");
-    std::fs::create_dir_all(&alternates_dir)?;
-    let mirrors = if same_mirror {
-        vec![&base_mirror]
-    } else {
-        vec![&base_mirror, &head_mirror]
-    };
-    let mut alternates = mirrors
-        .iter()
-        .map(|mirror| git_path(&mirror.path.join("objects")))
-        .collect::<Vec<_>>()
-        .join("\n");
-    alternates.push('\n');
-    std::fs::write(alternates_dir.join("alternates"), alternates)?;
-    if same_mirror {
-        update_worktree_refs(
-            &worktree,
-            &[(&identity.base_sha, "base"), (&identity.head_sha, "head")],
-        )
-        .await?;
-    } else {
-        for (_mirror, sha, reference) in [
-            (&base_mirror, identity.base_sha.as_str(), "base"),
-            (&head_mirror, identity.head_sha.as_str(), "head"),
-        ] {
-            check_cancel(cancel.as_ref(), lang)?;
-            update_worktree_refs(&worktree, &[(sha, reference)]).await?;
-        }
-    }
-
-    if !worktree_has_merge_base(&worktree).await {
+    if !mirror_has_merge_base(&base_mirror, &identity.base_sha, &identity.head_sha).await {
         if same_mirror {
             deepen_git_mirror(
                 &base_mirror,
@@ -718,7 +715,7 @@ pub async fn build_ocr_git_snapshot(
             }
         }
     }
-    if !worktree_has_merge_base(&worktree).await {
+    if !mirror_has_merge_base(&base_mirror, &identity.base_sha, &identity.head_sha).await {
         if same_mirror {
             unshallow_git_mirror(
                 &base_mirror,
@@ -738,32 +735,96 @@ pub async fn build_ocr_git_snapshot(
         }
     }
     git_output(
-        &worktree,
-        &["merge-base", "refs/heads/base", "refs/heads/head"],
+        &base_mirror.path,
+        &["merge-base", &identity.base_sha, &identity.head_sha],
     )
     .await?;
-    git(
-        &worktree,
-        &["checkout", "--quiet", "--detach", &identity.head_sha],
-    )
-    .await?;
+    configure_git_mirror(&base_mirror, repo, identity.number, cancel.as_ref(), lang).await?;
+
+    std::fs::create_dir_all(&final_path)?;
+    let repository = final_path.join("repository");
+    if std::fs::symlink_metadata(&repository).is_ok() {
+        let metadata = std::fs::symlink_metadata(&repository)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink(),
+            "轻量 Git repository 路径不是普通目录"
+        );
+    }
+    write_repository_gitdir(&repository, &base_mirror.path)?;
+    check_cancel(cancel.as_ref(), lang)?;
     std::fs::write(
-        staging.path.join("context.json"),
+        final_path.join("context.json"),
         serde_json::to_vec_pretty(&identity.manifest())?,
     )?;
     anyhow::ensure!(
-        valid_context(&staging.path, &identity).await,
-        "完整 Git 工作区校验失败"
+        valid_context(&final_path, &identity).await,
+        "轻量 Git 上下文校验失败"
     );
-
-    if let Err(error) = std::fs::rename(&staging.path, &final_path) {
-        if valid_context(&final_path, &identity).await {
-            return Ok(snapshot(final_path));
-        }
-        return Err(error).context("发布完整 Git 工作区失败");
-    }
-    staging.publish = true;
     Ok(snapshot(final_path))
+}
+
+struct ReviewWorktree {
+    path: PathBuf,
+    index_path: PathBuf,
+}
+
+impl ReviewWorktree {
+    async fn create(
+        snapshot: &OcrGitSnapshot,
+        cancel: Option<&Arc<AtomicBool>>,
+        lang: &str,
+    ) -> Result<Self> {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        check_cancel(cancel, lang)?;
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        let path = snapshot.context_root().join(format!(
+            "review-worktree-{}-{counter}-{nanos:x}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&path).context("创建临时 OCR 工作树失败")?;
+        let review = Self {
+            index_path: path.join(".review-index"),
+            path,
+        };
+        write_repository_gitdir(&review.path, &snapshot.mirror_path)?;
+        let output = Command::new("git")
+            .args([
+                "-c",
+                "core.longpaths=true",
+                "checkout",
+                "--quiet",
+                "--detach",
+                snapshot.head_sha(),
+            ])
+            .current_dir(&review.path)
+            .env("GIT_WORK_TREE", &review.path)
+            .env("GIT_INDEX_FILE", &review.index_path)
+            .output()
+            .await
+            .context("初始化临时 OCR 工作树失败")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "初始化临时 OCR 工作树失败：{}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        check_cancel(cancel, lang)?;
+        Ok(review)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ReviewWorktree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 /// 使用调用方固定的同一份 Diff 快照运行 OCR。
@@ -802,6 +863,7 @@ pub async fn run_ocr_review_with_diff(
         cancel.clone(),
     )
     .await?;
+    let review_worktree = ReviewWorktree::create(&snapshot, cancel.as_ref(), lang).await?;
 
     // LLM 配置：经环境变量传给 ocr 子进程（OCR_CONFIG_PATH 只对 ocr 的 config 子命令生效，
     // review 的 LLM resolver 只认 OCR_LLM_* 环境变量和 ~/.opencodereview/config.json——后者不动）。
@@ -810,7 +872,7 @@ pub async fn run_ocr_review_with_diff(
     let mut cmd = Command::new(&ocr_bin);
     cmd.arg("review")
         .arg("--repo")
-        .arg(snapshot.path())
+        .arg(review_worktree.path())
         .arg("--from")
         .arg(snapshot.base_sha())
         .arg("--to")
@@ -823,7 +885,9 @@ pub async fn run_ocr_review_with_diff(
         .arg(snapshot.context_root().join("result.json"))
         .arg("--background")
         .arg(&background)
-        .current_dir(snapshot.path())
+        .current_dir(review_worktree.path())
+        .env("GIT_WORK_TREE", review_worktree.path())
+        .env("GIT_INDEX_FILE", &review_worktree.index_path)
         .kill_on_drop(true)
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
@@ -888,7 +952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worktree_refs_do_not_require_mirror_cache_ref() {
+    async fn bare_context_does_not_require_mirror_cache_ref() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -926,20 +990,13 @@ mod tests {
         test_git(&mirror.path, &["fetch", "--quiet", &git_path(&seed), &sha]);
         test_git(&mirror.path, &["update-ref", "refs/heads/seed", &sha]);
 
-        let worktree = root.join("worktree");
-        std::fs::create_dir_all(&worktree).unwrap();
-        test_git(&worktree, &["init", "--quiet"]);
-        let info = worktree.join(".git/objects/info");
-        std::fs::create_dir_all(&info).unwrap();
-        std::fs::write(
-            info.join("alternates"),
-            format!("{}\n", git_path(&mirror.path.join("objects"))),
-        )
-        .unwrap();
-        update_worktree_refs(&worktree, &[(&sha, "head")])
-            .await
-            .unwrap();
-        assert_eq!(test_git(&worktree, &["rev-parse", "refs/heads/head"]), sha);
+        let repository = root.join("context/repository");
+        write_repository_gitdir(&repository, &mirror.path).unwrap();
+        assert_eq!(
+            test_git(&repository, &["show", &format!("{sha}:file.txt")]),
+            "content"
+        );
+        assert!(!repository.join("objects").exists());
         assert!(
             git_output(&mirror.path, &["rev-parse", &format!("refs/pr-desk/{sha}")])
                 .await
@@ -1181,24 +1238,19 @@ mod tests {
         }
     }
 
-    fn assert_shared_mirrors(snapshot: &OcrGitSnapshot, root: &Path, urls: &[&str]) {
-        let expected = urls
-            .iter()
-            .map(|url| git_path(&git_mirror(root, url).path.join("objects")))
-            .collect::<Vec<_>>();
-        let alternates =
-            std::fs::read_to_string(snapshot.path().join(".git/objects/info/alternates")).unwrap();
+    fn assert_bare_context(snapshot: &OcrGitSnapshot, root: &Path, base_url: &str) {
+        let mirror = git_mirror(root, base_url);
+        assert!(snapshot.path().join(".git").is_file());
         assert_eq!(
-            alternates.lines().collect::<Vec<_>>(),
-            expected.iter().map(String::as_str).collect::<Vec<_>>()
+            std::fs::read_to_string(snapshot.path().join(".git")).unwrap(),
+            format!("gitdir: {}\n", git_path(&mirror.path))
         );
-        assert_eq!(
-            std::fs::read_dir(snapshot.path().join(".git/objects/pack"))
-                .unwrap()
-                .count(),
-            0,
-            "工作树不应复制 mirror 的 pack 对象"
-        );
+        assert!(snapshot.context_root().join("context.json").is_file());
+        assert!(!snapshot.context_root().join("worktree").exists());
+        assert!(!snapshot.path().join("src").exists());
+        assert!(!snapshot.path().join("objects").exists());
+        assert!(!snapshot.path().join("objects/info/alternates").exists());
+        assert!(!snapshot.path().join("objects/pack").exists());
         assert_eq!(
             test_git(snapshot.path(), &["rev-parse", "--is-shallow-repository"]),
             "false"
@@ -1206,7 +1258,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_is_a_complete_persistent_range_worktree() {
+    async fn snapshot_is_a_lightweight_bare_context() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1298,33 +1350,67 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(snapshot.path().join("src/unchanged.rs").is_file());
-        assert!(snapshot.path().join("src/lib.rs").is_file());
-        assert_eq!(test_git(snapshot.path(), &["rev-parse", "HEAD"]), head_sha);
+        assert_bare_context(&snapshot, &workspace_root, &base_url);
         assert_eq!(
             test_git(
                 snapshot.path(),
-                &["diff", "--name-only", "refs/heads/base", "refs/heads/head"]
+                &["show", &format!("{head_sha}:src/unchanged.rs")]
+            ),
+            "fn untouched() { 42 }"
+        );
+        assert_eq!(
+            test_git(
+                snapshot.path(),
+                &["show", &format!("{head_sha}:src/lib.rs")]
+            ),
+            "fn changed() { 2 }"
+        );
+        assert_eq!(
+            test_git(
+                snapshot.path(),
+                &["diff", "--name-only", &base_sha, &head_sha]
             ),
             "src/lib.rs"
         );
-        assert_shared_mirrors(&snapshot, &workspace_root, &[&base_url, &head_url]);
+        assert!(
+            test_git(
+                snapshot.path(),
+                &["grep", "untouched", &head_sha, "--", "src/unchanged.rs"]
+            )
+            .contains("fn untouched() { 42 }")
+        );
+        assert_eq!(
+            test_git(snapshot.path(), &["merge-base", &base_sha, &head_sha]),
+            base_sha
+        );
         assert_eq!(
             test_git(snapshot.path(), &["remote", "get-url", "origin"]),
             base_url
         );
-        for (url, sha) in [(&base_url, &base_sha), (&head_url, &head_sha)] {
-            let mirror = git_mirror(&workspace_root, url);
+        assert_eq!(
+            test_git(snapshot.path(), &["config", "remote.pr-desk-pr-7.fetch"]),
+            "+refs/pull/7/head:refs/remotes/pr-desk-pr-7/head"
+        );
+        let mirror = git_mirror(&workspace_root, &base_url);
+        for sha in [&base_sha, &head_sha] {
             let reference = format!("refs/pr-desk/{sha}");
             assert_eq!(test_git(&mirror.path, &["rev-parse", &reference]), *sha);
         }
-        test_git(
-            snapshot.path(),
-            &["symbolic-ref", "HEAD", "refs/heads/pr-desk"],
-        );
+        assert!(!git_mirror(&workspace_root, &head_url).path.exists());
+        for reference in ["refs/heads/base", "refs/heads/head"] {
+            assert!(
+                git_output(&mirror.path, &["rev-parse", reference])
+                    .await
+                    .is_err()
+            );
+        }
         let snapshot_path = snapshot.path().to_path_buf();
         drop(snapshot);
 
+        let legacy_worktree = snapshot_path.parent().unwrap().join("worktree");
+        std::fs::create_dir_all(&legacy_worktree).unwrap();
+        std::fs::write(legacy_worktree.join("uncommitted.txt"), "keep me\n").unwrap();
+        std::fs::remove_file(snapshot_path.parent().unwrap().join("context.json")).unwrap();
         let persistent = build_ocr_git_snapshot(
             &gh,
             "owner/repo",
@@ -1338,6 +1424,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(persistent.path(), snapshot_path);
+        assert_eq!(
+            std::fs::read_to_string(legacy_worktree.join("uncommitted.txt")).unwrap(),
+            "keep me\n"
+        );
         drop(persistent);
 
         let same_repo_root = root.join("same-repo-workspaces");
@@ -1355,13 +1445,19 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_bare_context(&same_repo_snapshot, &same_repo_root, &base_url);
         assert_eq!(
-            test_git(same_repo_snapshot.path(), &["rev-parse", "HEAD"]),
-            head_sha
+            test_git(
+                same_repo_snapshot.path(),
+                &["show", &format!("{head_sha}:src/lib.rs")]
+            ),
+            "fn changed() { 2 }"
         );
-        assert_shared_mirrors(&same_repo_snapshot, &same_repo_root, &[&base_url]);
         assert_eq!(
-            test_git(same_repo_snapshot.path(), &["merge-base", "base", "head"]),
+            test_git(
+                same_repo_snapshot.path(),
+                &["merge-base", &base_sha, &head_sha]
+            ),
             base_sha
         );
         drop(same_repo_snapshot);
@@ -1398,8 +1494,34 @@ mod tests {
         let first = first.unwrap();
         let second = second.unwrap();
         assert_ne!(first.path(), second.path());
-        assert_shared_mirrors(&first, &concurrent_root, &[&base_url, &head_url]);
-        assert_shared_mirrors(&second, &concurrent_root, &[&base_url, &head_url]);
+        assert_ne!(first.context_root(), second.context_root());
+        assert_bare_context(&first, &concurrent_root, &base_url);
+        assert_bare_context(&second, &concurrent_root, &base_url);
+        std::fs::write(first.path().join("pr-body.md"), "first").unwrap();
+        std::fs::write(second.path().join("pr-body.md"), "second").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first.path().join("pr-body.md")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            std::fs::read_to_string(second.path().join("pr-body.md")).unwrap(),
+            "second"
+        );
+        let shared_mirror = git_mirror(&concurrent_root, &base_url);
+        assert_eq!(
+            test_git(
+                &shared_mirror.path,
+                &["config", "remote.pr-desk-pr-9.fetch"]
+            ),
+            "+refs/pull/9/head:refs/remotes/pr-desk-pr-9/head"
+        );
+        assert_eq!(
+            test_git(
+                &shared_mirror.path,
+                &["config", "remote.pr-desk-pr-10.fetch"]
+            ),
+            "+refs/pull/10/head:refs/remotes/pr-desk-pr-10/head"
+        );
         drop(first);
         drop(second);
 
@@ -1420,25 +1542,18 @@ mod tests {
         .await
         .unwrap();
         assert_ne!(offline.path(), snapshot_path);
-        assert_shared_mirrors(&offline, &workspace_root, &[&base_url, &head_url]);
         assert_eq!(
-            test_git(offline.path(), &["merge-base", "base", "head"]),
+            test_git(
+                offline.path(),
+                &["show", &format!("{head_sha}:src/unchanged.rs")]
+            ),
+            "fn untouched() { 42 }"
+        );
+        assert_eq!(
+            test_git(offline.path(), &["merge-base", &base_sha, &head_sha]),
             base_sha
         );
-        std::fs::write(snapshot_path.join("src/lib.rs"), "first worktree\n").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(offline.path().join("src/lib.rs"))
-                .unwrap()
-                .replace("\r\n", "\n"),
-            "fn changed() { 2 }\n"
-        );
-        std::fs::write(offline.path().join("src/unchanged.rs"), "second worktree\n").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(snapshot_path.join("src/unchanged.rs"))
-                .unwrap()
-                .replace("\r\n", "\n"),
-            "fn untouched() { 42 }\n"
-        );
+        assert!(!offline.context_root().join("worktree").exists());
         drop(offline);
 
         let invalid_root = root.join("invalid");
@@ -1469,6 +1584,93 @@ mod tests {
         assert_eq!(backups.len(), 1);
         assert!(backups[0].is_file());
         assert!(!invalid_path.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn review_worktree_cleans_up_on_success_and_failure() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pr-desk-review-worktree-test-{}-{unique}",
+            std::process::id()
+        ));
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        test_git(&seed, &["init", "--quiet"]);
+        std::fs::write(seed.join("file.txt"), "review me\n").unwrap();
+        test_git(&seed, &["add", "."]);
+        test_git(
+            &seed,
+            &[
+                "-c",
+                "user.email=test@local",
+                "-c",
+                "user.name=test",
+                "commit",
+                "--quiet",
+                "-m",
+                "head",
+            ],
+        );
+        let head_sha = test_git(&seed, &["rev-parse", "HEAD"]);
+        let mirror = git_mirror(&root, &test_file_url(&seed));
+        let mirror_parent = mirror.path.parent().unwrap();
+        std::fs::create_dir_all(mirror_parent).unwrap();
+        test_git(
+            mirror_parent,
+            &["init", "--quiet", "--bare", &git_path(&mirror.path)],
+        );
+        test_git(
+            &mirror.path,
+            &["fetch", "--quiet", &git_path(&seed), &head_sha],
+        );
+        let repository = root.join("context/repository");
+        write_repository_gitdir(&repository, &mirror.path).unwrap();
+        let snapshot = OcrGitSnapshot {
+            path: repository,
+            mirror_path: mirror.path.clone(),
+            base_sha: head_sha.clone(),
+            head_sha: head_sha.clone(),
+        };
+        let temporary_path = {
+            let review = ReviewWorktree::create(&snapshot, None, "zh").await.unwrap();
+            assert_eq!(
+                std::fs::read_to_string(review.path().join("file.txt"))
+                    .unwrap()
+                    .replace("\r\n", "\n"),
+                "review me\n"
+            );
+            assert!(review.path().join(".git").is_file());
+            review.path().to_path_buf()
+        };
+        assert!(!temporary_path.exists());
+        assert!(snapshot.path().is_dir());
+        assert!(!snapshot.path().join("file.txt").exists());
+
+        let invalid_snapshot = OcrGitSnapshot {
+            path: snapshot.path.clone(),
+            mirror_path: snapshot.mirror_path.clone(),
+            base_sha: head_sha,
+            head_sha: "0000000000000000000000000000000000000000".into(),
+        };
+        assert!(
+            ReviewWorktree::create(&invalid_snapshot, None, "zh")
+                .await
+                .is_err()
+        );
+        let temporary_directories = std::fs::read_dir(snapshot.context_root())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("review-worktree-"))
+            })
+            .collect::<Vec<_>>();
+        assert!(temporary_directories.is_empty());
+        assert!(snapshot.path().is_dir());
         let _ = std::fs::remove_dir_all(root);
     }
 }

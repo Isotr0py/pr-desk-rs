@@ -33,12 +33,13 @@ assert "绘制帧不会反复重启 CLI" "$REQUEST_ID > 0 and d.get('kimi_reques
 WORKSPACE=$(state | python -c "import json,sys; print(json.load(sys.stdin).get('kimi_workspace') or '')")
 CONTEXT=$(dirname "$WORKSPACE")
 assert "工作区路径已持久化到可配置根目录" "bool(d.get('kimi_workspace'))"
-[ -n "$WORKSPACE" ] && [ -d "$WORKSPACE/.git" ] && { echo "  PASS: 完整 Git 工作树"; PASS=$((PASS+1)); } || { echo "  FAIL: 完整 Git 工作树: $WORKSPACE"; FAIL=$((FAIL+1)); }
-[ -f "$WORKSPACE/.git/objects/info/alternates" ] && grep -q '.git-mirrors' "$WORKSPACE/.git/objects/info/alternates" && { echo "  PASS: 工作树通过 alternates 共享 mirror 对象"; PASS=$((PASS+1)); } || { echo "  FAIL: 工作树未使用共享 mirror"; FAIL=$((FAIL+1)); }
+[ -n "$WORKSPACE" ] && [ -f "$WORKSPACE/.git" ] && { echo "  PASS: 轻量 gitdir 上下文"; PASS=$((PASS+1)); } || { echo "  FAIL: 轻量 gitdir 上下文: $WORKSPACE"; FAIL=$((FAIL+1)); }
+grep -q '.git-mirrors' "$WORKSPACE/.git" && [ ! -d "$CONTEXT/worktree" ] && { echo "  PASS: 无持久源码 worktree，直接共享 bare mirror"; PASS=$((PASS+1)); } || { echo "  FAIL: 未使用 bare mirror 或仍有 worktree"; FAIL=$((FAIL+1)); }
 [ -f "$CONTEXT/pr.json" ] && [ -f "$CONTEXT/pr-body.md" ] && [ -f "$CONTEXT/pr.diff" ] && { echo "  PASS: PR 描述、元数据与完整 diff"; PASS=$((PASS+1)); } || { echo "  FAIL: PR 上下文文件"; FAIL=$((FAIL+1)); }
 [ ! -e "$CONTEXT/findings.json" ] && { echo "  PASS: 不再生成 findings.json"; PASS=$((PASS+1)); } || { echo "  FAIL: 仍有 findings.json"; FAIL=$((FAIL+1)); }
 BASE_SHA=$(python -c "import json; print(json.load(open('$CONTEXT/pr.json'))['base_sha'])" 2>/dev/null)
-if [ -n "$WORKSPACE" ] && [ -n "$BASE_SHA" ] && git -C "$WORKSPACE" cat-file -e "$BASE_SHA^{commit}" 2>/dev/null && git -C "$WORKSPACE" merge-base "$BASE_SHA" HEAD >/dev/null 2>&1; then
+HEAD_SHA=$(python -c "import json; print(json.load(open('$CONTEXT/pr.json'))['head_sha'])" 2>/dev/null)
+if [ -n "$WORKSPACE" ] && [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] && git -C "$WORKSPACE" cat-file -e "$BASE_SHA^{commit}" 2>/dev/null && git -C "$WORKSPACE" cat-file -e "$HEAD_SHA^{commit}" 2>/dev/null && git -C "$WORKSPACE" merge-base "$BASE_SHA" "$HEAD_SHA" >/dev/null 2>&1; then
   echo "  PASS: Git 工作树包含 base/head 与 merge-base 历史"
   PASS=$((PASS+1))
 else
