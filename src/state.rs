@@ -555,12 +555,14 @@ pub fn importance_props(row: Option<&Value>, lang: &str) -> ImportanceProps {
                 label: tr(lang, label_key).to_string(),
                 points: factor["points"].as_i64().unwrap_or(0) as i32,
                 max_points: factor["max_points"].as_u64().unwrap_or(0) as u32,
-                evidence: factor["evidence"]
-                    .as_str()
-                    .unwrap_or("")
-                    .strip_prefix("K3: ")
-                    .map(|evidence| format!("智能校准: {evidence}"))
-                    .unwrap_or_else(|| factor["evidence"].as_str().unwrap_or("").to_string()),
+                evidence: {
+                    let evidence = factor["evidence"].as_str().unwrap_or("");
+                    evidence
+                        .strip_prefix("智能校准: ")
+                        .or_else(|| evidence.strip_prefix("K3: "))
+                        .unwrap_or(evidence)
+                        .to_string()
+                },
             }
         })
         .collect();
@@ -1471,7 +1473,7 @@ mod tests {
         assert_eq!(props.score, Some(0.0));
         assert_eq!(props.factors.len(), 3);
         assert_eq!(props.factors[0].label, "缺陷严重度");
-        assert_eq!(props.factors[0].evidence, "智能校准: calibrated");
+        assert_eq!(props.factors[0].evidence, "calibrated");
         assert_eq!(props.factors[1].label, "社区关注");
         assert_eq!(props.factors[2].label, "惩罚");
         assert_eq!(props.factors[2].points, -5);

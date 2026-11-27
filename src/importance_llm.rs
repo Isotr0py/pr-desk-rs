@@ -89,7 +89,7 @@ fn parse_response(
         }
         let factor = score.factors.iter_mut().find(|factor| factor.key == *key)?;
         factor.points = points;
-        factor.evidence = format!("智能校准: {rationale} | Rule evidence: {}", factor.evidence);
+        factor.evidence = format!("{rationale} | Rule evidence: {}", factor.evidence);
     }
     score.raw_score = score
         .factors
@@ -183,7 +183,7 @@ mod tests {
         assert_eq!(score.factors.len(), 12);
         assert_eq!(score.raw_score, 43);
         assert_eq!(score.score, 4.3);
-        assert!(score.factors[0].evidence.contains("智能校准:"));
+        assert!(score.factors[0].evidence.starts_with("severity 的证据理由"));
         assert!(score.factors[0].evidence.contains("Rule evidence:"));
         assert_eq!(score.input_hash, candidate.score.input_hash);
     }
