@@ -533,6 +533,20 @@ fn importance_group_color(group: &str, dark: bool) -> Color32 {
     }
 }
 
+fn importance_rule_evidence_tooltip(ui: &mut Ui, importance: &ImportanceProps, group: &str) {
+    ui.set_max_width(420.0);
+    for factor in importance
+        .factors
+        .iter()
+        .filter(|factor| factor.group == group)
+    {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(format!("Rule evidence: {}", factor.rule_evidence));
+            ui.weak(format!("{:+.1}", factor.points as f32 / 10.0));
+        });
+    }
+}
+
 fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
     let dark = ui.visuals().dark_mode;
     let groups: Vec<(&str, String, i32)> = IMPORTANCE_GROUPS
@@ -585,6 +599,12 @@ fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str)
         );
         ui.painter()
             .rect_filled(segment, 0.0, importance_group_color(group, dark));
+        ui.interact(
+            segment,
+            egui::Id::unique(("importance-summary-group", *group)),
+            egui::Sense::hover(),
+        )
+        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, group));
         left += width;
     }
     if penalty > 0 {
@@ -606,6 +626,12 @@ fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str)
             );
             x += 6.0;
         }
+        ui.interact(
+            segment,
+            egui::Id::unique("importance-summary-penalty"),
+            egui::Sense::hover(),
+        )
+        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, "penalty"));
     }
     ui.add_space(2.0);
     ui.horizontal_wrapped(|ui| {
@@ -697,15 +723,7 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
             egui::Id::unique(("importance-group", *group)),
             egui::Sense::hover(),
         )
-        .on_hover_ui_at_pointer(|ui| {
-            ui.set_max_width(420.0);
-            for factor in &factors {
-                ui.horizontal_wrapped(|ui| {
-                    ui.weak(format!("Rule evidence: {}", factor.rule_evidence));
-                    ui.weak(format!("{:+.1}", factor.points as f32 / 10.0));
-                });
-            }
-        });
+        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, group));
         for factor in factors {
             ui.weak(&factor.evidence);
         }
