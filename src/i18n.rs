@@ -289,6 +289,7 @@ const ZH: &[(&str, &str)] = &[
         "质量分项（可读性 20% · 正确性 40% · 测试 20% · 安全 20%）",
     ),
     ("importance_title", "重要性"),
+    ("importance_running", "正在校准 PR 重要性…"),
     ("importance_subtitle", "仓库影响与评审顺序，独立于代码质量"),
     ("importance_pending", "重要性待计算（刷新 GitHub 后生成）"),
     ("importance_factor_count", "{0} 个因子"),
@@ -845,6 +846,7 @@ const EN: &[(&str, &str)] = &[
         "Quality dimensions (readability 20% · correctness 40% · tests 20% · security 20%)",
     ),
     ("importance_title", "Importance"),
+    ("importance_running", "Calibrating PR importance…"),
     (
         "importance_subtitle",
         "Repository impact and review order, independent of code quality",

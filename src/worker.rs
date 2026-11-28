@@ -515,7 +515,21 @@ async fn fetch_inbox_more(gh: &github::GitHub, app: &Arc<Mutex<App>>, msg_tx: &m
 
 // ── 评审任务 ──
 
-/// 单个预评审任务体：评分 + OCR 行级评论两段式流程，结果入库并回送消息。
+async fn refine_importance_for_pr(
+    llm: &LlmSettings,
+    gh: &github::GitHub,
+    repo: &str,
+    number: i64,
+) -> Option<pr_desk_rs::importance::ImportanceScore> {
+    let key = (repo.to_string(), number);
+    let mut candidates = gh.fetch_importance_scores(&[key.clone()]).await.ok()?;
+    let candidate = candidates.remove(&key)?;
+    pr_desk_rs::importance_llm::refine_importance(llm, &candidate)
+        .await
+        .ok()
+}
+
+/// 单个预评审任务体：质量评分 + 重要性校准 + OCR 行级评论，结果入库并回送消息。
 /// 由 Cmd::RunReview 臂在并发槽位内 tokio::spawn 调用（GitHub 客户端每任务自建）。
 async fn run_review_task(
     cfg: &Config,
@@ -565,6 +579,16 @@ async fn run_review_task(
     .await
     {
         Ok(mut v) => {
+            progress(tr(lang, "importance_running").into());
+            if let Some(score) = refine_importance_for_pr(llm, g, repo, number).await {
+                store_importance_scores(
+                    app,
+                    profile,
+                    &std::collections::HashMap::from([((repo.to_string(), number), score)]),
+                );
+            } else {
+                tracing::warn!("PR 重要性校准失败 {repo} #{number}，保留后续刷新重试");
+            }
             // 第二段：OCR 行级评论（评分已拿到，OCR 失败不拖垮整单）
             match g.fetch_pr_meta(repo, number).await {
                 Ok(meta) => {
@@ -3081,9 +3105,7 @@ mod tests {
             Config::default(),
             Db::open_memory().unwrap(),
         )));
-        assert!(
-            import_assigned_prs(&app, &[assigned_pr(1, "wrong profile")], "default").is_none()
-        );
+        assert!(import_assigned_prs(&app, &[assigned_pr(1, "wrong profile")], "default").is_none());
         assert!(app.lock_recover().db.list_pr_keys().unwrap().is_empty());
     }
 
