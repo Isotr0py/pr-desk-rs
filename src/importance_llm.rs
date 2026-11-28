@@ -92,6 +92,11 @@ fn parse_response(
             return None;
         }
         let factor = score.factors.iter_mut().find(|factor| factor.key == *key)?;
+        factor.max_points = if *max > 0 {
+            *max as u32
+        } else {
+            min.unsigned_abs() as u32
+        };
         factor.points = points;
         factor.evidence = format!("{rationale} | Rule evidence: {}", factor.evidence);
     }
@@ -185,6 +190,7 @@ mod tests {
         let score = parse_response(&candidate, &valid_response(), "k3-test").unwrap();
         assert_eq!(score.method, "llm:k3-test");
         assert_eq!(score.factors.len(), 14);
+        assert_eq!(score.factors[0].max_points, 50);
         assert_eq!(score.raw_score, 58);
         assert_eq!(score.score, 5.8);
         assert!(score.factors[0].evidence.starts_with("severity 的证据理由"));

@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-pub const SCORING_VERSION: &str = "2026-11-28.2";
+pub const SCORING_VERSION: &str = "2026-11-28.3";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ImportanceFactor {
@@ -298,7 +298,7 @@ fn severity_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
         "how_bad",
         "severity",
         candidate.points as i32,
-        30,
+        50,
         candidate.evidence,
     )
 }
@@ -977,6 +977,7 @@ mod tests {
             vec![issue(7, "Incorrect results", &["wrong-output"], 0, 0)],
         ));
         assert_eq!(points(&score, "severity"), 50);
+        assert_eq!(score.factors[0].max_points, 50);
         assert!(score.factors[0].evidence.contains("wrong-output"));
     }
 
