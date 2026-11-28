@@ -687,15 +687,15 @@ pub struct App {
     pub status_msg_at: Option<std::time::Instant>, // 临时消息写入时刻（egui 侧按 6s 到期清除，替代 Slint Timer）
     pub gh_refreshing: bool,                       // GitHub 刷新在途（顶栏转圈 + 连点去重）
     pub sync_inflight: bool,                       // 同步在途（顶栏转圈 + 连点/定时去重）
-    pub assigned_sync_inflight: bool,              // Assigned PR 搜索/入库在途（顶栏转圈 + 连点去重）
-    pub inbox: Vec<Value>,                         // 最近一批通知行（未过滤；repo 下拉由此去重）
-    pub inbox_view: Vec<Value>, // 仓库过滤后的通知行（inbox_activated 按下标取 thread id）
-    pub inbox_filter: String,   // Inbox 仓库过滤（"" = 全部）
-    pub inbox_all: bool,        // 通知拉取范围：true = 含已读（&all=true），false = 只看未读
-    pub inbox_page: u32,        // 已加载到的页码（每页 50 条；「加载更多」追加下一页）
-    pub inbox_has_more: bool,   // 是否还有下一页可加载
-    pub inbox_loading_more: bool, // 「加载更多」进行中（防重入）
-    pub inbox_fetching: bool,   // 通知拉取在飞（fetch_inbox 在飞去重：并发触发合并为一次+补跑）
+    pub assigned_sync_inflight: bool, // Assigned PR 搜索/入库在途（顶栏转圈 + 连点去重）
+    pub inbox: Vec<Value>,            // 最近一批通知行（未过滤；repo 下拉由此去重）
+    pub inbox_view: Vec<Value>,       // 仓库过滤后的通知行（inbox_activated 按下标取 thread id）
+    pub inbox_filter: String,         // Inbox 仓库过滤（"" = 全部）
+    pub inbox_all: bool,              // 通知拉取范围：true = 含已读（&all=true），false = 只看未读
+    pub inbox_page: u32,              // 已加载到的页码（每页 50 条；「加载更多」追加下一页）
+    pub inbox_has_more: bool,         // 是否还有下一页可加载
+    pub inbox_loading_more: bool,     // 「加载更多」进行中（防重入）
+    pub inbox_fetching: bool, // 通知拉取在飞（fetch_inbox 在飞去重：并发触发合并为一次+补跑）
     pub inbox_fetch_again: bool, // 在飞期间又来拉取需求：结束后补跑一次
     pub inbox_detail: Option<(String, i64, String, String)>, // 预览面板当前行（repo, number, kind, url）
     pub inbox_added: bool, // 预览面板当前行「已加入」标记（InboxRows 重发时重算）
@@ -1496,6 +1496,14 @@ mod tests {
         assert_eq!(props.factors[2].evidence, "Model rationale");
         assert_eq!(props.factors[2].rule_evidence, "raw evidence");
         assert_eq!(props.factors[2].points, -5);
+        assert_eq!(
+            props
+                .factors
+                .iter()
+                .map(|factor| factor.max_points)
+                .collect::<Vec<_>>(),
+            [50, 30, 15]
+        );
         assert_eq!(props.version, "v1");
         let english = importance_props(Some(&row), "en");
         assert_eq!(english.factors[0].label, "How bad");

@@ -6,7 +6,115 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-pub const SCORING_VERSION: &str = "2026-11-28.3";
+pub const SCORING_VERSION: &str = "2026-11-28.4";
+pub const MIN_RAW_SCORE: i32 = 0;
+pub const MAX_RAW_SCORE: i32 = 100;
+pub const SCORE_SCALE: f64 = 10.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FactorSpec {
+    pub group: &'static str,
+    pub key: &'static str,
+    pub min_points: i32,
+    pub max_points: i32,
+}
+
+impl FactorSpec {
+    pub const fn display_max_points(&self) -> u32 {
+        if self.max_points > 0 {
+            self.max_points as u32
+        } else {
+            self.min_points.unsigned_abs()
+        }
+    }
+}
+
+pub const FACTOR_SPECS: &[FactorSpec] = &[
+    FactorSpec {
+        group: "how_bad",
+        key: "severity",
+        min_points: 0,
+        max_points: 50,
+    },
+    FactorSpec {
+        group: "who_it_hits",
+        key: "production_surface",
+        min_points: 0,
+        max_points: 15,
+    },
+    FactorSpec {
+        group: "who_it_hits",
+        key: "model_popularity",
+        min_points: 0,
+        max_points: 6,
+    },
+    FactorSpec {
+        group: "who_it_hits",
+        key: "gpu_tier",
+        min_points: 0,
+        max_points: 5,
+    },
+    FactorSpec {
+        group: "release",
+        key: "release_urgency",
+        min_points: 0,
+        max_points: 10,
+    },
+    FactorSpec {
+        group: "evidence",
+        key: "reproduction",
+        min_points: 0,
+        max_points: 6,
+    },
+    FactorSpec {
+        group: "evidence",
+        key: "diagnostics",
+        min_points: 0,
+        max_points: 4,
+    },
+    FactorSpec {
+        group: "community",
+        key: "comments",
+        min_points: 0,
+        max_points: 6,
+    },
+    FactorSpec {
+        group: "community",
+        key: "reactions",
+        min_points: 0,
+        max_points: 4,
+    },
+    FactorSpec {
+        group: "pr_signals",
+        key: "linked_issue",
+        min_points: 0,
+        max_points: 10,
+    },
+    FactorSpec {
+        group: "pr_signals",
+        key: "includes_tests",
+        min_points: 0,
+        max_points: 5,
+    },
+    FactorSpec {
+        group: "pr_signals",
+        key: "focused_change",
+        min_points: 0,
+        max_points: 5,
+    },
+    FactorSpec {
+        group: "pr_signals",
+        key: "production_change",
+        min_points: 0,
+        max_points: 5,
+    },
+    FactorSpec {
+        group: "penalty",
+        key: "change_penalties",
+        min_points: -15,
+        max_points: 0,
+    },
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ImportanceFactor {
@@ -33,6 +141,14 @@ pub struct ImportanceCandidate {
     pub input: Value,
 }
 
+impl ImportanceCandidate {
+    pub fn from_pr(pr: &Value) -> Self {
+        let input = importance_input(pr);
+        let score = score_canonical_input(&input);
+        Self { score, input }
+    }
+}
+
 pub fn importance_input(pr: &Value) -> Value {
     let mut input = pr.clone();
     if let Some(body) = input["body"].as_str() {
@@ -50,27 +166,81 @@ pub fn importance_input(pr: &Value) -> Value {
     input
 }
 
-pub fn importance_input_hash(pr: &Value) -> String {
+fn canonical_input_hash(input: &Value) -> String {
     let input = json!({
         "scoring_version": SCORING_VERSION,
-        "input": importance_input(pr),
+        "input": input,
     });
     hex::encode(Sha256::digest(input.to_string().as_bytes()))
 }
 
-fn factor(
-    group: &'static str,
-    key: &'static str,
-    points: i32,
-    max_points: u32,
-    evidence: impl Into<String>,
-) -> ImportanceFactor {
+pub fn importance_input_hash(pr: &Value) -> String {
+    canonical_input_hash(&importance_input(pr))
+}
+
+fn factor_spec(key: &str) -> &'static FactorSpec {
+    FACTOR_SPECS
+        .iter()
+        .find(|spec| spec.key == key)
+        .unwrap_or_else(|| panic!("unknown importance factor: {key}"))
+}
+
+fn factor(key: &'static str, points: i32, evidence: impl Into<String>) -> ImportanceFactor {
+    let spec = factor_spec(key);
+    assert!(
+        (spec.min_points..=spec.max_points).contains(&points),
+        "importance factor {key} points {points} outside {}..={}",
+        spec.min_points,
+        spec.max_points
+    );
     ImportanceFactor {
-        group,
-        key,
+        group: spec.group,
+        key: spec.key,
         points,
-        max_points,
+        max_points: spec.display_max_points(),
         evidence: evidence.into(),
+    }
+}
+
+pub fn finalize_score(
+    factors: Vec<ImportanceFactor>,
+    method: impl Into<String>,
+    input_hash: impl Into<String>,
+) -> ImportanceScore {
+    assert_eq!(
+        factors.len(),
+        FACTOR_SPECS.len(),
+        "importance score must contain every factor"
+    );
+    for (factor, spec) in factors.iter().zip(FACTOR_SPECS) {
+        assert_eq!(factor.key, spec.key, "importance factors are out of order");
+        assert_eq!(factor.group, spec.group, "importance factor group mismatch");
+        assert_eq!(
+            factor.max_points,
+            spec.display_max_points(),
+            "importance factor limit mismatch"
+        );
+        assert!(
+            (spec.min_points..=spec.max_points).contains(&factor.points),
+            "importance factor {} points {} outside {}..={}",
+            factor.key,
+            factor.points,
+            spec.min_points,
+            spec.max_points
+        );
+    }
+    let raw_score = factors
+        .iter()
+        .map(|factor| factor.points)
+        .sum::<i32>()
+        .clamp(MIN_RAW_SCORE, MAX_RAW_SCORE) as u32;
+    ImportanceScore {
+        score: raw_score as f64 / SCORE_SCALE,
+        raw_score,
+        scoring_version: SCORING_VERSION,
+        factors,
+        method: method.into(),
+        input_hash: input_hash.into(),
     }
 }
 
@@ -196,7 +366,7 @@ fn severity_candidate(title: &str, labels: &[String], source: &str) -> Option<Ca
     let title = title.to_ascii_lowercase();
     let rules: &[(u32, &[&str], &[&str], &[&str])] = &[
         (
-            50,
+            factor_spec("severity").max_points as u32,
             &[
                 "security",
                 "vulnerability",
@@ -294,13 +464,7 @@ fn severity_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
         points: 0,
         evidence: "No severity signal in PR or linked issues".into(),
     });
-    factor(
-        "how_bad",
-        "severity",
-        candidate.points as i32,
-        50,
-        candidate.evidence,
-    )
+    factor("severity", candidate.points as i32, candidate.evidence)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -409,22 +573,10 @@ fn file_summary(pr: &Value) -> FileSummary {
 
 fn surface_factor(summary: &FileSummary) -> ImportanceFactor {
     if !summary.files_present {
-        return factor(
-            "who_it_hits",
-            "production_surface",
-            0,
-            15,
-            "File details unavailable",
-        );
+        return factor("production_surface", 0, "File details unavailable");
     }
     if summary.production_files == 0 {
-        return factor(
-            "who_it_hits",
-            "production_surface",
-            2,
-            15,
-            "No production code changed",
-        );
+        return factor("production_surface", 2, "No production code changed");
     }
     let points = match summary.areas.len() {
         0 | 1 => 4,
@@ -440,10 +592,8 @@ fn surface_factor(summary: &FileSummary) -> ImportanceFactor {
         .collect::<Vec<_>>()
         .join(", ");
     factor(
-        "who_it_hits",
         "production_surface",
         points,
-        15,
         format!(
             "{} production files across {} areas: {areas}",
             summary.production_files,
@@ -515,7 +665,7 @@ fn model_popularity_factor(pr: &Value) -> ImportanceFactor {
     } else {
         (0, "No named model evidence".to_string())
     };
-    factor("who_it_hits", "model_popularity", points, 6, evidence)
+    factor("model_popularity", points, evidence)
 }
 
 fn gpu_tier_factor(pr: &Value) -> ImportanceFactor {
@@ -547,7 +697,7 @@ fn gpu_tier_factor(pr: &Value) -> ImportanceFactor {
     } else {
         (0, "No named GPU or hardware evidence".to_string())
     };
-    factor("who_it_hits", "gpu_tier", points, 5, evidence)
+    factor("gpu_tier", points, evidence)
 }
 
 fn release_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
@@ -626,20 +776,16 @@ fn release_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
         evidence: "No release signal".into(),
     });
     factor(
-        "release",
         "release_urgency",
         candidate.points as i32,
-        10,
         candidate.evidence,
     )
 }
 
 fn issue_evidence_factor(issues: &[Value], reproduction: bool) -> ImportanceFactor {
-    let (group, key, max_points, needles): (&str, &str, i32, &[&str]) = if reproduction {
+    let (key, needles): (&str, &[&str]) = if reproduction {
         (
-            "evidence",
             "reproduction",
-            6,
             &[
                 "steps to reproduce",
                 "reproduction steps",
@@ -651,9 +797,7 @@ fn issue_evidence_factor(issues: &[Value], reproduction: bool) -> ImportanceFact
         )
     } else {
         (
-            "evidence",
             "diagnostics",
-            4,
             &[
                 "expected behavior",
                 "actual behavior",
@@ -675,10 +819,8 @@ fn issue_evidence_factor(issues: &[Value], reproduction: bool) -> ImportanceFact
         let body = issue["body"].as_str().unwrap_or("").to_ascii_lowercase();
         if let Some(needle) = needles.iter().find(|needle| body.contains(**needle)) {
             return factor(
-                group,
                 key,
-                max_points,
-                max_points as u32,
+                factor_spec(key).max_points,
                 format!(
                     "issue #{} contains {needle}",
                     issue["number"].as_i64().unwrap_or(0)
@@ -693,7 +835,7 @@ fn issue_evidence_factor(issues: &[Value], reproduction: bool) -> ImportanceFact
     } else {
         "No expected/actual behavior or diagnostic logs found".to_string()
     };
-    factor(group, key, 0, max_points as u32, evidence)
+    factor(key, 0, evidence)
 }
 
 fn comments_factor(issues: &[Value]) -> ImportanceFactor {
@@ -701,7 +843,7 @@ fn comments_factor(issues: &[Value]) -> ImportanceFactor {
         .iter()
         .max_by_key(|issue| issue["comments"]["totalCount"].as_u64().unwrap_or(0));
     let Some(issue) = best else {
-        return factor("community", "comments", 0, 6, "No linked issue");
+        return factor("comments", 0, "No linked issue");
     };
     let comments = issue["comments"]["totalCount"].as_u64().unwrap_or(0);
     let points = match comments {
@@ -711,10 +853,8 @@ fn comments_factor(issues: &[Value]) -> ImportanceFactor {
         _ => 6,
     };
     factor(
-        "community",
         "comments",
         points,
-        6,
         format!(
             "issue #{}: {comments} comments",
             issue["number"].as_i64().unwrap_or(0)
@@ -727,7 +867,7 @@ fn reactions_factor(issues: &[Value]) -> ImportanceFactor {
         .iter()
         .max_by_key(|issue| issue["reactions"]["totalCount"].as_u64().unwrap_or(0));
     let Some(issue) = best else {
-        return factor("community", "reactions", 0, 4, "No linked issue");
+        return factor("reactions", 0, "No linked issue");
     };
     let reactions = issue["reactions"]["totalCount"].as_u64().unwrap_or(0);
     let points = match reactions {
@@ -738,10 +878,8 @@ fn reactions_factor(issues: &[Value]) -> ImportanceFactor {
         _ => 4,
     };
     factor(
-        "community",
         "reactions",
         points,
-        4,
         format!(
             "issue #{}: {reactions} reactions",
             issue["number"].as_i64().unwrap_or(0)
@@ -777,21 +915,13 @@ fn linked_issue_factor(issues: &[Value], tracking_issues: &[Value]) -> Importanc
     } else {
         "No closing issue or roadmap reference".to_string()
     };
-    factor(
-        "pr_signals",
-        "linked_issue",
-        if has_context { 10 } else { 0 },
-        10,
-        evidence,
-    )
+    factor("linked_issue", if has_context { 10 } else { 0 }, evidence)
 }
 
 fn tests_factor(summary: &FileSummary) -> ImportanceFactor {
     factor(
-        "pr_signals",
         "includes_tests",
         if summary.test_files > 0 { 5 } else { 0 },
-        5,
         if summary.test_files > 0 {
             format!(
                 "Includes {} test files (validation maturity)",
@@ -814,10 +944,8 @@ fn focused_factor(summary: &FileSummary) -> ImportanceFactor {
         0
     };
     factor(
-        "pr_signals",
         "focused_change",
         points,
-        5,
         if summary.size_present {
             format!(
                 "{} changed files, +/− {} lines total",
@@ -831,10 +959,8 @@ fn focused_factor(summary: &FileSummary) -> ImportanceFactor {
 
 fn production_factor(summary: &FileSummary) -> ImportanceFactor {
     factor(
-        "pr_signals",
         "production_change",
         if summary.production_files > 0 { 5 } else { 0 },
-        5,
         if summary.production_files > 0 {
             format!("Touches {} production files", summary.production_files)
         } else {
@@ -867,10 +993,8 @@ fn penalties_factor(pr: &Value, summary: &FileSummary) -> ImportanceFactor {
         reasons.push("draft PR (-5)".to_string());
     }
     factor(
-        "penalty",
         "change_penalties",
         -((large + draft) as i32),
-        15,
         if reasons.is_empty() {
             "No large-change or draft penalty".to_string()
         } else {
@@ -879,22 +1003,22 @@ fn penalties_factor(pr: &Value, summary: &FileSummary) -> ImportanceFactor {
     )
 }
 
-pub fn score_pr(pr: &Value) -> ImportanceScore {
-    let issues = pr["closingIssuesReferences"]["nodes"]
+fn score_canonical_input(input: &Value) -> ImportanceScore {
+    let issues = input["closingIssuesReferences"]["nodes"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let tracking_issues = pr["trackingIssuesReferences"]["nodes"]
+    let tracking_issues = input["trackingIssuesReferences"]["nodes"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let files = file_summary(pr);
+    let files = file_summary(input);
     let factors = vec![
-        severity_factor(pr, &issues),
+        severity_factor(input, &issues),
         surface_factor(&files),
-        model_popularity_factor(pr),
-        gpu_tier_factor(pr),
-        release_factor(pr, &issues),
+        model_popularity_factor(input),
+        gpu_tier_factor(input),
+        release_factor(input, &issues),
         issue_evidence_factor(&issues, true),
         issue_evidence_factor(&issues, false),
         comments_factor(&issues),
@@ -903,21 +1027,13 @@ pub fn score_pr(pr: &Value) -> ImportanceScore {
         tests_factor(&files),
         focused_factor(&files),
         production_factor(&files),
-        penalties_factor(pr, &files),
+        penalties_factor(input, &files),
     ];
-    let raw_score = factors
-        .iter()
-        .map(|factor| factor.points)
-        .sum::<i32>()
-        .clamp(0, 100) as u32;
-    ImportanceScore {
-        score: raw_score as f64 / 10.0,
-        raw_score,
-        scoring_version: SCORING_VERSION,
-        factors,
-        method: "rules".into(),
-        input_hash: importance_input_hash(pr),
-    }
+    finalize_score(factors, "rules", canonical_input_hash(input))
+}
+
+pub fn score_pr(pr: &Value) -> ImportanceScore {
+    ImportanceCandidate::from_pr(pr).score
 }
 
 #[cfg(test)]
@@ -967,6 +1083,126 @@ mod tests {
             .find(|factor| factor.key == key)
             .map(|factor| factor.points)
             .unwrap()
+    }
+
+    #[test]
+    fn factor_specs_match_rule_metadata_and_order() {
+        let expected = vec![
+            ("how_bad", "severity", 0, 50),
+            ("who_it_hits", "production_surface", 0, 15),
+            ("who_it_hits", "model_popularity", 0, 6),
+            ("who_it_hits", "gpu_tier", 0, 5),
+            ("release", "release_urgency", 0, 10),
+            ("evidence", "reproduction", 0, 6),
+            ("evidence", "diagnostics", 0, 4),
+            ("community", "comments", 0, 6),
+            ("community", "reactions", 0, 4),
+            ("pr_signals", "linked_issue", 0, 10),
+            ("pr_signals", "includes_tests", 0, 5),
+            ("pr_signals", "focused_change", 0, 5),
+            ("pr_signals", "production_change", 0, 5),
+            ("penalty", "change_penalties", -15, 0),
+        ];
+        let actual = FACTOR_SPECS
+            .iter()
+            .map(|spec| (spec.group, spec.key, spec.min_points, spec.max_points))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+
+        let score = score_pr(&json!({}));
+        assert_eq!(score.factors.len(), FACTOR_SPECS.len());
+        for (factor, spec) in score.factors.iter().zip(FACTOR_SPECS) {
+            assert_eq!(factor.group, spec.group);
+            assert_eq!(factor.key, spec.key);
+            assert_eq!(factor.max_points, spec.display_max_points());
+        }
+    }
+
+    #[test]
+    fn finalize_score_clamps_only_after_summing_all_factors() {
+        fn at_limits(maximum: bool) -> Vec<ImportanceFactor> {
+            FACTOR_SPECS
+                .iter()
+                .map(|spec| {
+                    factor(
+                        spec.key,
+                        if maximum {
+                            spec.max_points
+                        } else {
+                            spec.min_points
+                        },
+                        "boundary",
+                    )
+                })
+                .collect()
+        }
+
+        let maximum = finalize_score(at_limits(true), "test", "maximum");
+        assert_eq!(
+            maximum
+                .factors
+                .iter()
+                .map(|factor| factor.points)
+                .sum::<i32>(),
+            131
+        );
+        assert_eq!(maximum.raw_score, MAX_RAW_SCORE as u32);
+        assert_eq!(maximum.score, MAX_RAW_SCORE as f64 / SCORE_SCALE);
+        assert_eq!(maximum.method, "test");
+        assert_eq!(maximum.input_hash, "maximum");
+
+        let minimum = finalize_score(at_limits(false), "test", "minimum");
+        assert_eq!(
+            minimum
+                .factors
+                .iter()
+                .map(|factor| factor.points)
+                .sum::<i32>(),
+            -15
+        );
+        assert_eq!(minimum.raw_score, MIN_RAW_SCORE as u32);
+        assert_eq!(minimum.score, MIN_RAW_SCORE as f64 / SCORE_SCALE);
+    }
+
+    #[test]
+    fn candidate_uses_one_canonical_input_at_clip_boundaries() {
+        let pr_body = "界".repeat(6_001);
+        let issue_body = "🦀".repeat(3_001);
+        let mut closing = issue(1, "Bug", &[], 0, 0);
+        closing["body"] = json!(issue_body);
+        let mut tracking = issue(2, "Roadmap", &[], 0, 0);
+        tracking["body"] = json!(issue_body);
+        let mut input = pr("Fix bug", &[], vec![closing]);
+        input["body"] = json!(pr_body);
+        input["trackingIssuesReferences"] = json!({"nodes": [tracking]});
+
+        let candidate = ImportanceCandidate::from_pr(&input);
+        let expected_pr_body = "界".repeat(6_000);
+        let expected_issue_body = "🦀".repeat(3_000);
+        assert_eq!(
+            candidate.input["body"].as_str(),
+            Some(expected_pr_body.as_str())
+        );
+        for field in ["closingIssuesReferences", "trackingIssuesReferences"] {
+            assert_eq!(
+                candidate.input[field]["nodes"][0]["body"].as_str(),
+                Some(expected_issue_body.as_str())
+            );
+        }
+        assert_eq!(
+            candidate.score.input_hash,
+            canonical_input_hash(&candidate.input)
+        );
+        assert_eq!(candidate.score.input_hash, importance_input_hash(&input));
+        assert_eq!(candidate.score, score_pr(&candidate.input));
+
+        let exact_body = "a".repeat(6_000);
+        let mut exact = pr("Unclassified", &[], vec![]);
+        exact["body"] = json!(exact_body.clone());
+        assert_eq!(
+            ImportanceCandidate::from_pr(&exact).input["body"].as_str(),
+            Some(exact_body.as_str())
+        );
     }
 
     #[test]
@@ -1085,6 +1321,7 @@ mod tests {
         let score = score_pr(&input);
         assert_eq!(points(&score, "focused_change"), 0);
         assert_eq!(points(&score, "change_penalties"), -15);
+        assert_eq!(score.factors.last().unwrap().max_points, 15);
         assert!(score.raw_score <= 100);
 
         let mut negative = pr("Unclassified", &[], vec![]);

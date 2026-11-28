@@ -5,25 +5,8 @@ use std::collections::BTreeMap;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::importance::{ImportanceCandidate, ImportanceScore};
+use crate::importance::{FACTOR_SPECS, ImportanceCandidate, ImportanceScore, finalize_score};
 use crate::reviewer::LlmSettings;
-
-const FACTOR_LIMITS: &[(&str, i32, i32)] = &[
-    ("severity", 0, 50),
-    ("production_surface", 0, 15),
-    ("model_popularity", 0, 6),
-    ("gpu_tier", 0, 5),
-    ("release_urgency", 0, 10),
-    ("reproduction", 0, 6),
-    ("diagnostics", 0, 4),
-    ("comments", 0, 6),
-    ("reactions", 0, 4),
-    ("linked_issue", 0, 10),
-    ("includes_tests", 0, 5),
-    ("focused_change", 0, 5),
-    ("production_change", 0, 5),
-    ("change_penalties", -15, 0),
-];
 
 const SYSTEM_PROMPT: &str = "你是资深开源仓库维护者，负责校准 PR 的重要性。\
 你只能使用输入中的 GitHub 证据和规则因子，不得虚构模型热度、用户规模、硬件影响或业务背景。\
@@ -36,19 +19,27 @@ authorAssociation 仅用于判断证据可信度，作者身份本身不得直�
 fn build_prompt(candidate: &ImportanceCandidate) -> String {
     let input = serde_json::to_string(&candidate.input).unwrap_or_else(|_| "{}".into());
     let baseline = serde_json::to_string(&candidate.score.factors).unwrap_or_else(|_| "[]".into());
+    let factor_specs = FACTOR_SPECS
+        .iter()
+        .map(|spec| format!("{}({}..{})", spec.key, spec.min_points, spec.max_points))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let example = FACTOR_SPECS
+        .first()
+        .expect("factor specs must not be empty");
     format!(
         "请校准这个 PR 的重要性因子。规则版本：{}。\n\n\
          GitHub 结构化输入（正文已裁剪）：\n{input}\n\n\
          规则基线因子（含上下限和证据）：\n{baseline}\n\n\
          输出 JSON 格式：\n\
-         {{\"factors\":[{{\"key\":\"severity\",\"points\":20,\"rationale\":\"中文理由\"}}]}}\n\
-         必须且只能包含以下 14 个 key，每个恰好一次：\n\
-         severity(0..50), production_surface(0..15), model_popularity(0..6), gpu_tier(0..5), \
-         release_urgency(0..10), reproduction(0..6), diagnostics(0..4), comments(0..6), \
-         reactions(0..4), linked_issue(0..10), includes_tests(0..5), focused_change(0..5), \
-         production_change(0..5), change_penalties(-15..0)。\n\
+         {{\"factors\":[{{\"key\":\"{}\",\"points\":{},\"rationale\":\"中文理由\"}}]}}\n\
+         必须且只能包含以下 {} 个 key，每个恰好一次：\n\
+         {factor_specs}。\n\
          每项 rationale 必须是有证据的中文短句；没有证据时明确写无证据。",
-        candidate.score.scoring_version
+        candidate.score.scoring_version,
+        example.key,
+        (example.min_points + example.max_points) / 2,
+        FACTOR_SPECS.len(),
     )
 }
 
@@ -80,35 +71,26 @@ fn parse_response(
             return None;
         }
     }
-    if assessed.len() != FACTOR_LIMITS.len() {
+    if assessed.len() != FACTOR_SPECS.len() {
         return None;
     }
 
-    let mut score = candidate.score.clone();
-    for (key, min, max) in FACTOR_LIMITS {
-        let (points, rationale) = assessed.get(*key)?;
+    let mut factors = candidate.score.factors.clone();
+    for spec in FACTOR_SPECS {
+        let (points, rationale) = assessed.get(spec.key)?;
         let points = i32::try_from(*points).ok()?;
-        if !(*min..=*max).contains(&points) {
+        if !(spec.min_points..=spec.max_points).contains(&points) {
             return None;
         }
-        let factor = score.factors.iter_mut().find(|factor| factor.key == *key)?;
-        factor.max_points = if *max > 0 {
-            *max as u32
-        } else {
-            min.unsigned_abs() as u32
-        };
+        let factor = factors.iter_mut().find(|factor| factor.key == spec.key)?;
         factor.points = points;
         factor.evidence = format!("{rationale} | Rule evidence: {}", factor.evidence);
     }
-    score.raw_score = score
-        .factors
-        .iter()
-        .map(|factor| factor.points)
-        .sum::<i32>()
-        .clamp(0, 100) as u32;
-    score.score = score.raw_score as f64 / 10.0;
-    score.method = format!("llm:{model}");
-    Some(score)
+    Some(finalize_score(
+        factors,
+        format!("llm:{model}"),
+        candidate.score.input_hash.clone(),
+    ))
 }
 
 pub async fn refine_importance(
@@ -135,12 +117,13 @@ pub async fn refine_importance(
             return Ok(score);
         }
     }
-    anyhow::bail!("LLM 重要性校准结果缺少有效 14 因子")
+    anyhow::bail!("LLM 重要性校准结果缺少有效 {} 因子", FACTOR_SPECS.len())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::importance::FactorSpec;
     use serde_json::json;
 
     fn candidate() -> ImportanceCandidate {
@@ -164,42 +147,91 @@ mod tests {
                 "reactions": {"totalCount": 1}
             }]}
         });
-        ImportanceCandidate {
-            score: crate::importance::score_pr(&pr),
-            input: crate::importance::importance_input(&pr),
-        }
+        ImportanceCandidate::from_pr(&pr)
     }
 
-    fn valid_response() -> String {
-        let factors: Vec<Value> = FACTOR_LIMITS
+    fn response_with_points(points: impl Fn(&FactorSpec) -> i32) -> String {
+        let factors: Vec<Value> = FACTOR_SPECS
             .iter()
-            .map(|(key, min, max)| {
+            .map(|spec| {
                 json!({
-                    "key": key,
-                    "points": if *key == "change_penalties" { -5 } else { (min + max) / 2 },
-                    "rationale": format!("{key} 的证据理由")
+                    "key": spec.key,
+                    "points": points(spec),
+                    "rationale": format!("{} 的证据理由", spec.key)
                 })
             })
             .collect();
         json!({"factors": factors}).to_string()
     }
 
+    fn valid_response() -> String {
+        response_with_points(|spec| (spec.min_points + spec.max_points) / 2)
+    }
+
     #[test]
     fn parses_calibrated_factors_and_recomputes_total() {
         let candidate = candidate();
         let score = parse_response(&candidate, &valid_response(), "k3-test").unwrap();
+        let expected = FACTOR_SPECS
+            .iter()
+            .map(|spec| (spec.min_points + spec.max_points) / 2)
+            .sum::<i32>()
+            .clamp(0, 100) as u32;
         assert_eq!(score.method, "llm:k3-test");
-        assert_eq!(score.factors.len(), 14);
-        assert_eq!(score.factors[0].max_points, 50);
-        assert_eq!(score.raw_score, 58);
-        assert_eq!(score.score, 5.8);
-        assert!(score.factors[0].evidence.starts_with("severity 的证据理由"));
-        assert!(score.factors[0].evidence.contains("Rule evidence:"));
+        assert_eq!(score.factors.len(), FACTOR_SPECS.len());
+        assert_eq!(score.raw_score, expected);
+        assert_eq!(score.score, expected as f64 / 10.0);
+        for (factor, baseline) in score.factors.iter().zip(&candidate.score.factors) {
+            assert_eq!(factor.group, baseline.group);
+            assert_eq!(factor.key, baseline.key);
+            assert_eq!(factor.max_points, baseline.max_points);
+            assert!(
+                factor
+                    .evidence
+                    .starts_with(&format!("{} 的证据理由", factor.key))
+            );
+            assert!(factor.evidence.contains("Rule evidence:"));
+        }
         assert_eq!(score.input_hash, candidate.score.input_hash);
     }
 
     #[test]
-    fn rejects_missing_duplicate_and_out_of_range_factors() {
+    fn accepts_and_enforces_every_spec_boundary() {
+        let candidate = candidate();
+        for spec in FACTOR_SPECS {
+            for points in [spec.min_points, spec.max_points] {
+                let response = response_with_points(|current| {
+                    if current.key == spec.key {
+                        points
+                    } else {
+                        current.min_points
+                    }
+                });
+                assert!(
+                    parse_response(&candidate, &response, "k3").is_some(),
+                    "{} should accept {points}",
+                    spec.key
+                );
+            }
+            for points in [spec.min_points - 1, spec.max_points + 1] {
+                let response = response_with_points(|current| {
+                    if current.key == spec.key {
+                        points
+                    } else {
+                        current.min_points
+                    }
+                });
+                assert!(
+                    parse_response(&candidate, &response, "k3").is_none(),
+                    "{} should reject {points}",
+                    spec.key
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_missing_duplicate_and_unknown_factors() {
         let candidate = candidate();
         let mut data: Value = serde_json::from_str(&valid_response()).unwrap();
         data["factors"].as_array_mut().unwrap().remove(0);
@@ -211,11 +243,7 @@ mod tests {
         assert!(parse_response(&candidate, &data.to_string(), "k3").is_none());
 
         let mut data: Value = serde_json::from_str(&valid_response()).unwrap();
-        data["factors"][0]["points"] = json!(51);
-        assert!(parse_response(&candidate, &data.to_string(), "k3").is_none());
-
-        let mut data: Value = serde_json::from_str(&valid_response()).unwrap();
-        data["factors"][13]["points"] = json!(1);
+        data["factors"][0]["key"] = json!("unknown_factor");
         assert!(parse_response(&candidate, &data.to_string(), "k3").is_none());
     }
 
@@ -223,12 +251,34 @@ mod tests {
     fn prompt_contains_capped_input_and_all_factor_limits() {
         let prompt = build_prompt(&candidate());
         assert!(prompt.contains("o/r"));
-        assert!(prompt.contains("severity(0..50)"));
-        assert!(prompt.contains("model_popularity(0..6)"));
-        assert!(prompt.contains("gpu_tier(0..5)"));
-        assert!(prompt.contains("change_penalties(-15..0)"));
+        assert!(prompt.contains(&format!("必须且只能包含以下 {} 个 key", FACTOR_SPECS.len())));
+        for spec in FACTOR_SPECS {
+            assert!(prompt.contains(&format!(
+                "{}({}..{})",
+                spec.key, spec.min_points, spec.max_points
+            )));
+        }
         assert!(prompt.contains("规则基线因子"));
         assert!(!prompt.contains("overall_score"));
+    }
+
+    #[test]
+    fn llm_total_matches_rules_for_unchanged_factor_points() {
+        let candidate = candidate();
+        let response = response_with_points(|spec| {
+            candidate
+                .score
+                .factors
+                .iter()
+                .find(|factor| factor.key == spec.key)
+                .unwrap()
+                .points
+        });
+        let score = parse_response(&candidate, &response, "k3-test").unwrap();
+        assert_eq!(score.raw_score, candidate.score.raw_score);
+        assert_eq!(score.score, candidate.score.score);
+        assert_eq!(score.scoring_version, candidate.score.scoring_version);
+        assert_eq!(score.input_hash, candidate.score.input_hash);
     }
 
     #[test]

@@ -394,9 +394,7 @@ impl GitHub {
             for (key, mut pr) in inputs {
                 pr["repo"] = serde_json::json!(key.0);
                 pr["number"] = serde_json::json!(key.1);
-                let input = crate::importance::importance_input(&pr);
-                let score = crate::importance::score_pr(&pr);
-                out.insert(key, crate::importance::ImportanceCandidate { score, input });
+                out.insert(key, crate::importance::ImportanceCandidate::from_pr(&pr));
             }
         }
         Ok(out)

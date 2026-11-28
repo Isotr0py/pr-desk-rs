@@ -547,9 +547,16 @@ fn importance_rule_evidence_tooltip(ui: &mut Ui, importance: &ImportanceProps, g
     }
 }
 
-fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
-    let dark = ui.visuals().dark_mode;
-    let groups: Vec<(&str, String, i32)> = IMPORTANCE_GROUPS
+struct ImportanceGroupView {
+    group: &'static str,
+    label: String,
+    points: i32,
+    max_points: u32,
+    fraction: f32,
+}
+
+fn importance_group_views(importance: &ImportanceProps, lang: &str) -> Vec<ImportanceGroupView> {
+    IMPORTANCE_GROUPS
         .iter()
         .map(|group| {
             let label = importance
@@ -574,43 +581,106 @@ fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str)
                 .iter()
                 .filter(|factor| factor.group == *group)
                 .map(|factor| factor.points)
-                .sum();
-            (*group, label, points)
+                .sum::<i32>();
+            let max_points = importance
+                .factors
+                .iter()
+                .filter(|factor| factor.group == *group)
+                .map(|factor| factor.max_points)
+                .sum::<u32>();
+            let fraction = if max_points == 0 {
+                0.0
+            } else {
+                (points as f32).abs() / max_points as f32
+            }
+            .clamp(0.0, 1.0);
+            ImportanceGroupView {
+                group,
+                label,
+                points,
+                max_points,
+                fraction,
+            }
         })
-        .collect();
+        .collect()
+}
+
+fn importance_group_score_label(group: &ImportanceGroupView) -> String {
+    format!(
+        "{:+.1}/{:.1}",
+        group.points as f32 / 10.0,
+        group.max_points as f32 / 10.0
+    )
+}
+
+fn importance_summary_widths(groups: &[ImportanceGroupView], track_width: f32) -> (Vec<f32>, f32) {
+    let positive_points = groups.iter().map(|group| group.points.max(0)).sum::<i32>();
     let penalty = groups
         .iter()
-        .map(|(_, _, points)| (-*points).max(0))
+        .map(|group| (-group.points).max(0))
         .sum::<i32>();
-    let units = 100 + penalty;
+    let units = positive_points.max(pr_desk_rs::importance::MAX_RAW_SCORE as i32) + penalty;
+    let widths = groups
+        .iter()
+        .map(|group| {
+            if group.points > 0 {
+                track_width * group.points as f32 / units as f32
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let penalty_width = track_width * penalty as f32 / units as f32;
+    (widths, penalty_width)
+}
+
+fn importance_score_note(raw_points: i32, lang: &str) -> Option<String> {
+    let key = if raw_points > pr_desk_rs::importance::MAX_RAW_SCORE as i32 {
+        "importance_score_capped"
+    } else if raw_points < 0 {
+        "importance_score_clamped"
+    } else {
+        return None;
+    };
+    let raw = format!("{:.1}", raw_points as f32 / 10.0);
+    Some(tr(lang, key).replacen("{0}", &raw, 1))
+}
+
+fn importance_summary_bar(
+    ui: &mut Ui,
+    importance: &ImportanceProps,
+    groups: &[ImportanceGroupView],
+    lang: &str,
+) {
+    let dark = ui.visuals().dark_mode;
     let (track, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
     ui.painter()
         .rect_filled(track, 3.0, ui.visuals().extreme_bg_color);
+    let (group_widths, penalty_width) = importance_summary_widths(groups, track.width());
     let mut left = track.left();
-    for (group, _, points) in &groups {
-        if *points <= 0 {
+    for (group, width) in groups.iter().zip(group_widths) {
+        if width <= 0.0 {
             continue;
         }
-        let width = track.width() * *points as f32 / units as f32;
         let segment = egui::Rect::from_min_size(
             egui::pos2(left, track.top()),
             egui::vec2(width, track.height()),
         );
         ui.painter()
-            .rect_filled(segment, 0.0, importance_group_color(group, dark));
+            .rect_filled(segment, 0.0, importance_group_color(group.group, dark));
         ui.interact(
             segment,
-            egui::Id::unique(("importance-summary-group", *group)),
+            egui::Id::unique(("importance-summary-group", group.group)),
             egui::Sense::hover(),
         )
-        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, group));
+        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, group.group));
         left += width;
     }
-    if penalty > 0 {
+    if penalty_width > 0.0 {
         let segment = egui::Rect::from_min_size(
             egui::pos2(left, track.top()),
-            egui::vec2(track.right() - left, track.height()),
+            egui::vec2(penalty_width, track.height()),
         );
         let painter = ui.painter().with_clip_rect(segment);
         painter.rect_filled(segment, 0.0, importance_group_color("penalty", dark));
@@ -635,17 +705,25 @@ fn importance_summary_bar(ui: &mut Ui, importance: &ImportanceProps, lang: &str)
     }
     ui.add_space(2.0);
     ui.horizontal_wrapped(|ui| {
-        for (group, label, points) in &groups {
+        for group in groups {
             ui.label(
                 RichText::new("●")
                     .size(10.0)
-                    .color(importance_group_color(group, dark)),
+                    .color(importance_group_color(group.group, dark)),
             );
-            ui.weak(format!("{label} {:+.1}", *points as f32 / 10.0));
+            ui.weak(format!(
+                "{} {:+.1}",
+                group.label,
+                group.points as f32 / 10.0
+            ));
             ui.add_space(8.0);
         }
         if let Some(score) = importance.score {
             ui.strong(format!("= {score:.1}"));
+        }
+        let raw_points = groups.iter().map(|group| group.points).sum::<i32>();
+        if let Some(note) = importance_score_note(raw_points, lang) {
+            ui.weak(note);
         }
     });
     ui.add_space(4.0);
@@ -679,51 +757,38 @@ fn importance_section(ui: &mut Ui, importance: &ImportanceProps, lang: &str) {
         ui.weak(tr(lang, "importance_pending"));
         return;
     };
-    importance_summary_bar(ui, importance, lang);
-    for group in IMPORTANCE_GROUPS {
+    let groups = importance_group_views(importance, lang);
+    importance_summary_bar(ui, importance, &groups, lang);
+    for group in &groups {
         let factors: Vec<&ImportanceFactorProps> = importance
             .factors
             .iter()
-            .filter(|factor| factor.group == *group)
+            .filter(|factor| factor.group == group.group)
             .collect();
         if factors.is_empty() {
             continue;
         }
-        let points: i32 = factors.iter().map(|factor| factor.points).sum();
-        let max_points = match *group {
-            "how_bad" => 30,
-            "release" => 10,
-            "who_it_hits" => 15,
-            "evidence" | "community" => 10,
-            "pr_signals" => 25,
-            _ => 15,
-        };
         ui.add_space(6.0);
         let row = ui.horizontal_wrapped(|ui| {
-            ui.monospace(&factors[0].label);
-            let frac = points.abs() as f32 / max_points as f32;
+            ui.monospace(&group.label);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(120.0, 8.0), egui::Sense::hover());
             ui.painter()
                 .rect_filled(rect, 4.0, ui.visuals().extreme_bg_color);
             let mut fill = rect;
-            fill.set_width(rect.width() * frac.clamp(0.0, 1.0));
+            fill.set_width(rect.width() * group.fraction);
             ui.painter().rect_filled(
                 fill,
                 4.0,
-                importance_group_color(group, ui.visuals().dark_mode),
+                importance_group_color(group.group, ui.visuals().dark_mode),
             );
-            ui.weak(format!(
-                "{:+.1}/{:.1}",
-                points as f32 / 10.0,
-                max_points as f32 / 10.0
-            ));
+            ui.weak(importance_group_score_label(group));
         });
         ui.interact(
             row.response.rect,
-            egui::Id::unique(("importance-group", *group)),
+            egui::Id::unique(("importance-group", group.group)),
             egui::Sense::hover(),
         )
-        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, group));
+        .on_hover_ui_at_pointer(|ui| importance_rule_evidence_tooltip(ui, importance, group.group));
         for factor in factors {
             ui.weak(&factor.evidence);
         }
@@ -1025,6 +1090,114 @@ mod tests {
                 assert!(colors[..index].iter().all(|other| other != color));
             }
         }
+    }
+
+    fn importance_factor(group: &str, points: i32, max_points: u32) -> ImportanceFactorProps {
+        ImportanceFactorProps {
+            group: group.to_string(),
+            label: group.to_string(),
+            points,
+            max_points,
+            ..Default::default()
+        }
+    }
+
+    fn importance_views(factors: Vec<ImportanceFactorProps>) -> Vec<ImportanceGroupView> {
+        importance_group_views(
+            &ImportanceProps {
+                factors,
+                ..Default::default()
+            },
+            "zh",
+        )
+    }
+
+    fn group_view<'a>(groups: &'a [ImportanceGroupView], name: &str) -> &'a ImportanceGroupView {
+        groups.iter().find(|group| group.group == name).unwrap()
+    }
+
+    #[test]
+    fn importance_group_views_sum_snapshot_points_and_limits() {
+        let groups = importance_views(vec![
+            importance_factor("how_bad", 50, 50),
+            importance_factor("who_it_hits", 10, 20),
+            importance_factor("who_it_hits", 6, 6),
+        ]);
+        let severity = group_view(&groups, "how_bad");
+        assert_eq!(severity.points, 50);
+        assert_eq!(severity.max_points, 50);
+        assert_eq!(severity.fraction, 1.0);
+        assert_eq!(importance_group_score_label(severity), "+5.0/5.0");
+
+        let reach = group_view(&groups, "who_it_hits");
+        assert_eq!(reach.points, 16);
+        assert_eq!(reach.max_points, 26);
+        assert!((reach.fraction - 16.0 / 26.0).abs() < f32::EPSILON);
+        assert_eq!(importance_group_score_label(reach), "+1.6/2.6");
+    }
+
+    #[test]
+    fn importance_group_views_keep_legacy_limits_and_handle_zero() {
+        let legacy = importance_views(vec![importance_factor("how_bad", 30, 30)]);
+        assert_eq!(
+            importance_group_score_label(group_view(&legacy, "how_bad")),
+            "+3.0/3.0"
+        );
+
+        let zero = importance_views(vec![importance_factor("evidence", 5, 0)]);
+        assert_eq!(group_view(&zero, "evidence").fraction, 0.0);
+        assert_eq!(
+            importance_group_score_label(group_view(&zero, "evidence")),
+            "+0.5/0.0"
+        );
+    }
+
+    #[test]
+    fn importance_summary_never_overflows_and_uses_real_penalty_width() {
+        let high = importance_views(vec![
+            importance_factor("how_bad", 50, 50),
+            importance_factor("release", 10, 10),
+            importance_factor("who_it_hits", 26, 26),
+            importance_factor("evidence", 10, 10),
+            importance_factor("community", 10, 10),
+            importance_factor("pr_signals", 25, 25),
+            importance_factor("penalty", -15, 15),
+        ]);
+        let (widths, penalty_width) = importance_summary_widths(&high, 600.0);
+        assert!((widths.iter().sum::<f32>() - 600.0 * 131.0 / 146.0).abs() < 0.001);
+        assert!((penalty_width - 600.0 * 15.0 / 146.0).abs() < 0.001);
+        assert!(widths.iter().all(|width| *width >= 0.0));
+        assert!(widths.iter().sum::<f32>() + penalty_width <= 600.001);
+
+        let below_cap = importance_views(vec![
+            importance_factor("pr_signals", 80, 80),
+            importance_factor("penalty", -20, 20),
+        ]);
+        let (widths, penalty_width) = importance_summary_widths(&below_cap, 600.0);
+        assert!((widths.iter().sum::<f32>() - 400.0).abs() < 0.001);
+        assert!((penalty_width - 100.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn importance_score_notes_explain_both_clamped_ends() {
+        assert_eq!(
+            importance_score_note(131, "zh").as_deref(),
+            Some("原始 13.1 · 已封顶")
+        );
+        assert_eq!(
+            importance_score_note(131, "en").as_deref(),
+            Some("Raw 13.1 · capped at 10.0")
+        );
+        assert_eq!(
+            importance_score_note(-5, "zh").as_deref(),
+            Some("原始 -0.5 · 已截断至 0")
+        );
+        assert_eq!(
+            importance_score_note(-5, "en").as_deref(),
+            Some("Raw -0.5 · clamped to 0.0")
+        );
+        assert_eq!(importance_score_note(100, "zh"), None);
+        assert_eq!(importance_score_note(0, "zh"), None);
     }
 
     #[test]
