@@ -1118,7 +1118,7 @@ mod tests {
         let score = &out[&("o/r".to_string(), 42)];
         assert_eq!(score.raw_score, 30 + 8 + 4 + 1 + 10);
         assert_eq!(score.score, 5.3);
-        assert_eq!(score.factors.len(), 12);
+        assert_eq!(score.factors.len(), 14);
     }
 
     #[test]

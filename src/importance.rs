@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-pub const SCORING_VERSION: &str = "2026-11-27.3";
+pub const SCORING_VERSION: &str = "2026-11-28.1";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ImportanceFactor {
@@ -452,6 +452,104 @@ fn surface_factor(summary: &FileSummary) -> ImportanceFactor {
     )
 }
 
+fn evidence_text(pr: &Value) -> String {
+    let mut parts = vec![
+        pr["title"].as_str().unwrap_or(""),
+        pr["body"].as_str().unwrap_or(""),
+    ];
+    for group in ["closingIssuesReferences", "trackingIssuesReferences"] {
+        if let Some(issues) = pr[group]["nodes"].as_array() {
+            for issue in issues {
+                parts.push(issue["title"].as_str().unwrap_or(""));
+                parts.push(issue["body"].as_str().unwrap_or(""));
+            }
+        }
+    }
+    if let Some(files) = pr["files"]["nodes"].as_array() {
+        for file in files {
+            parts.push(file["path"].as_str().unwrap_or(""));
+        }
+    }
+    parts.join("\n").to_lowercase()
+}
+
+fn contains_any<'a>(text: &str, terms: &'a [&'a str]) -> Option<&'a str> {
+    terms.iter().find_map(|term| {
+        if term.len() > 3 {
+            return text.contains(term).then_some(*term);
+        }
+        text.match_indices(term).find_map(|(start, _)| {
+            let previous = start.checked_sub(1).and_then(|i| text.as_bytes().get(i));
+            let next = text.as_bytes().get(start + term.len());
+            let bounded = previous.is_none_or(|byte| !byte.is_ascii_alphanumeric())
+                && next.is_none_or(|byte| !byte.is_ascii_alphanumeric());
+            bounded.then_some(*term)
+        })
+    })
+}
+
+fn model_popularity_factor(pr: &Value) -> ImportanceFactor {
+    let text = evidence_text(pr);
+    let mainstream = contains_any(
+        &text,
+        &["deepseek", "qwen", "llama", "kimi", "gemma", "gpt"],
+    );
+    let common = contains_any(
+        &text,
+        &[
+            "phi", "granite", "nemotron", "internvl", "mistral", "gemini", "claude",
+        ],
+    );
+    let customized = contains_any(
+        &text,
+        &["fine-tune", "finetune", "custom model", "rare model"],
+    );
+    let (points, evidence) = if customized.is_some() && (mainstream.is_some() || common.is_some()) {
+        (1, "Custom or fine-tuned model variant".to_string())
+    } else if let Some(model) = mainstream {
+        (6, format!("Mainstream model evidence: {model}"))
+    } else if let Some(model) = common {
+        (3, format!("Established model evidence: {model}"))
+    } else if customized.is_some() {
+        (1, "Custom or fine-tuned model variant".to_string())
+    } else {
+        (0, "No named model evidence".to_string())
+    };
+    factor("who_it_hits", "model_popularity", points, 6, evidence)
+}
+
+fn gpu_tier_factor(pr: &Value) -> ImportanceFactor {
+    let text = evidence_text(pr);
+    let high = contains_any(
+        &text,
+        &[
+            "h100", "h200", "b200", "b300", "gb200", "gb300", "mi300x", "mi355x",
+        ],
+    );
+    let common = contains_any(
+        &text,
+        &[
+            "a100", "mi325x", "tpu", "l40s", "cpu_x86", "cpu_arm", "gaudi", "xpu",
+        ],
+    );
+    let other = contains_any(
+        &text,
+        &[
+            "rtx", "geforce", "gtx", "v100", "t4", "p100", "4090", "3090", "5090", "a5000", "a6000",
+        ],
+    );
+    let (points, evidence) = if let Some(gpu) = high {
+        (5, format!("High-tier GPU evidence: {gpu}"))
+    } else if let Some(gpu) = common {
+        (3, format!("Common datacenter hardware evidence: {gpu}"))
+    } else if let Some(gpu) = other {
+        (1, format!("Consumer or older hardware evidence: {gpu}"))
+    } else {
+        (0, "No named GPU or hardware evidence".to_string())
+    };
+    factor("who_it_hits", "gpu_tier", points, 5, evidence)
+}
+
 fn release_factor(pr: &Value, issues: &[Value]) -> ImportanceFactor {
     let mut best: Option<Candidate> = None;
     let mut consider = |candidate: Candidate| {
@@ -794,6 +892,8 @@ pub fn score_pr(pr: &Value) -> ImportanceScore {
     let factors = vec![
         severity_factor(pr, &issues),
         surface_factor(&files),
+        model_popularity_factor(pr),
+        gpu_tier_factor(pr),
         release_factor(pr, &issues),
         issue_evidence_factor(&issues, true),
         issue_evidence_factor(&issues, false),
@@ -1023,12 +1123,37 @@ mod tests {
     }
 
     #[test]
+    fn model_and_gpu_evidence_have_bounded_independent_weights() {
+        let mainstream = score_pr(&pr("Fix Qwen3 crash on H100", &[], vec![]));
+        assert_eq!(points(&mainstream, "model_popularity"), 6);
+        assert_eq!(points(&mainstream, "gpu_tier"), 5);
+
+        let custom = score_pr(&pr("Fix Qwen fine-tune on RTX 4090", &[], vec![]));
+        assert_eq!(points(&custom, "model_popularity"), 1);
+        assert_eq!(points(&custom, "gpu_tier"), 1);
+
+        let unknown = score_pr(&pr("Fix incorrect output", &[], vec![]));
+        assert_eq!(points(&unknown, "model_popularity"), 0);
+        assert_eq!(points(&unknown, "gpu_tier"), 0);
+    }
+
+    #[test]
+    fn model_and_gpu_evidence_can_come_from_changed_files() {
+        let mut input = pr("Fix vision encoder", &[], vec![]);
+        set_files(&mut input, &["vllm/model_executor/models/qwen3.py"]);
+        input["body"] = json!("Fails on A100 with default settings");
+        let score = score_pr(&input);
+        assert_eq!(points(&score, "model_popularity"), 6);
+        assert_eq!(points(&score, "gpu_tier"), 3);
+    }
+
+    #[test]
     fn empty_input_is_a_scored_zero_with_versioned_explanations() {
         let score = score_pr(&json!({}));
         assert_eq!(score.score, 0.0);
         assert_eq!(score.raw_score, 0);
         assert_eq!(score.scoring_version, SCORING_VERSION);
-        assert_eq!(score.factors.len(), 12);
+        assert_eq!(score.factors.len(), 14);
         assert!(score.factors.iter().all(|factor| factor.points == 0));
         assert!(score.factors.iter().any(|factor| factor.group == "penalty"));
     }
