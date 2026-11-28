@@ -11,6 +11,7 @@ pub mod importance;
 pub mod importance_llm;
 pub mod markdown;
 pub mod ocr;
+pub mod review_view;
 pub mod reviewer;
 pub mod selection;
 pub mod sync;
