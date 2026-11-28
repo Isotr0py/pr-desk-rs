@@ -9,7 +9,7 @@ use crate::importance::{ImportanceCandidate, ImportanceScore};
 use crate::reviewer::LlmSettings;
 
 const FACTOR_LIMITS: &[(&str, i32, i32)] = &[
-    ("severity", 0, 30),
+    ("severity", 0, 50),
     ("production_surface", 0, 15),
     ("model_popularity", 0, 6),
     ("gpu_tier", 0, 5),
@@ -43,7 +43,7 @@ fn build_prompt(candidate: &ImportanceCandidate) -> String {
          输出 JSON 格式：\n\
          {{\"factors\":[{{\"key\":\"severity\",\"points\":20,\"rationale\":\"中文理由\"}}]}}\n\
          必须且只能包含以下 14 个 key，每个恰好一次：\n\
-         severity(0..30), production_surface(0..15), model_popularity(0..6), gpu_tier(0..5), \
+         severity(0..50), production_surface(0..15), model_popularity(0..6), gpu_tier(0..5), \
          release_urgency(0..10), reproduction(0..6), diagnostics(0..4), comments(0..6), \
          reactions(0..4), linked_issue(0..10), includes_tests(0..5), focused_change(0..5), \
          production_change(0..5), change_penalties(-15..0)。\n\
@@ -185,8 +185,8 @@ mod tests {
         let score = parse_response(&candidate, &valid_response(), "k3-test").unwrap();
         assert_eq!(score.method, "llm:k3-test");
         assert_eq!(score.factors.len(), 14);
-        assert_eq!(score.raw_score, 48);
-        assert_eq!(score.score, 4.8);
+        assert_eq!(score.raw_score, 58);
+        assert_eq!(score.score, 5.8);
         assert!(score.factors[0].evidence.starts_with("severity 的证据理由"));
         assert!(score.factors[0].evidence.contains("Rule evidence:"));
         assert_eq!(score.input_hash, candidate.score.input_hash);
@@ -205,7 +205,7 @@ mod tests {
         assert!(parse_response(&candidate, &data.to_string(), "k3").is_none());
 
         let mut data: Value = serde_json::from_str(&valid_response()).unwrap();
-        data["factors"][0]["points"] = json!(31);
+        data["factors"][0]["points"] = json!(51);
         assert!(parse_response(&candidate, &data.to_string(), "k3").is_none());
 
         let mut data: Value = serde_json::from_str(&valid_response()).unwrap();
@@ -217,7 +217,7 @@ mod tests {
     fn prompt_contains_capped_input_and_all_factor_limits() {
         let prompt = build_prompt(&candidate());
         assert!(prompt.contains("o/r"));
-        assert!(prompt.contains("severity(0..30)"));
+        assert!(prompt.contains("severity(0..50)"));
         assert!(prompt.contains("model_popularity(0..6)"));
         assert!(prompt.contains("gpu_tier(0..5)"));
         assert!(prompt.contains("change_penalties(-15..0)"));

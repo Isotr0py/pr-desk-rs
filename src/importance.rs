@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-pub const SCORING_VERSION: &str = "2026-11-28.1";
+pub const SCORING_VERSION: &str = "2026-11-28.2";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ImportanceFactor {
@@ -196,7 +196,7 @@ fn severity_candidate(title: &str, labels: &[String], source: &str) -> Option<Ca
     let title = title.to_ascii_lowercase();
     let rules: &[(u32, &[&str], &[&str], &[&str])] = &[
         (
-            30,
+            50,
             &[
                 "security",
                 "vulnerability",
@@ -217,7 +217,7 @@ fn severity_candidate(title: &str, labels: &[String], source: &str) -> Option<Ca
             ],
         ),
         (
-            25,
+            40,
             &["regression", "crash"],
             &["regression", "crash", "crashes"],
             &["回归", "崩溃"],
@@ -976,7 +976,7 @@ mod tests {
             &["bug"],
             vec![issue(7, "Incorrect results", &["wrong-output"], 0, 0)],
         ));
-        assert_eq!(points(&score, "severity"), 30);
+        assert_eq!(points(&score, "severity"), 50);
         assert!(score.factors[0].evidence.contains("wrong-output"));
     }
 

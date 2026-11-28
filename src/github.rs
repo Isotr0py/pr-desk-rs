@@ -1116,8 +1116,8 @@ mod tests {
         parse_importance_response(&body, &items, &mut out);
         assert_eq!(out.len(), 1);
         let score = &out[&("o/r".to_string(), 42)];
-        assert_eq!(score.raw_score, 30 + 8 + 4 + 1 + 10);
-        assert_eq!(score.score, 5.3);
+        assert_eq!(score.raw_score, 50 + 8 + 4 + 1 + 10);
+        assert_eq!(score.score, 7.3);
         assert_eq!(score.factors.len(), 14);
     }
 

@@ -3199,7 +3199,7 @@ mod tests {
         {
             let a = app.lock_recover();
             let row = &a.db.list_prs(&[]).unwrap()[0];
-            assert_eq!(row["importance_score"].as_f64(), Some(2.9));
+            assert_eq!(row["importance_score"].as_f64(), Some(4.4));
             assert!(row["score"].is_null());
         }
         scores.get_mut(&("o/r".to_string(), 1)).unwrap().score = 9.9;
@@ -3208,7 +3208,7 @@ mod tests {
         let a = app.lock_recover();
         assert_eq!(
             a.db.list_prs(&[]).unwrap()[0]["importance_score"].as_f64(),
-            Some(2.9)
+            Some(4.4)
         );
     }
 
