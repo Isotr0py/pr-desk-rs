@@ -167,11 +167,25 @@ fn col_cmp(
     use std::cmp::Ordering;
     let str_of = |r: &serde_json::Value, k: &str| r[k].as_str().unwrap_or("").to_lowercase();
     let num = |r: &serde_json::Value, k: &str| r[k].as_i64().unwrap_or(0);
+    let assignee_key = |r: &serde_json::Value| match &r["assignees"] {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+            .to_lowercase(),
+        serde_json::Value::String(s) => serde_json::from_str::<Vec<String>>(s)
+            .unwrap_or_default()
+            .join(",")
+            .to_lowercase(),
+        _ => String::new(),
+    };
     let ordering = match col {
         "priority" => num(a, "priority").cmp(&num(b, "priority")),
         "num" => num(a, "number").cmp(&num(b, "number")),
         "title" => str_of(a, "title").cmp(&str_of(b, "title")),
         "author" => str_of(a, "author").cmp(&str_of(b, "author")),
+        "assignees" => assignee_key(a).cmp(&assignee_key(b)),
         "turn" => str_of(a, "turn").cmp(&str_of(b, "turn")),
         "review" => str_of(a, "review_decision").cmp(&str_of(b, "review_decision")),
         // CI：failure < pending < 无/其它 < success（升序 = 失败在前）
@@ -320,5 +334,15 @@ mod tests {
         assert_eq!(sections.len(), 1);
         assert_eq!(sections[0].key, "pinned");
         assert!(sections[0].title.contains("Pinned"));
+    }
+
+    #[test]
+    fn assignee_sort_supports_both_json_shapes() {
+        let alice_array = serde_json::json!({"assignees": ["Alice"]});
+        let bob_string = serde_json::json!({"assignees": "[\"bob\"]"});
+        let nobody = serde_json::json!({});
+        assert!(col_cmp(&alice_array, &bob_string, "assignees", true).is_lt());
+        assert!(col_cmp(&bob_string, &alice_array, "assignees", true).is_gt());
+        assert!(col_cmp(&nobody, &alice_array, "assignees", true).is_lt());
     }
 }

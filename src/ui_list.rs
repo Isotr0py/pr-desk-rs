@@ -19,9 +19,14 @@ pub fn search_id() -> egui::Id {
 pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
     egui::Panel::top("top_bar").show(ui, |ui| {
         ui.horizontal(|ui| {
-            let (lang, refreshing, syncing) = {
+            let (lang, refreshing, syncing, assigned_syncing) = {
                 let a = app.app.lock_recover();
-                (a.cfg.language.clone(), a.gh_refreshing, a.sync_inflight)
+                (
+                    a.cfg.language.clone(),
+                    a.gh_refreshing,
+                    a.sync_inflight,
+                    a.assigned_sync_inflight,
+                )
             };
             // 刷新：连点去重——一轮刷新在途时忽略后续点击（避免排队跑 N 轮全量拉取）
             if ui
@@ -44,6 +49,27 @@ pub fn top_bar(app: &mut EguiApp, ui: &mut Ui) {
                 }
             }
             if refreshing {
+                ui.add(egui::Spinner::new());
+            }
+            if ui
+                .button(tr(&lang, "tb_sync_assigned"))
+                .on_hover_text(tr(&lang, "sync_assigned_tooltip"))
+                .clicked()
+            {
+                let send = {
+                    let mut a = app.app.lock_recover();
+                    if a.assigned_sync_inflight {
+                        false
+                    } else {
+                        a.assigned_sync_inflight = true;
+                        true
+                    }
+                };
+                if send {
+                    let _ = app.cmd_tx.send(Cmd::SyncAssigned);
+                }
+            }
+            if assigned_syncing {
                 ui.add(egui::Spinner::new());
             }
             // 同步：同刷新（连点去重）
@@ -338,6 +364,7 @@ struct RowData {
     key: (String, i64),
     title: String,
     author: String,
+    assignees: Vec<String>,
     turn: String,
     review: String,
     ci: String,
@@ -363,6 +390,7 @@ fn row_data(a: &App, idx: usize) -> RowData {
         ),
         title: r["title"].as_str().unwrap_or("").to_string(),
         author: r["author"].as_str().unwrap_or("").to_string(),
+        assignees: assignees(r),
         turn: r["turn"].as_str().unwrap_or("").to_string(),
         review: r["review_decision"].as_str().unwrap_or("").to_string(),
         ci: r["ci_status"].as_str().unwrap_or("").to_string(),
@@ -404,6 +432,7 @@ pub const COL_SPECS: &[ColSpec] = &[
     ColSpec { id: "num", label: "#", def_w: 60.0, min_w: 44.0, flex: false },
     ColSpec { id: "title", label: "col_title", def_w: 0.0, min_w: 120.0, flex: true },
     ColSpec { id: "author", label: "col_author", def_w: 110.0, min_w: 60.0, flex: false },
+    ColSpec { id: "assignees", label: "col_assignees", def_w: 110.0, min_w: 60.0, flex: false },
     ColSpec { id: "turn", label: "col_turn", def_w: 38.0, min_w: 30.0, flex: false },
     ColSpec { id: "review", label: "col_review", def_w: 84.0, min_w: 40.0, flex: false },
     ColSpec { id: "ci", label: "CI", def_w: 40.0, min_w: 32.0, flex: false },
@@ -421,8 +450,8 @@ pub fn default_col_widths() -> Vec<f32> {
 
 fn col_label<'a>(key: &'a str, lang: &str) -> &'a str {
     match key {
-        "col_title" | "col_author" | "col_turn" | "col_review" | "col_size" | "col_importance"
-        | "col_quality" | "col_updated" => tr(lang, key),
+        "col_title" | "col_author" | "col_assignees" | "col_turn" | "col_review" | "col_size"
+        | "col_importance" | "col_quality" | "col_updated" => tr(lang, key),
         other => other,
     }
 }
@@ -984,9 +1013,19 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             resp.on_hover_text(row.orgs.join(", "));
         }
     }
+    if !row.assignees.is_empty() {
+        let c = cell(4);
+        paint_cell(ui, c, &row.assignees.join(", "), small.clone(), weak);
+        ui.interact(
+            c,
+            egui::Id::unique(("assignees", row.key.clone())),
+            egui::Sense::hover(),
+        )
+        .on_hover_text(row.assignees.join(", "));
+    }
     // Turn 列：药丸徽章（painter 圆角矩形 + 文字，me=淡蓝/them=灰）
     {
-        let c = cell(4);
+        let c = cell(5);
         let (label, bg, fg) = match row.turn.as_str() {
             "me" => (tr(lang, "turn_me"), Color32::from_rgb(0x1f, 0x6f, 0xeb).gamma_multiply(0.25), Color32::from_rgb(0x58, 0xa6, 0xff)),
             "them" => (tr(lang, "turn_them"), Color32::from_rgb(0x8a, 0x8a, 0x8a).gamma_multiply(0.25), weak),
@@ -1003,7 +1042,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     }
     // Rev 列：painter 矢量语义图标（旧版是 SVG；文字徽章会让列宽被顶开）
     {
-        let c = cell(5);
+        let c = cell(6);
         paint_rev_icon(ui, c, &row.review, dark);
         if row.review.is_empty() && !row.activity.is_empty() {
             paint_cell(ui, c, &row.activity, small.clone(), weak);
@@ -1011,14 +1050,14 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     }
     // CI 圆点
     if !row.ci.is_empty() {
-        let c = cell(6);
+        let c = cell(7);
         ui.painter().circle_filled(egui::pos2(icon_center_x(c), c.center().y), 3.5, ui_detail::ci_color(&row.ci));
     }
-    paint_size_badge(ui, cell(7), &row.size, small.clone(), weak, dark);
-    paint_diff_count(ui, cell(8), row.adds, row.dels, small.clone(), weak, dark);
+    paint_size_badge(ui, cell(8), &row.size, small.clone(), weak, dark);
+    paint_diff_count(ui, cell(9), row.adds, row.dels, small.clone(), weak, dark);
     // 重要性评分列：NULL/缺失留空，0 分也正常显示
     if let Some(importance) = row.importance {
-        let c = cell(9);
+        let c = cell(10);
         let t = ellipsize(ui, &format!("{importance:.1}"), small.clone(), c.width() - 4.0);
         ui.painter().with_clip_rect(c).text(
             egui::pos2(icon_center_x(c), c.center().y),
@@ -1030,7 +1069,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
     }
     // 代码质量列：列内居中（图标列语义）
     if row.score > 0.0 {
-        let c = cell(10);
+        let c = cell(11);
         let t = ellipsize(ui, &format!("{:.1}", row.score), small.clone(), c.width() - 4.0);
         ui.painter().with_clip_rect(c).text(
             egui::pos2(icon_center_x(c), c.center().y),
@@ -1040,7 +1079,7 @@ fn pr_row(app: &mut EguiApp, ui: &mut Ui, row: &RowData, selected: bool, multi_s
             ui_detail::score_color(row.score, dark),
         );
     }
-    paint_cell(ui, cell(11), &row.age, small.clone(), weak);
+    paint_cell(ui, cell(12), &row.age, small.clone(), weak);
 
     // 点击（带修饰键语义）
     if resp.clicked() {
@@ -1316,17 +1355,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn importance_column_precedes_quality_and_updated() {
-        assert_eq!(COL_SPECS[9].id, "importance");
-        assert_eq!(COL_SPECS[9].label, "col_importance");
-        assert_eq!(COL_SPECS[10].id, "score");
-        assert_eq!(COL_SPECS[10].label, "col_quality");
-        assert_eq!(COL_SPECS[11].id, "upd");
+    fn assignees_and_importance_columns_match_merged_layout() {
+        assert_eq!(COL_SPECS[4].id, "assignees");
+        assert_eq!(COL_SPECS[4].label, "col_assignees");
+        assert_eq!(COL_SPECS[10].id, "importance");
+        assert_eq!(COL_SPECS[10].label, "col_importance");
+        assert_eq!(COL_SPECS[11].id, "score");
+        assert_eq!(COL_SPECS[11].label, "col_quality");
+        assert_eq!(COL_SPECS[12].id, "upd");
         let widths = default_col_widths();
         assert_eq!(widths.len(), COL_SPECS.len());
-        assert_eq!(widths[9], COL_SPECS[9].def_w);
+        assert_eq!(widths[4], COL_SPECS[4].def_w);
         assert_eq!(widths[10], COL_SPECS[10].def_w);
         assert_eq!(widths[11], COL_SPECS[11].def_w);
+        assert_eq!(widths[12], COL_SPECS[12].def_w);
     }
 
     #[test]
@@ -1350,29 +1392,29 @@ mod tests {
 
     #[test]
     fn pair_drag_compensates_clamps_and_reverses() {
-        // Rev|CI 边界（i=5）：拖左 = Rev 变窄、CI 变宽，总量不变，其余列不动
+        // Rev|CI 边界（i=6）：拖左 = Rev 变窄、CI 变宽，总量不变，其余列不动
         let mut w = default_col_widths();
         let before = w.clone();
-        let d = apply_pair_drag(&mut w, 5, -20.0);
+        let d = apply_pair_drag(&mut w, 6, -20.0);
         assert!((d - -20.0).abs() < 0.01);
-        assert!((w[5] - (before[5] - 20.0)).abs() < 0.01);
-        assert!((w[6] - (before[6] + 20.0)).abs() < 0.01);
+        assert!((w[6] - (before[6] - 20.0)).abs() < 0.01);
+        assert!((w[7] - (before[7] + 20.0)).abs() < 0.01);
         for (j, (&a, &b)) in w.iter().zip(&before).enumerate() {
-            if j != 5 && j != 6 {
+            if j != 6 && j != 7 {
                 assert!((a - b).abs() < 0.01, "列 {j} 不应变化");
             }
         }
         // 拖右过极限：CI 只能让出 28px（60→min 32），位移被钳，不穿透
-        let d = apply_pair_drag(&mut w, 5, 1000.0);
+        let d = apply_pair_drag(&mut w, 6, 1000.0);
         assert!((d - 28.0).abs() < 0.01);
-        assert!((w[6] - COL_SPECS[6].min_w).abs() < 0.01);
+        assert!((w[7] - COL_SPECS[7].min_w).abs() < 0.01);
         // 到极限后反向拖能拖回来（钳制区间按当前宽度重算，无卡死态）
-        let d = apply_pair_drag(&mut w, 5, -25.0);
+        let d = apply_pair_drag(&mut w, 6, -25.0);
         assert!((d - -25.0).abs() < 0.01);
-        assert!((w[6] - (COL_SPECS[6].min_w + 25.0)).abs() < 0.01);
+        assert!((w[7] - (COL_SPECS[7].min_w + 25.0)).abs() < 0.01);
         // 反向也钳本列 min_w
-        let d = apply_pair_drag(&mut w, 5, -1000.0);
-        assert!((w[5] - COL_SPECS[5].min_w).abs() < 0.01);
+        let d = apply_pair_drag(&mut w, 6, -1000.0);
+        assert!((w[6] - COL_SPECS[6].min_w).abs() < 0.01);
         assert!(d < 0.0 && d > -1000.0, "位移被钳制");
     }
 

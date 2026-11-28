@@ -74,6 +74,14 @@ pub fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+fn json_array_or_str(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Array(_) => serde_json::to_string(value).ok(),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
 pub fn validate_database(path: &std::path::Path) -> Result<()> {
     anyhow::ensure!(path.is_file(), "数据库文件不存在：{}", path.display());
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -209,6 +217,10 @@ impl Db {
                 conn.execute_batch(sql)?;
             }
         }
+        // v8：GitHub 指派人 login 的 JSON 数组字符串；旧行默认无人指派。
+        if !prs_cols.is_empty() && !prs_cols.iter().any(|c| c == "assignees") {
+            conn.execute_batch("ALTER TABLE prs ADD COLUMN assignees TEXT NOT NULL DEFAULT '[]'")?;
+        }
         if version < 2 {
             // v1 → v2：prs 加 extras 缓存列（幂等：列已存在则跳过）
             let cols: Vec<String> = {
@@ -246,11 +258,13 @@ impl Db {
 
     // ── upsert（sync_pull 应用；幂等） ──
     pub fn upsert_pr(&self, p: &serde_json::Value) -> Result<()> {
+        let assignees = json_array_or_str(&p["assignees"]);
         self.conn.execute(
             "INSERT INTO prs(repo, number, title, author, url, head_sha, status, tags, role,
                 on_board, priority, pinned, ci_status, review_decision, turn, updated_at,
-                recent_commits, extras_detail, extras_updated_at, source)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)
+                recent_commits, extras_detail, extras_updated_at, source, assignees)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                COALESCE(?21, '[]'))
              ON CONFLICT(repo, number) DO UPDATE SET
                 title=excluded.title, author=excluded.author, url=excluded.url,
                 head_sha=excluded.head_sha, status=excluded.status, tags=excluded.tags,
@@ -264,7 +278,8 @@ impl Db {
                 source=CASE
                     WHEN excluded.source='server' OR prs.source='server' THEN 'server'
                     WHEN excluded.source='inbox' OR prs.source='inbox' THEN 'inbox'
-                    ELSE 'github' END",
+                    ELSE 'github' END,
+                assignees=COALESCE(?21, prs.assignees)",
             params![
                 p["repo"].as_str().unwrap_or(""),
                 p["number"].as_i64().unwrap_or(0),
@@ -286,6 +301,7 @@ impl Db {
                 p["extras_detail"].as_str(),
                 p["extras_updated_at"].as_str(),
                 p["source"].as_str().unwrap_or("github"),
+                assignees,
             ],
         )?;
         Ok(())
@@ -444,7 +460,7 @@ impl Db {
                 r.score, r.reviewed_at, r.size_label, r.additions, r.deletions,
                 p.additions, p.deletions, p.importance_score, p.importance_factors,
                 p.importance_version, p.importance_updated_at,
-                p.importance_method, p.importance_input_hash
+                p.importance_method, p.importance_input_hash, p.assignees
              FROM prs p
              LEFT JOIN reviews r ON r.rowid = (
                 SELECT r2.rowid FROM reviews r2
@@ -492,6 +508,7 @@ impl Db {
                     "importance_updated_at": row.get::<_, Option<String>>(29)?,
                     "importance_method": row.get::<_, Option<String>>(30)?,
                     "importance_input_hash": row.get::<_, Option<String>>(31)?,
+                    "assignees": row.get::<_, String>(32)?,
                 }))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -669,6 +686,15 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// 整体回写指派人（GitHub 元数据回填，不属于本地策展改动，不进 outbox）。
+    pub fn set_pr_assignees(&self, repo: &str, number: i64, assignees: &[String]) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE prs SET assignees=?1 WHERE repo=?2 AND number=?3",
+            params![serde_json::to_string(assignees)?, repo, number],
+        )?;
+        Ok(n > 0)
+    }
+
     /// 只补空缺字段（Inbox「+ 预评审」入库的行缺 author/head_sha 等）：
     /// 空/NULL 才写入，已有值一律不动；行不存在返回 false。
     pub fn fill_pr_meta_if_empty(
@@ -786,7 +812,7 @@ impl Db {
                 recent_commits, extras_detail, extras_updated_at, source, author_orgs,
                 additions, deletions, importance_score, importance_factors,
                 importance_version, importance_updated_at, importance_method,
-                importance_input_hash
+                importance_input_hash, assignees
              FROM prs WHERE repo=?1 AND number=?2",
         )?;
         let mut rows = stmt.query(params![repo, number])?;
@@ -823,6 +849,7 @@ impl Db {
             "importance_updated_at": r.get::<_, Option<String>>(26)?,
             "importance_method": r.get::<_, Option<String>>(27)?,
             "importance_input_hash": r.get::<_, Option<String>>(28)?,
+            "assignees": r.get::<_, String>(29)?,
         })))
     }
 
@@ -874,8 +901,9 @@ impl Db {
                 recent_commits, extras_detail, extras_updated_at, source, author_orgs,
                 additions, deletions, importance_score, importance_factors,
                 importance_version, importance_updated_at, importance_method,
-                importance_input_hash)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29)",
+                importance_input_hash, assignees)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,
+                ?21,?22,?23,?24,?25,?26,?27,?28,?29,COALESCE(?30, '[]'))",
             params![
                 p["repo"].as_str().unwrap_or(""),
                 p["number"].as_i64().unwrap_or(0),
@@ -906,6 +934,7 @@ impl Db {
                 p["importance_updated_at"].as_str(),
                 p["importance_method"].as_str(),
                 p["importance_input_hash"].as_str(),
+                json_array_or_str(&p["assignees"]),
             ],
         )?;
         Ok(n > 0)
@@ -1072,6 +1101,49 @@ mod tests {
         assert_eq!(rows[0]["title"], "t2");
         // 未带 source 字段 → 默认 'github'
         assert_eq!(rows[0]["source"], "github");
+    }
+
+    #[test]
+    fn assignees_roundtrip_and_upsert_merge_semantics() {
+        let db = Db::open_memory().unwrap();
+        let mut array = pr_json("o/r", 1, "array");
+        array["assignees"] = serde_json::json!(["alice", "bob"]);
+        db.upsert_pr(&array).unwrap();
+        assert_eq!(
+            db.list_prs(&[]).unwrap()[0]["assignees"],
+            serde_json::json!(r#"["alice","bob"]"#)
+        );
+
+        let mut string = pr_json("o/r", 1, "string");
+        string["assignees"] = serde_json::json!(r#"["carol"]"#);
+        db.upsert_pr(&string).unwrap();
+        assert_eq!(
+            db.get_pr_full("o/r", 1).unwrap().unwrap()["assignees"],
+            r#"["carol"]"#
+        );
+
+        db.upsert_pr(&pr_json("o/r", 1, "missing")).unwrap();
+        let mut null = pr_json("o/r", 1, "null");
+        null["assignees"] = serde_json::Value::Null;
+        db.upsert_pr(&null).unwrap();
+        assert_eq!(
+            db.get_pr_full("o/r", 1).unwrap().unwrap()["assignees"],
+            r#"["carol"]"#
+        );
+
+        let mut empty = pr_json("o/r", 1, "empty");
+        empty["assignees"] = serde_json::json!([]);
+        db.upsert_pr(&empty).unwrap();
+        assert_eq!(db.list_prs(&[]).unwrap()[0]["assignees"], "[]");
+
+        let replacements = vec!["dave".to_string(), "erin".to_string()];
+        assert!(db.set_pr_assignees("o/r", 1, &replacements).unwrap());
+        assert_eq!(
+            db.get_pr_full("o/r", 1).unwrap().unwrap()["assignees"],
+            r#"["dave","erin"]"#
+        );
+        assert!(!db.set_pr_assignees("o/r", 99, &replacements).unwrap());
+        assert!(db.outbox_drain().unwrap().is_empty());
     }
 
     fn pr_json_src(repo: &str, n: i64, title: &str, source: &str) -> serde_json::Value {
@@ -1389,6 +1461,46 @@ mod tests {
     }
 
     #[test]
+    fn migrate_adds_assignees_to_v7_db_idempotently() {
+        let dir =
+            std::env::temp_dir().join(format!("prdesk-db-mig-assignees-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(MIGRATE_V2).unwrap();
+            conn.execute_batch(
+                "INSERT INTO prs(repo, number, title) VALUES ('o/r', 1, 'old');
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+
+        let db = Db::open(&path).unwrap();
+        let version: i32 = db
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(db.list_prs(&[]).unwrap()[0]["assignees"], "[]");
+        assert!(
+            db.set_pr_assignees("o/r", 1, &["alice".to_string()])
+                .unwrap()
+        );
+        drop(db);
+
+        let db = Db::open(&path).unwrap();
+        assert_eq!(
+            db.get_pr_full("o/r", 1).unwrap().unwrap()["assignees"],
+            r#"["alice"]"#
+        );
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn cursor_roundtrip() {
         let db = Db::open_memory().unwrap();
         assert!(db.get_cursor().unwrap().is_none());
@@ -1455,8 +1567,9 @@ mod tests {
         // 目标已有行整行跳过（本地策展状态不动）；重复复制幂等。
         let src = Db::open_memory().unwrap();
         let dst = Db::open_memory().unwrap();
-        src.upsert_pr(&pr_json_src("o/r", 1, "src pr1", "server"))
-            .unwrap();
+        let mut src_pr1 = pr_json_src("o/r", 1, "src pr1", "server");
+        src_pr1["assignees"] = serde_json::json!(["alice", "bob"]);
+        src.upsert_pr(&src_pr1).unwrap();
         src.upsert_pr(&pr_json_src("o/r", 2, "src pr2", "server"))
             .unwrap();
         src.upsert_review(&review_json("o/r", 1, "sha-a", 8.0))
@@ -1482,6 +1595,7 @@ mod tests {
         assert_eq!(r1["title"], "src pr1");
         assert_eq!(r1["head_sha"], "s");
         assert_eq!(r1["source"], "server");
+        assert_eq!(r1["assignees"], r#"["alice","bob"]"#);
         // 目标已有行的本地策展状态不被覆盖
         let r2 = dst.get_pr_full("o/r", 2).unwrap().unwrap();
         assert_eq!(r2["pinned"], 1);

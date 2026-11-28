@@ -520,6 +520,35 @@ mod tests {
     }
 
     #[test]
+    fn apply_pull_preserves_assignees_when_old_response_omits_them() {
+        let db = Db::open_memory().unwrap();
+        let body = serde_json::json!({
+            "prs": [{
+                "repo": "o/r", "number": 1, "title": "with assignees",
+                "assignees": ["alice", "bob"]
+            }]
+        });
+        apply_pull(&db, &body).unwrap();
+        assert_eq!(
+            db.list_prs(&[]).unwrap()[0]["assignees"],
+            r#"["alice","bob"]"#
+        );
+
+        assert!(
+            db.set_pr_assignees("o/r", 1, &["backfilled".to_string()])
+                .unwrap()
+        );
+        let legacy_body = serde_json::json!({
+            "prs": [{"repo": "o/r", "number": 1, "title": "legacy response"}]
+        });
+        apply_pull(&db, &legacy_body).unwrap();
+        assert_eq!(
+            db.list_prs(&[]).unwrap()[0]["assignees"],
+            r#"["backfilled"]"#
+        );
+    }
+
+    #[test]
     fn apply_pull_deduplicates_new_keys_within_batch() {
         let db = Db::open_memory().unwrap();
         let body = serde_json::json!({

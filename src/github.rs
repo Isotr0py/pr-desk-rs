@@ -540,6 +540,31 @@ impl GitHub {
         Ok((ci, items))
     }
 
+    /// 搜索当前账号所有 open 且指派给自己的 PR（GitHub Search API 最多返回前 1000 条）。
+    pub async fn fetch_assigned_prs(&self) -> Result<Vec<Value>> {
+        let mut prs = Vec::new();
+        for page in 1..=10 {
+            let mut url = reqwest::Url::parse(&format!("{API}/search/issues"))?;
+            url.query_pairs_mut()
+                .append_pair("q", "is:pr is:open assignee:@me")
+                .append_pair("per_page", "100")
+                .append_pair("page", &page.to_string());
+            let resp = self.client.get(url).send().await?;
+            self.record_rate_limit(resp.headers());
+            if !resp.status().is_success() {
+                anyhow::bail!("GitHub assigned PR search: {}", resp.status());
+            }
+            let body: Value = resp.json().await?;
+            let items = body["items"].as_array().cloned().unwrap_or_default();
+            let count = items.len();
+            prs.extend(items.iter().filter_map(assigned_pr_from_search_item));
+            if count < 100 {
+                break;
+            }
+        }
+        Ok(prs)
+    }
+
     /// 拉取 PR 的文件清单（仅 PullRequest 有；返回 [{path, adds, dels}]）。
     pub async fn fetch_pr_files(&self, repo: &str, number: i64) -> Result<Vec<Value>> {
         let url = format!("{API}/repos/{repo}/pulls/{number}/files?per_page=100");
@@ -560,6 +585,53 @@ impl GitHub {
             })
             .collect())
     }
+}
+
+/// 从 PR 元数据提取非空指派人 login，去重并保持 GitHub 返回顺序。
+pub fn assignee_logins(meta: &Value) -> Vec<String> {
+    fn push_login(logins: &mut Vec<String>, login: &str) {
+        if !login.is_empty() && !logins.iter().any(|existing| existing == login) {
+            logins.push(login.to_string());
+        }
+    }
+
+    let mut logins = Vec::new();
+    if let Some(assignees) = meta["assignees"].as_array() {
+        for login in assignees
+            .iter()
+            .filter_map(|assignee| assignee["login"].as_str())
+        {
+            push_login(&mut logins, login);
+        }
+    } else if let Some(login) = meta["assignee"]["login"].as_str() {
+        push_login(&mut logins, login);
+    }
+    logins
+}
+
+fn assigned_pr_from_search_item(item: &Value) -> Option<Value> {
+    if item["pull_request"].is_null() {
+        return None;
+    }
+    let number = item["number"].as_i64().filter(|n| *n > 0)?;
+    let repository_url = item["repository_url"].as_str()?;
+    let repo = repository_url.strip_prefix(&format!("{API}/repos/"))?;
+    let (owner, name) = repo.split_once('/')?;
+    if !valid_repo_part(owner) || !valid_repo_part(name) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "repo": repo,
+        "number": number,
+        "title": item["title"].as_str().unwrap_or(""),
+        "author": item["user"]["login"].as_str().unwrap_or(""),
+        "url": item["html_url"].as_str().unwrap_or(""),
+        "head_sha": "",
+        "status": "pending",
+        "updated_at": item["updated_at"].as_str().unwrap_or(""),
+        "source": "inbox",
+        "assignees": assignee_logins(item),
+    }))
 }
 
 /// owner/name 的字符白名单（GitHub 合法字符）：repo 名来自远程 API 响应，
@@ -746,6 +818,91 @@ mod tests {
         // 斜杠不得穿透成路径分隔
         assert_eq!(encode_path_segment("a/b"), "a%2Fb");
         assert_eq!(encode_path_segment(""), "");
+    }
+
+    #[test]
+    fn assignee_logins_extracts_multiple_and_ignores_empty_values() {
+        let meta = serde_json::json!({
+            "assignees": [
+                {"login": "alice"},
+                {"login": ""},
+                {"login": null},
+                {"login": "bob"},
+                {"login": "alice"}
+            ],
+            "assignee": {"login": "fallback"}
+        });
+        assert_eq!(assignee_logins(&meta), vec!["alice", "bob"]);
+    }
+
+    #[test]
+    fn assignee_logins_falls_back_to_singular_assignee() {
+        let meta = serde_json::json!({"assignee": {"login": "alice"}});
+        assert_eq!(assignee_logins(&meta), vec!["alice"]);
+        assert!(assignee_logins(&serde_json::json!({})).is_empty());
+
+        let empty = serde_json::json!({
+            "assignees": [],
+            "assignee": {"login": "not-used"}
+        });
+        assert!(assignee_logins(&empty).is_empty());
+    }
+
+    #[test]
+    fn assigned_search_item_maps_to_inbox_pr() {
+        let item = serde_json::json!({
+            "number": 42,
+            "title": "Fix parser",
+            "html_url": "https://github.com/octocat/Hello-World/pull/42",
+            "repository_url": "https://api.github.com/repos/octocat/Hello-World",
+            "updated_at": "2026-11-26T08:00:00Z",
+            "user": { "login": "octocat" },
+            "assignees": [{"login": "octocat"}, {"login": "hubot"}],
+            "pull_request": { "url": "https://api.github.com/repos/octocat/Hello-World/pulls/42" }
+        });
+        let pr = assigned_pr_from_search_item(&item).unwrap();
+        assert_eq!(pr["repo"], "octocat/Hello-World");
+        assert_eq!(pr["number"], 42);
+        assert_eq!(pr["title"], "Fix parser");
+        assert_eq!(pr["author"], "octocat");
+        assert_eq!(pr["url"], item["html_url"]);
+        assert_eq!(pr["updated_at"], "2026-11-26T08:00:00Z");
+        assert_eq!(pr["status"], "pending");
+        assert_eq!(pr["source"], "inbox");
+        assert_eq!(pr["assignees"], serde_json::json!(["octocat", "hubot"]));
+    }
+
+    #[test]
+    fn assigned_search_item_rejects_malformed_entries() {
+        for item in [
+            serde_json::json!({"number": 1, "repository_url": format!("{API}/repos/o/r")}),
+            serde_json::json!({"number": 1, "pull_request": {}}),
+            serde_json::json!({
+                "number": 1,
+                "repository_url": "https://example.com/repos/o/r",
+                "pull_request": {}
+            }),
+            serde_json::json!({
+                "number": 1,
+                "repository_url": format!("{API}/repos/o/r/extra"),
+                "pull_request": {}
+            }),
+            serde_json::json!({
+                "number": 0,
+                "repository_url": format!("{API}/repos/o/r"),
+                "pull_request": {}
+            }),
+            serde_json::json!({
+                "number": "1",
+                "repository_url": format!("{API}/repos/o/r"),
+                "pull_request": {}
+            }),
+        ] {
+            assert!(
+                assigned_pr_from_search_item(&item).is_none(),
+                "应拒绝 {item}"
+            );
+        }
     }
 
     #[test]

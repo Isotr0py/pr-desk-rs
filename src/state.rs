@@ -38,6 +38,7 @@ pub struct AutoReviewJob {
 pub enum Cmd {
     RefreshGithub,
     Sync,
+    SyncAssigned,
     FetchDiff {
         repo: String,
         number: i64,
@@ -686,6 +687,7 @@ pub struct App {
     pub status_msg_at: Option<std::time::Instant>, // 临时消息写入时刻（egui 侧按 6s 到期清除，替代 Slint Timer）
     pub gh_refreshing: bool,                       // GitHub 刷新在途（顶栏转圈 + 连点去重）
     pub sync_inflight: bool,                       // 同步在途（顶栏转圈 + 连点/定时去重）
+    pub assigned_sync_inflight: bool,              // Assigned PR 搜索/入库在途（顶栏转圈 + 连点去重）
     pub inbox: Vec<Value>,                         // 最近一批通知行（未过滤；repo 下拉由此去重）
     pub inbox_view: Vec<Value>, // 仓库过滤后的通知行（inbox_activated 按下标取 thread id）
     pub inbox_filter: String,   // Inbox 仓库过滤（"" = 全部）
@@ -727,6 +729,7 @@ impl App {
             status_msg_at: None,
             gh_refreshing: false,
             sync_inflight: false,
+            assigned_sync_inflight: false,
             inbox: Vec::new(),
             inbox_view: Vec::new(),
             inbox_filter: String::new(),
@@ -925,7 +928,7 @@ pub fn activity_text(r: &Value, lang: &str) -> String {
     }
 }
 
-/// 大小写不敏感子串匹配：title / number（query 可带 # 前缀）/ author / repo。
+/// 大小写不敏感子串匹配：title / number（query 可带 # 前缀）/ author / assignees / repo。
 /// 内部自行转小写（调用方无需预处理）。
 pub fn row_matches(r: &Value, query: &str) -> bool {
     let q = query.trim().trim_start_matches('#').to_lowercase();
@@ -936,16 +939,15 @@ pub fn row_matches(r: &Value, query: &str) -> bool {
     hit(r["title"].as_str().unwrap_or(""))
         || hit(r["author"].as_str().unwrap_or(""))
         || hit(r["repo"].as_str().unwrap_or(""))
+        || assignees(r).iter().any(|s| hit(s))
         || r["number"]
             .as_i64()
             .map(|n| n.to_string())
             .is_some_and(|n| n.contains(&q))
 }
 
-/// 作者所属组织列表。GitHub/sync 侧在行数据上提供 `author_orgs` 字段时生效，
-/// 兼容 JSON 数组与 JSON 字符串两种形态；没有该字段时返回空 Vec。
-pub fn author_orgs(r: &Value) -> Vec<String> {
-    match &r["author_orgs"] {
+fn string_list_field(r: &Value, key: &str) -> Vec<String> {
+    match &r[key] {
         Value::Array(a) => a
             .iter()
             .filter_map(|v| v.as_str())
@@ -960,6 +962,16 @@ pub fn author_orgs(r: &Value) -> Vec<String> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// 作者所属组织列表。GitHub/sync 侧在行数据上提供 `author_orgs` 字段时生效。
+pub fn author_orgs(r: &Value) -> Vec<String> {
+    string_list_field(r, "author_orgs")
+}
+
+/// PR 指派人 login 列表，兼容 JSON 数组与 JSON 字符串两种形态。
+pub fn assignees(r: &Value) -> Vec<String> {
+    string_list_field(r, "assignees")
 }
 
 /// 头像字母降级的单字母：作者名首字符大写（空 → "?"）。
@@ -1568,6 +1580,18 @@ mod tests {
     }
 
     #[test]
+    fn assignees_parse_both_shapes() {
+        let arr = serde_json::json!({"assignees": ["alice", " bob ", ""]});
+        assert_eq!(
+            assignees(&arr),
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        let s = serde_json::json!({"assignees": "[\"carol\"]"});
+        assert_eq!(assignees(&s), vec!["carol".to_string()]);
+        assert!(assignees(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
     fn activity_text_shows_review_count_only() {
         use chrono::Duration;
         let recent = (chrono::Local::now().naive_local() - Duration::minutes(27))
@@ -1602,12 +1626,13 @@ mod tests {
     fn row_matches_case_insensitive_substring() {
         let rows = vec![
             serde_json::json!({"repo": "acme/web", "number": 12, "title": "Fix Login Bug", "author": "Alice"}),
-            serde_json::json!({"repo": "acme/api", "number": 34, "title": "Add endpoint", "author": "bob"}),
+            serde_json::json!({"repo": "acme/api", "number": 34, "title": "Add endpoint", "author": "bob", "assignees": ["Carol"]}),
         ];
         assert!(row_matches(&rows[0], "login"));
         assert!(row_matches(&rows[0], "LOGIN"));
         assert!(row_matches(&rows[0], "ali"));
         assert!(row_matches(&rows[0], "acme"));
+        assert!(row_matches(&rows[1], "carol"));
         assert!(row_matches(&rows[1], "34"));
         assert!(row_matches(&rows[1], "#34"));
         assert!(!row_matches(&rows[0], "zzz"));

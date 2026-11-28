@@ -998,6 +998,155 @@ async fn refresh_importance(
     refresh_importance_for_keys(gh, app, msg_tx, for_profile, keys).await;
 }
 
+#[derive(Default, Debug, PartialEq, Eq)]
+struct AssignedImportSummary {
+    inserted: usize,
+    existing: usize,
+    tombstoned: usize,
+    failed: usize,
+}
+
+fn import_assigned_prs(
+    app: &Arc<Mutex<App>>,
+    prs: &[Value],
+    for_profile: &str,
+) -> Option<(AssignedImportSummary, Vec<(String, i64)>)> {
+    let a = lock_for_profile(app, for_profile)?;
+    let mut summary = AssignedImportSummary::default();
+    let mut new_keys = Vec::new();
+    for pr in prs {
+        let repo = pr["repo"].as_str().unwrap_or("");
+        let number = pr["number"].as_i64().unwrap_or(0);
+        match a.db.insert_pr_from_inbox(pr) {
+            Ok(db::InsertPrOutcome::Inserted) => {
+                summary.inserted += 1;
+                new_keys.push((repo.to_string(), number));
+            }
+            Ok(db::InsertPrOutcome::AlreadyExists) => summary.existing += 1,
+            Ok(db::InsertPrOutcome::Tombstoned) => summary.tombstoned += 1,
+            Err(error) => {
+                summary.failed += 1;
+                tracing::warn!("Assigned PR 入库失败 {repo} #{number}: {error}");
+            }
+        }
+    }
+    Some((summary, new_keys))
+}
+
+async fn sync_assigned_prs(
+    gh: &github::GitHub,
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    cmd_tx: &UnboundedSender<Cmd>,
+    for_profile: &str,
+) {
+    let lang = lang_of(app);
+    send(msg_tx, Msg::Status(tr(&lang, "assigned_syncing").into()));
+    match gh.fetch_assigned_prs().await {
+        Ok(prs) => {
+            let found = prs.len();
+            let Some((summary, new_keys)) = import_assigned_prs(app, &prs, for_profile) else {
+                send(
+                    msg_tx,
+                    Msg::Status(tr(&lang, "assigned_sync_discarded").into()),
+                );
+                return;
+            };
+            reload_rows(app, msg_tx);
+            for (repo, number) in &new_keys {
+                let _ = cmd_tx.send(Cmd::FetchPrMeta {
+                    repo: repo.clone(),
+                    number: *number,
+                });
+            }
+            if !new_keys.is_empty() {
+                let _ = cmd_tx.send(Cmd::QueueAutoReviews {
+                    profile: for_profile.to_string(),
+                    keys: new_keys,
+                });
+            }
+            send(
+                msg_tx,
+                Msg::Status(trf(
+                    &lang,
+                    "assigned_sync_done",
+                    &[
+                        &found.to_string(),
+                        &summary.inserted.to_string(),
+                        &summary.existing.to_string(),
+                        &summary.tombstoned.to_string(),
+                        &summary.failed.to_string(),
+                    ],
+                )),
+            );
+        }
+        Err(error) => send(
+            msg_tx,
+            Msg::Status(trf(&lang, "assigned_sync_failed", &[&error.to_string()])),
+        ),
+    }
+}
+
+/// 并发刷新在库 PR 的 GitHub 元数据。assignees 总是整体覆盖；只有本地模式回写终态，
+/// sync 模式的工作流状态仍以服务器为准。
+async fn refresh_pr_metadata(
+    gh: &github::GitHub,
+    app: &Arc<Mutex<App>>,
+    msg_tx: &mpsc::Sender<Msg>,
+    for_profile: &str,
+    update_status: bool,
+) {
+    let keys = {
+        let a = app.lock_recover();
+        match a.db.list_pr_keys() {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!("列出 PR 键失败，跳过 GitHub 元数据刷新: {e}");
+                Vec::new()
+            }
+        }
+    };
+    let mut set = tokio::task::JoinSet::new();
+    for (repo, number) in keys {
+        let g = gh.clone();
+        set.spawn(async move {
+            let meta = g.fetch_pr_meta(&repo, number).await;
+            (repo, number, meta)
+        });
+    }
+    while let Some(Ok((repo, number, res))) = set.join_next().await {
+        match res {
+            Ok(meta) => {
+                let assignees = github::assignee_logins(&meta);
+                let gh_state = update_status.then(|| {
+                    if meta["merged_at"].is_null() {
+                        meta["state"].as_str().unwrap_or("open").to_string()
+                    } else {
+                        "merged".to_string()
+                    }
+                });
+                if let Some(a) = lock_for_profile(app, for_profile) {
+                    if let Err(e) = a.db.set_pr_assignees(&repo, number, &assignees) {
+                        tracing::warn!("回写 PR 指派人失败 {repo} #{number}: {e}");
+                    }
+                    if let Some(gh_state) = gh_state
+                        && (gh_state == "merged" || gh_state == "closed")
+                    {
+                        let _ = a.db.conn.execute(
+                            "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
+                            rusqlite::params![gh_state, repo, number],
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("刷新 PR 元数据失败 {repo} #{number}: {e}");
+            }
+        }
+    }
+    reload_rows(app, msg_tx);
+}
+
 /// 本地模式刷新：本地库是手动策展的（只有 Inbox「+ 预评审」加入的 PR），
 /// 不从 GitHub 自动拉任何 PR 列表——这里只刷新在库行的 GitHub 状态 + 通知收件箱。
 /// sync 启用时不走这条路——列表以服务器插件数据库为准。
@@ -1052,52 +1201,7 @@ async fn refresh_from_github(
                 }
             }
         }
-        // 并行拉每个在库 PR 的 GitHub 状态（merged/closed 写入 status 列后分组会把
-        // 已完结 PR 移出待评审区；否则合入了列表还显示 Open）。之前是串行循环，
-        // N 个 PR + M 个作者串行各一次请求，切换档案时要卡十几秒
-        let keys = {
-            let a = app.lock_recover();
-            match a.db.list_pr_keys() {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::warn!("列出 PR 键失败，跳过 GitHub 状态刷新: {e}");
-                    Vec::new()
-                }
-            }
-        };
-        {
-            let mut set = tokio::task::JoinSet::new();
-            for (repo, number) in keys {
-                let g = gh.clone();
-                set.spawn(async move {
-                    let meta = g.fetch_pr_meta(&repo, number).await;
-                    (repo, number, meta)
-                });
-            }
-            while let Some(Ok((repo, number, res))) = set.join_next().await {
-                match res {
-                    Ok(meta) => {
-                        let gh_state = if meta["merged_at"].is_null() {
-                            meta["state"].as_str().unwrap_or("open").to_string()
-                        } else {
-                            "merged".to_string()
-                        };
-                        if gh_state == "merged" || gh_state == "closed" {
-                            // 档案已切走则丢弃这条在途结果，不写进新档案的库
-                            if let Some(a) = lock_for_profile(app, for_profile) {
-                                let _ = a.db.conn.execute(
-                                    "UPDATE prs SET status=?1 WHERE repo=?2 AND number=?3 AND status NOT IN ('merged','closed')",
-                                    rusqlite::params![gh_state, repo, number],
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::debug!("刷新 PR 状态失败 {repo} #{number}: {e}");
-                    }
-                }
-            }
-        }
+        refresh_pr_metadata(gh, app, msg_tx, for_profile, true).await;
         // 作者公开组织成员关系（org 徽章数据源；本地行没人填这个字段，永远不会有 org 标）。
         // 同样并行
         let authors = {
@@ -1596,6 +1700,7 @@ async fn worker(
                             fetch_inbox(&g, &app2, &tx).await;
                             do_sync(&app2, &sc, &tx, &cmd2, &for_profile).await;
                             refresh_importance(&g, &app2, &tx, &for_profile).await;
+                            refresh_pr_metadata(&g, &app2, &tx, &for_profile, false).await;
                         } else {
                             refresh_from_github(&g, &app2, &tx, &for_profile).await;
                             // 顺便拉一次通知
@@ -1630,6 +1735,37 @@ async fn worker(
                     // 本地模式 sync 未启用时 do_sync 静默跳过，这里也不打扰状态栏）
                     app2.lock_recover().sync_inflight = false;
                     send(&tx, Msg::SyncFinished);
+                });
+            }
+            Cmd::SyncAssigned => {
+                let (for_profile, has_token) = {
+                    let a = app.lock_recover();
+                    (a.cfg.active_profile.clone(), a.cfg.token().is_some())
+                };
+                if !has_token {
+                    app.lock_recover().assigned_sync_inflight = false;
+                    send(
+                        &msg_tx,
+                        Msg::Status(tr(&lang, "assigned_sync_token_required").into()),
+                    );
+                    continue;
+                }
+                let Some(g) = gh.clone() else {
+                    app.lock_recover().assigned_sync_inflight = false;
+                    let detail = tr(&lang, "cfg_unconfigured");
+                    send(
+                        &msg_tx,
+                        Msg::Status(trf(&lang, "assigned_sync_failed", &[detail])),
+                    );
+                    continue;
+                };
+                let app2 = app.clone();
+                let tx = msg_tx.clone();
+                let cmd2 = cmd_tx.clone();
+                tokio::spawn(async move {
+                    sync_assigned_prs(&g, &app2, &tx, &cmd2, &for_profile).await;
+                    app2.lock_recover().assigned_sync_inflight = false;
+                    send(&tx, Msg::StatusBarRefresh);
                 });
             }
             Cmd::FetchDiff { repo, number } => {
@@ -2260,9 +2396,10 @@ async fn worker(
                                 let head_sha =
                                     meta["head"]["sha"].as_str().unwrap_or("").to_string();
                                 let title = meta["title"].as_str().unwrap_or("").to_string();
+                                let assignees = github::assignee_logins(&meta);
                                 let filled = {
                                     let a = app2.lock_recover();
-                                    match a.db.fill_pr_meta_if_empty(
+                                    let filled = match a.db.fill_pr_meta_if_empty(
                                         &repo, number, &author, &url, &head_sha, &title,
                                     ) {
                                         Ok(f) => f,
@@ -2271,6 +2408,15 @@ async fn worker(
                                                 "补齐 PR 元数据落库失败 {repo} #{number}: {e}"
                                             );
                                             false
+                                        }
+                                    };
+                                    match a.db.set_pr_assignees(&repo, number, &assignees) {
+                                        Ok(updated) => filled || updated,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "回写 PR 指派人失败 {repo} #{number}: {e}"
+                                            );
+                                            filled
                                         }
                                     }
                                 };
@@ -2482,6 +2628,7 @@ async fn worker(
                             let url = meta["html_url"].as_str().unwrap_or("").to_string();
                             let title = meta["title"].as_str().unwrap_or("").to_string();
                             let sha = meta["head"]["sha"].as_str().unwrap_or("").to_string();
+                            let assignees = github::assignee_logins(meta);
                             let meta_updated =
                                 meta["updated_at"].as_str().unwrap_or("").to_string();
                             // GitHub 终态（merged/closed）覆盖 status：分组靠它把已完结 PR 移出
@@ -2496,6 +2643,9 @@ async fn worker(
                                 let _ = a.db.fill_pr_meta_if_empty(
                                     &repo, number, &author, &url, &sha, &title,
                                 );
+                                if let Err(e) = a.db.set_pr_assignees(&repo, number, &assignees) {
+                                    tracing::warn!("回写 PR 指派人失败 {repo} #{number}: {e}");
+                                }
                                 if !sha.is_empty() {
                                     let _ = a.db.conn.execute(
                                         "UPDATE prs SET head_sha=?1 WHERE repo=?2 AND number=?3",
@@ -2865,6 +3015,77 @@ async fn worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assigned_pr(number: i64, title: &str) -> Value {
+        serde_json::json!({
+            "repo": "o/r",
+            "number": number,
+            "title": title,
+            "author": "author",
+            "url": format!("https://github.com/o/r/pull/{number}"),
+            "head_sha": "",
+            "status": "pending",
+            "source": "inbox",
+        })
+    }
+
+    #[test]
+    fn assigned_import_preserves_existing_and_tombstoned_prs() {
+        let app = Arc::new(Mutex::new(App::new(
+            Config::default(),
+            Db::open_memory().unwrap(),
+        )));
+        {
+            let a = app.lock_recover();
+            let mut existing = assigned_pr(1, "local title");
+            existing["pinned"] = Value::from(1);
+            existing["priority"] = Value::from(3);
+            assert_eq!(
+                a.db.insert_pr_from_inbox(&existing).unwrap(),
+                db::InsertPrOutcome::Inserted
+            );
+            a.db.insert_pr_from_inbox(&assigned_pr(3, "deleted"))
+                .unwrap();
+            a.db.delete_prs(&[("o/r".into(), 3)]).unwrap();
+        }
+
+        let prs = vec![
+            assigned_pr(1, "remote title"),
+            assigned_pr(2, "new"),
+            assigned_pr(3, "must stay deleted"),
+        ];
+        let (summary, new_keys) = import_assigned_prs(&app, &prs, "local").unwrap();
+        assert_eq!(
+            summary,
+            AssignedImportSummary {
+                inserted: 1,
+                existing: 1,
+                tombstoned: 1,
+                failed: 0,
+            }
+        );
+        assert_eq!(new_keys, vec![("o/r".into(), 2)]);
+
+        let a = app.lock_recover();
+        let existing = a.db.get_pr_full("o/r", 1).unwrap().unwrap();
+        assert_eq!(existing["title"], "local title");
+        assert_eq!(existing["pinned"], 1);
+        assert_eq!(existing["priority"], 3);
+        assert!(a.db.get_pr_full("o/r", 2).unwrap().is_some());
+        assert!(a.db.get_pr_full("o/r", 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn assigned_import_discards_results_after_profile_switch() {
+        let app = Arc::new(Mutex::new(App::new(
+            Config::default(),
+            Db::open_memory().unwrap(),
+        )));
+        assert!(
+            import_assigned_prs(&app, &[assigned_pr(1, "wrong profile")], "default").is_none()
+        );
+        assert!(app.lock_recover().db.list_pr_keys().unwrap().is_empty());
+    }
 
     #[test]
     fn auto_review_queue_deduplicates_and_settles_standard() {

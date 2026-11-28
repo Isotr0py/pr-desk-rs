@@ -757,18 +757,23 @@ fn tab_llm(app: &mut EguiApp, ui: &mut egui::Ui, lang: &str) {
     });
     ui.weak(tr(lang, "settings_kimi_cli_hint"));
     field(ui, tr(lang, "settings_kimi_workspace_root"), |ui| {
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut app.s_kimi_workspace_root)
-                    .hint_text(tr(lang, "settings_kimi_workspace_default"))
-                    .desired_width(f32::INFINITY),
-            );
-            if ui.button(tr(lang, "settings_browse")).clicked()
-                && let Some(path) = rfd::FileDialog::new().pick_folder()
-            {
-                app.s_kimi_workspace_root = path.to_string_lossy().into_owned();
-            }
-        });
+        let row_size = egui::vec2(ui.available_width(), ui.spacing().interact_size.y);
+        ui.allocate_ui_with_layout(
+            row_size,
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                if ui.button(tr(lang, "settings_browse")).clicked()
+                    && let Some(path) = rfd::FileDialog::new().pick_folder()
+                {
+                    app.s_kimi_workspace_root = path.to_string_lossy().into_owned();
+                }
+                ui.add(
+                    egui::TextEdit::singleline(&mut app.s_kimi_workspace_root)
+                        .hint_text(tr(lang, "settings_kimi_workspace_default"))
+                        .desired_width(f32::INFINITY),
+                );
+            },
+        );
     });
     ui.weak(tr(lang, "settings_kimi_workspace_hint"));
     ui.add_space(6.0);
